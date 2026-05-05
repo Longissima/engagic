@@ -20,8 +20,8 @@ PROCEDURAL_PATTERNS = [
     r'invocation',
     r'pledge of allegiance',
     r'flag salute',  # Regional variant of pledge
-    r'approval of\b.*\b(minutes|agenda)',  # "Approval of Draft Raleigh Board of Adjustment Minutes"
-    r'approve\b.*\bminutes',  # "Approve the minutes of...", "Approve the Liquor Commission meeting minutes of..."
+    r'approval of\s+(?:the\s+|draft\s+)?(?:meeting\s+)?(?:minutes|agenda)\b',  # "Approval of Draft Minutes", "Approval of Agenda"
+    r'\bapprove\s+(?:the\s+|draft\s+)?(?:meeting\s+)?minutes\b',  # "Approve the minutes of..." -- requires "minutes" right after the verb, not "Approve and record into the minutes [tax refunds]"
     r'adopt minutes',
     r'review of minutes',
     r'^minutes of',  # Standalone minutes items
@@ -31,10 +31,14 @@ PROCEDURAL_PATTERNS = [
     r'\brecess\b',  # Meeting recess (\b prevents matching "recession")
     r'moment of silence',
     r'public comment',  # The period itself, not the content
-    r'communications',  # Generic communications period
+    r'^communications?\s*$',  # Standalone "Communications" agenda section -- not "Telecommunications Agreement"
+    r'communications? from\s+(council|board|members?|staff|the\s+(public|chair|mayor|manager))',
     r'time fixed for next',
     r'identify items (to|for)',  # Future items placeholder ("identify items to discuss")
     r'meeting schedule for',  # Calendar scheduling items
+    r'^approve bills\.?\s*$',  # County boilerplate ("Approve Bills.") -- \s*$ handles the trailing space from f"{title} {item_type}"
+    r'^ratify\b.*\b(disburse|payment|warrant)',  # "Ratify the release of time-sensitive disbursements..."
+    r'^(authorize|authorization)\s+(?:advertising|advertisement)\s+for\s+(bids?|proposals)',  # Procurement notices, no policy substance until bids return
 ]
 
 # Ceremonial — searchable names, no policy substance
@@ -59,7 +63,7 @@ CEREMONIAL_PATTERNS = [
 # Administrative — save for record, no LLM value
 ADMINISTRATIVE_PATTERNS = [
     r'\bappointment\b',
-    r'\bconfirmation\b',
+    r'\bconfirmation of\b.*\b(appointment|appointee|nominee|hiring|director|chief|officer|commissioner)',  # Tightened from \bconfirmation\b which caught "effective upon confirmation from..."
     r'(?i)liquor license',
     r'(?i)beer (and|&) wine license',
     r'(?i)alcoholic beverage license',
@@ -126,6 +130,8 @@ BOILERPLATE_CONTRACT_PATTERNS = [
     r'certificate of insurance',
     r'w-?9',  # Tax forms
     r'bid tabulation',  # Bid results tables (useful but huge)
+    r'^budget transfer form$',  # Fort Bend etc. -- the item title already says "transfer $X from Y to Z for purpose"; the form just restates it as a checkbox sheet
+    r"^director'?s?\s+form$",  # Same family: salary/personnel transfer cover form, no policy substance beyond the title
 ]
 
 # SF procedural boilerplate (internal routing, compliance checkboxes, no policy substance)

@@ -248,12 +248,23 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         links = []
         seen_urls = set()
 
-        # Strategy 1: Parse structured AgendaCenter sections (h2 + table rows)
+        # Strategy 1: Parse structured AgendaCenter sections (h2 + table rows).
+        # Two-tier sites (e.g. Kenosha County WI) wrap committees in nested
+        # div.category > h3 blocks under each div.listing > h2 group; prefer
+        # the inner h3 for committee attribution when present.
         category_divs = soup.find_all("div", class_="listing")
         if category_divs:
+            sections: List[tuple] = []
             for cat_div in category_divs:
-                h2 = cat_div.find("h2")
-                body_name = h2.get_text(strip=True) if h2 else None
+                nested = cat_div.find_all("div", class_="category")
+                if nested:
+                    for nc in nested:
+                        sections.append((nc, nc.find("h3")))
+                else:
+                    sections.append((cat_div, cat_div.find("h2")))
+
+            for section_div, heading in sections:
+                body_name = heading.get_text(strip=True) if heading else None
 
                 # Skip notice-only categories -- these are announcements,
                 # not meetings with agendas worth summarizing.
@@ -264,7 +275,7 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 ):
                     continue
 
-                for row in cat_div.find_all("tr", class_="catAgendaRow"):
+                for row in section_div.find_all("tr", class_="catAgendaRow"):
                     # Primary meeting link is in a <p> inside the first <td>
                     td = row.find("td")
                     if not td:

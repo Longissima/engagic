@@ -13,29 +13,32 @@ logger = get_logger(__name__).bind(component="vendor")
 
 # Per-vendor minimum interval between requests on a single slot.
 DELAYS: Dict[str, float] = {
-    "primegov": 2.7,
-    "granicus": 3.6,
-    "civicclerk": 2.7,
-    "legistar": 2.7,
-    "civicplus": 7.2,  # aggressive blocking, longer per-slot delay
-    "civicengage": 4.5,
-    "novusagenda": 3.6,
-    "iqm2": 2.7,
-    "escribe": 2.7,
-    "municode": 2.7,
-    "onbase": 2.7,
-    "civicweb": 2.7,
-    "visioninternet": 2.7,
-    "agendaonline": 2.7,
-    "proudcity": 2.7,
-    "wp_events": 2.7,
-    "berkeley": 2.7,
-    "menlopark": 2.7,
-    "chicago": 2.7,
-    "ross": 2.7,
-    "destiny": 2.7,
-    "boardbook": 1.5,  # Sparq BoardBook -- SaaS serving hundreds of districts
-    "unknown": 4.5,
+    # Vendor-hosted APIs / SaaS endpoints (talking to vendor infra, not city
+    # site) -- aggressive pacing OK; these are sized for high-volume traffic.
+    "legistar": 0.3,    # webapi.legistar.com (Azure REST API)
+    "civicclerk": 0.5,  # Azure-hosted multi-tenant API
+    "granicus": 0.6,    # {city}.granicus.com / mccmeetings blob
+    "primegov": 0.5,
+    "iqm2": 0.6,        # owned by Granicus, similar infra
+    "municode": 0.6,    # meetings.municode.com + {tenant}.municodemeetings.com
+    "boardbook": 0.5,   # Sparq central host, hundreds of districts
+    "novusagenda": 0.8,
+    "escribe": 0.8,
+    "civicweb": 0.8,
+    "agendaonline": 0.8,
+    "destiny": 1.0,
+    "onbase": 1.0,      # mixed: hylandcloud SaaS + self-hosted city subpaths
+    # Hits the city's own site -- be polite to municipal infra.
+    "civicplus": 5.4,   # known Cloudflare blocking; stay conservative
+    "civicengage": 2.0, # archive.aspx on city domain
+    "visioninternet": 2.7,  # Akamai-fronted city sites; blocks aggressively
+    "proudcity": 1.8,   # city WordPress
+    "wp_events": 1.8,   # city WordPress
+    "berkeley": 1.8,
+    "menlopark": 1.8,
+    "chicago": 1.8,
+    "ross": 1.8,
+    "unknown": 2.7,
 }
 
 # Per-vendor concurrent slots. Each slot is paced independently at DELAYS[vendor],
@@ -46,12 +49,21 @@ DELAYS: Dict[str, float] = {
 # vendor is sized for high concurrent traffic from real district staff. Keep
 # at 1 for vendors that have shown signs of aggressive bot blocking.
 SLOTS: Dict[str, int] = {
-    "boardbook": 3,   # Sparq SaaS, ~hundreds of districts -- 2 req/sec aggregate
-    "legistar": 2,    # Many cities on legistar.com subdomains
-    "granicus": 2,    # Many cities on granicus.com subdomains
-    "primegov": 2,    # Multi-tenant SaaS
-    "civicclerk": 2,  # Multi-tenant SaaS
-    # Everyone else stays at 1 (default below)
+    # Vendor-hosted multi-tenant SaaS / APIs -- bursts of N concurrent reqs OK
+    "legistar": 12,   # webapi.legistar.com one shared Azure host
+    "civicclerk": 10,
+    "granicus": 8,
+    "primegov": 6,
+    "iqm2": 6,
+    "municode": 6,
+    "boardbook": 6,
+    "novusagenda": 4,
+    "escribe": 4,
+    "civicweb": 4,
+    "agendaonline": 3,
+    "onbase": 12,     # each city is on its own domain, no real cross-city contention
+    "destiny": 3,
+    # City-direct scrapers stay at 1 (default below)
 }
 
 
@@ -74,7 +86,13 @@ class AsyncRateLimiter:
     async def wait_if_needed(self, vendor: str):
         min_delay = DELAYS.get(vendor, DELAYS["unknown"])
         n_slots = SLOTS.get(vendor, 1)
-        jitter = random.uniform(0, 2) if vendor == "civicplus" else random.uniform(0, 1)
+        # Jitter scales with delay: 0-1s of jitter on a 0.3s delay would
+        # dominate; cap jitter at half the configured delay so high-throughput
+        # API vendors actually pace at their configured rate.
+        if vendor == "civicplus":
+            jitter = random.uniform(0, 2)
+        else:
+            jitter = random.uniform(0, min(1.0, min_delay * 0.5))
 
         # Reserve a slot inside the lock; sleep outside so concurrent callers
         # can serialize their reservations without serializing their waits.
@@ -92,7 +110,10 @@ class AsyncRateLimiter:
             sleep_time = fire_at - now
 
         if sleep_time > 0.05:
-            logger.info(
+            # Routine pacing waits log at debug; only surface long stalls to
+            # info so the console isn't flooded during multi-city syncs.
+            log_fn = logger.info if sleep_time >= 30 else logger.debug
+            log_fn(
                 "vendor rate limit",
                 vendor=vendor,
                 sleep_seconds=round(sleep_time, 1),

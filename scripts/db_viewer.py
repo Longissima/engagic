@@ -9,8 +9,6 @@ Adapted for async PostgreSQL with repository pattern
 import sys
 import os
 import asyncio
-import re
-import unicodedata
 from datetime import datetime
 from typing import Optional
 
@@ -20,69 +18,7 @@ from uszipcode import SearchEngine
 
 from database.db_postgres import Database
 from database.models import Jurisdiction
-
-
-def to_banana_slug(name: str) -> str:
-    """Normalize a jurisdiction name to its banana slug fragment.
-
-    Strips diacritics so n-tilde -> n, e-acute -> e, etc. The prior
-    [^a-zA-Z0-9] regex dropped them entirely (La Canada -> lacaada).
-    """
-    normalized = unicodedata.normalize("NFKD", name)
-    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-zA-Z0-9]", "", ascii_only).lower()
-
-
-# Order matters: longest phrases first so "school district" doesn't fire before
-# "independent school district" can. The loop in derive_district_stem strips
-# repeatedly, so "Joint Unified School District" peels in three passes.
-_DISTRICT_SUFFIXES = (
-    "consolidated school district",
-    "independent school district",
-    "joint unified school district",
-    "unified school district",
-    "regional school district",
-    "central school district",
-    "public schools",
-    "school district",
-    "city schools",
-    "schools",
-    "consolidated",
-    "independent",
-    "regional",
-    "unified",
-    "central",
-    "joint",
-    "isd",
-    "usd",
-    "csd",
-    "psd",
-    "rsd",
-)
-
-
-def derive_district_stem(name: str) -> str:
-    """Strip district-suffix words from the right to produce a short banana stem.
-
-    'Prosper Independent School District' -> 'prosper'
-    'Los Angeles Unified School District' -> 'losangeles'
-    'Fairfax County Public Schools'       -> 'fairfaxcounty'
-    'Pierre School District 32-2'         -> 'pierre'
-
-    Geographic qualifiers ('county', 'city') are preserved -- 'Fairfax County'
-    is meaningfully distinct from 'Fairfax City'. Trailing district numbers
-    (SD/IL/IA convention, e.g. '32-2') are stripped before suffix matching.
-    """
-    s = re.sub(r"\s+[\d\-]+$", "", name.strip())
-    while True:
-        lower = s.lower()
-        for suf in _DISTRICT_SUFFIXES:
-            if lower.endswith(" " + suf) or lower == suf:
-                s = s[: -len(suf)].rstrip()
-                break
-        else:
-            break
-    return to_banana_slug(s)
+from scripts._jurisdiction_naming import to_banana_slug, derive_district_stem
 
 
 # State abbreviation to FIPS code mapping
@@ -786,11 +722,7 @@ class DatabaseViewer:
 
                 # If updating name or state, recalculate banana
                 if field in ['name', 'state']:
-                    import re
-                    new_banana = (
-                        re.sub(r"[^a-zA-Z0-9]", "", city.name).lower()
-                        + city.state.upper()
-                    )
+                    new_banana = to_banana_slug(city.name) + city.state.upper()
 
                     if new_banana != current_banana:
                         # Need to update banana and all foreign keys
