@@ -12,6 +12,11 @@
 		return source?.real_metrics ?? null;
 	}
 
+	function compact(n: number): string {
+		if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+		return n.toLocaleString();
+	}
+
 	const metrics = $derived(getMetrics());
 
 	onMount(async () => {
@@ -46,9 +51,9 @@
 		{@const byType = metrics.by_type?.total}
 		<p class="footer-stats">
 			{#if byType}
-				Tracking {byType.city.toLocaleString()} cities, {byType.county.toLocaleString()} counties, {byType.school_district.toLocaleString()} school districts &bull; {metrics.meetings_tracked.toLocaleString()} meetings analyzed
+				{compact(byType.city)} cities &middot; {compact(byType.county)} counties &middot; {compact(byType.school_district)} school districts &middot; {compact(metrics.meetings_tracked)} meetings
 			{:else}
-				Tracking {metrics.cities_covered.toLocaleString()} jurisdictions &bull; {metrics.meetings_tracked.toLocaleString()} meetings analyzed
+				Tracking {compact(metrics.cities_covered)} jurisdictions &bull; {compact(metrics.meetings_tracked)} meetings analyzed
 			{/if}
 		</p>
 	{/if}

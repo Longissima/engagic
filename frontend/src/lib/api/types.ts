@@ -815,12 +815,14 @@ export interface GlobalHappeningResponse {
 	items: GlobalHappeningItem[];
 }
 
-// City coverage types for transparency page
+// Jurisdiction coverage types for transparency page
 export type CoverageType = 'matter' | 'item' | 'monolithic' | 'synced' | 'pending';
+export type JurisdictionType = 'city' | 'county' | 'school_district';
 
 export interface CityWithCoverage {
 	name: string;
 	state: string;
+	type: JurisdictionType;
 	population: number;
 	coverage_type: CoverageType;
 	summary_count: number;
@@ -832,6 +834,11 @@ export interface CityCoverageSummary {
 	monolithic: number;
 	synced: number;
 	total: number;
+	by_type?: {
+		city: number;
+		county: number;
+		school_district: number;
+	};
 }
 
 export interface CityCoverageResponse {

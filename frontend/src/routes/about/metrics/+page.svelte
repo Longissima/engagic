@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { PageData } from './$types';
-	import type { CoverageType } from '$lib/api/types';
+	import type { CoverageType, JurisdictionType } from '$lib/api/types';
 	import SeoHead from '$lib/components/SeoHead.svelte';
 
 	let { data }: { data: PageData } = $props();
@@ -60,6 +60,15 @@
 		}
 	}
 
+	function jurisdictionLabel(type: JurisdictionType): string {
+		switch (type) {
+			case 'city': return 'City';
+			case 'county': return 'County';
+			case 'school_district': return 'School District';
+			default: return type;
+		}
+	}
+
 	function sparklinePath(values: number[], width: number = 80, height: number = 24): string {
 		if (!values || values.length < 2) return '';
 		const max = Math.max(...values);
@@ -96,15 +105,15 @@
 			class:active={activeView === 'coverage'}
 			onclick={() => activeView = 'coverage'}
 		>
-			City Coverage
+			Jurisdiction Coverage
 		</button>
 	</div>
 
 	{#if activeView === 'coverage'}
 		{#if data.cityCoverage}
 			<section class="metrics-section">
-				<h1 class="primary-heading">City Coverage</h1>
-				<p class="section-desc">All cities with active coverage, sorted by population. Coverage depth indicates the granularity of legislative tracking.</p>
+				<h1 class="primary-heading">Jurisdiction Coverage</h1>
+				<p class="section-desc">All jurisdictions with active coverage — cities, counties, and school districts — sorted by population. Coverage depth indicates the granularity of legislative tracking.</p>
 
 				<div class="coverage-summary">
 					<div class="summary-item">
@@ -125,15 +134,21 @@
 					</div>
 					<div class="summary-item">
 						<span class="summary-count">{data.cityCoverage.summary.total}</span>
-						<span class="summary-label">Total Cities</span>
+						<span class="summary-label">Total</span>
 					</div>
 				</div>
+
+				{#if data.cityCoverage.summary.by_type}
+					{@const bt = data.cityCoverage.summary.by_type}
+					<p class="coverage-breakdown">{bt.city.toLocaleString()} cities · {bt.county.toLocaleString()} counties · {bt.school_district.toLocaleString()} school districts</p>
+				{/if}
 
 				<div class="jurisdiction-table-container">
 					<table class="jurisdiction-table">
 						<thead>
 							<tr>
-								<th class="col-city">City</th>
+								<th class="col-jurisdiction">Jurisdiction</th>
+								<th class="col-type">Type</th>
 								<th class="col-coverage">Coverage</th>
 								<th class="col-count">Count</th>
 								<th class="col-pop">Population</th>
@@ -142,7 +157,8 @@
 						<tbody>
 							{#each data.cityCoverage.cities as city}
 								<tr>
-									<td class="col-city">{city.name}, {city.state}</td>
+									<td class="col-jurisdiction">{city.name}, {city.state}</td>
+									<td class="col-type">{jurisdictionLabel(city.type)}</td>
 									<td class="col-coverage">
 										<span class="coverage-badge {coverageClass(city.coverage_type)}">
 											{coverageLabel(city.coverage_type)}
@@ -655,12 +671,28 @@
 		background: var(--surface-secondary);
 	}
 
-	.col-city {
+	.col-city,
+	.col-jurisdiction {
 		min-width: 200px;
+	}
+
+	.col-type {
+		min-width: 110px;
+		font-size: 0.85rem;
+		color: var(--text-secondary);
+		white-space: nowrap;
 	}
 
 	.col-coverage {
 		min-width: 140px;
+	}
+
+	.coverage-breakdown {
+		font-family: var(--font-mono);
+		font-size: 0.8rem;
+		color: var(--text-secondary);
+		margin: 0 0 var(--space-lg) 0;
+		opacity: 0.75;
 	}
 
 	.col-count {
@@ -740,8 +772,14 @@
 			padding: var(--space-sm) var(--space-md);
 		}
 
-		.col-city {
+		.col-city,
+		.col-jurisdiction {
 			min-width: 150px;
+		}
+
+		.col-type {
+			min-width: 90px;
+			font-size: 0.8rem;
 		}
 	}
 </style>

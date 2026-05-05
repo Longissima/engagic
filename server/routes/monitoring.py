@@ -544,6 +544,7 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                 SELECT
                     c.name,
                     c.state,
+                    c.type AS jurisdiction_type,
                     COALESCE(c.population, 0) AS population,
                     CASE
                         WHEN COALESCE(mc.cnt, 0) > 0 THEN 'matter'
@@ -571,6 +572,7 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                 {
                     "name": row["name"],
                     "state": row["state"],
+                    "type": row["jurisdiction_type"],
                     "population": row["population"],
                     "coverage_type": row["coverage_type"],
                     "summary_count": row["summary_count"],
@@ -585,6 +587,11 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                 "monolithic": sum(1 for c in cities if c["coverage_type"] == "monolithic"),
                 "synced": sum(1 for c in cities if c["coverage_type"] == "synced"),
                 "total": len(cities),
+                "by_type": {
+                    "city": sum(1 for c in cities if c["type"] == "city"),
+                    "county": sum(1 for c in cities if c["type"] == "county"),
+                    "school_district": sum(1 for c in cities if c["type"] == "school_district"),
+                },
             }
 
         return {
