@@ -322,7 +322,7 @@ async def main(apply: bool, limit: Optional[int]):
                 type="school_district",
                 status="active",
             )
-            await db.cities.upsert_city(j)
+            await db.jurisdictions.upsert_city(j)
 
         inserted = 0
         failed = []

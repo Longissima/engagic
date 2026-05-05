@@ -442,9 +442,9 @@
 					<div class="section-rule">Cities</div>
 					<div class="cities-grid">
 						{#each displayedCities as city}
-							<a href="/{city.banana}" class="city-cell">
-								<div class="city-cell-name">{city.name}</div>
-								<div class="city-cell-stats">{city.matter_count} matters · {city.meeting_count} meetings</div>
+							<a href="/{city.banana}" class="jurisdiction-cell">
+								<div class="jurisdiction-cell-name">{city.name}</div>
+								<div class="jurisdiction-cell-stats">{city.matter_count} matters · {city.meeting_count} meetings</div>
 							</a>
 						{/each}
 					</div>
@@ -1004,7 +1004,7 @@
 		background: var(--border-primary);
 	}
 
-	.city-cell {
+	.jurisdiction-cell {
 		background: var(--surface-primary);
 		padding: 1.125rem 1rem;
 		cursor: pointer;
@@ -1013,18 +1013,18 @@
 		color: inherit;
 	}
 
-	.city-cell:hover {
+	.jurisdiction-cell:hover {
 		background: var(--surface-secondary);
 	}
 
-	.city-cell-name {
+	.jurisdiction-cell-name {
 		font-family: var(--font-display);
 		font-size: 1.125rem;
 		color: var(--text-primary);
 		margin-bottom: 0.375rem;
 	}
 
-	.city-cell-stats {
+	.jurisdiction-cell-stats {
 		font-family: var(--font-mono);
 		font-size: 0.7rem;
 		color: var(--civic-gray);

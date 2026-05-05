@@ -11,7 +11,7 @@ from enum import Enum
 import aiohttp
 
 from database.db_postgres import Database
-from database.models import City
+from database.models import Jurisdiction
 from exceptions import VendorError
 from vendors.adapters.base_adapter_async import FetchResult
 from vendors.factory import get_async_adapter, VENDOR_ADAPTERS
@@ -111,7 +111,7 @@ class Fetcher:
         logger.info("starting polite city sync")
 
         self.failed_cities.clear()
-        cities = await self.db.cities.get_all_cities(status="active")
+        cities = await self.db.jurisdictions.get_all_cities(status="active")
         logger.info("syncing cities with rate limiting", city_count=len(cities))
 
         by_vendor = {}
@@ -141,7 +141,7 @@ class Fetcher:
             # Parallel sync with semaphore for controlled concurrency
             semaphore = asyncio.Semaphore(CITY_SYNC_CONCURRENCY)
 
-            async def sync_city_with_limit(city: City) -> Optional[SyncResult]:
+            async def sync_city_with_limit(city: Jurisdiction) -> Optional[SyncResult]:
                 if not self.is_running:
                     return None
 
@@ -189,7 +189,7 @@ class Fetcher:
         results = []
 
         for banana in city_bananas:
-            city = await self.db.cities.get_city(banana=banana)
+            city = await self.db.jurisdictions.get_city(banana=banana)
             if not city:
                 logger.warning("city not found", banana=banana)
                 results.append(SyncResult(city_banana=banana, status=SyncStatus.FAILED, error_message="City not found in database"))
@@ -211,7 +211,7 @@ class Fetcher:
             return SyncResult(city_banana=city_banana, status=SyncStatus.FAILED, error_message="City not found")
         return await self._sync_city_with_retry(city)
 
-    async def _sync_city(self, city: City) -> SyncResult:
+    async def _sync_city(self, city: Jurisdiction) -> SyncResult:
         """Sync a city across its primary vendor and any extra_vendors.
 
         Primary runs first; extras run sequentially afterward (rate-limited per vendor).
@@ -242,7 +242,7 @@ class Fetcher:
 
         return aggregate
 
-    async def _sync_with_vendor(self, city: City, vendor: str, slug: str) -> SyncResult:
+    async def _sync_with_vendor(self, city: Jurisdiction, vendor: str, slug: str) -> SyncResult:
         """Single-vendor sync pass for a city. One adapter, one fetch, store all meetings."""
         result = SyncResult(city_banana=city.banana, status=SyncStatus.PENDING)
         start_time = time.time()
@@ -345,7 +345,7 @@ class Fetcher:
 
         return result
 
-    async def _sync_city_with_retry(self, city: City, max_retries: int = 1) -> SyncResult:
+    async def _sync_city_with_retry(self, city: Jurisdiction, max_retries: int = 1) -> SyncResult:
         """Sync city with retry (5s, 20s delays)."""
         wait_times = [5, 20]
         last_error = "Unknown retry error"
@@ -379,11 +379,11 @@ class Fetcher:
             return last_result
         return SyncResult(city_banana=city.banana, status=SyncStatus.FAILED, error_message=last_error)
 
-    async def _should_sync_city(self, city: City) -> bool:
+    async def _should_sync_city(self, city: Jurisdiction) -> bool:
         """Determine if city needs syncing based on activity patterns."""
         try:
-            recent_meetings = await self.db.cities.get_city_meeting_frequency(city.banana, days=30)
-            last_sync = await self.db.cities.get_city_last_sync(city.banana)
+            recent_meetings = await self.db.jurisdictions.get_city_meeting_frequency(city.banana, days=30)
+            last_sync = await self.db.jurisdictions.get_city_last_sync(city.banana)
 
             if not last_sync:
                 return True
@@ -402,12 +402,12 @@ class Fetcher:
             logger.warning("error checking sync schedule", city=city.banana, error=str(e))
             return True
 
-    async def _prioritize_cities(self, cities: List[City]) -> List[City]:
+    async def _prioritize_cities(self, cities: List[Jurisdiction]) -> List[Jurisdiction]:
         """Sort cities by sync priority (high activity first)."""
-        async def get_priority(city: City) -> float:
+        async def get_priority(city: Jurisdiction) -> float:
             try:
-                recent_meetings = await self.db.cities.get_city_meeting_frequency(city.banana, days=30)
-                last_sync = await self.db.cities.get_city_last_sync(city.banana)
+                recent_meetings = await self.db.jurisdictions.get_city_meeting_frequency(city.banana, days=30)
+                last_sync = await self.db.jurisdictions.get_city_last_sync(city.banana)
                 if not last_sync:
                     return 1000
                 hours_since_sync = (datetime.now() - last_sync).total_seconds() / 3600

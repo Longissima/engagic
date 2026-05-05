@@ -1,5 +1,12 @@
 <script lang="ts">
 	import SeoHead from '$lib/components/SeoHead.svelte';
+	import type { PageData } from './$types';
+
+	let { data }: { data: PageData } = $props();
+	const byType = $derived(data.analytics?.real_metrics.by_type?.total);
+	const total = $derived(
+		byType ? byType.city + byType.county + byType.school_district : null
+	);
 </script>
 
 <SeoHead
@@ -12,7 +19,15 @@
 	<section class="section">
 		<h1 class="page-title">Our Mission</h1>
 		<p class="lead">Help you stay informed and make your voice heard in local government.</p>
-		<p>We track city council meetings across the US, summarize what's being decided, and show you exactly how to weigh in - call, email, or Zoom.</p>
+		<p>We track public meetings of local government across the US — city councils, county boards, school districts — summarize what's being decided, and show you exactly how to weigh in: call, email, or Zoom.</p>
+	</section>
+
+	<section class="section">
+		<div class="section-rule">What We Cover</div>
+		<p>"Local government" isn't just city hall. The decisions that shape your block come from a patchwork of <strong>jurisdictions</strong>: cities and towns, counties, school districts, and special-purpose boards. Engagic treats them all as first-class.</p>
+		{#if byType && total}
+			<p>Right now we're tracking <strong>{total.toLocaleString()}</strong> jurisdictions: <strong>{byType.city.toLocaleString()}</strong> cities, <strong>{byType.county.toLocaleString()}</strong> counties, and <strong>{byType.school_district.toLocaleString()}</strong> school districts.</p>
+		{/if}
 	</section>
 
 	<section class="section">
@@ -20,7 +35,11 @@
 		<div class="feature-list">
 			<div class="feature-item">
 				<h3 class="feature-heading">Find What Matters</h3>
-				<p>We track 600+ cities, pulling meeting agendas and documents so you don't have to hunt across government websites.</p>
+				{#if total}
+					<p>We track {total.toLocaleString()}+ jurisdictions, pulling meeting agendas and documents so you don't have to hunt across government websites.</p>
+				{:else}
+					<p>We track jurisdictions across the US, pulling meeting agendas and documents so you don't have to hunt across government websites.</p>
+				{/if}
 			</div>
 			<div class="feature-item">
 				<h3 class="feature-heading">Make It Understandable</h3>

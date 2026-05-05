@@ -373,8 +373,8 @@
 								<div class="edit-field">
 									<span class="edit-label">City</span>
 									{#if editingCityForDigest === digest.id}
-										<div class="city-edit">
-											<div class="city-search-row">
+										<div class="jurisdiction-edit">
+											<div class="jurisdiction-search-row">
 												<input
 													type="text"
 													bind:value={citySearchQuery}
@@ -393,10 +393,10 @@
 												<button onclick={cancelCityEdit} class="btn-secondary">Cancel</button>
 											</div>
 											{#if citySearchResults.length > 0}
-												<div class="city-results">
+												<div class="jurisdiction-results">
 													{#each citySearchResults as city}
 														<button
-															class="city-result"
+															class="jurisdiction-result"
 															onclick={() => handleAddCity(digest.id, city.banana)}
 															disabled={cityLoading[digest.id]}
 														>
@@ -862,22 +862,22 @@
 
 	/* ── Form controls ── */
 
-	.city-edit { margin-top: 0.25rem; }
+	.jurisdiction-edit { margin-top: 0.25rem; }
 
-	.city-search-row,
+	.jurisdiction-search-row,
 	.keyword-input-row {
 		display: flex;
 		gap: 0.5rem;
 	}
 
-	.city-results {
+	.jurisdiction-results {
 		display: flex;
 		flex-direction: column;
 		gap: 0.25rem;
 		margin: 0.5rem 0;
 	}
 
-	.city-result {
+	.jurisdiction-result {
 		text-align: left;
 		padding: 0.5rem 0.75rem;
 		background: transparent;
@@ -890,7 +890,7 @@
 		transition: all var(--transition-fast);
 	}
 
-	.city-result:hover {
+	.jurisdiction-result:hover {
 		background: var(--surface-secondary);
 		border-color: var(--civic-blue);
 	}
@@ -1232,7 +1232,7 @@
 			padding-left: var(--space-sm);
 		}
 
-		.city-search-row {
+		.jurisdiction-search-row {
 			flex-wrap: wrap;
 		}
 

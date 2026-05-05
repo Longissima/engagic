@@ -61,7 +61,7 @@
 					Agendas are typically posted 48 hours before meetings. If this is a valid city,
 					please check back later or try searching by zipcode.
 				</p>
-				<div class="request-city-cta">
+				<div class="request-jurisdiction-cta">
 					<p class="cta-text">Want us to track {cityDisplay || 'this city'}?</p>
 					{#if requestSent}
 						<p class="cta-success">You're now watching {cityDisplay}. We'll email you when it's added.</p>
@@ -161,7 +161,7 @@
 		line-height: 1.6;
 	}
 
-	.request-city-cta {
+	.request-jurisdiction-cta {
 		margin: 2rem 0;
 		padding: 1.5rem;
 		background: var(--surface-secondary);

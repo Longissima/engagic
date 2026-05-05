@@ -129,11 +129,6 @@ class Jurisdiction:
         return data
 
 
-# Backward compatibility alias
-City = Jurisdiction
-
-
-
 @dataclass
 class Meeting:
     """Meeting entity with optional summary

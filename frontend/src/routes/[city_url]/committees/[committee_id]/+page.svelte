@@ -79,7 +79,7 @@
 				<h1 class="committee-name">{committee.name}</h1>
 				<div class="committee-meta">
 					{#if cityName}
-						<span class="city-name">{cityName}, {stateName}</span>
+						<span class="jurisdiction-name">{cityName}, {stateName}</span>
 					{/if}
 					{#if committee.status !== 'active'}
 						<span class="status-badge inactive">Inactive</span>
@@ -308,7 +308,7 @@
 		margin-bottom: 0.5rem;
 	}
 
-	.city-name {
+	.jurisdiction-name {
 		font-family: var(--font-mono);
 		font-size: 0.9rem;
 		color: var(--civic-gray);

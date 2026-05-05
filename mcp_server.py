@@ -99,7 +99,7 @@ async def list_cities(state: Optional[str] = None) -> str:
     Args:
         state: Two-letter state code (e.g. 'CA', 'TX'). Omit for all.
     """
-    cities = await db.cities.get_cities(state=state)
+    cities = await db.jurisdictions.get_cities(state=state)
     return json.dumps([c.to_dict() for c in cities], default=str)
 
 

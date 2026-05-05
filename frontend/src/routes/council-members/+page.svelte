@@ -61,8 +61,8 @@
 		</div>
 	</div>
 
-	<div class="city-table-container">
-		<table class="city-table">
+	<div class="jurisdiction-table-container">
+		<table class="jurisdiction-table">
 			<thead>
 				<tr>
 					<th class="col-city">City</th>
@@ -76,7 +76,7 @@
 				{#each data.cities as city}
 					<tr>
 						<td class="col-city">
-							<a href="/{city.banana}/council" class="city-link">
+							<a href="/{city.banana}/council" class="jurisdiction-link">
 								{city.city_name}, {city.state}
 							</a>
 						</td>
@@ -163,7 +163,7 @@
 		color: var(--text-secondary);
 	}
 
-	.city-table-container {
+	.jurisdiction-table-container {
 		overflow-x: auto;
 		border: 1px solid var(--border-primary);
 		border-radius: var(--radius-md);
@@ -171,20 +171,20 @@
 		overflow-y: auto;
 	}
 
-	.city-table {
+	.jurisdiction-table {
 		width: 100%;
 		border-collapse: collapse;
 		font-size: 0.9rem;
 	}
 
-	.city-table thead {
+	.jurisdiction-table thead {
 		position: sticky;
 		top: 0;
 		background: var(--surface-secondary);
 		z-index: 1;
 	}
 
-	.city-table th {
+	.jurisdiction-table th {
 		font-family: var(--font-mono);
 		font-weight: 600;
 		text-align: left;
@@ -196,13 +196,13 @@
 		letter-spacing: 0.05em;
 	}
 
-	.city-table td {
+	.jurisdiction-table td {
 		padding: var(--space-md) var(--space-lg);
 		border-bottom: 1px solid var(--border-subtle);
 		color: var(--text-primary);
 	}
 
-	.city-table tbody tr:hover {
+	.jurisdiction-table tbody tr:hover {
 		background: var(--surface-secondary);
 	}
 
@@ -210,14 +210,14 @@
 		min-width: 200px;
 	}
 
-	.city-link {
+	.jurisdiction-link {
 		color: var(--text-primary);
 		text-decoration: none;
 		font-weight: 500;
 		transition: color var(--transition-fast);
 	}
 
-	.city-link:hover {
+	.jurisdiction-link:hover {
 		color: var(--civic-blue);
 	}
 
@@ -227,7 +227,7 @@
 		font-family: var(--font-mono);
 	}
 
-	.city-table th.col-count {
+	.jurisdiction-table th.col-count {
 		text-align: right;
 	}
 
@@ -236,7 +236,7 @@
 		text-align: center;
 	}
 
-	.city-table th.col-votes {
+	.jurisdiction-table th.col-votes {
 		text-align: center;
 	}
 
@@ -265,7 +265,7 @@
 		font-family: var(--font-mono);
 	}
 
-	.city-table th.col-pop {
+	.jurisdiction-table th.col-pop {
 		text-align: right;
 	}
 
@@ -287,8 +287,8 @@
 			font-size: 1.25rem;
 		}
 
-		.city-table th,
-		.city-table td {
+		.jurisdiction-table th,
+		.jurisdiction-table td {
 			padding: var(--space-sm) var(--space-md);
 		}
 

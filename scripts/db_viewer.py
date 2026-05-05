@@ -162,7 +162,7 @@ class DatabaseViewer:
 
     async def show_cities_table(self, limit: int = 50):
         """Display cities table with zipcode counts"""
-        cities = await self.db.cities.get_cities(status="active", limit=limit)
+        cities = await self.db.jurisdictions.get_cities(status="active", limit=limit)
 
         print(f"\n=== JURISDICTIONS TABLE (showing {len(cities)}) ===")
         print(
@@ -218,7 +218,7 @@ class DatabaseViewer:
         """Display meetings table with city information"""
         if city_filter:
             # Search for matching cities
-            all_cities = await self.db.cities.get_cities(status="active", limit=1000)
+            all_cities = await self.db.jurisdictions.get_cities(status="active", limit=1000)
             matching_bananas = [
                 c.banana
                 for c in all_cities
@@ -256,7 +256,7 @@ class DatabaseViewer:
         print("-" * 105)
 
         for meeting in meetings:
-            city = await self.db.cities.get_city(meeting.banana)
+            city = await self.db.jurisdictions.get_city(meeting.banana)
             city_display = (
                 f"{city.name[:15]}, {city.state}" if city else meeting.banana[:19]
             )
@@ -406,7 +406,7 @@ class DatabaseViewer:
             county_banana = input("County banana (optional, e.g. alamedacountyCA): ").strip() or None
 
             if county_banana:
-                parent = await self.db.cities.get_city(county_banana)
+                parent = await self.db.jurisdictions.get_city(county_banana)
                 if not parent:
                     print(f"   No jurisdiction found with banana '{county_banana}' -- skipping county link")
                     county_banana = None
@@ -445,7 +445,7 @@ class DatabaseViewer:
                 population=population
             )
 
-            await self.db.cities.upsert_city(city)
+            await self.db.jurisdictions.upsert_city(city)
 
             # Add zipcodes
             if zipcodes:
@@ -530,7 +530,7 @@ class DatabaseViewer:
                 population=population,
             )
 
-            await self.db.cities.upsert_city(county)
+            await self.db.jurisdictions.upsert_city(county)
 
             print(f"Added county '{display_name}, {state}' with banana {banana}")
             if population:
@@ -539,7 +539,7 @@ class DatabaseViewer:
             # Offer to link existing cities to this county
             link = input(f"\nLink existing cities in {display_name} to this county? (y/N): ").strip().lower()
             if link == 'y':
-                all_cities = await self.db.cities.get_cities(state=state)
+                all_cities = await self.db.jurisdictions.get_cities(state=state)
                 state_cities = [c for c in all_cities if c.type == 'city']
                 if state_cities:
                     print(f"\nCities in {state}:")
@@ -619,7 +619,7 @@ class DatabaseViewer:
 
             county_banana = input("Parent county banana (optional, e.g. losangelescountyCA): ").strip() or None
             if county_banana:
-                parent = await self.db.cities.get_city(county_banana)
+                parent = await self.db.jurisdictions.get_city(county_banana)
                 if not parent:
                     print(f"   No jurisdiction found with banana '{county_banana}' -- skipping county link")
                     county_banana = None
@@ -641,7 +641,7 @@ class DatabaseViewer:
                 population=population,
             )
 
-            await self.db.cities.upsert_city(district)
+            await self.db.jurisdictions.upsert_city(district)
 
             print(f"Added school district '{district_name}, {state}' with banana {banana}")
             if population:
@@ -672,7 +672,7 @@ class DatabaseViewer:
                         return False
 
                     # Get current city
-                    city = await self.db.cities.get_city(banana)
+                    city = await self.db.jurisdictions.get_city(banana)
                     if not city:
                         print(f"No city found with banana {banana}")
                         continue
@@ -680,7 +680,7 @@ class DatabaseViewer:
                     current_banana = banana
                 else:
                     # Refresh city data
-                    city = await self.db.cities.get_city(current_banana)
+                    city = await self.db.jurisdictions.get_city(current_banana)
                     if not city:
                         print(f"City {current_banana} no longer exists")
                         current_banana = None
@@ -751,10 +751,10 @@ class DatabaseViewer:
                         print(f"Updated city and banana: {current_banana} → {new_banana}")
                         current_banana = new_banana
                     else:
-                        await self.db.cities.upsert_city(city)
+                        await self.db.jurisdictions.upsert_city(city)
                         print(f"Updated {field} = '{new_value}'")
                 else:
-                    await self.db.cities.upsert_city(city)
+                    await self.db.jurisdictions.upsert_city(city)
                     print(f"Updated {field} = '{new_value}'")
 
             except KeyboardInterrupt:
@@ -782,7 +782,7 @@ class DatabaseViewer:
         results = []
 
         # Search cities
-        all_cities = await self.db.cities.get_cities(status="active", limit=1000)
+        all_cities = await self.db.jurisdictions.get_cities(status="active", limit=1000)
         for city in all_cities:
             if (
                 query.lower() in city.name.lower()

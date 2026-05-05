@@ -66,7 +66,7 @@ async def get_committee(committee_id: str, db: Database = Depends(get_db)):
     members = await db.committees.get_committee_members(committee_id, active_only=True)
 
     # Get city info
-    city = await db.cities.get_city(committee.banana)
+    city = await db.jurisdictions.get_city(committee.banana)
 
     return {
         "success": True,

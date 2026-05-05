@@ -43,8 +43,13 @@
 	</nav>
 
 	{#if metrics}
+		{@const byType = metrics.by_type?.total}
 		<p class="footer-stats">
-			Tracking {metrics.cities_covered} cities &bull; {metrics.meetings_tracked.toLocaleString()} meetings analyzed
+			{#if byType}
+				Tracking {byType.city.toLocaleString()} cities, {byType.county.toLocaleString()} counties, {byType.school_district.toLocaleString()} school districts &bull; {metrics.meetings_tracked.toLocaleString()} meetings analyzed
+			{:else}
+				Tracking {metrics.cities_covered.toLocaleString()} jurisdictions &bull; {metrics.meetings_tracked.toLocaleString()} meetings analyzed
+			{/if}
 		</p>
 	{/if}
 

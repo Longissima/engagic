@@ -11,10 +11,9 @@ from datetime import datetime
 from pathlib import Path
 
 from config import get_logger, config
-from database.models import Jurisdiction, City, Meeting, AgendaItem
+from database.models import Jurisdiction, Meeting, AgendaItem
 from database.repositories_async import (
     JurisdictionRepository,
-    CityRepository,
     CommitteeRepository,
     CouncilMemberRepository,
     HappeningRepository,
@@ -52,7 +51,7 @@ class Database:
     pool: asyncpg.Pool
 
     # Repository attributes
-    cities: JurisdictionRepository
+    jurisdictions: JurisdictionRepository
     council_members: CouncilMemberRepository
     meetings: MeetingRepository
     items: ItemRepository
@@ -65,7 +64,7 @@ class Database:
 
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
-        self.cities = JurisdictionRepository(pool)
+        self.jurisdictions = JurisdictionRepository(pool)
         self.committees = CommitteeRepository(pool)
         self.council_members = CouncilMemberRepository(pool)
         self.happening = HappeningRepository(pool)
@@ -279,14 +278,14 @@ class Database:
         name: Optional[str] = None,
         state: Optional[str] = None,
         zipcode: Optional[str] = None
-    ) -> Optional[City]:
-        """Get city by banana, name+state, or zipcode."""
+    ) -> Optional[Jurisdiction]:
+        """Get jurisdiction by banana, name+state, or zipcode."""
         if banana:
-            return await self.cities.get_city(banana)
+            return await self.jurisdictions.get_city(banana)
         elif zipcode:
-            return await self.cities.get_city_by_zipcode(zipcode)
+            return await self.jurisdictions.get_city_by_zipcode(zipcode)
         elif name and state:
-            cities = await self.cities.get_cities(name=name, state=state, limit=1)
+            cities = await self.jurisdictions.get_cities(name=name, state=state, limit=1)
             return cities[0] if cities else None
         return None
 
@@ -298,9 +297,9 @@ class Database:
         status: str = "active",
         limit: Optional[int] = None,
         include_zipcodes: bool = False,
-    ) -> List[City]:
-        """Get cities with optional filtering."""
-        return await self.cities.get_cities(
+    ) -> List[Jurisdiction]:
+        """Get jurisdictions with optional filtering."""
+        return await self.jurisdictions.get_cities(
             state=state,
             name=name,
             vendor=vendor,
@@ -310,8 +309,8 @@ class Database:
         )
 
     async def get_city_names(self, status: str = "active") -> List[str]:
-        """Get city names for fuzzy matching."""
-        return await self.cities.get_city_names(status=status)
+        """Get jurisdiction names for fuzzy matching."""
+        return await self.jurisdictions.get_city_names(status=status)
 
     async def get_meeting(self, meeting_id: str) -> Optional[Meeting]:
         return await self.meetings.get_meeting(meeting_id)

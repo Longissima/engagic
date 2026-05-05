@@ -251,12 +251,12 @@
 			<img src="/icon-64.png" alt="engagic" class="logo-icon" />
 		</a>
 
-	<div class="city-header">
+	<div class="jurisdiction-header">
 		<a href="/" class="back-link">← Back to search</a>
 		{#if searchResults && 'city_name' in searchResults}
-			<div class="city-title-row">
-				<h1 class="city-title">{searchResults.city_name}, {searchResults.state}</h1>
-				<div class="city-actions">
+			<div class="jurisdiction-title-row">
+				<h1 class="jurisdiction-title">{searchResults.city_name}, {searchResults.state}</h1>
+				<div class="jurisdiction-actions">
 					<a href="/{city_banana}/council" class="council-link" data-sveltekit-preload-data="tap">
 						Council
 					</a>
@@ -264,7 +264,7 @@
 						Committees
 					</a>
 					<button
-					class="watch-city-btn"
+					class="watch-jurisdiction-btn"
 					class:watching={isWatching}
 					onclick={() => showWatchModal = true}
 				>
@@ -319,7 +319,7 @@
 			<div class="search-container">
 				<input
 					type="text"
-					class="city-search"
+					class="jurisdiction-search"
 					placeholder="Search {viewMode}..."
 					bind:value={searchQuery}
 					onkeydown={handleSearchKeydown}
@@ -454,7 +454,7 @@
 					<div class="no-meetings">
 						<p class="empty-state-title">No meetings found</p>
 						<p class="empty-state-message">This city might not have any upcoming meetings scheduled yet. Check back soon!</p>
-						<div class="request-city-cta">
+						<div class="request-jurisdiction-cta">
 							<p class="cta-text">Want AI summaries for this city?</p>
 							<button class="cta-button" onclick={() => showWatchModal = true}>Follow city</button>
 							<p class="cta-subtext">Followers activate weekly meeting processing and summaries.</p>
@@ -465,7 +465,7 @@
 				<div class="no-meetings">
 					<p class="empty-state-title">No meetings found</p>
 					<p class="empty-state-message">{'message' in searchResults ? searchResults.message : 'We could not find any meetings for this city. Agendas are typically posted 48 hours before meetings.'}</p>
-					<div class="request-city-cta">
+					<div class="request-jurisdiction-cta">
 						<p class="cta-text">Want AI summaries for this city?</p>
 						<button class="cta-button" onclick={() => showWatchModal = true}>Follow city</button>
 						<p class="cta-subtext">Followers activate weekly meeting processing and summaries.</p>
@@ -607,7 +607,7 @@
 		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 	}
 
-	.city-header {
+	.jurisdiction-header {
 		margin-bottom: 2rem;
 		min-height: 80px;
 	}
@@ -625,7 +625,7 @@
 		text-decoration: underline;
 	}
 
-	.city-title-row {
+	.jurisdiction-title-row {
 		display: flex;
 		justify-content: space-between;
 		align-items: baseline;
@@ -633,7 +633,7 @@
 		margin-bottom: 0.75rem;
 	}
 
-	.city-title {
+	.jurisdiction-title {
 		font-family: var(--font-display);
 		font-size: clamp(2rem, 5vw, 2.75rem);
 		color: var(--text-primary);
@@ -643,7 +643,7 @@
 		line-height: 1.1;
 	}
 
-	.city-actions {
+	.jurisdiction-actions {
 		display: flex;
 		align-items: baseline;
 		gap: 0.75rem;
@@ -669,7 +669,7 @@
 		color: var(--civic-blue);
 	}
 
-	.watch-city-btn {
+	.watch-jurisdiction-btn {
 		padding: 0;
 		font-size: 0.8rem;
 		font-weight: 700;
@@ -684,15 +684,15 @@
 		font-family: var(--font-body);
 	}
 
-	.watch-city-btn:hover {
+	.watch-jurisdiction-btn:hover {
 		color: var(--civic-accent);
 	}
 
-	.watch-city-btn.watching {
+	.watch-jurisdiction-btn.watching {
 		color: var(--civic-green);
 	}
 
-	.watch-city-btn.watching:hover {
+	.watch-jurisdiction-btn.watching:hover {
 		color: var(--action-yes-hover);
 	}
 
@@ -794,7 +794,7 @@
 		align-items: center;
 	}
 
-	.city-search {
+	.jurisdiction-search {
 		font-family: var(--font-mono);
 		font-size: 0.9rem;
 		padding: 0.6rem 2rem 0.6rem 1rem;
@@ -806,13 +806,13 @@
 		transition: border-color var(--transition-normal), box-shadow var(--transition-normal);
 	}
 
-	.city-search:focus {
+	.jurisdiction-search:focus {
 		outline: none;
 		border-color: var(--civic-blue);
 		box-shadow: 0 0 0 3px rgba(181, 100, 42, 0.08);
 	}
 
-	.city-search::placeholder {
+	.jurisdiction-search::placeholder {
 		color: var(--civic-gray);
 	}
 
@@ -1025,7 +1025,7 @@
 		background: var(--civic-accent);
 	}
 
-	.request-city-cta {
+	.request-jurisdiction-cta {
 		margin-top: 2rem;
 		padding: 1.5rem;
 		background: var(--surface-secondary);
@@ -1111,11 +1111,11 @@
 			border-radius: var(--radius-md);
 		}
 
-		.city-title {
+		.jurisdiction-title {
 			font-size: 1.5rem;
 		}
 
-		.city-title-row {
+		.jurisdiction-title-row {
 			flex-wrap: wrap;
 		}
 
@@ -1123,7 +1123,7 @@
 			font-size: 0.75rem;
 		}
 
-		.watch-city-btn {
+		.watch-jurisdiction-btn {
 			font-size: 0.75rem;
 		}
 
@@ -1147,7 +1147,7 @@
 			width: 100%;
 		}
 
-		.city-search {
+		.jurisdiction-search {
 			width: 100%;
 		}
 

@@ -411,6 +411,12 @@ async def get_analytics(db: Database = Depends(get_db)):
                 SELECT
                     (SELECT COUNT(*) FROM jurisdictions) as total_cities,
                     (SELECT COUNT(DISTINCT banana) FROM meetings) as active_cities,
+                    (SELECT COUNT(*) FROM jurisdictions WHERE type = 'city') as total_cities_only,
+                    (SELECT COUNT(*) FROM jurisdictions WHERE type = 'county') as total_counties,
+                    (SELECT COUNT(*) FROM jurisdictions WHERE type = 'school_district') as total_school_districts,
+                    (SELECT COUNT(DISTINCT m.banana) FROM meetings m JOIN jurisdictions j ON m.banana = j.banana WHERE j.type = 'city') as active_cities_only,
+                    (SELECT COUNT(DISTINCT m.banana) FROM meetings m JOIN jurisdictions j ON m.banana = j.banana WHERE j.type = 'county') as active_counties,
+                    (SELECT COUNT(DISTINCT m.banana) FROM meetings m JOIN jurisdictions j ON m.banana = j.banana WHERE j.type = 'school_district') as active_school_districts,
                     (SELECT COUNT(*) FROM meetings) as meetings_count,
                     (SELECT COUNT(DISTINCT meeting_id) FROM items) as meetings_with_items,
                     (SELECT COUNT(*) FROM meetings WHERE packet_url IS NOT NULL AND packet_url != '') as packets_count,
@@ -459,6 +465,18 @@ async def get_analytics(db: Database = Depends(get_db)):
             "real_metrics": {
                 "cities_covered": counts["total_cities"],
                 "active_cities": counts["active_cities"],
+                "by_type": {
+                    "total": {
+                        "city": counts["total_cities_only"],
+                        "county": counts["total_counties"],
+                        "school_district": counts["total_school_districts"],
+                    },
+                    "active": {
+                        "city": counts["active_cities_only"],
+                        "county": counts["active_counties"],
+                        "school_district": counts["active_school_districts"],
+                    },
+                },
                 "frequently_updated_cities": complex_stats["frequently_updated"],
                 "frequently_updated_population": complex_stats["frequently_updated_pop"],
                 "meetings_tracked": counts["meetings_count"],

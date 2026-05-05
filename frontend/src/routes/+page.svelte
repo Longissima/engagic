@@ -263,10 +263,10 @@
 				<div class="ambiguous-message">
 					{@html searchResults.message}
 				</div>
-				<div class="city-options">
+				<div class="jurisdiction-options">
 					{#each searchResults.city_options as cityOption}
 						<button
-							class="city-option"
+							class="jurisdiction-option"
 							onclick={() => handleCityOptionClick(cityOption)}
 						>
 							{cityOption.display_name}
@@ -579,13 +579,13 @@
 		line-height: 1.5;
 	}
 
-	.ambiguous-inline .city-options {
+	.ambiguous-inline .jurisdiction-options {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.5rem;
 	}
 
-	.ambiguous-inline .city-option {
+	.ambiguous-inline .jurisdiction-option {
 		padding: 0.5rem 1rem;
 		background: var(--surface-primary);
 		border: 1px solid var(--border-primary);
@@ -598,7 +598,7 @@
 		transition: all var(--transition-fast);
 	}
 
-	.ambiguous-inline .city-option:hover {
+	.ambiguous-inline .jurisdiction-option:hover {
 		background: var(--civic-blue);
 		color: white;
 		border-color: var(--civic-blue);

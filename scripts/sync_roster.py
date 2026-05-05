@@ -244,7 +244,7 @@ async def main():
     try:
         if args.city:
             # Get city info
-            city = await db.cities.get_city(args.city)
+            city = await db.jurisdictions.get_city(args.city)
             if not city:
                 print(f"City not found: {args.city}")
                 return

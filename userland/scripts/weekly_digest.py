@@ -62,7 +62,7 @@ def generate_anchor_id(item: Dict[str, Any]) -> str:
 
 async def get_city_name(db: Database, city_banana: str) -> str:
     """Get formatted city name from banana (e.g., 'paloaltoCA' -> 'Palo Alto, CA')"""
-    city = await db.cities.get_city(city_banana)
+    city = await db.jurisdictions.get_city(city_banana)
     if city:
         return f"{city.name}, {city.state}"
     return city_banana

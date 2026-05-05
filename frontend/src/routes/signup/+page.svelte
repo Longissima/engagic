@@ -92,8 +92,8 @@
 		{:else}
 			<div class="card">
 				{#if cityDisplayName}
-					<div class="city-context">
-						<span class="city-badge">Watching: {cityDisplayName}</span>
+					<div class="jurisdiction-context">
+						<span class="jurisdiction-badge">Watching: {cityDisplayName}</span>
 					</div>
 					<h1>Get Notified</h1>
 					<p class="subtitle">We'll email you when we add {cityDisplayName} to our coverage.</p>
@@ -217,11 +217,11 @@
 		font-weight: bold;
 	}
 
-	.city-context {
+	.jurisdiction-context {
 		margin-bottom: 1rem;
 	}
 
-	.city-badge {
+	.jurisdiction-badge {
 		display: inline-block;
 		padding: 0.5rem 1rem;
 		background: var(--badge-info-bg);

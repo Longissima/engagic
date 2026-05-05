@@ -125,7 +125,7 @@
 					}
 				},
 				{
-					id: 'city-fill',
+					id: 'jurisdiction-fill',
 					type: 'fill',
 					source: 'cities',
 					'source-layer': 'cities',
@@ -152,7 +152,7 @@
 					}
 				},
 				{
-					id: 'city-outline',
+					id: 'jurisdiction-outline',
 					type: 'line',
 					source: 'cities',
 					'source-layer': 'cities',
@@ -170,7 +170,7 @@
 					}
 				},
 				{
-					id: 'city-hover',
+					id: 'jurisdiction-hover',
 					type: 'fill',
 					source: 'cities',
 					'source-layer': 'cities',
@@ -189,9 +189,9 @@
 		mapInstance.setPaintProperty('background', 'background-color', colors.countryFill);
 		mapInstance.setPaintProperty('states-fill', 'fill-color', colors.background);
 		mapInstance.setPaintProperty('state-borders', 'line-color', colors.stateBorder);
-		mapInstance.setPaintProperty('city-fill', 'fill-color', fillColorExpr(colors.tiers));
-		mapInstance.setPaintProperty('city-outline', 'line-color', colors.outline);
-		mapInstance.setPaintProperty('city-hover', 'fill-color', colors.hover);
+		mapInstance.setPaintProperty('jurisdiction-fill', 'fill-color', fillColorExpr(colors.tiers));
+		mapInstance.setPaintProperty('jurisdiction-outline', 'line-color', colors.outline);
+		mapInstance.setPaintProperty('jurisdiction-hover', 'fill-color', colors.hover);
 	}
 
 	// Map initialization effect
@@ -241,7 +241,7 @@
 		});
 
 		// Click to navigate to city page (pending cities are non-interactive)
-		mapInstance.on('click', 'city-fill', (e) => {
+		mapInstance.on('click', 'jurisdiction-fill', (e) => {
 			const feat = e.features?.[0];
 			if (!feat) return;
 			const banana = feat.properties?.banana;
@@ -266,14 +266,14 @@
 				coverage_type: tier,
 				summary_count: live?.c ?? props.summary_count ?? 0
 			};
-			mapInstance.setFilter('city-hover', ['==', ['get', 'banana'], banana]);
+			mapInstance.setFilter('jurisdiction-hover', ['==', ['get', 'banana'], banana]);
 		}
 
-		mapInstance.on('mousemove', 'city-fill', handleHover);
-		mapInstance.on('mouseleave', 'city-fill', () => {
+		mapInstance.on('mousemove', 'jurisdiction-fill', handleHover);
+		mapInstance.on('mouseleave', 'jurisdiction-fill', () => {
 			mapInstance.getCanvas().style.cursor = '';
 			hoveredCity = null;
-			mapInstance.setFilter('city-hover', ['==', ['get', 'banana'], '']);
+			mapInstance.setFilter('jurisdiction-hover', ['==', ['get', 'banana'], '']);
 		});
 
 		// Watch for theme changes via MutationObserver on <html> element

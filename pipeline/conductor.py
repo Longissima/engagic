@@ -407,7 +407,7 @@ async def _expand_jurisdictions(db: Database, bananas: List[str]) -> List[str]:
 
         # State code: 2 uppercase letters
         if len(banana) == 2 and banana.isalpha() and banana.isupper():
-            state_jurisdictions = await db.cities.get_cities(state=banana)
+            state_jurisdictions = await db.jurisdictions.get_cities(state=banana)
             state_bananas = [j.banana for j in state_jurisdictions]
             logger.info("expanded state", state=banana, jurisdictions=len(state_bananas))
             for b in state_bananas:
@@ -416,9 +416,9 @@ async def _expand_jurisdictions(db: Database, bananas: List[str]) -> List[str]:
                     expanded.append(b)
             continue
 
-        city = await db.cities.get_city(banana)
+        city = await db.jurisdictions.get_city(banana)
         if city and city.type == "county":
-            county_bananas = await db.cities.get_county_jurisdictions(banana)
+            county_bananas = await db.jurisdictions.get_county_jurisdictions(banana)
             logger.info("expanded county", county=banana, jurisdictions=len(county_bananas))
             for b in county_bananas:
                 if b not in seen:
@@ -605,7 +605,7 @@ def main():
                 valid_cities = []
                 unknown_cities = []
                 for banana in demanded:
-                    city = await db.cities.get_city(banana)
+                    city = await db.jurisdictions.get_city(banana)
                     if city:
                         valid_cities.append({"banana": banana, "name": city.name, "state": city.state})
                     else:
@@ -650,7 +650,7 @@ def main():
                 valid_cities = []
                 unknown_cities = []
                 for banana in demanded:
-                    city = await db.cities.get_city(banana)
+                    city = await db.jurisdictions.get_city(banana)
                     if city:
                         valid_cities.append(banana)
                     else:
@@ -707,7 +707,7 @@ def main():
                 valid_cities = []
                 unknown_cities = []
                 for banana in demanded:
-                    city = await db.cities.get_city(banana)
+                    city = await db.jurisdictions.get_city(banana)
                     if city:
                         valid_cities.append(banana)
                     else:

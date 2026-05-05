@@ -177,6 +177,18 @@ export interface AnalyticsData {
 	real_metrics: {
 		cities_covered: number;
 		active_cities: number;
+		by_type: {
+			total: {
+				city: number;
+				county: number;
+				school_district: number;
+			};
+			active: {
+				city: number;
+				county: number;
+				school_district: number;
+			};
+		};
 		frequently_updated_cities: number;
 		frequently_updated_population: number;
 		meetings_tracked: number;

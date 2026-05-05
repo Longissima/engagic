@@ -7,7 +7,7 @@ from asyncpg import Connection
 
 from config import get_logger
 from database.id_generation import generate_meeting_id, generate_matter_id, generate_item_id, validate_matter_id
-from database.models import City, Meeting, AgendaItem, Matter, MatterMetadata
+from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
 from pipeline.utils import hash_substantive_attachments
@@ -46,7 +46,7 @@ class MeetingSyncOrchestrator:
     async def sync_meeting(
         self,
         meeting_dict: Dict[str, Any],
-        city: City
+        city: Jurisdiction
     ) -> tuple[Optional[Meeting], MeetingStoreStats]:
         """Transform vendor meeting dict, store meeting and items, enqueue for processing."""
         stats: MeetingStoreStats = {
@@ -574,7 +574,7 @@ class MeetingSyncOrchestrator:
         meetings = await self.db.meetings.get_meetings_for_city(banana, limit=1)
         return len(meetings) == 0
 
-    async def _notify_city_activation(self, city: City) -> None:
+    async def _notify_city_activation(self, city: Jurisdiction) -> None:
         """Notify users who signed up for alerts when city first gets data.
 
         Sends "city now available" email and updates city_request status.

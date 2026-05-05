@@ -954,7 +954,7 @@ class Processor:
             return {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 0}
 
         # Check if city has centralized participation configured
-        city = await self.db.cities.get_city(meeting.banana)
+        city = await self.db.jurisdictions.get_city(meeting.banana)
         city_has_participation = bool(city and city.participation)
 
         item_sequences = [item.sequence for item in agenda_items]
