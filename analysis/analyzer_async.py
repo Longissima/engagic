@@ -33,6 +33,7 @@ from parsing.pdf import PdfExtractor
 from parsing.participation import parse_participation_info
 from analysis.llm.summarizer import GeminiSummarizer
 from pipeline.protocols import MetricsCollector, NullMetrics
+from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 
 from config import config, get_logger
 
@@ -313,6 +314,12 @@ class AsyncAnalyzer:
                     asyncio.create_task(self._drain_and_close_session(old_session))
             session = await self._get_session()
             self._in_flight += 1
+
+        # Per-vendor politeness gate: shared with the sync side so processing
+        # downloads pace through the same multi-slot rate limiter rather than
+        # bypassing it via the analyzer's separate aiohttp session.
+        vendor = vendor_for_url(url)
+        await get_rate_limiter().wait_if_needed(vendor)
 
         # Actual download happens outside lock (concurrent)
         try:
