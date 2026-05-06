@@ -32,15 +32,6 @@ Engagic is an open-source civic technology platform (AGPL-3.0 licensed) that pro
 - **Cost:** Free with attribution
 - **Contact:** hello@engagic.org
 
-### Commercial (Enterprise) Tier
-- **Limits:** Negotiable (1,000+ requests/minute, 100,000+ requests/day)
-- **Use case:** Commercial products, for-profit ventures, paid research services
-- **Requirements:**
-  - Commercial license agreement
-  - Payment for infrastructure costs
-- **Cost:** Contact for pricing
-- **Contact:** admin@motioncount.com
-
 ## 4. Attribution Requirements
 
 If you use Engagic data in a public-facing product or publication (website, app, research paper, article), you must provide **clear attribution**:

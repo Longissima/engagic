@@ -95,31 +95,6 @@
 					<p class="tier-cost">Free with attribution</p>
 					<a href="mailto:hello@engagic.org" class="tier-contact">Contact: hello@engagic.org</a>
 				</div>
-
-				<div class="tier-card tier-enterprise">
-					<h3 class="tier-name">Enterprise Tier</h3>
-					<div class="tier-limits">
-						<div class="limit-item">
-							<span class="limit-value">1k+</span>
-							<span class="limit-unit">req/min</span>
-						</div>
-						<div class="limit-divider">•</div>
-						<div class="limit-item">
-							<span class="limit-value">100k+</span>
-							<span class="limit-unit">req/day</span>
-						</div>
-					</div>
-					<p class="tier-use-case">Commercial products, for-profit ventures, paid research services</p>
-					<div class="tier-requirements">
-						<p class="tier-requirement-title">Requirements:</p>
-						<ul>
-							<li>Commercial license agreement</li>
-							<li>Payment for infrastructure costs</li>
-						</ul>
-					</div>
-					<p class="tier-cost">Contact for pricing</p>
-					<a href="mailto:admin@motioncount.com" class="tier-contact">Contact: admin@motioncount.com</a>
-				</div>
 			</div>
 		</section>
 
@@ -439,10 +414,6 @@
 		border-color: var(--civic-accent);
 	}
 
-	.tier-enterprise {
-		border-color: var(--civic-orange);
-	}
-
 	.tier-name {
 		font-family: var(--font-mono);
 		font-size: 1.2rem;
@@ -456,10 +427,6 @@
 
 	.tier-hacktivist .tier-name {
 		color: var(--civic-accent);
-	}
-
-	.tier-enterprise .tier-name {
-		color: var(--civic-orange);
 	}
 
 	.tier-limits {

@@ -196,7 +196,14 @@ class Database:
                     (SELECT COUNT(*) FROM city_matters
                      WHERE created_at >= NOW() - INTERVAL '30 days') as matters_30d,
                     (SELECT COUNT(*) FROM votes
-                     WHERE created_at >= NOW() - INTERVAL '30 days') as votes_30d
+                     WHERE created_at >= NOW() - INTERVAL '30 days') as votes_30d,
+                    -- Summarization output: summarized meetings whose meeting date
+                    -- falls in the last 30 days. Uses meetings.date (immutable) instead
+                    -- of updated_at (which bumps on every re-fetch UPSERT).
+                    (SELECT COUNT(*) FROM meetings
+                     WHERE summary IS NOT NULL AND summary != ''
+                       AND date >= NOW() - INTERVAL '30 days'
+                       AND date <= NOW()) as meeting_summaries_30d
             """)
 
             metrics = dict(result)
@@ -225,7 +232,9 @@ class Database:
             """)
             metrics['votes_by_city'] = [dict(row) for row in vote_breakdown]
 
-            # Weekly trends for sparklines (last 8 weeks)
+            # Weekly trends for sparklines (last 8 weeks).
+            # `summaries` buckets summarized meetings by meetings.date (the meeting's
+            # actual occurrence) — stable, parallels the meeting_summaries_30d badge.
             trends = await conn.fetch("""
                 WITH weeks AS (
                     SELECT generate_series(
@@ -239,7 +248,8 @@ class Database:
                     COALESCE(m.cnt, 0) as meetings,
                     COALESCE(i.cnt, 0) as items,
                     COALESCE(mat.cnt, 0) as matters,
-                    COALESCE(v.cnt, 0) as votes
+                    COALESCE(v.cnt, 0) as votes,
+                    COALESCE(s.cnt, 0) as summaries
                 FROM weeks w
                 LEFT JOIN (
                     SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
@@ -261,6 +271,14 @@ class Database:
                     FROM votes WHERE created_at >= NOW() - INTERVAL '8 weeks'
                     GROUP BY 1
                 ) v ON v.wk = w.week_start
+                LEFT JOIN (
+                    SELECT date_trunc('week', date) AS wk, COUNT(*) AS cnt
+                    FROM meetings
+                    WHERE summary IS NOT NULL AND summary != ''
+                      AND date >= NOW() - INTERVAL '8 weeks'
+                      AND date <= NOW()
+                    GROUP BY 1
+                ) s ON s.wk = w.week_start
                 ORDER BY w.week_start
             """)
             metrics['trends'] = {
@@ -268,6 +286,7 @@ class Database:
                 'items': [row['items'] for row in trends],
                 'matters': [row['matters'] for row in trends],
                 'votes': [row['votes'] for row in trends],
+                'summaries': [row['summaries'] for row in trends],
             }
 
             return metrics

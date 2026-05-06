@@ -3,7 +3,11 @@
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
-	const byType = $derived(data.analytics?.real_metrics.by_type?.total);
+	// Prefer "live" counts (jurisdictions with at least one summary at meeting/item/matter
+	// level) over naive table totals — those include jurisdictions we haven't summarized yet.
+	const byType = $derived(
+		data.analytics?.real_metrics.by_type?.live ?? data.analytics?.real_metrics.by_type?.total
+	);
 	const total = $derived(
 		byType ? byType.city + byType.county + byType.school_district : null
 	);

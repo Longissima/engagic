@@ -48,12 +48,13 @@
 	</nav>
 
 	{#if metrics}
-		{@const byType = metrics.by_type?.total}
+		{@const byType = metrics.by_type?.live ?? metrics.by_type?.total}
+		{@const meetingCount = metrics.meetings_with_summary ?? metrics.meetings_tracked}
 		<p class="footer-stats">
 			{#if byType}
-				{compact(byType.city)} cities &middot; {compact(byType.county)} counties &middot; {compact(byType.school_district)} school districts &middot; {compact(metrics.meetings_tracked)} meetings
+				{compact(byType.city)} cities &middot; {compact(byType.county)} counties &middot; {compact(byType.school_district)} school districts &middot; {compact(meetingCount)} meetings
 			{:else}
-				Tracking {compact(metrics.cities_covered)} jurisdictions &bull; {compact(metrics.meetings_tracked)} meetings analyzed
+				Tracking {compact(metrics.live_jurisdictions ?? metrics.cities_covered)} jurisdictions &bull; {compact(meetingCount)} meetings analyzed
 			{/if}
 		</p>
 	{/if}

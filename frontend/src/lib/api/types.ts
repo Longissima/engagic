@@ -188,10 +188,20 @@ export interface AnalyticsData {
 				county: number;
 				school_district: number;
 			};
+			// "live" = jurisdictions with at least one summary at meeting/item/matter level.
+			// Prefer this over `total` for user-facing coverage claims.
+			live: {
+				city: number;
+				county: number;
+				school_district: number;
+			};
 		};
+		live_jurisdictions: number;
 		frequently_updated_cities: number;
 		frequently_updated_population: number;
 		meetings_tracked: number;
+		// meetings with a summary at meeting/item/matter level — the "live" meeting count
+		meetings_with_summary: number;
 		meetings_with_items: number;
 		meetings_with_packet: number;
 		agendas_summarized: number;
@@ -244,12 +254,15 @@ export interface PlatformMetrics {
 		items_30d: number;
 		matters_30d: number;
 		votes_30d: number;
+		// Summarized meetings whose meeting date fell in the last 30 days.
+		meeting_summaries_30d: number;
 	};
 	trends: {
 		meetings: number[];
 		items: number[];
 		matters: number[];
 		votes: number[];
+		summaries: number[];
 	};
 }
 
