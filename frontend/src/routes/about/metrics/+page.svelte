@@ -346,7 +346,7 @@
 							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
 								<path d={sparklinePath(data.platformMetrics.trends.summaries)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
 							</svg>
-							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meeting_summaries_30d)} summarized</div>
+							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meeting_summaries_30d)}</div>
 						{:else}
 							<div class="stat-description">Full meeting summaries generated</div>
 						{/if}

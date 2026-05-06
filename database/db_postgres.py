@@ -214,13 +214,24 @@ class Database:
                      WHERE created_at >= NOW() - INTERVAL '30 days') as matters_30d,
                     (SELECT COUNT(*) FROM votes
                      WHERE created_at >= NOW() - INTERVAL '30 days') as votes_30d,
-                    -- Summarization output: summarized meetings whose meeting date
-                    -- falls in the last 30 days. Uses meetings.date (immutable) instead
-                    -- of updated_at (which bumps on every re-fetch UPSERT).
-                    (SELECT COUNT(*) FROM meetings
-                     WHERE summary IS NOT NULL AND summary != ''
-                       AND date >= NOW() - INTERVAL '30 days'
-                       AND date <= NOW()) as meeting_summaries_30d
+                    -- Total summaries (meeting + item + matter level) attached to
+                    -- meetings whose date is in the last 30 days. Anchored on
+                    -- meetings.date (immutable). Each summary surface counted
+                    -- separately; matters de-duped across appearances.
+                    (
+                        (SELECT COUNT(*) FROM meetings
+                         WHERE summary IS NOT NULL AND summary != ''
+                           AND date >= NOW() - INTERVAL '30 days')
+                      + (SELECT COUNT(*) FROM items i
+                         JOIN meetings m ON m.id = i.meeting_id
+                         WHERE i.summary IS NOT NULL AND i.summary != ''
+                           AND m.date >= NOW() - INTERVAL '30 days')
+                      + (SELECT COUNT(DISTINCT cm.id) FROM city_matters cm
+                         JOIN items i ON i.matter_id = cm.id
+                         JOIN meetings m ON m.id = i.meeting_id
+                         WHERE cm.canonical_summary IS NOT NULL AND cm.canonical_summary != ''
+                           AND m.date >= NOW() - INTERVAL '30 days')
+                    ) as meeting_summaries_30d
             """)
 
             metrics = dict(result)
@@ -289,11 +300,14 @@ class Database:
                     GROUP BY 1
                 ) v ON v.wk = w.week_start
                 LEFT JOIN (
-                    SELECT date_trunc('week', date) AS wk, COUNT(*) AS cnt
-                    FROM meetings
-                    WHERE summary IS NOT NULL AND summary != ''
-                      AND date >= NOW() - INTERVAL '8 weeks'
-                      AND date <= NOW()
+                    SELECT date_trunc('week', m.date) AS wk, COUNT(DISTINCT m.id) AS cnt
+                    FROM meetings m
+                    LEFT JOIN items i ON i.meeting_id = m.id
+                    LEFT JOIN city_matters cm ON cm.id = i.matter_id
+                    WHERE m.date >= NOW() - INTERVAL '8 weeks'
+                      AND ((m.summary IS NOT NULL AND m.summary != '')
+                           OR (i.summary IS NOT NULL AND i.summary != '')
+                           OR (cm.canonical_summary IS NOT NULL AND cm.canonical_summary != ''))
                     GROUP BY 1
                 ) s ON s.wk = w.week_start
                 ORDER BY w.week_start
