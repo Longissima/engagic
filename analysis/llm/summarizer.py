@@ -1052,19 +1052,24 @@ class GeminiSummarizer:
         except KeyError as e:
             raise ValueError(f"Prompt not found: {category}.{prompt_type}") from e
 
+        # Validate the TEMPLATE for missing variables before substitution.
+        # Substituted values often include user content (PDF text, agenda items)
+        # that legitimately contains literal {word} tokens -- e.g. CAD notation,
+        # engineering drawings, code snippets -- which would false-positive a
+        # post-substitution scan.
+        template_vars = set(re.findall(r"\{(\w+)\}", template))
+        missing = template_vars - set(variables.keys())
+        if missing:
+            logger.warning(
+                "template variables not provided to formatter",
+                category=category,
+                prompt_type=prompt_type,
+                missing_variables=sorted(missing),
+            )
+
         result = template
         for key, value in variables.items():
             result = result.replace("{" + key + "}", str(value))
-
-        # Validate all template variables were substituted
-        remaining = re.findall(r"\{(\w+)\}", result)
-        if remaining:
-            logger.warning(
-                "unsubstituted template variables remain after prompt formatting",
-                category=category,
-                prompt_type=prompt_type,
-                missing_variables=remaining,
-            )
 
         return result
 
