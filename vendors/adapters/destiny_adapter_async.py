@@ -179,8 +179,12 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
 
         soup = await asyncio.to_thread(BeautifulSoup, html, 'html.parser')
 
-        # PDF packet link: <a id="pdf" href="/...pdf">
+        # PDF packet link. Modern multi-tenant hosts use <a id="pdf">; some legacy
+        # single-tenant deployments (e.g. Walla Walla) instead mark it with
+        # class="popup" + title="Download PDF Packet". Fall back when id is absent.
         pdf_link = soup.find('a', id='pdf')
+        if not pdf_link:
+            pdf_link = soup.find('a', title=re.compile(r'PDF\s+Packet', re.I))
         if pdf_link and isinstance(pdf_link, Tag):
             result['packet_url'] = urljoin(self.base_url, pdf_link.get('href', ''))
 
@@ -209,12 +213,16 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
     def _parse_agenda_items(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
         """Parse items from Destiny's multi-column agenda table.
 
-        Two known column layouts:
-        - [letter | item# | ... | content]  (Newark: sections use letters)
-        - [anchor | section# | letter | sub# | spacer | content]  (Pacific Grove: sections use digits)
+        Three known column layouts (all share: section row has digit/letter early +
+        <strong> text; item row has a.ai_link[href] somewhere in the row):
+        - [letter | item# | ... | content]                            (Newark)
+        - [anchor | section# | letter | sub# | spacer | content]      (Pacific Grove)
+        - [anchor | letter | _ | _ | pgs | content | status]          (Walla Walla -- trailing
+                                                                       'Approved' status column)
 
-        Items: rows with a.ai_link (with href) in the content cell.
-        Sections: rows with a letter or digit in an early cell + bold text in content.
+        Anchor on the title link itself (a.ai_link[href]) rather than cells[-1] so the
+        Walla Walla status column doesn't break detection. Numbering comes from cells
+        before the title cell; cells after it (status, etc) are ignored.
         """
         items: List[Dict[str, Any]] = []
         current_section = ""
@@ -228,10 +236,21 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
             if len(cells) < 2:
                 continue
 
-            content_cell = cells[-1]
-            item_link = content_cell.find('a', class_='ai_link')
-            if not item_link or not item_link.get('href'):
-                # Not an item -- check for section header (letter/digit + bold)
+            # Locate the title cell by content. Skip named anchors (a.ai_link without
+            # href, used for ReturnTo bookmarks) and the secondary 'Pgs. N-M' link
+            # which is a plain <a> without ai_link class.
+            item_link = None
+            item_link_idx = -1
+            for i, c in enumerate(cells):
+                link = c.find('a', class_='ai_link', href=True)
+                if link:
+                    item_link = link
+                    item_link_idx = i
+                    break
+
+            if item_link is None:
+                # Not an item -- check for section header (letter/digit + bold in last cell)
+                content_cell = cells[-1]
                 for cell in cells[:-1]:
                     t = cell.get_text(strip=True).rstrip('.')
                     if t.isdigit() or re.match(r'^[A-Z]$', t):
@@ -248,9 +267,10 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
 
             memo_href = item_link.get('href', '')
 
-            # Collect numbering from cells before content
+            # Collect numbering from cells before the title cell. Cells after it
+            # (e.g. Walla Walla's 'Approved' status) are not part of numbering.
             num_parts = []
-            for cell in cells[:-1]:
+            for cell in cells[:item_link_idx]:
                 t = cell.get_text(strip=True).rstrip('.')
                 if not t or t == '\xa0':
                     continue
@@ -485,7 +505,8 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         """
         for suffix in (' Regular Meeting', ' Special Meeting', ' Meeting'):
             if title.endswith(suffix):
-                return title[:-len(suffix)]
+                # Walla Walla uses "X - Regular Meeting"; strip trailing " -" leftover.
+                return title[:-len(suffix)].rstrip(' -')
         return title
 
     @staticmethod

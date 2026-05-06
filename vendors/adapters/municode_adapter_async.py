@@ -397,10 +397,17 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
     def _parse_drupal_table(self, html: str) -> List[Dict[str, Any]]:
         """Parse CivicPlus Drupal Views meeting table.
 
-        Two schema variants seen in the wild (same column order, different field names):
+        Three schema variants seen in the wild (same column order, different field names):
           DELREYOAKS-style: field-smart-date, title, nothing, nothing-1, nothing-2, nothing-3, view-node
           ROLLWDTX-style:   field-calendar-date, title, field-agendas, field-packets-link,
                             field-minutes, field-video-link, view-node
+          DESCHUTES-style:  field-calendar-date-1, title, field-agendas, field-packets,
+                            field-minutes, field-video-link, view-node
+
+        Drupal Views auto-numbers field classes (-1, -2, ...) when the same field appears
+        in multiple places (e.g. upcoming + past tables on one page), and field names
+        sometimes vary (`field-packets-link` vs `field-packets`). Match by class PREFIX
+        so any -N or trimmed variant resolves to the same logical column.
         """
         soup = BeautifulSoup(html, "html.parser")
         meetings: List[Dict[str, Any]] = []
@@ -409,10 +416,11 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         if not table:
             return []
 
-        def first(cell_map: Dict[str, Any], *keys: str) -> Any:
-            for k in keys:
-                if k in cell_map:
-                    return cell_map[k]
+        def find_by_prefix(cell_map: Dict[str, Any], *prefixes: str) -> Any:
+            for prefix in prefixes:
+                for key, cell in cell_map.items():
+                    if key.startswith(prefix):
+                        return cell
             return None
 
         for row in table.find_all("tr"):
@@ -428,7 +436,12 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                         cell_map[cls] = cell
                         break
 
-            date_cell = first(cell_map, "views-field-field-smart-date", "views-field-field-calendar-date")
+            # Date: match any "views-field-field-{smart,calendar}-date[-N]" variant
+            date_cell = find_by_prefix(
+                cell_map,
+                "views-field-field-smart-date",
+                "views-field-field-calendar-date",
+            )
             title_cell = cell_map.get("views-field-title")
             if not date_cell or not title_cell:
                 continue
@@ -436,9 +449,16 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             title = title_cell.get_text(strip=True)
             parsed_date = self._parse_drupal_date(date_cell.get_text(strip=True))
 
-            # Collect links from agenda and packet columns
-            agenda_cell = first(cell_map, "views-field-nothing", "views-field-field-agendas")
-            packet_cell = first(cell_map, "views-field-nothing-1", "views-field-field-packets-link")
+            # Agenda: try named-field first ("views-field-field-agendas[-N]"), then
+            # fall back to DELREYOAKS' generic "views-field-nothing".
+            agenda_cell = find_by_prefix(cell_map, "views-field-field-agendas") or cell_map.get(
+                "views-field-nothing"
+            )
+            # Packet: same pattern. The "views-field-field-packets" prefix matches both
+            # "field-packets" (Deschutes) and "field-packets-link" (Rollingwood) cleanly.
+            packet_cell = find_by_prefix(cell_map, "views-field-field-packets") or cell_map.get(
+                "views-field-nothing-1"
+            )
 
             meeting_guid = None
             agenda_url = None
@@ -613,34 +633,66 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         return processed
 
     async def _fetch_publish_page_meetings(self, days_back: int, days_forward: int) -> List[Dict[str, Any]]:
-        """Fetch meetings from PublishPage HTML table, then enrich with HTML agenda items."""
+        """Fetch meetings from PublishPage HTML table, then enrich with HTML agenda items.
+
+        Supports multi-ppid cities (e.g. Meridian ID): config `ppid` may be a string
+        OR a list of UUIDs, one per body (Council, Planning, Historic, etc.). Each
+        ppid surfaces a distinct meeting set; we merge and dedupe by meeting GUID.
+        """
         start_date, end_date = self._date_range(days_back, days_forward)
 
-        # PublishPage URL: cid=CITYCODE, ppid for page ID (0 default, some cities need specific UUID)
-        # p=-1 fetches all meetings, but some sites 500 on it — fall back to p=1
-        ppid = self._site_config.get("ppid", "0")
-        base_publish_url = f"{self.base_url}/PublishPage/index?cid={self.city_code}&ppid={ppid}"
+        # PublishPage URL: cid=CITYCODE, ppid for page ID (0 default, specific UUIDs per body).
+        # ppid may be a single string or a list -- normalize to list for uniform handling.
+        ppid_cfg = self._site_config.get("ppid", "0")
+        ppids = ppid_cfg if isinstance(ppid_cfg, list) else [ppid_cfg]
 
         try:
-            html = None
-            for page_param in ["-1", "1"]:
-                url = f"{base_publish_url}&p={page_param}"
-                try:
-                    response = await self._get(url)
-                    html = await response.text()
-                    break
-                except Exception as e:
-                    logger.debug("publish page param failed, trying next", vendor="municode", slug=self.slug, p=page_param, error=str(e))
+            all_meetings: List[Dict[str, Any]] = []
+            for ppid in ppids:
+                base_publish_url = f"{self.base_url}/PublishPage/index?cid={self.city_code}&ppid={ppid}"
 
-            if not html:
-                logger.error("all publish page attempts failed", vendor="municode", slug=self.slug)
+                # p=-1 fetches all meetings, but some ppids 500 on it -- fall back to p=1
+                html = None
+                for page_param in ["-1", "1"]:
+                    url = f"{base_publish_url}&p={page_param}"
+                    try:
+                        response = await self._get(url)
+                        html = await response.text()
+                        # Sanity: error pages can return 200 with "Sorry, something went wrong";
+                        # treat them as failures to trigger fallback.
+                        if "Friendly Error Page" in html or "Sorry, something went wrong" in html:
+                            html = None
+                            continue
+                        break
+                    except Exception as e:
+                        logger.debug("publish page param failed, trying next", vendor="municode", slug=self.slug, ppid=ppid, p=page_param, error=str(e))
+
+                if not html:
+                    logger.warning("publish page attempts failed for ppid", vendor="municode", slug=self.slug, ppid=ppid)
+                    continue
+
+                meetings = await asyncio.to_thread(self._parse_publish_page_html, html)
+                all_meetings.extend(meetings)
+
+            if not all_meetings:
+                logger.error("all publish page attempts failed", vendor="municode", slug=self.slug, ppid_count=len(ppids))
                 return []
 
-            meetings = await asyncio.to_thread(self._parse_publish_page_html, html)
+            # Dedupe by meeting GUID (same meeting could in theory appear under multiple
+            # ppids, though in practice each body has its own).
+            seen_guids: set[str] = set()
+            unique: List[Dict[str, Any]] = []
+            for m in all_meetings:
+                guid = m.get("_meeting_guid")
+                if guid:
+                    if guid in seen_guids:
+                        continue
+                    seen_guids.add(guid)
+                unique.append(m)
 
             # Filter by date range
             filtered = []
-            for meeting in meetings:
+            for meeting in unique:
                 meeting_date = meeting.get("_parsed_date")
                 if meeting_date:
                     if start_date <= meeting_date <= end_date:
@@ -653,7 +705,8 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                 "municode PublishPage meetings fetched",
                 vendor="municode",
                 slug=self.slug,
-                total=len(meetings),
+                ppid_count=len(ppids),
+                total=len(unique),
                 in_range=len(filtered)
             )
 

@@ -32,12 +32,14 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
     # Some Granicus sites use 'odd'/'even', others use 'listingRow'
     rows = soup.find_all('tr', class_=['odd', 'even', 'listingRow'])
 
-    # Fallback: Blacksburg-style sites use unclassed <tr> with td.listedItem
+    # Fallback: sites with unclassed <tr> rows where the cells carry the class.
+    # Two cell-class variants seen: td.listedItem (Blacksburg) and td.listItem
+    # (Multnomah). Mirrors the dual accept at line 44 below.
     if not rows:
         for listing_table in soup.find_all('table', class_='listingTable'):
             rows.extend(
                 tr for tr in listing_table.find_all('tr')
-                if tr.find('td', class_='listedItem')
+                if tr.find('td', class_=['listItem', 'listedItem'])
             )
 
     for row in rows:

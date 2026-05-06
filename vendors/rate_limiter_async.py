@@ -30,7 +30,7 @@ DELAYS: Dict[str, float] = {
     "destiny": 1.0,
     "onbase": 1.0,      # mixed: hylandcloud SaaS + self-hosted city subpaths
     # Hits the city's own site -- be polite to municipal infra.
-    "civicplus": 5.4,   # known Cloudflare blocking; stay conservative
+    "civicplus": 2.7,   # Cloudflare-protected; modest concurrency via slots
     "civicengage": 2.0, # archive.aspx on city domain
     "visioninternet": 2.7,  # Akamai-fronted city sites; blocks aggressively
     "proudcity": 1.8,   # city WordPress
@@ -64,6 +64,7 @@ SLOTS: Dict[str, int] = {
     "agendaonline": 3,
     "onbase": 12,     # each city is on its own domain, no real cross-city contention
     "destiny": 3,
+    "civicplus": 3,   # each city is on its own domain; slots ~ effective parallel hosts
     # City-direct scrapers stay at 1 (default below)
 }
 
