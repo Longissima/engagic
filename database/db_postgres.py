@@ -214,23 +214,29 @@ class Database:
                      WHERE created_at >= NOW() - INTERVAL '30 days') as matters_30d,
                     (SELECT COUNT(*) FROM votes
                      WHERE created_at >= NOW() - INTERVAL '30 days') as votes_30d,
-                    -- Total summaries (meeting + item + matter level) attached to
-                    -- meetings whose date is in the last 30 days. Anchored on
-                    -- meetings.date (immutable). Each summary surface counted
-                    -- separately; matters de-duped across appearances.
-                    (
-                        (SELECT COUNT(*) FROM meetings
-                         WHERE summary IS NOT NULL AND summary != ''
-                           AND date >= NOW() - INTERVAL '30 days')
-                      + (SELECT COUNT(*) FROM items i
-                         JOIN meetings m ON m.id = i.meeting_id
-                         WHERE i.summary IS NOT NULL AND i.summary != ''
-                           AND m.date >= NOW() - INTERVAL '30 days')
-                      + (SELECT COUNT(DISTINCT cm.id) FROM city_matters cm
-                         JOIN items i ON i.matter_id = cm.id
-                         JOIN meetings m ON m.id = i.meeting_id
-                         WHERE cm.canonical_summary IS NOT NULL AND cm.canonical_summary != ''
-                           AND m.date >= NOW() - INTERVAL '30 days')
+                    -- Coverage: distinct meetings whose date falls in the last 30
+                    -- days AND have at least one form of summary attached -- meeting
+                    -- level (legacy packet path), item level (modern item-first), or
+                    -- matter canonical (cross-meeting matter rollups). Anchored on
+                    -- meetings.date (immutable). Same unit as the weekly sparkline
+                    -- and the headline summarized_meetings stat.
+                    (SELECT COUNT(*) FROM meetings m WHERE
+                        m.date >= NOW() - INTERVAL '30 days'
+                        AND (
+                            (m.summary IS NOT NULL AND m.summary != '')
+                            OR EXISTS (
+                                SELECT 1 FROM items i
+                                WHERE i.meeting_id = m.id
+                                  AND i.summary IS NOT NULL AND i.summary != ''
+                            )
+                            OR EXISTS (
+                                SELECT 1 FROM items i2
+                                JOIN city_matters cm ON cm.id = i2.matter_id
+                                WHERE i2.meeting_id = m.id
+                                  AND cm.canonical_summary IS NOT NULL
+                                  AND cm.canonical_summary != ''
+                            )
+                        )
                     ) as meeting_summaries_30d
             """)
 
