@@ -136,13 +136,23 @@ class Database:
         logger.info("userland schema initialized")
 
     async def get_stats(self) -> dict:
-        """Get database statistics for monitoring."""
+        """Get database statistics for monitoring.
+
+        A meeting counts as "summarized" if it has either a meeting-level summary
+        (legacy pymupdf_gemini path that summarizes the whole packet PDF) OR at
+        least one item-level summary (new item-first pipeline). Counting only
+        meetings.summary undercounts ~5x because the modern pipeline never writes
+        that column -- it writes per-item summaries to items.summary.
+        """
         async with self.pool.acquire() as conn:
             result = await conn.fetchrow("""
                 SELECT
                     (SELECT COUNT(*) FROM jurisdictions WHERE status = 'active') as active_cities,
                     (SELECT COUNT(*) FROM meetings) as total_meetings,
-                    (SELECT COUNT(*) FROM meetings WHERE summary IS NOT NULL) as summarized_meetings,
+                    (SELECT COUNT(*) FROM meetings m WHERE
+                         m.summary IS NOT NULL
+                         OR EXISTS (SELECT 1 FROM items i WHERE i.meeting_id = m.id AND i.summary IS NOT NULL)
+                    ) as summarized_meetings,
                     (SELECT COUNT(*) FROM meetings WHERE processing_status = 'pending') as pending_meetings
             """)
 
@@ -173,8 +183,15 @@ class Database:
                     (SELECT COUNT(*) FROM sponsorships) as sponsorships,
                     (SELECT COUNT(DISTINCT SPLIT_PART(council_member_id, '_', 1)) FROM votes) as cities_with_votes,
                     (SELECT COUNT(DISTINCT council_member_id) FROM votes) as officials_with_votes,
-                    -- Processing stats
-                    (SELECT COUNT(*) FROM meetings WHERE summary IS NOT NULL) as summarized_meetings,
+                    -- Processing stats. summarized_meetings counts meetings that
+                    -- have EITHER a meeting-level summary (legacy pymupdf_gemini path)
+                    -- OR at least one item-level summary (modern item-first pipeline).
+                    -- The modern pipeline never writes meetings.summary, so counting
+                    -- it alone undercounts ~5x.
+                    (SELECT COUNT(*) FROM meetings m WHERE
+                         m.summary IS NOT NULL
+                         OR EXISTS (SELECT 1 FROM items i WHERE i.meeting_id = m.id AND i.summary IS NOT NULL)
+                    ) as summarized_meetings,
                     (SELECT COUNT(*) FROM items WHERE summary IS NOT NULL) as summarized_items,
                     (SELECT COUNT(*) FROM items WHERE filter_reason IS NOT NULL) as filtered_items,
                     -- Items from meetings that have actually been processed
@@ -424,13 +441,15 @@ class Database:
         }
 
         async with self.pool.acquire() as conn:
-            # Single batch query: JOIN items once, GROUP BY banana
-            # Uses subquery to identify meetings with summarized items
+            # Single batch query: identify meetings with any form of summarization.
+            # A meeting is "summarized" if EITHER it has a meeting-level summary
+            # (legacy packet-PDF path) OR any of its items has a summary
+            # (modern item-first path). Counting only one side undercounts.
             rows = await conn.fetch("""
                 WITH summarized_meetings AS (
-                    SELECT DISTINCT meeting_id
-                    FROM items
-                    WHERE summary IS NOT NULL
+                    SELECT DISTINCT meeting_id FROM items WHERE summary IS NOT NULL
+                    UNION
+                    SELECT id AS meeting_id FROM meetings WHERE summary IS NOT NULL
                 )
                 SELECT
                     m.banana,
