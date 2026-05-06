@@ -342,11 +342,11 @@
 					<div class="stats-card">
 						<div class="number-primary">{formatNumber(data.platformMetrics.processing.summarized_meetings)}</div>
 						<div class="stat-title">Meetings Summarized</div>
-						{#if data.platformMetrics.trends.meetings}
+						{#if data.platformMetrics.trends.summaries}
 							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
-								<path d={sparklinePath(data.platformMetrics.trends.meetings)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
+								<path d={sparklinePath(data.platformMetrics.trends.summaries)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
 							</svg>
-							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meetings_30d)} ingested</div>
+							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meeting_summaries_30d)} summarized</div>
 						{:else}
 							<div class="stat-description">Full meeting summaries generated</div>
 						{/if}

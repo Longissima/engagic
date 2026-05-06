@@ -321,6 +321,8 @@ async def get_platform_metrics(db: Database = Depends(get_db)):
                 "items_30d": metrics["items_30d"],
                 "matters_30d": metrics["matters_30d"],
                 "votes_30d": metrics["votes_30d"],
+                # Summarized meetings whose date fell in the last 30 days.
+                "meeting_summaries_30d": metrics["meeting_summaries_30d"],
             },
             "trends": metrics["trends"],
         }
@@ -430,13 +432,30 @@ async def get_analytics(db: Database = Depends(get_db)):
             unique_summaries = counts["matters_with_summary"] + counts["standalone_items"]
 
             # Complex aggregations that need CTEs - batch together
+            # "Live" / "switched on" = has a summary at meeting, item, or matter level.
+            # We surface live counts so dashboards reflect coverage with content,
+            # not naive table totals (empty shells skew the picture).
             complex_stats = await conn.fetchrow("""
                 WITH
                     summarized_meetings AS (
                         SELECT DISTINCT m.id, m.banana
                         FROM meetings m
-                        LEFT JOIN items i ON m.id = i.meeting_id AND i.summary IS NOT NULL AND i.summary != ''
-                        WHERE (m.summary IS NOT NULL AND m.summary != '') OR i.id IS NOT NULL
+                        LEFT JOIN items i ON i.meeting_id = m.id
+                        LEFT JOIN city_matters cm ON cm.id = i.matter_id
+                        WHERE (m.summary IS NOT NULL AND m.summary != '')
+                           OR (i.summary IS NOT NULL AND i.summary != '')
+                           OR (cm.canonical_summary IS NOT NULL AND cm.canonical_summary != '')
+                    ),
+                    summarized_bananas AS (
+                        SELECT banana FROM summarized_meetings
+                        UNION
+                        SELECT banana FROM city_matters
+                        WHERE canonical_summary IS NOT NULL AND canonical_summary != ''
+                    ),
+                    live_jurisdictions AS (
+                        SELECT j.banana, j.type, j.population
+                        FROM jurisdictions j
+                        JOIN summarized_bananas sb ON sb.banana = j.banana
                     ),
                     frequently_updated AS (
                         SELECT sm.banana, c.population as pop
@@ -447,11 +466,13 @@ async def get_analytics(db: Database = Depends(get_db)):
                     ),
                     active_bananas AS (
                         SELECT DISTINCT banana FROM meetings
-                    ),
-                    summarized_bananas AS (
-                        SELECT DISTINCT banana FROM summarized_meetings
                     )
                 SELECT
+                    (SELECT COUNT(*) FROM summarized_meetings) as live_meetings,
+                    (SELECT COUNT(*) FROM live_jurisdictions WHERE type = 'city') as live_cities,
+                    (SELECT COUNT(*) FROM live_jurisdictions WHERE type = 'county') as live_counties,
+                    (SELECT COUNT(*) FROM live_jurisdictions WHERE type = 'school_district') as live_school_districts,
+                    (SELECT COUNT(*) FROM live_jurisdictions) as live_jurisdictions_total,
                     (SELECT COUNT(*) FROM frequently_updated) as frequently_updated,
                     (SELECT COALESCE(SUM(pop), 0) FROM frequently_updated) as frequently_updated_pop,
                     (SELECT COALESCE(SUM(population), 0) FROM jurisdictions WHERE geom IS NOT NULL) as total_pop,
@@ -476,10 +497,17 @@ async def get_analytics(db: Database = Depends(get_db)):
                         "county": counts["active_counties"],
                         "school_district": counts["active_school_districts"],
                     },
+                    "live": {
+                        "city": complex_stats["live_cities"],
+                        "county": complex_stats["live_counties"],
+                        "school_district": complex_stats["live_school_districts"],
+                    },
                 },
+                "live_jurisdictions": complex_stats["live_jurisdictions_total"],
                 "frequently_updated_cities": complex_stats["frequently_updated"],
                 "frequently_updated_population": complex_stats["frequently_updated_pop"],
                 "meetings_tracked": counts["meetings_count"],
+                "meetings_with_summary": complex_stats["live_meetings"],
                 "meetings_with_items": counts["meetings_with_items"],
                 "meetings_with_packet": counts["packets_count"],
                 "agendas_summarized": counts["summaries_count"],
