@@ -4,7 +4,7 @@ import asyncio
 import time
 import random
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 from enum import Enum
 
@@ -106,101 +106,110 @@ class Fetcher:
             self._shutdown_event.clear()
 
     async def sync_all(self) -> List[SyncResult]:
-        """Sync all active cities with vendor-aware rate limiting."""
-        start_time = time.time()
-        logger.info("starting polite city sync")
+        """Sync all active jurisdictions due for refresh.
 
-        self.failed_cities.clear()
+        Thin wrapper over `sync_cities`. Filters out jurisdictions that aren't
+        due based on adaptive scheduling (`_should_sync_city`), then delegates.
+        """
         cities = await self.db.jurisdictions.get_all_cities(status="active")
-        logger.info("syncing cities with rate limiting", city_count=len(cities))
+        logger.info("starting full sync", candidate_count=len(cities))
 
-        by_vendor = {}
-        skipped_count = 0
-
+        due_bananas: List[str] = []
+        skipped_not_due = 0
         for city in cities:
-            if city.vendor in VENDOR_ADAPTERS:
-                by_vendor.setdefault(city.vendor, []).append(city)
-            else:
-                skipped_count += 1
-                logger.debug("skipping city with no adapter", city_name=city.name, vendor=city.vendor)
+            if not await self._should_sync_city(city):
+                skipped_not_due += 1
+                continue
+            due_bananas.append(city.banana)
 
-        total_supported = sum(len(v) for v in by_vendor.values())
-        if skipped_count:
-            logger.info("cities skipped due to missing adapter", skipped_count=skipped_count)
-        logger.info("processing cities", vendor_count=len(by_vendor), city_count=total_supported)
+        if skipped_not_due:
+            logger.info("cities skipped - not due for sync", skipped_count=skipped_not_due)
 
-        results = []
-
-        for vendor, vendor_cities in by_vendor.items():
-            if not self.is_running:
-                break
-
-            sorted_cities = await self._prioritize_cities(vendor_cities)
-            logger.info("syncing vendor cities", vendor=vendor, city_count=len(sorted_cities), concurrency=CITY_SYNC_CONCURRENCY)
-
-            # Parallel sync with semaphore for controlled concurrency
-            semaphore = asyncio.Semaphore(CITY_SYNC_CONCURRENCY)
-
-            async def sync_city_with_limit(city: Jurisdiction) -> Optional[SyncResult]:
-                if not self.is_running:
-                    return None
-
-                if not await self._should_sync_city(city):
-                    logger.debug("skipping city - not due for sync", city_name=city.name)
-                    return SyncResult(city_banana=city.banana, status=SyncStatus.SKIPPED, error_message="Not due for sync")
-
-                async with semaphore:
-                    if not self.is_running:
-                        return None
-                    # Per-request gating in adapter `_request` handles vendor delay
-                    result = await self._sync_city_with_retry(city)
-                    logger.info("sync completed", city=city.banana, status=result.status.value)
-
-                    if result.status == SyncStatus.FAILED:
-                        self.failed_cities.add(city.banana)
-                    return result
-
-            vendor_results = await asyncio.gather(*[sync_city_with_limit(c) for c in sorted_cities], return_exceptions=True)
-
-            for result in vendor_results:
-                if isinstance(result, BaseException):
-                    logger.error("unexpected sync exception", error=str(result))
-                elif result is not None:
-                    results.append(result)
-
-            if vendor_cities:
-                vendor_break = 30 + random.uniform(0, 10)
-                logger.info("completed vendor cities - taking break", vendor=vendor, break_seconds=round(vendor_break, 1))
-                await asyncio.sleep(vendor_break)
-
-        total_meetings = sum(r.meetings_found for r in results)
-        total_processed = sum(r.meetings_processed for r in results)
-        duration = time.time() - start_time
-
-        logger.info("polite sync completed", duration_seconds=round(duration, 1), meetings_found=total_meetings, meetings_processed=total_processed, cities_failed=len(self.failed_cities))
-        if self.failed_cities:
-            logger.warning("cities failed during sync", failed_cities=sorted(self.failed_cities))
-
-        return results
+        return await self.sync_cities(due_bananas)
 
     async def sync_cities(self, city_bananas: List[str]) -> List[SyncResult]:
-        """Sync specific cities by city_banana."""
-        logger.info("syncing specific cities", city_count=len(city_bananas))
-        results = []
+        """Canonical sync path. Sync the given jurisdictions.
 
+        Vendor-grouped parallel: each vendor's cities run with
+        CITY_SYNC_CONCURRENCY parallelism; vendor batches themselves run in
+        parallel since the per-vendor rate limiter already serializes traffic
+        to each vendor's infra. Within a vendor, high-activity / stale cities
+        sync first so partial runs prioritize useful work.
+
+        Result order is NOT preserved.
+        """
+        start_time = time.time()
+        self.failed_cities.clear()
+
+        by_vendor: Dict[str, List[Jurisdiction]] = {}
+        results: List[SyncResult] = []
         for banana in city_bananas:
             city = await self.db.jurisdictions.get_city(banana=banana)
             if not city:
                 logger.warning("city not found", banana=banana)
                 results.append(SyncResult(city_banana=banana, status=SyncStatus.FAILED, error_message="City not found in database"))
                 continue
+            if city.vendor not in VENDOR_ADAPTERS:
+                logger.debug("skipping city - no adapter", banana=banana, vendor=city.vendor)
+                results.append(SyncResult(city_banana=banana, status=SyncStatus.SKIPPED, error_message=f"No adapter for vendor {city.vendor}"))
+                continue
+            by_vendor.setdefault(city.vendor, []).append(city)
 
-            # Per-request gating in adapter `_request` handles vendor delay
-            result = await self._sync_city_with_retry(city)
-            results.append(result)
+        total_supported = sum(len(v) for v in by_vendor.values())
+        logger.info(
+            "vendor-parallel sync",
+            vendor_count=len(by_vendor),
+            cities=total_supported,
+            concurrency_per_vendor=CITY_SYNC_CONCURRENCY,
+        )
 
-            if result.status == SyncStatus.FAILED:
-                self.failed_cities.add(banana)
+        async def sync_vendor_batch(vendor: str, vendor_cities: List[Jurisdiction]) -> List[SyncResult]:
+            sorted_cities = await self._prioritize_cities(vendor_cities)
+            sem = asyncio.Semaphore(CITY_SYNC_CONCURRENCY)
+
+            async def sync_one(city: Jurisdiction) -> Optional[SyncResult]:
+                if not self.is_running:
+                    return None
+                async with sem:
+                    if not self.is_running:
+                        return None
+                    result = await self._sync_city_with_retry(city)
+                    logger.info("sync completed", city=city.banana, status=result.status.value)
+                    if result.status == SyncStatus.FAILED:
+                        self.failed_cities.add(city.banana)
+                    return result
+
+            raw = await asyncio.gather(*[sync_one(c) for c in sorted_cities], return_exceptions=True)
+            out: List[SyncResult] = []
+            for r in raw:
+                if isinstance(r, BaseException):
+                    logger.error("unexpected sync exception", vendor=vendor, error=str(r))
+                elif r is not None:
+                    out.append(r)
+            return out
+
+        vendor_batches = await asyncio.gather(
+            *[sync_vendor_batch(v, cs) for v, cs in by_vendor.items()],
+            return_exceptions=True,
+        )
+        for batch in vendor_batches:
+            if isinstance(batch, BaseException):
+                logger.error("vendor batch failed", error=str(batch))
+            else:
+                results.extend(batch)
+
+        total_meetings = sum(r.meetings_found for r in results)
+        total_processed = sum(r.meetings_processed for r in results)
+        duration = time.time() - start_time
+        logger.info(
+            "sync complete",
+            duration_seconds=round(duration, 1),
+            meetings_found=total_meetings,
+            meetings_processed=total_processed,
+            cities_failed=len(self.failed_cities),
+        )
+        if self.failed_cities:
+            logger.warning("cities failed during sync", failed_cities=sorted(self.failed_cities))
 
         return results
 

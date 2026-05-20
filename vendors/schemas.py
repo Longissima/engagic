@@ -17,8 +17,11 @@ class AttachmentSchema(BaseModel):
     name: str
     url: str
     type: str  # pdf, doc, spreadsheet, unknown
-    portal_url: Optional[str] = None  # Stable viewer URL (CivicClerk portal)
+    portal_url: Optional[str] = None  # Stable viewer URL (CivicClerk portal) -- HTML, not a download
     history_id: Optional[str] = None  # PrimeGov-specific identifier for downloading
+    meta_id: Optional[str] = None  # Granicus-specific
+    cc_agenda_id: Optional[int] = None  # CivicClerk: Meetings/{id} for URL refresh
+    cc_attachment_id: Optional[int] = None  # CivicClerk: attachment id within agenda
 
     @field_validator("url")
     @classmethod

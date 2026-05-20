@@ -267,7 +267,7 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             raw_items = data.get("items", [])
 
             # Flatten hierarchy and process items
-            items = self._flatten_items(raw_items, event_id)
+            items = self._flatten_items(raw_items, event_id, agenda_id)
 
             logger.debug(
                 "extracted items from meeting",
@@ -290,7 +290,12 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             )
             return []
 
-    def _flatten_items(self, items: List[Dict[str, Any]], event_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _flatten_items(
+        self,
+        items: List[Dict[str, Any]],
+        event_id: Optional[int] = None,
+        agenda_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """Recursively extract leaf items (isSection=0), skipping section containers."""
         result = []
 
@@ -301,20 +306,25 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             if is_section == 1:
                 # Section - recurse into children
                 if child_items:
-                    result.extend(self._flatten_items(child_items, event_id))
+                    result.extend(self._flatten_items(child_items, event_id, agenda_id))
             else:
                 # Leaf item - process it
-                processed = self._process_item(item, event_id)
+                processed = self._process_item(item, event_id, agenda_id)
                 if processed:
                     result.append(processed)
 
                 # Also process any children (items can have nested items)
                 if child_items:
-                    result.extend(self._flatten_items(child_items, event_id))
+                    result.extend(self._flatten_items(child_items, event_id, agenda_id))
 
         return result
 
-    def _process_item(self, item: Dict[str, Any], event_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    def _process_item(
+        self,
+        item: Dict[str, Any],
+        event_id: Optional[int] = None,
+        agenda_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Convert CivicClerk item to our schema."""
         item_id = item.get("id")
         if not item_id:
@@ -363,6 +373,10 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
                         if att_id and event_id else None
                     )
 
+                    # Durable identifiers: pdfVersionFullPath above is a SAS-signed
+                    # blob URL that expires (~24h). Storing (agenda_id, attachment_id)
+                    # lets pipeline.url_refresh re-resolve a fresh URL at fetch time
+                    # by re-hitting /v1/Meetings/{agenda_id}.
                     attachment_entry = {
                         "name": name,
                         "url": url,
@@ -370,6 +384,13 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
                     }
                     if portal_url:
                         attachment_entry["portal_url"] = portal_url
+                    if agenda_id is not None:
+                        attachment_entry["cc_agenda_id"] = int(agenda_id)
+                    if att_id is not None:
+                        try:
+                            attachment_entry["cc_attachment_id"] = int(att_id)
+                        except (TypeError, ValueError):
+                            pass
 
                     attachments.append(attachment_entry)
 

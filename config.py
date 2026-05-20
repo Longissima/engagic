@@ -164,6 +164,12 @@ class Config:
         # Model selection: use Flash-Lite for small docs (cost savings) or Flash for all (quality)
         self.USE_FLASH_LITE = os.getenv("ENGAGIC_USE_FLASH_LITE", "true").lower() == "true"
 
+        # Gemini model IDs (overridable via env for A/B or preview swaps)
+        # PRIMARY_MODEL is the default workhorse; SMALL_DOC_MODEL kicks in only
+        # when USE_FLASH_LITE is true AND the document is below the size cutoff.
+        self.PRIMARY_MODEL = os.getenv("ENGAGIC_PRIMARY_MODEL", "gemini-3.1-flash-lite")
+        self.SMALL_DOC_MODEL = os.getenv("ENGAGIC_SMALL_DOC_MODEL", "gemini-2.5-flash-lite")
+
         # Admin authentication
         self.ADMIN_TOKEN = os.getenv("ENGAGIC_ADMIN_TOKEN", "")
         # Whitelist VPS IP for admin access (uses CF-Connecting-IP from Cloudflare)

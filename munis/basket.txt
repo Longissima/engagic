@@ -1,0 +1,143 @@
+# Basket - Major US Metros and Counties
+# Last updated: 2026-05-07
+
+# Texas
+dallasTX
+fortworthTX
+sanantonioTX
+austinTX
+houstonTX
+corpuschristiTX
+midlandTX
+elpasoTX
+
+# Colorado
+denverCO
+coloradospringsCO
+
+# Arizona
+phoenixAZ
+mesaAZ
+tucsonAZ
+
+# Wisconsin
+milwaukeeWI
+madisonWI
+appletonWI
+
+# Minnesota
+saintpaulMN
+rochesterMN
+
+# Illinois
+chicagoIL
+auroraIL
+napervilleIL
+jolietIL
+
+# Florida
+jacksonvilleFL
+tampaFL
+orlandoFL
+miamiFL
+fortlauderdaleFL
+sarasotaFL
+pensacolaFL
+
+# New York
+newyorkNY
+buffaloNY
+yonkersNY
+
+# California
+losangelesCA
+sanfranciscoCA
+sanjoseCA
+oaklandCA
+sacramentoCA
+sanbernardinoCA
+stocktonCA
+fresnoCA
+
+# Washington
+seattleWA
+
+# Tennessee / Kentucky
+nashvilleTN
+louisvilleKY
+lexingtonKY
+
+# North Carolina
+charlotteNC
+raleighNC
+
+# Massachusetts / Rhode Island
+bostonMA
+providenceRI
+
+# Pennsylvania
+philadelphiaPA
+pittsburghPA
+scrantonPA
+
+# Maryland / New Jersey
+baltimoreMD
+newarkNJ
+
+# Michigan
+detroitMI
+grandrapidsMI
+
+# Ohio
+clevelandOH
+columbusOH
+cincinnatiOH
+daytonOH
+
+# Missouri
+kansascityMO
+stlouisMO
+
+# Oklahoma
+oklahomacityOK
+tulsaOK
+
+# Other
+atlantaGA
+boiseID
+indianapolisIN
+
+# Utah / Nevada
+saltlakecityUT
+renoNV
+lasvegasNV
+
+# New Mexico
+albuquerqueNM
+
+# Louisiana
+neworleansLA
+batonrougeLA
+shreveportLA
+
+# Virginia / South Carolina / Kansas
+richmondVA
+charlestonSC
+wichitaKS
+
+# Counties
+jeffersoncountyAL
+cookcountyIL
+harriscountyTX
+dallascountyTX
+orangecountyCA
+alamedacountyCA
+hennepincountyMN
+alleghenycountyPA
+kingcountyWA
+milwaukeecountyWI
+sacramentocountyCA
+sanbernardinocountyCA
+fresnocountyCA
+riversidecountyCA
+sandiegocountyCA

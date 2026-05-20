@@ -11,6 +11,7 @@ from database.db_postgres import Database
 from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
 from pipeline.utils import hash_substantive_attachments
+from pipeline.url_refresh import refresh_attachment_urls
 from exceptions import ProcessingError, ExtractionError, LLMError
 from analysis.analyzer_async import AsyncAnalyzer
 from analysis.topics.normalizer import get_normalizer
@@ -107,9 +108,11 @@ class Processor:
         self._shutdown_event = asyncio.Event()
         self._running = True  # Internal state, use property for access
 
-        # Global PDF extraction semaphore — shared across all concurrent meetings
-        # Cap at 6 subprocesses total (each may run OCR on 3 vCPU / 4GB box)
-        self._pdf_semaphore = asyncio.Semaphore(6)
+        # Global PDF extraction semaphore — shared across all concurrent meetings.
+        # Cap at 8 subprocesses total (each may run OCR on 3 vCPU / 4GB box).
+        # Bumped 6 -> 8 after swap was doubled 6Gi -> 13Gi (2026-05-20); modest
+        # increase to relieve the extraction bottleneck without piling on RSS.
+        self._pdf_semaphore = asyncio.Semaphore(8)
 
         if analyzer is not None:
             self.analyzer = analyzer
@@ -531,6 +534,14 @@ class Processor:
         if not all_attachments:
             logger.debug("matter skipped - no attachments", matter_id=matter_id)
             return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
+
+        # Refresh ephemeral signed URLs before extraction. See _process_meeting_with_items.
+        city = await self.db.jurisdictions.get_city(banana)
+        if city and city.vendor:
+            try:
+                await refresh_attachment_urls(city.vendor, city.slug, all_attachments)
+            except (OSError, RuntimeError) as e:
+                logger.warning("url refresh failed, falling back to stored urls", matter_id=matter_id, error=str(e))
 
         try:
             result = await self._process_single_item(representative_item)
@@ -970,6 +981,18 @@ class Processor:
             logger.info("all items already processed", item_count=len(already_processed))
         else:
             logger.info("extracting text from items for batch processing", item_count=len(need_processing))
+
+            # Refresh ephemeral signed URLs (CivicClerk SAS, etc.) just before fetch.
+            # Stored att.url is whatever the vendor returned at scrape time and may
+            # be hours-to-weeks expired; durable identifiers on AttachmentInfo let
+            # url_refresh resolve a fresh URL via the vendor API.
+            if city and city.vendor:
+                all_atts = [att for it in need_processing for att in (it.attachments or [])]
+                if all_atts:
+                    try:
+                        await refresh_attachment_urls(city.vendor, city.slug, all_atts)
+                    except (OSError, RuntimeError) as e:
+                        logger.warning("url refresh failed, falling back to stored urls", banana=meeting.banana, error=str(e))
 
             document_cache, item_attachments, shared_urls = await self._build_document_cache(need_processing)
 

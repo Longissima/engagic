@@ -85,14 +85,22 @@ class AttachmentInfo(BaseModel):
     Typed JSONB for attachments arrays (items.attachments, city_matters.attachments).
 
     Mirrors vendors.schemas.AttachmentSchema but used for DB fields.
+
+    URL semantics: `url` is whatever the vendor handed us at scrape time --
+    for CivicClerk and similar Azure-backed vendors, that's a SAS-signed blob URL
+    with a finite lifetime. Treat it as ephemeral. The vendor-specific identifiers
+    below (cc_agenda_id, cc_attachment_id, history_id, meta_id) are the durable
+    references; `pipeline.url_refresh` resolves them to fresh URLs at fetch time.
     """
     model_config = ConfigDict(extra="forbid")
     name: str
     url: str
     type: str  # pdf, doc, spreadsheet, unknown
-    portal_url: Optional[str] = None  # Stable viewer URL (CivicClerk portal)
+    portal_url: Optional[str] = None  # Stable viewer URL (CivicClerk portal) -- HTML, not a download
     history_id: Optional[str] = None  # PrimeGov-specific
     meta_id: Optional[str] = None  # Granicus-specific
+    cc_agenda_id: Optional[int] = None  # CivicClerk Meetings/{id} -- input to URL refresh
+    cc_attachment_id: Optional[int] = None  # CivicClerk attachment id within agenda
 
 
 # --- Domain Dataclasses (with runtime validation) ---

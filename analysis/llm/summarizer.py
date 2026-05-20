@@ -12,6 +12,7 @@ Responsibilities:
 import asyncio
 import json
 import os
+import random
 import re
 import tempfile
 import time
@@ -63,9 +64,10 @@ class GeminiSummarizer:
 
         self.client = genai.Client(api_key=self.api_key)
 
-        # Model names
-        self.flash_model_name = "gemini-3.1-flash-lite-preview"
-        self.flash_lite_model_name = "gemini-2.5-flash-lite"
+        # Model IDs (env-overridable via config). Names reflect role, not generation:
+        # primary = default workhorse; small_doc = cost-saver when USE_FLASH_LITE + small input.
+        self.primary_model = config.PRIMARY_MODEL
+        self.small_doc_model = config.SMALL_DOC_MODEL
 
         # Load prompts from JSON
         self.prompts_version = "v3"
@@ -120,27 +122,32 @@ class GeminiSummarizer:
         # If USE_FLASH_LITE enabled: use Flash-Lite for small docs (cost savings)
         if config.USE_FLASH_LITE:
             if text_size < FLASH_LITE_MAX_CHARS and page_count <= FLASH_LITE_MAX_PAGES:
-                return self.flash_lite_model_name, "flash-lite"
-        return self.flash_model_name, "flash"
+                return self.small_doc_model, "flash-lite"
+        return self.primary_model, "flash"
 
-    def _call_with_retry(self, model_name: str, prompt: str, config, max_retries: int = 3, max_retry_seconds: int = 180):
-        """Call Gemini API with automatic retry on 429 rate limits.
+    def _call_with_retry(self, model_name: str, prompt: str, config, max_retries: int = 4, max_retry_seconds: int = 180):
+        """Call Gemini API with automatic retry on transient errors.
 
-        Instead of proactive rate limiting, we trust Gemini to tell us when to retry.
-        Gemini returns retryDelay in 429 responses - we parse and respect it.
+        Retryable conditions:
+          - 429 / RESOURCE_EXHAUSTED: respect Gemini's `retryDelay` if present
+          - 503 / UNAVAILABLE: server overloaded; exponential backoff with jitter
+          - 500 / INTERNAL: transient server error; same backoff
+          - 504 / DEADLINE_EXCEEDED: same backoff
+        Everything else raises immediately.
 
         Args:
             model_name: Gemini model to use
             prompt: The prompt text
             config: GenerateContentConfig
-            max_retries: Maximum retry attempts (default 3)
+            max_retries: Maximum retry attempts (default 4)
             max_retry_seconds: Total time cap for all retries (default 180s = 3 mins)
 
         Returns:
             GenerateContentResponse from Gemini
 
         Raises:
-            LLMError: If max retries exceeded or non-rate-limit error
+            LLMError: If max retries exceeded
+            Original exception: For non-retryable errors
         """
         last_error = None
         start_time = time.time()
@@ -155,52 +162,66 @@ class GeminiSummarizer:
             except Exception as e:  # Intentionally broad: retry logic needs to catch all errors
                 last_error = e
                 error_str = str(e)
+                is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                is_server_busy = (
+                    "503" in error_str
+                    or "UNAVAILABLE" in error_str
+                    or "500" in error_str
+                    or "INTERNAL" in error_str
+                    or "504" in error_str
+                    or "DEADLINE_EXCEEDED" in error_str
+                )
 
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if not (is_rate_limit or is_server_busy):
+                    raise
+
+                if is_rate_limit:
                     # Parse retryDelay from Gemini's error response (handles both quote styles)
                     retry_match = re.search(r'["\']retryDelay["\']:\s*["\'](\d+)s?["\']', error_str)
                     if retry_match:
                         delay = int(retry_match.group(1)) + 1  # Add 1s buffer
                     else:
-                        # Try alternate format: retryDelay: '28.5s' or similar
                         retry_match = re.search(r'retry.*?(\d+(?:\.\d+)?)\s*s', error_str, re.IGNORECASE)
                         if retry_match:
                             delay = int(float(retry_match.group(1))) + 1
                         else:
-                            # Fallback: exponential backoff (30s, 60s, 90s)
                             delay = 30 * (attempt + 1)
+                    reason = "rate_limit"
+                else:
+                    # 503/500/504: exponential backoff with jitter (2s, 4s, 8s, 16s + 0-1s jitter).
+                    # Shorter than rate-limit backoff because overload usually clears in seconds, not
+                    # the tens of seconds Gemini quotes in retryDelay.
+                    delay = (2 ** (attempt + 1)) + random.uniform(0, 1)
+                    reason = "server_busy"
 
-                    # Check if we'd exceed total time cap
-                    elapsed = time.time() - start_time
-                    if elapsed + delay > max_retry_seconds:
-                        logger.warning(
-                            "rate limit retry would exceed time cap, giving up",
-                            elapsed_seconds=round(elapsed),
-                            proposed_delay=delay,
-                            max_retry_seconds=max_retry_seconds
-                        )
-                        break
-
+                elapsed = time.time() - start_time
+                if elapsed + delay > max_retry_seconds:
                     logger.warning(
-                        "rate limited by gemini, waiting for retry",
-                        attempt=attempt + 1,
-                        max_retries=max_retries,
-                        delay_seconds=delay,
-                        total_elapsed=round(elapsed)
+                        "retry would exceed time cap, giving up",
+                        reason=reason,
+                        elapsed_seconds=round(elapsed),
+                        proposed_delay=round(delay, 1),
+                        max_retry_seconds=max_retry_seconds,
                     )
-                    time.sleep(delay)
-                    continue
+                    break
 
-                # Non-rate-limit error: raise immediately
-                raise
+                logger.warning(
+                    "transient gemini error, retrying",
+                    reason=reason,
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    delay_seconds=round(delay, 1),
+                    total_elapsed=round(elapsed),
+                )
+                time.sleep(delay)
+                continue
 
-        # All retries exhausted or time cap exceeded
         elapsed = time.time() - start_time
         raise LLMError(
-            f"Rate limit retries exhausted after {round(elapsed)}s",
+            f"Transient-error retries exhausted after {round(elapsed)}s",
             model=model_name,
             prompt_type="unknown",
-            original_error=last_error
+            original_error=last_error,
         )
 
     def summarize_meeting(self, text: str) -> str:
@@ -453,7 +474,7 @@ class GeminiSummarizer:
                         token_count=token_count
                     )
                     cache = self.client.caches.create(
-                        model=self.flash_model_name,
+                        model=self.primary_model,
                         config=types.CreateCachedContentConfig(
                             display_name=f"meeting-{meeting_id}-shared-docs",
                             contents=[types.Content(parts=[types.Part(text=shared_context)])],
@@ -920,7 +941,7 @@ class GeminiSummarizer:
                 batch_start_time = time.time()
 
                 batch_job = self.client.batches.create(
-                    model=self.flash_model_name,
+                    model=self.primary_model,
                     src=uploaded_file.name,
                     config={"display_name": f"chunk-{chunk_num}-{time.time()}"},
                 )
