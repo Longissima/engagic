@@ -23,7 +23,7 @@ import resource
 import re
 import tempfile
 import time
-from typing import List, Dict, Any, Optional, Tuple
+from typing import AsyncIterator, List, Dict, Any, Optional, Tuple
 from urllib.parse import urljoin
 
 import aiohttp
@@ -557,12 +557,15 @@ class AsyncAnalyzer:
         item_requests: List[Dict[str, Any]],
         shared_context: Optional[str] = None,
         meeting_id: Optional[str] = None
-    ) -> List[List[Dict[str, Any]]]:
+    ) -> AsyncIterator[List[Dict[str, Any]]]:
         """
-        Process multiple agenda items concurrently.
+        Process multiple agenda items concurrently, yielding each result as it
+        completes (streaming).
 
-        Unlike sync version (generator), returns complete results after processing.
-        Rate limiting handled reactively by summarizer via Gemini's retry instructions.
+        Items run through an LLM_CONCURRENCY-bounded semaphore; each finished
+        item is yielded immediately rather than waiting for the slowest sibling.
+        Callers see steady DB writes instead of a final bulk dump, and a slow
+        Gemini call only delays its own item -- siblings keep flowing.
 
         Args:
             item_requests: List of dicts with structure:
@@ -576,62 +579,62 @@ class AsyncAnalyzer:
             shared_context: Optional meeting-level shared document context
             meeting_id: Optional meeting ID (for cache naming)
 
-        Returns:
-            List of result chunks (compatible with sync generator interface)
-            [[{
-                'item_id': str,
-                'success': bool,
-                'summary': str,
-                'topics': List[str],
-                'error': str (if failed)
-            }, ...]]
+        Yields:
+            Single-item chunks [{...}] as each item finishes, in completion
+            order (NOT input order). Each item dict has:
+                'item_id': str
+                'success': bool
+                'summary': str (if success)
+                'topics': List[str] (if success)
+                'error': str (if not success)
         """
         if not item_requests:
-            return []
+            return
 
         logger.info(
             "processing batch items async",
             count=len(item_requests),
-            concurrent=True
+            concurrent=True,
         )
 
         async def process_item(item: Dict[str, Any]) -> Dict[str, Any]:
-            """Process single item with timeout"""
+            """Process single item with timeout."""
             try:
                 text = item.get("text", "")
                 title = item.get("title", "")
                 page_count = item.get("page_count")
 
-                # Summarize item (Gemini SDK is sync, run in thread pool)
-                # Rate limiting handled reactively by summarizer
-                # 5 min timeout per item - summarizer has 3 min internal retry budget
+                # Summarize item (Gemini SDK is sync, run in thread pool).
+                # SDK now has its own 300s http timeout matching this wait_for,
+                # so a real stall cancels the socket and frees the thread
+                # instead of leaking it past the async-layer cancellation.
                 summary, topics = await asyncio.wait_for(
                     asyncio.to_thread(
                         self.summarizer.summarize_item,
                         title,
                         text,
-                        page_count
+                        page_count,
                     ),
-                    timeout=300
+                    timeout=300,
                 )
 
                 return {
                     "item_id": item["item_id"],
                     "success": True,
                     "summary": summary,
-                    "topics": topics
+                    "topics": topics,
                 }
 
             except asyncio.TimeoutError:
                 logger.error(
                     "item summarization timed out after 5 minutes",
                     item_id=item.get("item_id"),
-                    title=item.get("title", "")[:50]
+                    title=item.get("title", "")[:50],
                 )
                 return {
                     "item_id": item["item_id"],
                     "success": False,
-                    "error": "LLM summarization timed out after 5 minutes"
+                    "error": "LLM summarization timed out after 5 minutes",
                 }
 
             except Exception as e:
@@ -639,44 +642,52 @@ class AsyncAnalyzer:
                     "item processing failed",
                     item_id=item.get("item_id"),
                     error=str(e),
-                    error_type=type(e).__name__
+                    error_type=type(e).__name__,
                 )
                 return {
                     "item_id": item["item_id"],
                     "success": False,
-                    "error": str(e)
+                    "error": str(e),
                 }
 
-        # Process items with controlled concurrency
-        # Gemini API has TPM limits but built-in retry handles 429s
-        # Concurrency configurable via ENGAGIC_LLM_CONCURRENCY (default 3)
         concurrency = config.LLM_CONCURRENCY
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def process_with_limit(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+        async def process_with_limit(item: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
-                logger.debug("processing item", index=index + 1, total=len(item_requests))
                 return await process_item(item)
 
-        # Concurrent processing with semaphore limiting
-        results = await asyncio.gather(
-            *[process_with_limit(item, i) for i, item in enumerate(item_requests)],
-            return_exceptions=True
+        # Fan out all tasks up-front; semaphore caps in-flight at LLM_CONCURRENCY.
+        # asyncio.as_completed yields each task's result the moment it lands,
+        # giving the caller a steady stream of completions to write to the DB.
+        tasks = [asyncio.create_task(process_with_limit(item)) for item in item_requests]
+        success_count = 0
+        try:
+            for finished in asyncio.as_completed(tasks):
+                try:
+                    result = await finished
+                except Exception as e:
+                    # process_item already swallows expected exceptions; this
+                    # only catches truly unexpected ones (e.g., CancelledError
+                    # bubbling up). Yield a synthetic failure rather than
+                    # losing the item silently.
+                    logger.error("unexpected task exception", error=str(e), error_type=type(e).__name__)
+                    yield [{"item_id": "unknown", "success": False, "error": str(e)}]
+                    continue
+                if result["success"]:
+                    success_count += 1
+                yield [result]
+        finally:
+            # If the consumer breaks out (e.g., shutdown), make sure no tasks
+            # keep running in the background holding semaphore slots or LLM
+            # connections.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+
+        logger.info(
+            "batch processing complete",
+            success=success_count,
+            total=len(item_requests),
+            concurrency=concurrency,
         )
-
-        # Handle any unexpected exceptions from gather
-        processed = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error("unexpected item exception", item_id=item_requests[i].get("item_id"), error=str(result))
-                processed.append({
-                    "item_id": item_requests[i]["item_id"],
-                    "success": False,
-                    "error": str(result)
-                })
-            else:
-                processed.append(result)
-
-        # Return as single chunk (compatible with sync generator interface)
-        logger.info("batch processing complete", success=sum(1 for r in processed if r["success"]), total=len(processed), concurrency=concurrency)
-        return [processed]

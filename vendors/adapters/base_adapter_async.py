@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import re
 import tempfile
 import time
@@ -86,14 +87,27 @@ class AsyncBaseAdapter:
     async def _get_session(self) -> aiohttp.ClientSession:
         return await AsyncSessionManager.get_session(self.vendor)
 
+    # Transient aiohttp errors worth retrying. ClientConnectionError is the
+    # umbrella for connection-level failures: ClientOSError (errno 104 etc.),
+    # ClientConnectorError, ServerDisconnectedError, ServerTimeoutError, etc.
+    # Excludes ClientPayloadError and TLS verification failures (permanent).
+    _RETRYABLE_CLIENT_ERRORS = (aiohttp.ClientConnectionError,)
+    _MAX_REQUEST_ATTEMPTS = 3
+
     async def _request(self, method: str, url: str, **kwargs) -> aiohttp.ClientResponse:
-        """Make async HTTP request with rate limiting and error handling.
+        """Make async HTTP request with rate limiting, retries, and error handling.
 
         Every request gates through the shared per-vendor rate limiter, so
         adapter-internal concurrency (gather/_bounded_gather) naturally
         serializes at the configured cadence rather than firing in parallel.
-        On 429/503 with a Retry-After header, defers the vendor's next slot
-        and raises VendorHTTPError -- callers decide whether to retry.
+
+        Retries up to _MAX_REQUEST_ATTEMPTS times on transient failures:
+        - TCP resets / disconnects / connector errors (ClientOSError covers
+          ConnectionResetError aka errno 104)
+        - asyncio.TimeoutError
+        - 5xx responses other than 503-with-Retry-After (which the rate
+          limiter already defers)
+        Permanent 4xx errors (auth, not-found, bad-request) raise immediately.
         """
         session = await self._get_session()
 
@@ -112,76 +126,132 @@ class AsyncBaseAdapter:
         if self.vendor == "granicus" or "granicus.com" in url or "granicus_production_attachments" in url:
             kwargs["ssl"] = False
 
-        # Per-request politeness gate: every request waits its turn for this
-        # vendor. Single global lock means parallel coroutines queue rather
-        # than burst.
-        await get_rate_limiter().wait_if_needed(self.vendor)
+        last_error: Optional[BaseException] = None
 
-        start_time = time.time()
+        for attempt in range(self._MAX_REQUEST_ATTEMPTS):
+            # Per-request politeness gate. Re-enter on every attempt so the
+            # rate limiter spaces retries too.
+            await get_rate_limiter().wait_if_needed(self.vendor)
 
-        try:
-            logger.debug("vendor request", vendor=self.vendor, slug=self.slug, method=method, url=url[:100])
-            response = await session.request(method, url, **kwargs)
-            duration = time.time() - start_time
+            start_time = time.time()
+            try:
+                logger.debug("vendor request", vendor=self.vendor, slug=self.slug, method=method, url=url[:100], attempt=attempt + 1)
+                response = await session.request(method, url, **kwargs)
+                duration = time.time() - start_time
 
-            logger.debug(
-                "vendor response",
-                vendor=self.vendor,
-                slug=self.slug,
-                status_code=response.status,
-                content_length=response.headers.get('content-length', 'unknown'),
-                content_type=response.headers.get('content-type', 'unknown'),
-                duration_seconds=round(duration, 2)
-            )
-
-            if response.status >= 400:
-                # Honor Retry-After when the server explicitly tells us how
-                # long to back off. Applies to 429 (rate-limited) and 503
-                # (service unavailable) -- both indicate the server wants us
-                # to pause, not retry blindly.
-                if response.status in (429, 503):
-                    retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
-                    if retry_after is not None:
-                        await get_rate_limiter().respect_retry_after(self.vendor, retry_after)
-
-                error_body = await response.text()
-                self.metrics.vendor_requests.labels(vendor=self.vendor, status=f"http_{response.status}").inc()
-                err = VendorHTTPError(
-                    f"HTTP {response.status} error",
-                    vendor=self.vendor,
-                    status_code=response.status,
-                    url=url,
-                    city_slug=self.slug
-                )
-                self.metrics.record_error(component="vendor", error=err)
-                logger.error(
-                    "vendor http error",
+                logger.debug(
+                    "vendor response",
                     vendor=self.vendor,
                     slug=self.slug,
                     status_code=response.status,
-                    url=url[:100],
-                    error_body=error_body[:500] if error_body else None,
-                    duration_seconds=round(duration, 2)
+                    content_length=response.headers.get('content-length', 'unknown'),
+                    content_type=response.headers.get('content-type', 'unknown'),
+                    duration_seconds=round(duration, 2),
                 )
-                raise err
 
-            self.metrics.vendor_requests.labels(vendor=self.vendor, status="success").inc()
-            self.metrics.vendor_request_duration.labels(vendor=self.vendor).observe(duration)
-            return response
+                if response.status >= 400:
+                    # Honor Retry-After when the server explicitly tells us how
+                    # long to back off. Applies to 429 (rate-limited) and 503
+                    # (service unavailable).
+                    if response.status in (429, 503):
+                        retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
+                        if retry_after is not None:
+                            await get_rate_limiter().respect_retry_after(self.vendor, retry_after)
 
-        except asyncio.TimeoutError as e:
-            duration = time.time() - start_time
-            self.metrics.vendor_requests.labels(vendor=self.vendor, status="timeout").inc()
-            self.metrics.record_error(component="vendor", error=e)
-            logger.error("vendor request timeout", vendor=self.vendor, slug=self.slug, url=url[:100], duration_seconds=round(duration, 2))
-            raise VendorHTTPError(f"Request timeout after {duration:.1f}s", vendor=self.vendor, url=url, city_slug=self.slug) from e
+                    error_body = await response.text()
+                    self.metrics.vendor_requests.labels(vendor=self.vendor, status=f"http_{response.status}").inc()
+                    err = VendorHTTPError(
+                        f"HTTP {response.status} error",
+                        vendor=self.vendor,
+                        status_code=response.status,
+                        url=url,
+                        city_slug=self.slug,
+                    )
+                    self.metrics.record_error(component="vendor", error=err)
+                    logger.error(
+                        "vendor http error",
+                        vendor=self.vendor,
+                        slug=self.slug,
+                        status_code=response.status,
+                        url=url[:100],
+                        error_body=error_body[:500] if error_body else None,
+                        duration_seconds=round(duration, 2),
+                        attempt=attempt + 1,
+                    )
 
-        except aiohttp.ClientError as e:
-            duration = time.time() - start_time
-            self.metrics.vendor_requests.labels(vendor=self.vendor, status="error").inc()
-            self.metrics.record_error(component="vendor", error=e)
-            logger.error("vendor request failed", vendor=self.vendor, slug=self.slug, url=url[:100], error=str(e), error_type=type(e).__name__, duration_seconds=round(duration, 2))
-            raise VendorHTTPError(f"Request failed: {e}", vendor=self.vendor, url=url, city_slug=self.slug) from e
+                    # 5xx are usually transient (server bug, gateway hiccup,
+                    # tenant-level throttle that didn't honor Retry-After).
+                    # 4xx are application errors -- retrying won't help.
+                    if 500 <= response.status < 600 and attempt < self._MAX_REQUEST_ATTEMPTS - 1:
+                        last_error = err
+                        await self._sleep_backoff(attempt)
+                        continue
+                    raise err
+
+                self.metrics.vendor_requests.labels(vendor=self.vendor, status="success").inc()
+                self.metrics.vendor_request_duration.labels(vendor=self.vendor).observe(duration)
+                return response
+
+            except asyncio.TimeoutError as e:
+                duration = time.time() - start_time
+                self.metrics.vendor_requests.labels(vendor=self.vendor, status="timeout").inc()
+                self.metrics.record_error(component="vendor", error=e)
+                logger.warning(
+                    "vendor request timeout",
+                    vendor=self.vendor,
+                    slug=self.slug,
+                    url=url[:100],
+                    duration_seconds=round(duration, 2),
+                    attempt=attempt + 1,
+                )
+                last_error = e
+                if attempt < self._MAX_REQUEST_ATTEMPTS - 1:
+                    await self._sleep_backoff(attempt)
+                    continue
+                raise VendorHTTPError(f"Request timeout after {duration:.1f}s", vendor=self.vendor, url=url, city_slug=self.slug) from e
+
+            except self._RETRYABLE_CLIENT_ERRORS as e:
+                duration = time.time() - start_time
+                self.metrics.vendor_requests.labels(vendor=self.vendor, status="error").inc()
+                self.metrics.record_error(component="vendor", error=e)
+                logger.warning(
+                    "vendor request transient failure",
+                    vendor=self.vendor,
+                    slug=self.slug,
+                    url=url[:100],
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    duration_seconds=round(duration, 2),
+                    attempt=attempt + 1,
+                )
+                last_error = e
+                if attempt < self._MAX_REQUEST_ATTEMPTS - 1:
+                    await self._sleep_backoff(attempt)
+                    continue
+                raise VendorHTTPError(f"Request failed: {e}", vendor=self.vendor, url=url, city_slug=self.slug) from e
+
+            except aiohttp.ClientError as e:
+                # Non-retryable aiohttp errors (TLS, payload, redirect).
+                duration = time.time() - start_time
+                self.metrics.vendor_requests.labels(vendor=self.vendor, status="error").inc()
+                self.metrics.record_error(component="vendor", error=e)
+                logger.error("vendor request failed", vendor=self.vendor, slug=self.slug, url=url[:100], error=str(e), error_type=type(e).__name__, duration_seconds=round(duration, 2))
+                raise VendorHTTPError(f"Request failed: {e}", vendor=self.vendor, url=url, city_slug=self.slug) from e
+
+        # Should be unreachable -- the final attempt either returned or raised.
+        # Kept as a defensive fallback so the type checker sees a terminating path.
+        raise VendorHTTPError(
+            f"Request failed after {self._MAX_REQUEST_ATTEMPTS} attempts: {last_error}",
+            vendor=self.vendor,
+            url=url,
+            city_slug=self.slug,
+        )
+
+    @staticmethod
+    async def _sleep_backoff(attempt: int) -> None:
+        """Exponential backoff with jitter: attempt 0 -> ~1s, 1 -> ~3s, 2 -> ~7s."""
+        delay = (2 ** attempt) + random.uniform(0, 1)
+        await asyncio.sleep(delay)
 
     @staticmethod
     def _parse_retry_after(value: Optional[str]) -> Optional[float]:

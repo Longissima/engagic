@@ -86,12 +86,13 @@ class Config:
         # Flash Lite: 4K RPM / 4M TPM - plenty of headroom for parallel calls
         self.LLM_CONCURRENCY = int(os.getenv("ENGAGIC_LLM_CONCURRENCY", "15"))
 
-        # Queue job concurrency: how many jobs process in parallel (default 3)
-        # Lowered from 4 -> 3 after 2026-04-10 OOM. Combined with city_concurrency=3,
-        # peak goes from 12 concurrent meetings to 9 -- throughput stays close to
-        # original but gives the Queue leak + session rotation + malloc_trim fixes
-        # headroom to prevent a rerun of the crash.
-        self.JOB_CONCURRENCY = int(os.getenv("ENGAGIC_JOB_CONCURRENCY", "3"))
+        # Queue job concurrency: how many jobs process in parallel (default 6).
+        # Lowered to 3 after 2026-04-10 OOM, then bumped to 6 on 2026-05-20 after
+        # swap was doubled (6Gi -> 13Gi) and PDF semaphore went 6 -> 8. Combined
+        # with city_concurrency=3, peak goes from 9 to 18 concurrent meetings,
+        # which is well under the Gemini 4K RPM ceiling. Watch RSS at 6 before
+        # pushing higher; the dominant memory cost is in-flight PDF bytes.
+        self.JOB_CONCURRENCY = int(os.getenv("ENGAGIC_JOB_CONCURRENCY", "6"))
 
         # Per-job wall-clock ceiling. Exists to prevent a hung LLM call or
         # aiohttp cleanup from pinning a queue slot indefinitely. PDF subprocess

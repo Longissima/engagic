@@ -354,8 +354,14 @@ class Fetcher:
 
         return result
 
-    async def _sync_city_with_retry(self, city: Jurisdiction, max_retries: int = 1) -> SyncResult:
-        """Sync city with retry (5s, 20s delays)."""
+    async def _sync_city_with_retry(self, city: Jurisdiction, max_retries: int = 3) -> SyncResult:
+        """Sync city with retry on transient failures.
+
+        max_retries=3 yields up to 2 backoff attempts after the initial try
+        (waits 5s then 20s before each retry). Bumped from 1 on 2026-05-20 after
+        single TCP resets and rate-limit blips were wiping whole-city syncs
+        (Miami/iqm2, Brighton/legistar).
+        """
         wait_times = [5, 20]
         last_error = "Unknown retry error"
         last_result: Optional[SyncResult] = None

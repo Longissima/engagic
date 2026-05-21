@@ -62,7 +62,17 @@ class GeminiSummarizer:
                 "API key required - set GEMINI_API_KEY or LLM_API_KEY environment variable"
             )
 
-        self.client = genai.Client(api_key=self.api_key)
+        # Per-call timeout at the SDK / HTTP layer (ms). Mirrors the 300s
+        # asyncio.wait_for budget already enforced in analyzer_async, but here
+        # it ACTUALLY closes the underlying socket -- asyncio.wait_for on a
+        # to_thread-wrapped sync SDK call can't cancel the thread, so without
+        # this a stalled connection leaks the thread + connection past the
+        # async-layer timeout. With this, the SDK raises after 300s and the
+        # thread exits cleanly.
+        self.client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(timeout=300_000),
+        )
 
         # Model IDs (env-overridable via config). Names reflect role, not generation:
         # primary = default workhorse; small_doc = cost-saver when USE_FLASH_LITE + small input.

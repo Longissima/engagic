@@ -26,6 +26,13 @@ logger = get_logger(__name__).bind(component="processor")
 QUEUE_POLL_INTERVAL = 5
 QUEUE_FATAL_ERROR_BACKOFF = 10
 
+# How often to sweep zombie processing rows back to pending, and what counts
+# as "stuck." Anything claimed but not heartbeating for STALE_MINUTES gets
+# reset on each sweep tick. Keep STALE_MINUTES > the longest legitimate job
+# duration (p99 meeting ~10min) so we never preempt healthy long-runners.
+STALE_SWEEP_INTERVAL = 300
+STALE_SWEEP_MINUTES = 15
+
 PUBLIC_COMMENT_SIGNATURE_THRESHOLD = 20
 
 # Per-attachment extracted text cap. Monster OCR packets can produce 3MB+ of text
@@ -114,6 +121,12 @@ class Processor:
         # increase to relieve the extraction bottleneck without piling on RSS.
         self._pdf_semaphore = asyncio.Semaphore(8)
 
+        # Background sweep that reclaims rows abandoned in 'processing' by
+        # earlier crashes/SIGKILLs. The startup-only reset misses jobs that
+        # cross the staleness threshold *after* the new processor starts, so
+        # this picks them up periodically.
+        self._stale_sweep_task: Optional[asyncio.Task] = None
+
         if analyzer is not None:
             self.analyzer = analyzer
         else:
@@ -137,6 +150,42 @@ class Processor:
             self._shutdown_event.set()
         else:
             self._shutdown_event.clear()
+
+    def _ensure_stale_sweep_running(self) -> None:
+        """Start the periodic stale-job sweep if it isn't already running.
+
+        Lazy-started on the first process_queue/process_city_jobs call so the
+        task lives inside the same event loop and respects the same shutdown
+        signal as the work it's protecting. Idempotent — safe to call from
+        every entry point.
+        """
+        if self._stale_sweep_task is not None and not self._stale_sweep_task.done():
+            return
+        self._stale_sweep_task = asyncio.create_task(self._periodic_stale_reset())
+
+    async def _periodic_stale_reset(self) -> None:
+        """Reset stuck 'processing' rows on a fixed interval until shutdown."""
+        logger.info("stale sweep started",
+                    interval_seconds=STALE_SWEEP_INTERVAL,
+                    stale_minutes=STALE_SWEEP_MINUTES)
+        try:
+            while self.is_running:
+                # First sleep, then sweep -- gives the startup-time reset (which
+                # the conductor already runs) time to act, and avoids a double-
+                # sweep race when both fire within the same second.
+                if await self._wait_with_shutdown_check(STALE_SWEEP_INTERVAL):
+                    break
+                try:
+                    count = await self.db.queue.reset_stale_processing_jobs(
+                        stale_minutes=STALE_SWEEP_MINUTES
+                    )
+                    if count:
+                        logger.warning("stale sweep reclaimed jobs", count=count)
+                except Exception as e:  # Intentionally broad: sweep must survive any DB hiccup
+                    logger.error("stale sweep failed",
+                                 error=str(e), error_type=type(e).__name__)
+        finally:
+            logger.info("stale sweep stopped")
 
     def _filter_document_versions(self, urls: List[str]) -> List[str]:
         """Keep only latest versions (Ver2 > Ver1, etc.)."""
@@ -227,6 +276,7 @@ class Processor:
         """
         concurrency = config.JOB_CONCURRENCY
         logger.info("starting queue processor", concurrency=concurrency)
+        self._ensure_stale_sweep_running()
 
         while self.is_running:
             try:
@@ -272,6 +322,7 @@ class Processor:
         throughput gains even on single-core machines.
         """
         logger.info("processing queued jobs for city", city=city_banana, concurrency=config.JOB_CONCURRENCY)
+        self._ensure_stale_sweep_running()
         stats = Counter()
 
         async def run_single_job(job) -> None:
@@ -475,8 +526,7 @@ class Processor:
         }]
 
         try:
-            chunks = await self.analyzer.process_batch_items_async(batch_request, shared_context=None, meeting_id=None)
-            for chunk_results in chunks:
+            async for chunk_results in self.analyzer.process_batch_items_async(batch_request, shared_context=None, meeting_id=None):
                 if chunk_results:
                     result = chunk_results[0]
                     if result.get("success"):
@@ -895,9 +945,8 @@ class Processor:
 
         logger.info("submitting batch to Gemini", item_count=len(batch_requests))
 
-        chunks = await self.analyzer.process_batch_items_async(batch_requests, shared_context=shared_context, meeting_id=meeting_id)
-        for chunk_results in chunks:
-            logger.info("saving results from completed chunk", result_count=len(chunk_results))
+        async for chunk_results in self.analyzer.process_batch_items_async(batch_requests, shared_context=shared_context, meeting_id=meeting_id):
+            logger.debug("saving results from completed chunk", result_count=len(chunk_results))
 
             for result in chunk_results:
                 item_id = result["item_id"]
@@ -1049,7 +1098,13 @@ class Processor:
         return {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 0}
 
     async def close(self):
-        """Cleanup resources (HTTP sessions)"""
+        """Cleanup resources (HTTP sessions, background tasks)"""
+        if self._stale_sweep_task is not None and not self._stale_sweep_task.done():
+            self._stale_sweep_task.cancel()
+            try:
+                await self._stale_sweep_task
+            except (asyncio.CancelledError, Exception) as e:
+                logger.debug("stale sweep task cleanup", error=str(e))
         if self.analyzer:
             await self.analyzer.close()
             logger.debug("analyzer http session closed")
