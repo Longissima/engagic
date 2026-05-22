@@ -12,7 +12,7 @@ Item-level adapter that extracts structured agenda items with:
 import asyncio
 import re
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from pipeline.protocols import MetricsCollector
@@ -351,6 +351,7 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
 
         # Process attachments
         attachments = []
+        seen_blobs: set[str] = set()
         for att in item.get("attachmentsList", []):
             if att.get("isPublished", True) and not att.get("isDeleted", False):
                 # Prefer pdfVersionFullPath, fall back to mediaFullPath
@@ -393,6 +394,32 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
                             pass
 
                     attachments.append(attachment_entry)
+                    seen_blobs.add(url.split("?", 1)[0])
+
+        # CivicClerk's "reports" (Staff Memo, Resolution, Notice, etc.) are
+        # generated from item templates and surfaced in the portal alongside
+        # user-uploaded attachments. They live in reportsList rather than
+        # attachmentsList. Without them the LLM is missing the documents that
+        # explain the item (e.g., a Staff Memo that explicitly justifies a
+        # contingency line item the resolution title makes look anomalous).
+        # Dedup by blob path because some sites file the same PDF in both lists.
+        for report in item.get("reportsList", []) or []:
+            if report.get("isDeleted"):
+                continue
+            if report.get("includeInPacket", 1) == 0:
+                continue
+            url = report.get("pdfMediaFullPath")
+            if not url:
+                continue
+            blob = url.split("?", 1)[0]
+            if blob in seen_blobs:
+                continue
+            seen_blobs.add(blob)
+            attachments.append({
+                "name": report.get("agendaObjItemReportName") or "Report",
+                "url": url,
+                "type": "pdf",
+            })
 
         result = {
             "vendor_item_id": str(item_id),

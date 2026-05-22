@@ -32,7 +32,7 @@ PROCEDURAL_PATTERNS = [
     r'moment of silence',
     r'public comment',  # The period itself, not the content
     r'^communications?\s*$',  # Standalone "Communications" agenda section -- not "Telecommunications Agreement"
-    r'communications? from\s+(council|board|members?|staff|the\s+(public|chair|mayor|manager))',
+    r'communications? from\s+the\s+public',  # Public comment routing; substantive senders (mayor, manager, council, staff, board) fall through to summarization
     r'time fixed for next',
     r'identify items (to|for)',  # Future items placeholder ("identify items to discuss")
     r'meeting schedule for',  # Calendar scheduling items
