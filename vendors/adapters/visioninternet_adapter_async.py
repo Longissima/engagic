@@ -105,11 +105,23 @@ class AsyncVisionInternetAdapter(AsyncBaseAdapter):
         self._tunnel_down = False
 
     async def _get_curl_session(self):
-        """Lazy-init a reusable curl_cffi async session."""
+        """Lazy-init a reusable curl_cffi async session.
+
+        Registers a closer with AsyncSessionManager so the libcurl handles
+        get torn down on shutdown -- without this they hold ESTAB+CLOSE_WAIT
+        sockets through the residential proxy and deadlock asyncpg teardown.
+        """
         if self._curl_session is None:
             from curl_cffi.requests import AsyncSession
+            from vendors.session_manager_async import AsyncSessionManager
             self._curl_session = AsyncSession(impersonate="chrome")
+            AsyncSessionManager.register_closer(self._close_curl_session)
         return self._curl_session
+
+    async def _close_curl_session(self) -> None:
+        if self._curl_session is not None:
+            session, self._curl_session = self._curl_session, None
+            await session.close()
 
     async def _request(self, method: str, url: str, **kwargs):
         """Route through residential proxy via curl_cffi when configured.

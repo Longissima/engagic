@@ -24,8 +24,10 @@ logger = get_logger(__name__).bind(component="fetcher")
 
 SYNC_ERROR_DELAY_BASE = 2
 SYNC_ERROR_DELAY_JITTER = 1
-# Concurrent cities per vendor - balances throughput vs vendor politeness
-CITY_SYNC_CONCURRENCY = 3
+# Concurrent cities per vendor - balances throughput vs vendor politeness.
+# Legistar dominates the long tail (~30 cities, 4 req/matter), so this is mainly
+# its dial. 8 stays under the legistar rate limiter's 12 slots (rate_limiter_async.py).
+CITY_SYNC_CONCURRENCY = 8
 
 
 class SyncStatus(Enum):

@@ -208,11 +208,23 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
     # mccmeetings.blob) go through normal aiohttp.
 
     async def _get_curl_session(self):
-        """Lazy-init a reusable curl_cffi async session."""
+        """Lazy-init a reusable curl_cffi async session.
+
+        Registers a closer with AsyncSessionManager so the libcurl handles
+        get torn down on shutdown -- without this they hold ESTAB+CLOSE_WAIT
+        sockets through the residential proxy and deadlock asyncpg teardown.
+        """
         if self._curl_session is None:
             from curl_cffi.requests import AsyncSession
+            from vendors.session_manager_async import AsyncSessionManager
             self._curl_session = AsyncSession(impersonate="chrome")
+            AsyncSessionManager.register_closer(self._close_curl_session)
         return self._curl_session
+
+    async def _close_curl_session(self) -> None:
+        if self._curl_session is not None:
+            session, self._curl_session = self._curl_session, None
+            await session.close()
 
     def _is_drupal_domain(self, url: str) -> bool:
         """Check if URL is on the Drupal site (needs proxy)."""

@@ -12,8 +12,9 @@ Benefits:
 Replaces: vendors/session_manager.py (sync version with requests)
 """
 
+import asyncio
 import aiohttp
-from typing import Any, Dict
+from typing import Any, Awaitable, Callable, Dict, List
 
 from config import get_logger
 
@@ -29,7 +30,18 @@ class AsyncSessionManager:
     """
 
     _sessions: Dict[str, aiohttp.ClientSession] = {}
+    # Adapters that hold non-aiohttp clients (curl_cffi, etc.) register an
+    # async closer here so close_all() can tear them down too. Without this,
+    # libcurl handles in adapters like municode/visioninternet stay open past
+    # process shutdown, leaving CLOSE_WAIT sockets and deadlocking asyncpg's
+    # Pool.close() teardown path.
+    _extra_closers: List[Callable[[], Awaitable[None]]] = []
     _closed = False
+
+    # Budget for any single foreign-session close. curl_cffi sessions can hold
+    # in-flight requests that won't unblock; we'd rather log+move on than hang
+    # the event loop.
+    _FOREIGN_CLOSE_TIMEOUT_SECONDS = 10
 
     @classmethod
     async def get_session(cls, vendor: str, timeout_total: int = 30) -> aiohttp.ClientSession:
@@ -88,6 +100,19 @@ class AsyncSessionManager:
         return cls._sessions[vendor]
 
     @classmethod
+    def register_closer(cls, closer: Callable[[], Awaitable[None]]) -> None:
+        """Register an async cleanup callback for non-aiohttp clients.
+
+        Adapters that lazy-init curl_cffi (or any other client outside this
+        manager's bookkeeping) must call this so close_all() can tear them
+        down. The callback should be idempotent.
+        """
+        if cls._closed:
+            logger.warning("register_closer called after close_all; resource may leak")
+            return
+        cls._extra_closers.append(closer)
+
+    @classmethod
     async def close_all(cls):
         """
         Close all active sessions (cleanup on shutdown).
@@ -98,14 +123,30 @@ class AsyncSessionManager:
         if cls._closed:
             return
 
-        logger.info("closing async sessions", session_count=len(cls._sessions))
+        logger.info(
+            "closing async sessions",
+            session_count=len(cls._sessions),
+            extra_closer_count=len(cls._extra_closers),
+        )
 
         for vendor, session in cls._sessions.items():
             if not session.closed:
                 await session.close()
                 logger.debug("closed async session", vendor=vendor)
 
+        # Close non-aiohttp clients (e.g. curl_cffi). Bound each call so a
+        # stuck libcurl handle can't deadlock the whole shutdown -- we'd rather
+        # leak one fd than hang asyncpg's Pool.close().
+        for closer in cls._extra_closers:
+            try:
+                await asyncio.wait_for(closer(), timeout=cls._FOREIGN_CLOSE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("foreign session close timed out", timeout_seconds=cls._FOREIGN_CLOSE_TIMEOUT_SECONDS)
+            except Exception as e:
+                logger.warning("foreign session close failed", error=str(e), error_type=type(e).__name__)
+
         cls._sessions.clear()
+        cls._extra_closers.clear()
         cls._closed = True
 
     @classmethod
