@@ -4,6 +4,7 @@ Clean architecture using async repositories for all data access.
 Database class provides connection pooling and convenience facades.
 """
 
+import asyncio
 import asyncpg
 import json
 from typing import Optional, List, Dict, Any
@@ -92,6 +93,10 @@ class Database:
             dsn = config.get_postgres_dsn()
 
         async def init_connection(conn):
+            # Server-side guard for genuinely stuck statements. Postgres aborts the
+            # statement and sends a clean error asyncpg fully consumes, so the
+            # follow-up ROLLBACK runs safely - unlike client-side command_timeout.
+            await conn.execute("SET statement_timeout = '300s'")
             await conn.set_type_codec(
                 'jsonb',
                 encoder=_jsonb_encoder,
@@ -100,11 +105,16 @@ class Database:
             )
 
         try:
+            # No blanket command_timeout: a per-statement timeout firing mid-sync
+            # cancels the in-flight query, which can leave the connection draining
+            # an error (PROTOCOL_ERROR_CONSUME) when the transaction's ROLLBACK or
+            # the pool's reset-on-release runs -> "another operation is in progress",
+            # and that poisoned connection then stalls pool.close(). Guard genuinely
+            # stuck statements with a Postgres-side statement_timeout instead.
             pool = await asyncpg.create_pool(
                 dsn,
                 min_size=min_size,
                 max_size=max_size,
-                command_timeout=60,
                 init=init_connection,
             )
             logger.info("connection pool created", min_size=min_size, max_size=max_size)
@@ -114,7 +124,13 @@ class Database:
             raise DatabaseConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
 
     async def close(self):
-        await self.pool.close()
+        # Graceful close waits to reset each connection; one left mid-operation
+        # can't be reset and blocks indefinitely. Bound it, then force-terminate.
+        try:
+            await asyncio.wait_for(self.pool.close(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("pool close timed out; terminating connections")
+            self.pool.terminate()
         logger.info("connection pool closed")
 
     async def init_schema(self):
