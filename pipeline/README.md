@@ -133,6 +133,10 @@ engagic-conductor preview-items MEETING_ID --extract-text
 - Parallel city sync within vendor groups (semaphore-controlled concurrency)
 - Meeting + item storage via `MeetingSyncOrchestrator.sync_meeting()`
 - Failed city tracking
+- Chunker hint seeding: once per Fetcher lifetime, loads each city's last
+  winning chunker rung from persisted audits (`queue.get_chunker_hints()`)
+  into the router's sticky-routing registry (see vendors/README, PDF
+  Chunking Cascade)
 
 #### Key Methods
 
@@ -204,7 +208,8 @@ Based on meeting frequency in the last 30 days:
 **Processes jobs from the queue.** Extracts text from PDFs, assembles items, orchestrates LLM analysis.
 
 #### Responsibilities
-- Process queue continuously (`process_queue()`)
+- Process queue continuously (`process_queue()`) — streaming lane
+- Batch API lane (`_batch_lane_loop()`) — non-urgent meetings at 50% cost
 - Extract text from PDFs (via `AsyncAnalyzer.extract_pdf_async()`)
 - Multi-tier filtering (procedural items, public comments, EIRs, boilerplate)
 - Document-level caching (deduplication within meeting)
@@ -214,6 +219,31 @@ Based on meeting frequency in the last 30 days:
 - Participation info extraction and merging
 - Incremental saving (per-chunk)
 - Public comment compilation detection (page count, OCR ratio, signature patterns)
+
+#### Processing Lanes (urgency-routed)
+
+Meeting jobs split into two lanes at dequeue time
+(`queue.get_next_for_processing(lane=...)`, joined against `meetings.date`):
+
+- **Streaming lane** (JOB_CONCURRENCY=6, JOB_TIMEOUT=1500s): meetings inside
+  the urgent window `[now - BATCH_URGENT_PAST_DAYS, now + BATCH_URGENT_FUTURE_DAYS]`
+  (default: next 24h), matter jobs, and undated meetings. Concurrent
+  single-item Gemini calls — summaries in seconds-to-minutes. The window
+  exists because special meetings only require ~24h posted notice and their
+  summaries must not land after the meeting happened.
+- **Batch lane** (BATCH_JOB_CONCURRENCY=3, BATCH_JOB_TIMEOUT=7200s):
+  everything else, routed through `summarizer.summarize_batch` — Gemini
+  Batch API at 50% token cost on a **separate quota pool** (bulk work never
+  competes with fresh meetings for TPM). Jobs park on Gemini poll loops, so
+  the lane heartbeats `queue.started_at` every 5min to stay clear of the
+  stale sweep, and gets its own generous wall-clock ceiling.
+
+Lanes are disjoint SQL predicates over `FOR UPDATE SKIP LOCKED` — no double
+claims. A meeting whose date drifts into the urgent window between retries
+switches lanes automatically. Kill switch: `ENGAGIC_BATCH_API_ENABLED=false`
+restores single-lane behavior. Note: `process_city_jobs()` claims
+streaming-only; its non-urgent leftovers are drained by the daemon's batch
+lane.
 
 #### Key Methods
 

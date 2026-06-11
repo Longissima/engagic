@@ -6,6 +6,115 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-06-11] Chunker Cascade Router, Morphology Telemetry, Gemini Batch Lane
+
+The chunker's dispatch went from string-keyed if/elif folklore to declarative,
+self-measuring routing; chunker failures went from silent empty lists to a
+classified, persisted audit trail; and the Gemini Batch API came back from the
+dead (orphaned since the 2025-11-23 async migration) as a second processing
+lane at 50% token cost. Measured along the way: chunker-dependent vendors run
+10-40% monolithic-fallback rates vs 3-8% for API vendors — that gap is now
+instrumented instead of estimated.
+
+### Cascade Router (vendors/adapters/parsers/router.py)
+
+The three-layer force_method dispatch (adapter retry chains + `_parse_pdf_bytes`
+if/elif + per-engine auto-detection) collapsed into data: a *rung* is one engine
+invocation ("v2:toc"), a *ladder* is an ordered rung list tried until one yields
+items. `chunk_pdf(path, ladder)` returns a ChunkResult carrying the winning
+output plus a full attempt audit — every rung tried, item counts, durations,
+and a classified failure reason (`download_failed`, `too_small`, `open_failed`,
+`encrypted`, `no_text_layer`, `no_items`, `engine_error`) where there used to be
+a bare `[]` at debug level. Per-rung exception isolation means a crash in one
+engine no longer skips the fallbacks. `_parse_packet_pdf`/`_parse_pdf_bytes`
+remain as force_method→ladder shims, so zero adapter churn. Bonus fix: the
+agenda chain no longer downloads the same PDF twice when its first strategy
+fails.
+
+### Corpus Regression Suite (tests/chunker/)
+
+Prod-stratified corpus: 76 meetings sampled per (vendor × item-level/fallback ×
+city), 52 PDFs fetched and sha256-pinned, committed golden snapshots. Three
+gates: routing (same PDF keeps winning the same rung), behavior (item numbers/
+titles/pages/attachments match golden + sanity invariants), failures (zero-item
+results must carry a classified reason, known-bad PDFs must keep failing the
+same way). Workflow: change a chunker → `update_goldens.py` → read the diff,
+because the diff IS the behavior change. Fixtures are gitignored (URL rot is
+why url_refresh.py exists); goldens and manifest are committed.
+
+### Audit Persistence + Sticky Routing (queue.processing_metadata)
+
+Chunk audits ride the meeting dict from `fetch_meetings()` through
+MeetingSyncOrchestrator into `queue.processing_metadata` (the jsonb column that
+sat empty in 102k rows). Per-city sticky hints derive from the persisted
+audits: `get_chunker_hints()` reads the latest winning rung per (vendor, slug,
+ladder), the Fetcher seeds the router's registry at startup, and wins update it
+in-process — steady-state chunking collapses to one attempt because cities
+regenerate the same layout every meeting. No schema change; the audit trail IS
+the hint store. Hints only reorder rungs, never skip the cascade, so format
+drift self-heals and leaves a trace.
+
+### Gemini Batch API Lane (pipeline/processor.py, analysis/llm/summarizer.py)
+
+`summarize_batch` (client.batches.create, 50% discount, separate quota pool
+from interactive) lost its last caller in the 2025-11-23 async migration —
+every summary since had been full-price single calls. Root cause it couldn't
+come back: 30min/chunk batch polls can't live inside a 25min job timeout with a
+15min stale sweep. Now: meeting jobs whose date falls outside the urgent window
+(default: next 24h, the Brown-Act special-meeting-notice hedge) are claimed by
+a dedicated batch lane — own worker slots (BATCH_JOB_CONCURRENCY=3), own 2h
+ceiling, and a heartbeat that bumps `started_at` every 5min so the sweep can't
+reclaim a parked job. Lane split happens in `get_next_for_processing(lane=...)`
+via a meetings-date join; lanes are disjoint predicates over FOR UPDATE SKIP
+LOCKED. Parity/reliability fixes while resurrecting: batch JSONL now sends
+responseSchema and the same adaptive thinkingConfig tiers as streaming;
+timed-out batch jobs get cancelled server-side (no double-pay on retry);
+orphaned JSONL uploads are deleted if job creation fails; shared-context cache
+TTL 1h→4h so it can't expire mid-batch. All env-tunable
+(ENGAGIC_BATCH_API_ENABLED et al).
+
+### PDF Morphology Profiler (vendors/adapters/parsers/pdf_profile.py)
+
+One bounded fitz pass per document measuring explicit signals before any
+extraction decision: TOC shape (entries, distinct pages, depth histogram),
+link inventory (external URI vs internal page-jumps, front-page distribution),
+text layer, item-number heading lines. The profile rides the chunk audit, so
+heuristic tuning becomes queries instead of vibes. First corpus census
+findings: thin TOCs (1-2 entries) fail 8/9 — convicting v1's >=2 "meaningful
+TOC" threshold; a single-page agenda can carry a 13-entry outline all pointing
+at page 1 (Nampa ID) — a morphology no heuristic anticipated; and 9 of 29
+failures had measurable item structure in plain text with no extractor for it.
+
+### Flat-Text Extractor (vendors/adapters/parsers/text_chunker.py)
+
+The rung the census asked for: short agendas whose only structure is numbered
+heading lines (no links, no usable outline) split by heading with bodies from
+the intervening text. Self-limiting — <=20 pages (all nine corpus specimens
+were 1-8), 3-80 deduped headings, titles must contain words (kills date rows).
+Terminal rung on every ladder, so it can only convert former no_items
+failures. Corpus: 8 of 9 recovered (Belvedere CA: 31 real items from a PDF
+whose 36 nav-chrome links the URL path had rightly refused for months);
+20→28 of 52 fixtures chunking (38%→54%); zero existing winners disturbed.
+Also fixed: `_chunk_agenda_then_packet` used to drop attachment-less agenda
+items entirely; they now survive as a last resort when the packet also fails.
+
+### Morphology Classifier, Shadow Mode (vendors/adapters/parsers/morphology.py)
+
+`classify(profile)` maps measured signals to named shapes (linked_agenda,
+anchored_packet, toc_packet, toc_agenda, flat_text_agenda, scanned, monolith)
+with ALL detection thresholds in one table, each carrying its corpus evidence
+in comments. Every classification plus agreement-with-actual-winner lands in
+the audit — prod accumulates the classifier's confusion matrix passively. Its
+only active power: suggestions fill the cascade's hint slot when a city has no
+sticky history (reorder-only, env-killable via
+ENGAGIC_CHUNKER_CLASSIFIER_HINTS). Corpus blast radius: exactly one fixture,
+an upgrade (Arlington MA: 1 thin-TOC item → 4 real text items). The endgame:
+when prod data shows the table out-predicting the engines' internal detection
+(v1 alone has three competing TOC definitions), the ~60 scattered inline
+thresholds become deletable.
+
+---
+
 ## [2026-04-16] Adapter Fallback Chains, Chunker Regex Fixes, Per-Job Timeout
 
 A pass over silent adapter/chunker failures observed across Granicus, OnBase, and

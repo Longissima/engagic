@@ -2,7 +2,7 @@
 
 **Fetch meeting data from 19 civic tech platforms.** Unified adapter architecture with vendor-specific parsers and shared utilities.
 
-**Last Updated:** March 2026
+**Last Updated:** June 2026
 
 ---
 
@@ -36,14 +36,19 @@ vendors/
 │   │   ├── chicago_adapter_async.py   # Chicago async (796 lines)
 │   │   ├── menlopark_adapter_async.py # Menlo Park async (182 lines)
 │   │   └── ross_adapter_async.py      # Ross async (420 lines)
-│   └── parsers/        # 7 vendor-specific parsers (HTML + PDF)
+│   └── parsers/        # Vendor-specific parsers (HTML) + PDF chunking cascade
 │       ├── legistar_parser.py         # Legistar HTML tables (373 lines)
 │       ├── primegov_parser.py         # PrimeGov HTML items (315 lines)
 │       ├── granicus_parser.py         # Granicus HTML formats (865 lines)
 │       ├── municode_parser.py         # Municode HTML sections (213 lines)
 │       ├── novusagenda_parser.py      # NovusAgenda HTML items (116 lines)
 │       ├── civicplus_parser.py        # CivicPlus HTML agendas (170 lines)
-│       └── agenda_chunker.py          # PDF agenda chunker (1749 lines)
+│       ├── router.py                  # Chunking cascade: ladders, audit, hints
+│       ├── pdf_profile.py             # Morphology signal measurement
+│       ├── morphology.py              # Profile -> named shape classifier
+│       ├── agenda_chunker.py          # v1 engine: URL + hardcoded-TOC paths
+│       ├── agenda_chunker_v2.py       # v2 engine: anchor-first, relative TOC
+│       └── text_chunker.py            # text engine: numbered-heading splitting
 ├── extractors/         # Data extraction utilities
 │   └── council_member_extractor.py    # Sponsor extraction (281 lines)
 ├── utils/              # Shared utilities
@@ -392,15 +397,74 @@ These adapters fetch **PDF packet URLs only** (no structured items). Meetings ar
 | `municode_parser.py` | Municode | `agenda-section` → `agenda-items` → `agenda_item_attachments` |
 | `novusagenda_parser.py` | NovusAgenda | CoverSheet.aspx links, exploratory multi-pattern detection |
 | `civicplus_parser.py` | CivicPlus | `div.item.level{1,2,3}` hierarchy from `?html=true` agendas; section/sub-section nesting; generic title replacement |
-| `agenda_chunker.py` | Granicus, CivicPlus, CivicWeb, ProudCity, Vision Internet, WP Events, Ross | Two-path PDF agenda parser via PyMuPDF. **TOC path** (first): detects PDF bookmark/outline tree; hierarchical mode assigns L2 entries as embedded memos, flat mode fuzzy-matches memos to items by title similarity. Extracts `body_text` from memo full_text for direct summarization without URL downloads. **URL path** (fallback): 4-pass extraction (metadata → sections/items → body text → link assignment) with hyperlinked attachment URLs. Handles varied numbering schemes, bold/caps headers, case/docket numbers, standalone number lines |
+| `router.py` + 3 chunker engines | All PDF-chunking adapters (Granicus, CivicPlus, CivicClerk, CivicWeb, ProudCity, BoardBook, Destiny, eScribe, Municode, Vision Internet, WP Events, Menlo Park, Ross, ...) | PDF chunking cascade — see **PDF Chunking Cascade** section below. Three engines (v1 URL/hardcoded-TOC, v2 anchor-first/relative-TOC, text numbered-heading splitting) behind declarative ladders with a per-attempt audit trail |
 
 **Adapters without dedicated parsers** (inline parsing): IQM2, eScribe, CivicClerk, CivicEngage, Berkeley, Chicago, Menlo Park, Ross, ProudCity, Vision Internet, WP Events.
 
 **Why separate parsers?**
 - **Vendor updates:** HTML changes → update parser only, adapter unchanged
 - **Testing:** Can test parsing logic independently
-- **Reusability:** Granicus parser reused by OnBase; agenda_chunker shared by Granicus and CivicPlus
+- **Reusability:** Granicus parser reused by OnBase; chunking cascade shared by all PDF-dependent adapters
 - **Clarity:** Adapter focuses on HTTP/retry, parser focuses on DOM traversal
+
+---
+
+## PDF Chunking Cascade (parsers/router.py)
+
+Routing policy for PDF item extraction is **data, not control flow**. A *rung*
+is one engine invocation written `"engine:method"`; a *ladder* is an ordered
+rung list tried until one yields items. Defined in `router.LADDERS`:
+
+| Ladder | Rungs | Used by |
+|--------|-------|---------|
+| `agenda` | `v2:url → v1:url → v2:auto → text:auto` | `_chunk_agenda_then_packet` agenda branch |
+| `packet` | `v2:toc → text:auto` | packet branch, `force_method="toc"` callers |
+| `url_legacy` | `v1:url → v2:auto → text:auto` | `force_method="url"` callers (Granicus) |
+| `auto` | `v2:auto → v1:auto → text:auto` | unforced `_parse_packet_pdf` callers |
+| `v2_url_only` | `v2:url` | `force_method="v2_url"` |
+
+**Engines:**
+- **v1** (`agenda_chunker.py`) — URL-anchored extraction + four hardcoded TOC
+  variants (hierarchical, flat, deep_hierarchical, document_bundle). Kept alive
+  by measured wins (Chicago, King County WA, Menlo Park); on an atrophy clock —
+  delete rungs when their prod win rate hits zero.
+- **v2** (`agenda_chunker_v2.py`) — anchor-first with relative TOC level
+  detection; internal auto-dispatch (toc/url/pageref/url_then_toc).
+- **text** (`text_chunker.py`) — numbered-heading splitting for short flat-text
+  agendas. Terminal rung everywhere; self-limits (≤20 pages, 3-80 deduped
+  headings, titles must contain words) so it only converts no_items failures.
+
+**ChunkResult / audit trail:** every `chunk_pdf()` call returns the winning
+items plus per-rung attempts (item counts, durations, classified failure
+reasons: `download_failed | too_small | open_failed | encrypted |
+no_text_layer | no_items | engine_error`). Audits ride the meeting dict into
+`queue.processing_metadata` — chunker error rates are SQL queries, not
+estimates.
+
+**Morphology telemetry:** `pdf_profile.py` measures explicit signals in one
+bounded pass (TOC shape, external vs internal links, item-number heading
+lines, text layer); `morphology.py` classifies the profile into a named shape
+(`linked_agenda`, `anchored_packet`, `toc_packet`, `toc_agenda`,
+`flat_text_agenda`, `scanned`, `monolith`) with **all detection thresholds in
+one table**. Classification + agreement-with-winner land in the audit (shadow
+mode = passive confusion matrix in prod).
+
+**Routing hints (reorder-only, cascade always intact):**
+1. *Sticky per-city*: last winning rung per (vendor, slug, ladder), seeded at
+   Fetcher startup from persisted audits, updated in-process on wins.
+   Steady-state chunking = one attempt.
+2. *Classifier suggestion*: fills the hint slot for cities with no history
+   (`ENGAGIC_CHUNKER_CLASSIFIER_HINTS`, default on).
+
+**Legacy shims:** `_parse_packet_pdf(url, vendor_id, force_method)` and
+`_parse_pdf_bytes(bytes, vendor_id, force_method)` map force_method strings to
+ladders and return bare item lists — adapters need no changes. New code should
+use `_chunk_packet_pdf(...) -> ChunkResult` for audit access.
+
+**Regression suite:** `tests/chunker/` — 52 sha256-pinned prod PDFs with
+committed goldens pinning winning rung, morphology, item structure, and
+failure reasons per fixture. Change a chunker → `update_goldens.py` → read the
+diff. See `tests/chunker/README.md`.
 
 ---
 
@@ -667,4 +731,4 @@ python -m pipeline.conductor sync-city examplecityCA --force
 - [pipeline/README.md](../pipeline/README.md) - How adapters integrate with processing pipeline
 - [database/README.md](../database/README.md) - How meeting data is stored
 
-**Last Updated:** 2026-03-25 (Added 6 new adapters: CivicEngage, CivicWeb, ProudCity, Vision Internet, WP Events, Ross. Expanded agenda chunker to 1749 lines. Updated existing adapters: CivicClerk, Granicus, eScribe, Municode, Legistar. Total: 19 vendors)
+**Last Updated:** 2026-06-11 (PDF chunking cascade: declarative ladders + audit trail in router.py, morphology profiler/classifier, flat-text engine, sticky per-city routing hints, corpus regression suite in tests/chunker/. Prior: 2026-03-25 added CivicEngage, CivicWeb, ProudCity, Vision Internet, WP Events, Ross — see CHANGELOG)

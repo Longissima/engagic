@@ -102,9 +102,16 @@ metrics = await db.get_platform_metrics()
 # --- Direct repository access ---
 
 # Queue
-await db.queue.enqueue_job(source_url, job_type="meeting", payload={...}, priority=150)
-job = await db.queue.get_next_for_processing()
+await db.queue.enqueue_job(
+    source_url, job_type="meeting", payload={...}, priority=150,
+    processing_metadata={"chunk": audit},  # optional diagnostic trail (chunker cascade audit)
+)
+job = await db.queue.get_next_for_processing()           # any job (legacy)
+job = await db.queue.get_next_for_processing(lane="streaming")  # urgent-window meetings, matters, undated
+job = await db.queue.get_next_for_processing(lane="batch")      # non-urgent meetings -> Gemini Batch lane
+await db.queue.heartbeat_job(job.id)   # refresh claim during long batch polls (stale-sweep protection)
 await db.queue.mark_processing_complete(job.id)
+hints = await db.queue.get_chunker_hints()  # latest winning chunker rung per (vendor, slug, ladder)
 
 # Council members
 member = await db.council_members.find_or_create_member("nashvilleTN", "Freddie O'Connell")

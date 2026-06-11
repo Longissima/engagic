@@ -281,6 +281,12 @@ def summarize_meeting(text: str) -> str:
 
 **Batch Processing (50% Cost Savings):**
 
+`summarize_batch` is the Gemini Batch API path — 50% token discount and a
+**separate quota pool** from interactive calls. Invoked by the processor's
+batch lane for meetings outside the urgent window (see pipeline/README,
+Processing Lanes); the streaming path (`process_batch_items_async`) keeps
+handling urgent meetings.
+
 ```python
 async def summarize_batch(
     item_requests: List[Dict[str, Any]],
@@ -291,21 +297,23 @@ async def summarize_batch(
     Process multiple items using Gemini Batch API (async generator).
 
     Yields results per chunk immediately for incremental saving:
-    - 5 items per chunk (respects TPM quota)
-    - 120-second delays between chunks (allows quota refill)
-    - Exponential backoff on 429 errors (60s, 120s, 240s)
-    - JSONL file upload method (client.batches.create)
+    - 30 items per chunk, 10s delays between chunks
+    - JSONL file upload (client.batches.create), poll until done; 1h
+      per-chunk wait, and timed-out jobs are CANCELLED server-side so a
+      retry never pays for the same tokens twice
+    - Same responseSchema and adaptive thinkingConfig tiers as the
+      streaming path (parity restored 2026-06-11)
+    - Orphaned JSONL uploads deleted if job creation fails
 
     Yields: List of results per chunk
     """
-    # Create cache for shared context (if token count >= 1024)
-    if shared_context and len(shared_context) // 4 >= 1024:
-        cache = self.client.caches.create(model=..., config=CreateCachedContentConfig(
-            contents=[shared_context], ttl="3600s"  # 1 hour
-        ))
-
-    # Process chunks, yield results, cleanup cache in finally block
+    # Shared-context cache (if token count >= 1024): ttl="14400s" — 4h,
+    # so a queued multi-chunk batch can't outlive its own cache
 ```
+
+**Model note:** batch always uses `PRIMARY_MODEL`; streaming may downgrade
+small docs to `SMALL_DOC_MODEL` (USE_FLASH_LITE). At 50% off, batch runs
+the newer model for roughly the streaming small-doc price.
 
 **Truncated Response Recovery:**
 
