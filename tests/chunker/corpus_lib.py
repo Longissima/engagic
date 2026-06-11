@@ -68,6 +68,7 @@ def result_to_golden(entry: Dict[str, Any], result: ChunkResult) -> Dict[str, An
     return {
         "ladder": ladder_for(entry),
         "morphology": result.morphology,
+        "quality": result.quality or None,
         "winning_rung": result.winning_rung,
         "parse_method": result.parse_method,
         "failure_reason": result.failure_reason,

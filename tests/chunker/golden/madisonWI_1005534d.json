@@ -1,6 +1,11 @@
 {
   "ladder": "agenda",
   "morphology": "linked_agenda",
+  "quality": {
+    "garbage_titles": 0,
+    "repaired_titles": 0,
+    "seg_smell": null
+  },
   "winning_rung": "v2:url",
   "parse_method": "v2_url",
   "failure_reason": null,

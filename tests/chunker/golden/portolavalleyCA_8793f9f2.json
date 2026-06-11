@@ -1,6 +1,11 @@
 {
   "ladder": "packet",
   "morphology": "linked_agenda",
+  "quality": {
+    "garbage_titles": 0,
+    "repaired_titles": 1,
+    "seg_smell": null
+  },
   "winning_rung": "v2:toc",
   "parse_method": "v2_toc",
   "failure_reason": null,
@@ -15,7 +20,7 @@
     },
     {
       "number": "4.a",
-      "title": "- Cover Page",
+      "title": "Hold interviews and appoint one resident to the Board of Trustees of the San",
       "page_start": 3,
       "attachments": 0
     }

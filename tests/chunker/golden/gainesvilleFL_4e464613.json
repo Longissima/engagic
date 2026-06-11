@@ -1,6 +1,11 @@
 {
   "ladder": "packet",
   "morphology": "toc_packet",
+  "quality": {
+    "garbage_titles": 0,
+    "repaired_titles": 2,
+    "seg_smell": null
+  },
   "winning_rung": "v2:toc",
   "parse_method": "v2_toc",
   "failure_reason": null,
@@ -15,13 +20,13 @@
     },
     {
       "number": "2",
-      "title": "2026-412 Agenda Item - Water Shortage Update 2026-0615.pdf",
+      "title": "Water Shortage Update",
       "page_start": 8,
       "attachments": 0
     },
     {
       "number": "3",
-      "title": "2026-413 Agenda Item - Citywide Outdoor Drinking Water Fountain Initiative 20260615.pdf",
+      "title": "Citywide Outdoor Drinking Water Fountain Initiative",
       "page_start": 16,
       "attachments": 0
     },

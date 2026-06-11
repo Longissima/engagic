@@ -27,6 +27,11 @@ from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf
 from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
 from vendors.adapters.parsers.morphology import classify
 from vendors.adapters.parsers.pdf_profile import PdfProfile, profile_doc
+from vendors.adapters.parsers.quality import (
+    garbage_titles,
+    repair_titles,
+    segmentation_smell,
+)
 from vendors.adapters.parsers.text_chunker import parse_agenda_pdf_text
 
 logger = get_logger(__name__)
@@ -176,6 +181,7 @@ class ChunkResult:
     morphology: Optional[str] = None  # classifier's named shape
     suggested_rung: Optional[str] = None  # classifier's pick (None = no opinion)
     suggestion_used: bool = False  # suggestion actually filled the hint slot
+    quality: Dict[str, Any] = field(default_factory=dict)  # extraction vs chunking layer signals
 
     @property
     def parse_method(self) -> str:
@@ -194,6 +200,7 @@ class ChunkResult:
                 self.suggested_rung == self.winning_rung
                 if self.suggested_rung and self.winning_rung else None
             ),
+            "quality": self.quality or None,
             "winning_rung": self.winning_rung,
             "parse_method": self.parse_method,
             "item_count": len(self.items),
@@ -324,6 +331,19 @@ def chunk_pdf(
             result.metadata = parsed.get("metadata") or {}
             result.raw = parsed
             result.winning_rung = rung
+
+            # Quality signals, by failure layer: garbage titles = extraction
+            # problem (repairable from the item's own page); count diverging
+            # from the document's own numbering = chunking problem.
+            repaired = repair_titles(items, pdf_path)
+            result.quality = {
+                "garbage_titles": len(garbage_titles(items)),  # post-repair
+                "repaired_titles": repaired,
+                "seg_smell": segmentation_smell(
+                    result.profile.item_number_lines if result.profile else 0,
+                    len(items),
+                ),
+            }
             return result
 
     result.failure_reason = _classify_empty(pdf_path, result.attempts, result.profile)

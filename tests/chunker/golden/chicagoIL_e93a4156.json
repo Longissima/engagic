@@ -1,6 +1,11 @@
 {
   "ladder": "agenda",
   "morphology": "monolith",
+  "quality": {
+    "garbage_titles": 0,
+    "repaired_titles": 0,
+    "seg_smell": null
+  },
   "winning_rung": "v1:url",
   "parse_method": "url",
   "failure_reason": null,

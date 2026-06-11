@@ -1,6 +1,11 @@
 {
   "ladder": "packet",
   "morphology": "linked_agenda",
+  "quality": {
+    "garbage_titles": 0,
+    "repaired_titles": 0,
+    "seg_smell": null
+  },
   "winning_rung": "v2:toc",
   "parse_method": "v2_toc",
   "failure_reason": null,

@@ -1,6 +1,11 @@
 {
   "ladder": "packet",
   "morphology": "flat_text_agenda",
+  "quality": {
+    "garbage_titles": 0,
+    "repaired_titles": 0,
+    "seg_smell": null
+  },
   "winning_rung": "text:auto",
   "parse_method": "text_items",
   "failure_reason": null,
