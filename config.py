@@ -119,6 +119,12 @@ class Config:
         # multi-chunk meetings exist) -- needs its own generous ceiling.
         self.BATCH_JOB_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_BATCH_JOB_TIMEOUT_SECONDS", "7200"))
 
+        # Morphology classifier suggestions fill the chunker's hint slot for
+        # cities with no sticky routing history. Hints only reorder rungs
+        # within a ladder (cascade still runs), so worst case = one wasted
+        # attempt. Classification itself always runs and lands in the audit.
+        self.CHUNKER_CLASSIFIER_HINTS = os.getenv("ENGAGIC_CHUNKER_CLASSIFIER_HINTS", "true").lower() == "true"
+
         # Payment processing
         self.STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
         self.STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")

@@ -1,5 +1,6 @@
 {
   "ladder": "agenda",
+  "morphology": "monolith",
   "winning_rung": "v2:url",
   "parse_method": "v2_url",
   "failure_reason": null,

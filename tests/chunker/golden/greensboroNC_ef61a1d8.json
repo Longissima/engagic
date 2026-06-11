@@ -1,5 +1,6 @@
 {
   "ladder": "packet",
+  "morphology": "flat_text_agenda",
   "winning_rung": "text:auto",
   "parse_method": "text_items",
   "failure_reason": null,

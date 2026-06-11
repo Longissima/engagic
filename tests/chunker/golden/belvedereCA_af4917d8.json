@@ -1,5 +1,6 @@
 {
   "ladder": "packet",
+  "morphology": "linked_agenda",
   "winning_rung": "text:auto",
   "parse_method": "text_items",
   "failure_reason": null,

@@ -1,5 +1,6 @@
 {
   "ladder": "packet",
+  "morphology": "scanned",
   "winning_rung": null,
   "parse_method": "",
   "failure_reason": "no_text_layer",

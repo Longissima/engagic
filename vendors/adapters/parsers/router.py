@@ -22,9 +22,10 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import fitz
 
-from config import get_logger
+from config import config, get_logger
 from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf
 from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
+from vendors.adapters.parsers.morphology import classify
 from vendors.adapters.parsers.pdf_profile import PdfProfile, profile_doc
 from vendors.adapters.parsers.text_chunker import parse_agenda_pdf_text
 
@@ -172,6 +173,9 @@ class ChunkResult:
     failure_reason: Optional[str] = None  # set iff no rung won
     ladder: Optional[str] = None  # ladder name when invoked with a named ladder
     profile: Optional[PdfProfile] = None  # measured morphology signals
+    morphology: Optional[str] = None  # classifier's named shape
+    suggested_rung: Optional[str] = None  # classifier's pick (None = no opinion)
+    suggestion_used: bool = False  # suggestion actually filled the hint slot
 
     @property
     def parse_method(self) -> str:
@@ -182,6 +186,14 @@ class ChunkResult:
         return {
             "ladder": self.ladder,
             "profile": self.profile.to_dict() if self.profile else None,
+            "morphology": self.morphology,
+            "suggested_rung": self.suggested_rung,
+            "suggestion_used": self.suggestion_used,
+            # the passive confusion matrix: did the classifier call it?
+            "suggestion_agreed": (
+                self.suggested_rung == self.winning_rung
+                if self.suggested_rung and self.winning_rung else None
+            ),
             "winning_rung": self.winning_rung,
             "parse_method": self.parse_method,
             "item_count": len(self.items),
@@ -239,9 +251,9 @@ def chunk_pdf(
 
     Each rung failure (no items or exception) is recorded and the cascade
     continues — a crash in one engine no longer skips the fallbacks.
-    A hint (the city's last winning rung) is tried first; see resolve_rungs.
+    A hint (the city's last winning rung) is tried first; absent one, the
+    morphology classifier's suggestion fills the slot. See resolve_rungs.
     """
-    rungs = resolve_rungs(ladder, hint)
     result = ChunkResult(ladder=ladder if isinstance(ladder, str) else None)
 
     try:
@@ -266,6 +278,19 @@ def chunk_pdf(
         result.failure_reason = ENCRYPTED
         result.attempts.append(Attempt(rung="preflight", failure_reason=ENCRYPTED))
         return result
+
+    used_suggestion = False
+    if result.profile is not None:
+        result.morphology, result.suggested_rung = classify(result.profile)
+        if hint is None and result.suggested_rung and config.CHUNKER_CLASSIFIER_HINTS:
+            hint = result.suggested_rung
+            used_suggestion = True
+
+    rungs = resolve_rungs(ladder, hint)
+    # "used" means it could actually influence routing — a suggestion outside
+    # this ladder's vocabulary is recorded but ignored by resolve_rungs
+    if used_suggestion:
+        result.suggestion_used = result.suggested_rung in rungs
 
     for rung in rungs:
         t0 = time.monotonic()

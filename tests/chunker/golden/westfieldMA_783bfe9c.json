@@ -1,5 +1,6 @@
 {
   "ladder": "packet",
+  "morphology": "monolith",
   "winning_rung": null,
   "parse_method": "",
   "failure_reason": "no_items",

@@ -1,5 +1,6 @@
 {
   "ladder": "packet",
+  "morphology": "toc_packet",
   "winning_rung": "v2:toc",
   "parse_method": "v2_toc",
   "failure_reason": null,
