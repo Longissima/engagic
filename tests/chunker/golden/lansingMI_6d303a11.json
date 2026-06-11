@@ -1,9 +1,58 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 1,
+  "item_count": 8,
+  "items": [
+    {
+      "number": "1",
+      "title": "Call to Order",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "Approval of the Saginaw St. CIA Meeting Minutes (5.27.26) - Action",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "Update on Corridor Art Projects",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "Approval of the LEDC and CIA Service Agreement- Action",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "Updates on Corridor Projects",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "Other Business",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "Public Comment",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "8",
+      "title": "Adjournment",
+      "page_start": 1,
+      "attachments": 0
+    }
+  ]
 }

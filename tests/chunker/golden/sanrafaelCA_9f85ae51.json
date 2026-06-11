@@ -1,9 +1,70 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 3,
+  "item_count": 10,
+  "items": [
+    {
+      "number": "1",
+      "title": "Open Time for Public Expression",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "Approval of Minutes \u2013  May 13, 2026",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "Event Planning Sub Committee \u2013 Verbal Update from Commissioner Chung",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "Fire Foundation \u2013 Verbal Update from Commissioner Donna McCusker",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "Fire Department Upcoming City Council Items \u2013 Verbal update from Fire staff",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "Marinwood and San Rafael Fire Draft Amendment \u2013 Verbal update from staff",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "Media \u2013 Articles and events pertaining to the Fire Service",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "8",
+      "title": "Chair and Commission Member Reports:",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "9",
+      "title": "Fire Chief Report",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "Approval of Minutes \u2013  April 8, 2026",
+      "page_start": 2,
+      "attachments": 0
+    }
+  ]
 }

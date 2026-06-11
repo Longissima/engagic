@@ -1,9 +1,64 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 8,
+  "item_count": 9,
+  "items": [
+    {
+      "number": "A",
+      "title": "Report Issued Pursuant to Government Code \u00a7 65858(d) Regarding Town Actions Following Adoption",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "Ordinance Extending a Moratorium on the Issuance of Entitlements for New Formula Businesses",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "1",
+      "title": "Uniform array of merchandise or menu;",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "Uniform color scheme;",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "Uniform d\u00e9cor;",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "Uniform fa\u00e7ade;",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "Uniform layout;",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "Uniform signage, service mark, or a trademark;",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "Uniform apparel.",
+      "page_start": 7,
+      "attachments": 0
+    }
+  ]
 }

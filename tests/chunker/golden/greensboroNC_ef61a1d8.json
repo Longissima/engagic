@@ -1,9 +1,34 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 2,
+  "item_count": 4,
+  "items": [
+    {
+      "number": "1",
+      "title": "Uses shall be limited to: Residential Uses.",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "No more than 175 homes shall be permitted, with a maximum of 120 Townhomes.",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "1",
+      "title": "Permitted Uses shall be limited to Residential Uses and Residential Office Conversion",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "The existing principal structures shall remain.",
+      "page_start": 2,
+      "attachments": 0
+    }
+  ]
 }

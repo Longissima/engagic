@@ -533,21 +533,24 @@ class AsyncBaseAdapter:
         and extracts embedded links (e.g. staff report cover sheets that link
         to the actual contracts/exhibits on Legistar S3).
         """
+        text_fallback: List[Dict[str, Any]] = []
         if agenda_url:
             result = await self._chunk_packet_pdf(agenda_url, vendor_id, ladder="agenda")
             if result.items:
-                # Only keep chunked items if at least one has attachments —
-                # items without attachments from a thin agenda are just text noise
+                # Only return attachment-bearing items directly — but keep
+                # attachment-less ones (flat-text agendas carry their content
+                # in body_text) as a last resort if the packet also fails.
                 items = await self._resolve_sub_attachments(result.items, vendor_id)
                 if any(it.get("attachments") for it in items):
                     return [it for it in items if it.get("attachments")]
+                text_fallback = [it for it in items if it.get("body_text")]
 
         if packet_url:
             result = await self._chunk_packet_pdf(packet_url, vendor_id, ladder="packet")
             if result.items:
                 return result.items
 
-        return []
+        return text_fallback
 
     async def _chunk_pdf_bytes(
         self,

@@ -26,6 +26,7 @@ from config import get_logger
 from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf
 from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
 from vendors.adapters.parsers.pdf_profile import PdfProfile, profile_doc
+from vendors.adapters.parsers.text_chunker import parse_agenda_pdf_text
 
 logger = get_logger(__name__)
 
@@ -43,25 +44,31 @@ MIN_PDF_BYTES = 500
 _ENGINE_FUNCS = {
     "v1": parse_agenda_pdf,
     "v2": parse_agenda_pdf_v2,
+    "text": parse_agenda_pdf_text,
 }
 
 _VALID_METHODS = {
     "v1": {"toc", "url", "auto"},
     "v2": {"toc", "url", "pageref", "auto"},
+    "text": {"auto"},
 }
 
+# Every ladder ends on text:auto — the flat-text extractor for short
+# agendas whose only structure is numbered heading lines (no links, no
+# usable outline). It self-limits (<=20 pages, 3-80 headings), so as a
+# terminal rung it only converts former no_items failures.
 LADDERS: Dict[str, List[str]] = {
     # agenda_url chain: short hyperlinked agendas. v2 url-anchor first;
     # v1 url catches URL-anchored layouts v2 misaligns (Ontario CA);
-    # final v2 auto sweeps up layouts v1's `\d{1,2}\.` item regex can't
+    # v2 auto sweeps up layouts v1's `\d{1,2}\.` item regex can't
     # match (Winter Springs FL uses 3-digit item numbers).
-    "agenda": ["v2:url", "v1:url", "v2:auto"],
+    "agenda": ["v2:url", "v1:url", "v2:auto", "text:auto"],
     # packet_url chain: compiled packets with bookmark trees.
-    "packet": ["v2:toc"],
+    "packet": ["v2:toc", "text:auto"],
     # legacy force_method="url" semantics: v1 first, v2 auto fallback.
-    "url_legacy": ["v1:url", "v2:auto"],
+    "url_legacy": ["v1:url", "v2:auto", "text:auto"],
     # unforced: v2 auto-detect (toc/url/pageref/url_then_toc), v1 fallback.
-    "auto": ["v2:auto", "v1:auto"],
+    "auto": ["v2:auto", "v1:auto", "text:auto"],
     # legacy force_method="v2_url": single rung, no fallback.
     "v2_url_only": ["v2:url"],
 }

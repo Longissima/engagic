@@ -15,19 +15,23 @@ def fresh_hint_registry(monkeypatch):
 
 class TestResolveRungs:
     def test_named_ladder_expands(self):
-        assert router.resolve_rungs("agenda") == ["v2:url", "v1:url", "v2:auto"]
+        assert router.resolve_rungs("agenda") == [
+            "v2:url", "v1:url", "v2:auto", "text:auto",
+        ]
 
     def test_hint_promoted_to_front(self):
         assert router.resolve_rungs("agenda", hint="v1:url") == [
-            "v1:url", "v2:url", "v2:auto",
+            "v1:url", "v2:url", "v2:auto", "text:auto",
         ]
 
     def test_hint_not_in_ladder_ignored(self):
-        assert router.resolve_rungs("packet", hint="v1:url") == ["v2:toc"]
+        assert router.resolve_rungs("packet", hint="v1:url") == [
+            "v2:toc", "text:auto",
+        ]
 
     def test_hint_already_first_is_noop(self):
         assert router.resolve_rungs("agenda", hint="v2:url") == [
-            "v2:url", "v1:url", "v2:auto",
+            "v2:url", "v1:url", "v2:auto", "text:auto",
         ]
 
     def test_explicit_rung_list_passes_through(self):

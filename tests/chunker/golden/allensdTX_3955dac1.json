@@ -1,9 +1,64 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 1,
+  "item_count": 9,
+  "items": [
+    {
+      "number": "A",
+      "title": "Call to Order",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "Announcement by President that a quorum is present, that the meeting has",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "A",
+      "title": "Pursuant to Texas Government Code Section 551.071, private consultation",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "Property Matters (Sec. 551.072)",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "C",
+      "title": "Security Devices or Security Audits (Sec. 551.076)",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "D",
+      "title": "School Children; School District Employees; Disciplinary Matter or Complaint",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "E",
+      "title": "School Board:  Personally Identifiable Information about Public School",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "A",
+      "title": "Reconvene from closed session for possible action relative to items",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "Discussion, consideration, and possible action regarding the naming and",
+      "page_start": 1,
+      "attachments": 0
+    }
+  ]
 }

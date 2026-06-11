@@ -1,9 +1,76 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 1,
+  "item_count": 11,
+  "items": [
+    {
+      "number": "A",
+      "title": "YTD 2026 Budget to Actual Report",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "A",
+      "title": "Range of Cost vs. Ad Sponsorships",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "VG Timeline",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "A",
+      "title": "Positivity Campaign Update",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "Kiosks",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "C",
+      "title": "Social Media",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "D",
+      "title": "First Ascent Award for Innovation",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "A",
+      "title": "Concession Stands",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "Welcome Center \u2013 possible future application",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "10",
+      "title": "NEXT REGULARLY SCHEDULE MEETING",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "11",
+      "title": "ADJOURNMENT",
+      "page_start": 1,
+      "attachments": 0
+    }
+  ]
 }

@@ -1,9 +1,196 @@
 {
   "ladder": "packet",
-  "winning_rung": null,
-  "parse_method": "",
-  "failure_reason": "no_items",
-  "page_count": null,
-  "item_count": 0,
-  "items": []
+  "winning_rung": "text:auto",
+  "parse_method": "text_items",
+  "failure_reason": null,
+  "page_count": 4,
+  "item_count": 31,
+  "items": [
+    {
+      "number": "1",
+      "title": "CALL TO ORDER \u2013 ROLL CALL",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "CLOSED SESSION",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "A",
+      "title": "PUBLIC COMMENT ON CLOSED SESSION AGENDA ITEM",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "B",
+      "title": "ADJOURN TO CLOSED SESSION",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "C",
+      "title": "CLOSED SESSION ITEM",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "D",
+      "title": "RECONVENE IN OPEN SESSION AND ANNOUNCE ACTIONS TAKEN IN CLOSED",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "REPORTS AND PRESENTATIONS",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "3.A",
+      "title": "City Council Reports",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "3.B",
+      "title": "City Manager Report",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "3.C",
+      "title": "Update on the Marin/Sonoma Mosquito & Vector Board presented by Peter Bonkrude,",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "3.D",
+      "title": "Interviews of the Following Applicants for Appointment to the Following Commissions and",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "CONSENT CALENDAR",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "4.A",
+      "title": "Motion to Approve the Warrants for May 2026",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "4.B",
+      "title": "Motion to Adopt a Resolution Establishing the Gann (Proposition 4) Appropriations Limit for",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "4.C",
+      "title": "Motion to Approve the Minutes of the May 11, 2026, Regular City Council Meeting",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "INDIVIDUAL CONSENT CALENDAR",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "5.A",
+      "title": "Motion to Approve a Revocable License for Existing Private Improvements in the Public",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "PUBLIC HEARINGS",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "6.A",
+      "title": "Discussion and Approval of a Request for an Extension of the Tentative Subdivision Map for",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "6.B",
+      "title": "Discussion and Approval of the City of Belvedere Annual Operating and Capital Budget for",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "6.C",
+      "title": "Discussion and Approval of Fire and Emergency Medical Services Special Tax Rates for",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "6.D",
+      "title": "Introduction & First Reading of an Ordinance Amending Belvedere Municipal Code Section",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "6.E",
+      "title": "Introduction & First Reading of an Ordinance Amending the Belvedere Municipal Code to",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "OTHER SCHEDULED ITEMS",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7.A",
+      "title": "Adoption of Resolutions Calling a General Municipal Election on November 3, 2026, and",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7.B",
+      "title": "First Reading and Review of a Resolution, for the period July 1, 2026, through June 30,",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7.C",
+      "title": "First Reading and Review of a Resolution, for the period July 1, 2026, through June 30,",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7.D",
+      "title": "Discussion and Approval of a Resolution Approving an Amendment to the City Manager",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7.E",
+      "title": "Discussion and Appointments to the Planning Commission, the Finance Committee, and",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "8",
+      "title": "OPEN FORUM",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "9",
+      "title": "ADJOURN",
+      "page_start": 3,
+      "attachments": 0
+    }
+  ]
 }
