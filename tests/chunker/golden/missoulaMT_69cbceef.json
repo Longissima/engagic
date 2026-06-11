@@ -1,0 +1,34 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 28,
+  "item_count": 4,
+  "items": [
+    {
+      "number": "1.2",
+      "title": "Approval of Minutes from May 14, 2025",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "4.1",
+      "title": "Open Space, Parks, and Trails Planning Processes (30-45 min)",
+      "page_start": 6,
+      "attachments": 0
+    },
+    {
+      "number": "4.2",
+      "title": "Open Space Advisory Committee Authority and Roles (15 min)",
+      "page_start": 17,
+      "attachments": 0
+    },
+    {
+      "number": "4.3",
+      "title": "Future Updates of Open Space Advisory Committee Bylaws",
+      "page_start": 24,
+      "attachments": 0
+    }
+  ]
+}

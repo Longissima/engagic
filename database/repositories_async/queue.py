@@ -34,6 +34,7 @@ class QueueRepository(BaseRepository):
         meeting_id: Optional[str] = None,
         banana: Optional[str] = None,
         priority: int = 0,
+        processing_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Add job to processing queue with deduplication
 
@@ -46,20 +47,25 @@ class QueueRepository(BaseRepository):
             meeting_id: Associated meeting ID
             banana: Associated city banana
             priority: Job priority (higher = processed first, default: 0)
+            processing_metadata: Diagnostic trail (e.g. chunker cascade audit);
+                on re-enqueue, a None keeps the previously stored value
         """
         await self._execute(
             """
             INSERT INTO queue (
                 source_url, meeting_id, banana, job_type, payload,
-                status, priority, retry_count
+                status, priority, retry_count, processing_metadata
             )
-            VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0)
+            VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0, $7)
             ON CONFLICT (source_url) DO UPDATE SET
                 status = 'pending',
                 priority = EXCLUDED.priority,
                 retry_count = 0,
                 error_message = NULL,
-                failed_at = NULL
+                failed_at = NULL,
+                processing_metadata = COALESCE(
+                    EXCLUDED.processing_metadata, queue.processing_metadata
+                )
             """,
             source_url,
             meeting_id,
@@ -67,9 +73,38 @@ class QueueRepository(BaseRepository):
             job_type,
             payload,
             priority,
+            processing_metadata,
         )
 
         logger.debug("job enqueued", source_url=source_url, job_type=job_type)
+
+    async def get_chunker_hints(self) -> list:
+        """Latest winning chunker rung per (vendor, slug, ladder).
+
+        Read from the cascade audits persisted in processing_metadata —
+        the audit trail doubles as the sticky-routing hint store, so
+        hints survive restarts without a dedicated table.
+        """
+        rows = await self._fetch(
+            """
+            SELECT DISTINCT ON (
+                j.vendor, j.slug, q.processing_metadata->'chunk'->>'winning_ladder'
+            )
+                j.vendor,
+                j.slug,
+                q.processing_metadata->'chunk'->>'winning_ladder' AS ladder,
+                q.processing_metadata->'chunk'->>'winning_rung' AS rung
+            FROM queue q
+            JOIN jurisdictions j USING (banana)
+            WHERE q.processing_metadata->'chunk'->>'winning_rung' IS NOT NULL
+              AND q.processing_metadata->'chunk'->>'winning_ladder' IS NOT NULL
+            ORDER BY
+                j.vendor, j.slug,
+                q.processing_metadata->'chunk'->>'winning_ladder',
+                q.created_at DESC
+            """
+        )
+        return [dict(r) for r in (rows or [])]
 
     async def reset_stale_processing_jobs(self, stale_minutes: int = 10) -> int:
         """Reset jobs stuck in 'processing' state after crash

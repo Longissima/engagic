@@ -1,0 +1,77 @@
+vendor	outcome	banana	meeting_id	date	agenda_url	packet_url
+boardbook	fallback	brookscountysdTX	brookscountysdTX_caecc729	2026-05-14	https://meetings.boardbook.org/Public/Agenda/2016?meeting=744186	https://meetings.boardbook.org/Documents/DownloadPDF/acfbc503-3ec0-4379-a13f-0e84da467970?org=2016
+boardbook	fallback	wallersdTX	wallersdTX_5fe8b6fa	2026-05-14	https://meetings.boardbook.org/Public/Agenda/737?meeting=745282	https://meetings.boardbook.org/Documents/DownloadPDF/677a2f5f-3192-4b69-ae4a-ef6736b30d2e?org=737
+boardbook	fallback	allensdTX	allensdTX_3955dac1	2026-05-14	https://meetings.boardbook.org/Public/Agenda/855?meeting=741230	https://meetings.boardbook.org/Documents/DownloadPDF/91b36df5-b02a-4808-933e-c2c32beba192?org=855
+boardbook	ok	portorfordlangloisschooldistrict2cjsdOR	portorfordlangloisschooldistrict2cjsdOR_87971f7e	2026-05-18	https://meetings.boardbook.org/Public/Agenda/1552?meeting=742223	
+boardbook	ok	quanahsdTX	quanahsdTX_afa4ab51	2026-05-18	https://meetings.boardbook.org/Public/Agenda/2244?meeting=745291	
+boardbook	ok	kellersdTX	kellersdTX_28aa470f	2026-05-14	https://meetings.boardbook.org/Public/Agenda/2320?meeting=734588	
+chicago	fallback	chicagoIL	chicagoIL_13c5f8c0	2026-06-17		https://occprodstoragev1.blob.core.usgovcloudapi.net/meetingattachmentspublic/ae622664-ef5a-4296-8664-30dd227e6c9e.pdf
+chicago	ok	chicagoIL	chicagoIL_e93a4156	2026-06-15	https://occprodstoragev1.blob.core.usgovcloudapi.net/meetingattachmentspublic/40f70a96-27e2-4834-8216-bd30c7b1af57.pdf	
+civicclerk	fallback	friendswoodTX	friendswoodTX_442ad922	2026-06-19		https://friendswoodtx.api.civicclerk.com/v1/Meetings/GetMeetingFileStream(fileId=4345,plainText=false)
+civicclerk	fallback	danvilleVA	danvilleVA_eb770e54	2026-06-18		https://danvilleva.api.civicclerk.com/v1/Meetings/GetMeetingFileStream(fileId=5968,plainText=false)
+civicclerk	fallback	lansingMI	lansingMI_6d303a11	2026-06-18		https://lansingmi.api.civicclerk.com/v1/Meetings/GetMeetingFileStream(fileId=15262,plainText=false)
+civicclerk	ok	lansingMI	lansingMI_abe2f7d5	2026-06-18	https://lansingmi.portal.civicclerk.com/event/8285/files/agenda/15260	
+civicclerk	ok	greenvilleSC	greenvilleSC_6502688e	2026-06-18	https://greenvillesc.portal.civicclerk.com/event/2443/files/agenda/5039	
+civicclerk	ok	springfieldMA	springfieldMA_8315a5b2	2026-06-17	https://springfieldma.portal.civicclerk.com/event/5679/files/agenda/20395	
+civicplus	fallback	lawrenceMA	lawrenceMA_f07a315c	2026-06-18		https://ma-lawrence.civicplus.com/AgendaCenter/ViewFile/Agenda/_06182026-1869
+civicplus	fallback	beverlyMA	beverlyMA_419a68e6	2026-06-18		https://ma-beverly.civicplus.com/AgendaCenter/ViewFile/Agenda/_06182026-2788
+civicplus	fallback	westfieldMA	westfieldMA_783bfe9c	2026-06-18		https://ma-westfield.civicplus.com/AgendaCenter/ViewFile/Agenda/_06182026-8546
+civicplus	ok	grantcountyWA	grantcountyWA_613c4968	2026-06-18		https://www.grantcountywa.gov/AgendaCenter/ViewFile/Agenda/_06182026-584?html=true
+civicplus	ok	yakimacountyWA	yakimacountyWA_835fe37c	2026-06-18		https://www.yakimacounty.us/AgendaCenter/ViewFile/Agenda/_06182026-1910?html=true
+civicplus	ok	schenectadyNY	schenectadyNY_f9a3f893	2026-06-17		https://ny-schenectady.civicplus.com/AgendaCenter/ViewFile/Agenda/_06172026-1430
+civicweb	fallback	washingtoncountyOR	washingtoncountyOR_9a3251f4	2026-06-18		https://washingtoncounty.civicweb.net/document/331076/Audit%20Committee%20-%20Jun%2018%202026.pdf?handle=7756B06B25654359B47C653055A74BAC
+civicweb	fallback	issaquahWA	issaquahWA_d0797dca	2026-06-11		https://issaquah.civicweb.net/document/385706/Cemetery%20Board%20Special%20Meeting%20-%20Jun%2011%202026.pdf?handle=F78896F1FEF645A680BF16311433E8C3
+civicweb	fallback	victoriaTX	victoriaTX_b36b1462	2026-06-11		https://victoriatx.civicweb.net/document/493477/Collective%20Bargaining%20Deliberations%20-%20Jun%2011%2020.pdf?handle=B511E59E34FD460BA73C92044F01BB67
+civicweb	ok	washingtoncountyOR	washingtoncountyOR_6df0c999	2026-06-18		https://washingtoncounty.civicweb.net/document/330446/Land%20Use%20Hearings%20-%20Jun%2018%202026.pdf?handle=40A5A04C6A9947439E58E31EEE25E883
+civicweb	ok	monteserenoCA	monteserenoCA_3f243ad6	2026-06-16		https://montesereno.civicweb.net/document/108011/City%20Council%20-%20Jun%2016%202026.pdf?handle=70FBC1904D5143AD978020AD9308DB5B
+civicweb	ok	waukeganIL	waukeganIL_8854adf7	2026-06-11		https://city-of-waukeganil.community.highbond.com/document/54155/?printPdf=true
+destiny	fallback	baytownTX	baytownTX_db79dcec	2026-06-11	https://public.destinyhosted.com/agenda_publish.cfm?id=22986&mt=ALL&get_month=6&get_year=2026&dsp=ag&seq=3804	https://public.destinyhosted.com/baytodocs/2026/AEC/20260611_3798/AGENDApacket_06-11-26_1117_3804.pdf
+destiny	fallback	copperascoveTX	copperascoveTX_d3613567	2026-06-10	https://public.destinyhosted.com/agenda_publish.cfm?id=26773&mt=ALL&get_month=6&get_year=2026&dsp=ag&seq=2353	https://public.destinyhosted.com/coppedocs/2026/CCSPC/20260610_2355/AGENDApacket__06-10-26_0948_2353.pdf
+destiny	fallback	chandlerAZ	chandlerAZ_a1a68d24	2026-06-09	https://public.destinyhosted.com/agenda_publish.cfm?id=24263&mt=ALL&get_month=6&get_year=2026&dsp=ag&seq=2319	https://public.destinyhosted.com/chanddocs/2026/MVAC/20260609_2323/AGENDApacket_06-09-26_0608_2319.pdf
+destiny	ok	baytownTX	baytownTX_b02648a4	2026-06-11	https://public.destinyhosted.com/agenda_publish.cfm?id=22986&mt=ALL&get_month=6&get_year=2026&dsp=ag&seq=3812	https://public.destinyhosted.com/baytodocs/2026/CC Regular/20260611_3806/AGENDApacket_06-11-26_1118_3812.pdf
+destiny	ok	chandlerAZ	chandlerAZ_38a7f115	2026-06-11	https://public.destinyhosted.com/agenda_publish.cfm?id=24263&mt=ALL&get_month=6&get_year=2026&dsp=ag&seq=2294	https://public.destinyhosted.com/chanddocs/2026/CC/20260611_2298/AGENDApacket_06-11-26_0712_2294.pdf
+destiny	ok	conroeTX	conroeTX_69f9b05c	2026-06-11	https://public.destinyhosted.com/agenda_publish.cfm?id=26676&mt=ALL&get_month=6&get_year=2026&dsp=ag&seq=205	https://public.destinyhosted.com/conrodocs/2026/CC/20260611_205/AGENDApacket_06-11-26_0305_205.pdf
+escribe	fallback	greensboroNC	greensboroNC_ef61a1d8	2026-06-15	https://pub-greensboro-nc.escribemeetings.com/Meeting.aspx?Id=96b46058-b9b6-44f1-8a82-f614b17ba5a4&Agenda=Merged&lang=English	https://pub-greensboro-nc.escribemeetings.com/FileStream.ashx?DocumentId=69679
+escribe	fallback	orindaCA	orindaCA_9554a74c	2026-06-10	https://pub-orinda.escribemeetings.com/Meeting.aspx?Id=fde097bb-a959-42b4-898a-b5d2d5fe1869&Agenda=Merged&lang=English	https://pub-orinda.escribemeetings.com/FileStream.ashx?DocumentId=5492
+escribe	fallback	hermosabeachCA	hermosabeachCA_bc969240	2026-06-09	https://pub-hermosabeach.escribemeetings.com/Meeting.aspx?Id=7467a6c7-879b-4e3a-82b8-a91753307a4d&Agenda=Merged&lang=English	https://pub-hermosabeach.escribemeetings.com/FileStream.ashx?DocumentId=58970
+escribe	ok	gainesvilleFL	gainesvilleFL_4e464613	2026-06-15	https://pub-cityofgainesville.escribemeetings.com/Meeting.aspx?Id=aedec810-ff46-4fb6-8f9c-9ff1a448f98b&Agenda=Merged&lang=English	https://pub-cityofgainesville.escribemeetings.com/FileStream.ashx?DocumentId=124274
+escribe	ok	missoulaMT	missoulaMT_69cbceef	2026-06-11	https://pub-missoula.escribemeetings.com/Meeting.aspx?Id=a805349c-bb59-43bf-a711-078da8738bf0&Agenda=Merged&lang=English	https://pub-missoula.escribemeetings.com/FileStream.ashx?DocumentId=341932
+escribe	ok	laporteTX	laporteTX_89f97715	2026-06-11	https://pub-laporte.escribemeetings.com/Meeting.aspx?Id=583b3c2b-8da1-45ee-9b88-118fa5665eaa&Agenda=Merged&lang=English	https://pub-laporte.escribemeetings.com/FileStream.ashx?DocumentId=7519
+granicus	fallback	martinezCA	martinezCA_98c31413	2026-06-17	https://martinez.granicus.com/AgendaViewer.php?view_id=9&event_id=3180	https://martinez.granicus.com/DocumentViewer.php?file=martinez_757a16d7b184ce1bee94e2628f700b1b.pdf&view=1
+granicus	fallback	oakleyCA	oakleyCA_24173a96	2026-06-16	https://oakley.granicus.com/AgendaViewer.php?view_id=1&event_id=464	https://oakley.granicus.com/DocumentViewer.php?file=oakley_62a4f1eac3271737e117b085a7104eab.pdf&view=1
+granicus	fallback	fairfaxVA	fairfaxVA_bf263e2a	2026-06-16	https://fairfax.granicus.com/AgendaViewer.php?view_id=13&event_id=3615	https://fairfax.granicus.com/DocumentViewer.php?file=fairfax_9ab94b8460c6361c42b2984643161ca8.pdf&view=1
+granicus	ok	puntagordaFL	puntagordaFL_c148284d	2026-06-19	https://puntagorda.granicus.com/AgendaViewer.php?view_id=1&event_id=1028	https://granicus_production_attachments.s3.amazonaws.com/puntagorda/11c656851901a9035cca74d36103ffbf0.pdf
+granicus	ok	topekaKS	topekaKS_a63230b5	2026-06-16	https://topeka.granicus.com/AgendaViewer.php?view_id=1&event_id=292	
+granicus	ok	acworthGA	acworthGA_382c6010	2026-06-16	https://acworth-ga.granicus.com/AgendaViewer.php?view_id=1&event_id=428	https://granicus_production_attachments.s3.amazonaws.com/acworth-ga/6d7cb7c18c2973ee3e2b11c94619876a0.pdf
+iqm2	fallback	santaclaracountyCA	santaclaracountyCA_a130f9b3	2026-04-08	https://sccgov.iqm2.com/Citizens/Detail_Meeting.aspx?ID=17420	https://sccgov.iqm2.com/FileOpen.aspx?Type=1&ID=15636&Inline=True
+iqm2	fallback	santaclaritaCA	santaclaritaCA_df154bfc	2026-04-02	https://santaclaritacityca.iqm2.com/Citizens/Detail_Meeting.aspx?ID=3185	https://santaclaritacityca.iqm2.com/FileOpen.aspx?Type=1&ID=2194&Inline=True
+iqm2	fallback	providenceRI	providenceRI_5e0e12fa	2026-03-11	https://providenceri.iqm2.com/Citizens/Detail_Meeting.aspx?ID=15846	https://providenceri.iqm2.com/FileOpen.aspx?Type=1&ID=12870&Inline=True
+iqm2	ok	buffaloNY	buffaloNY_b294b3b4	2026-06-17	https://buffalony.iqm2.com/Citizens/Detail_Meeting.aspx?ID=3226	https://buffalony.iqm2.com/FileView.aspx?Type=1&ID=3103
+iqm2	ok	santaclaracountyCA	santaclaracountyCA_15e1e42c	2026-06-12	https://sccgov.iqm2.com/Citizens/Detail_Meeting.aspx?ID=17319	https://sccgov.iqm2.com/FileOpen.aspx?Type=1&ID=15792&Inline=True
+iqm2	ok	grandrapidsMI	grandrapidsMI_62ef2f4c	2026-06-11	https://grandrapidscitymi.iqm2.com/Citizens/Detail_Meeting.aspx?ID=7873	https://grandrapidscitymi.iqm2.com/FileOpen.aspx?Type=1&ID=5853&Inline=True
+legistar	fallback	milwaukeecountyWI	milwaukeecountyWI_5c01cdeb	2026-06-19		https://milwaukeecounty.legistar.com/View.ashx?M=A&ID=1415799&GUID=42203043-1F46-47D6-A0D3-0B63B0840E1E
+legistar	fallback	haywardCA	haywardCA_c736e3d4	2026-06-18		https://hayward.legistar.com/View.ashx?M=A&ID=1417641&GUID=C73808D5-2B65-47B2-A764-237E430ADA56
+legistar	fallback	montereycountyCA	montereycountyCA_f66dc10e	2026-06-17		https://monterey.legistar.com/View.ashx?M=A&ID=1422260&GUID=7A1D82A1-9990-423C-ABD0-0118E451A01C
+legistar	ok	newportbeachCA	newportbeachCA_4ba9be6f	2026-06-18	https://newportbeach.legistar1.com/newportbeach/meetings/2026/6/4569_A_Public_Notice_26-06-18_Public_Notices.pdf	
+legistar	ok	kingcountyWA	kingcountyWA_21610e47	2026-06-18	https://kingcounty.legistar1.com/kingcounty/meetings/2026/6/12684_A_Board_of_Health_26-06-18_Meeting_Agenda.pdf	
+legistar	ok	madisonWI	madisonWI_1005534d	2026-06-18	https://madison.legistar1.com/madison/meetings/2026/6/29126_A_BUDGET_COMMITTEE_-_BOARD_OF_HEALTH_FOR_MADISON_AND_DANE_COUNTY_26-06-18_Agenda.pdf	
+menlopark	ok	menloparkCA	menloparkCA_f3a71681	2026-06-10	https://menlopark.gov/files/sharedassets/public/v/1/agendas-and-minutes/complete-streets-commission/2026-meetings/agendas/20260610-csc-agenda_original.pdf	
+municode	fallback	deschutescountyOR	deschutescountyOR_33dfe6ac	2026-06-12	https://meetings.municode.com/adaHtmlDocument/index?cc=DESCHUTES&me=ff44bd02ae0a4f2d87f6a1c65badae21&ip=False	https://mccmeetings.blob.core.usgovcloudapi.net/deschutes-pubu/MEET-Agenda-ff44bd02ae0a4f2d87f6a1c65badae21.pdf
+municode	fallback	tworiversWI	tworiversWI_2a6b8fbb	2026-06-11	https://meetings.municode.com/adaHtmlDocument/index?cc=TWORIVRSWI&me=ff70f9a2a54a4d4a879c6fef28173c58&ip=False	https://mccmeetings.blob.core.usgovcloudapi.net/tworivrswi-pubu/MEET-Agenda-ff70f9a2a54a4d4a879c6fef28173c58.pdf
+municode	fallback	prosperTX	prosperTX_f6a1ade8	2026-06-03	https://meetings.municode.com/d/f?u=https://mccmeetings.blob.core.usgovcloudapi.net/prospertx-pubu/MEET-Agenda-c68ee47e1718497a84c22bdf3feb99b3.pdf&n=Agenda-Community%20Engagement%20Committee-June 3, 2026 6.00 PM.pdf	https://meetings.municode.com/d/f?u=https://mccmeetings.blob.core.usgovcloudapi.net/prospertx-pubu/MEET-Packet-c68ee47e1718497a84c22bdf3feb99b3.pdf&n=AgendaPacket-Community%20Engagement%20Committee-June 3, 2026 6.00 PM.pdf
+municode	ok	losgatosCA	losgatosCA_6370c444	2026-06-19	https://meetings.municode.com/adaHtmlDocument/index?cc=LOSGATOS&me=c09e428caa354af580118b65d9dc313b&ip=True	
+municode	ok	escondidoCA	escondidoCA_8ec8fde7	2026-06-18	https://meetings.municode.com/adaHtmlDocument/index?cc=ESCONDIDCA&me=f4ac4426e5a140f6bbfec22bbefbb044&ip=True	
+municode	ok	whitewaterWI	whitewaterWI_97681fe3	2026-06-18	https://meetings.municode.com/adaHtmlDocument/index?cc=WHITEWATWI&me=32909129e0704ddb88efc9f81fc7a12f&ip=True	
+primegov	fallback	nampaID	nampaID_d9e4cafc	2026-06-10		https://nampa.primegov.com/Public/CompiledDocument?meetingTemplateId=9740&compileOutputType=1
+primegov	fallback	prescottvalleyAZ	prescottvalleyAZ_b34d564a	2026-06-09		https://prescottvalley.primegov.com/Public/CompiledDocument?meetingTemplateId=5721&compileOutputType=1
+primegov	fallback	longbeachCA	longbeachCA_983e3cb4	2026-06-04		https://longbeach.primegov.com/Public/CompiledDocument?meetingTemplateId=35846&compileOutputType=1
+primegov	ok	willcountyIL	willcountyIL_4a24b7e6	2026-06-17	https://willcountyil.primegov.com/Portal/Meeting?meetingTemplateId=19896	
+primegov	ok	arlingtonMA	arlingtonMA_421573df	2026-06-15		https://arlingtonma.primegov.com/Public/CompiledDocument?meetingTemplateId=4662&compileOutputType=1
+primegov	ok	renoNV	renoNV_d990b307	2026-06-15	https://reno.primegov.com/Portal/Meeting?meetingTemplateId=8720	
+proudcity	fallback	sanrafaelCA	sanrafaelCA_9f85ae51	2026-06-10	https://storage.googleapis.com/proudcity/sanrafaelca/2026/06/87c59398-agenda-06-10-26.pdf	https://storage.googleapis.com/proudcity/sanrafaelca/2026/06/2c66bd79-agenda-packet-06-10-26.pdf
+proudcity	fallback	belvedereCA	belvedereCA_af4917d8	2026-06-08		https://storage.googleapis.com/proudcity/belvedereca/2026/06/f67a81b8-2026-06-08-cc-agenda.pdf
+proudcity	fallback	fairfaxCA	fairfaxCA_9fff21c8	2026-04-17	https://storage.googleapis.com/proudcity/fairfaxca/2026/04/308a0f36-04-17-2026-special.pdf	https://storage.googleapis.com/proudcity/fairfaxca/2026/04/e9cae1f0-item-1-formula-business-moratorium-ordinance-extension.pdf
+proudcity	ok	sanrafaelCA	sanrafaelCA_a54b89a3	2026-06-10	https://storage.googleapis.com/proudcity/sanrafaelca/2026/06/989a9285-bpac-meeting-agenda-20260610.pdf	https://storage.googleapis.com/proudcity/sanrafaelca/2026/06/15c93b87-bpac-agenda-packet-20260610.pdf
+proudcity	ok	colmaCA	colmaCA_89d124cf	2026-06-10	https://storage.googleapis.com/proudcity/colmaca/2026/06/3e6ef7b3-06.10.26-regular-meeting-agenda.pdf	https://storage.googleapis.com/proudcity/colmaca/2026/06/747e3bbe-06.10.26-regular-meeting-agenda-packet.pdf
+proudcity	ok	fairfaxCA	fairfaxCA_349da69e	2026-06-03	https://townoffairfaxca.gov/meetings/town-council-meeting-june-3-2026/	https://storage.googleapis.com/proudcity/fairfaxca/2026/05/d72e5d8a-1.-proclamation-gun-violence-awareness-day-2026.pdf
+visioninternet	ok	portolavalleyCA	portolavalleyCA_8793f9f2	2026-04-22		https://www.portolavalley.net/home/showpublisheddocument/20577/639120336735970000

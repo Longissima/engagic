@@ -14,6 +14,7 @@ from database.db_postgres import Database
 from database.models import Jurisdiction
 from exceptions import VendorError
 from vendors.adapters.base_adapter_async import FetchResult
+from vendors.adapters.parsers.router import seed_city_hints
 from vendors.factory import get_async_adapter, VENDOR_ADAPTERS
 from vendors.rate_limiter_async import get_rate_limiter
 from config import config, get_logger
@@ -92,6 +93,25 @@ class Fetcher:
         self._shutdown_event = asyncio.Event()
         self._running = True
         self.meeting_sync = MeetingSyncOrchestrator(db)
+        self._chunker_hints_seeded = False
+
+    async def _ensure_chunker_hints(self) -> None:
+        """Seed the router's sticky per-city rungs from persisted audits.
+
+        Once per Fetcher lifetime; afterwards the registry self-updates
+        in-process as cities chunk, and each win re-persists via the
+        queue audit trail.
+        """
+        if self._chunker_hints_seeded:
+            return
+        self._chunker_hints_seeded = True
+        try:
+            rows = await self.db.queue.get_chunker_hints()
+            count = seed_city_hints(rows)
+            if count:
+                logger.info("seeded chunker routing hints", count=count)
+        except Exception as e:
+            logger.warning("chunker hint seeding failed", error=str(e))
 
     @property
     def is_running(self) -> bool:
@@ -142,6 +162,7 @@ class Fetcher:
         """
         start_time = time.time()
         self.failed_cities.clear()
+        await self._ensure_chunker_hints()
 
         by_vendor: Dict[str, List[Jurisdiction]] = {}
         results: List[SyncResult] = []

@@ -1,0 +1,70 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 108,
+  "item_count": 10,
+  "items": [
+    {
+      "number": "06.10.26",
+      "title": "Regular Meeting Agenda",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "1",
+      "title": "- Minutes - Regular Meeting 05.27.26",
+      "page_start": 5,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "- Report of Checks Paid May 2026",
+      "page_start": 11,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "- CCC Remodel Construction Contract",
+      "page_start": 21,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "- FY26-27 GANN Limit",
+      "page_start": 27,
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "- OBAG 4 Grant",
+      "page_start": 33,
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "- 2027 ATP",
+      "page_start": 43,
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "- FY26-27 Annual Budget",
+      "page_start": 51,
+      "attachments": 0
+    },
+    {
+      "number": "8",
+      "title": "- Cost of Service Fee Study",
+      "page_start": 67,
+      "attachments": 0
+    },
+    {
+      "number": "9",
+      "title": "-Third Amendment to City Manager Contract",
+      "page_start": 93,
+      "attachments": 0
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "ladder": "agenda",
+  "winning_rung": "v2:url",
+  "parse_method": "v2_url",
+  "failure_reason": null,
+  "page_count": 1,
+  "item_count": 1,
+  "items": [
+    {
+      "number": "6",
+      "title": "00 PM WESTCLIFF AT DOVER RESIDENTIAL DEVELOPMENT (PA2025-0254) Site Location: 1501 16th Street",
+      "page_start": 1,
+      "attachments": 1
+    }
+  ]
+}

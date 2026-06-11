@@ -17,8 +17,20 @@ import aiohttp
 
 from config import config, get_logger
 from pipeline.protocols import MetricsCollector, NullMetrics
-from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf, _normalize_link_url
-from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
+from vendors.adapters.parsers.agenda_chunker import _normalize_link_url
+from vendors.adapters.parsers.router import (
+    ChunkResult,
+    DOWNLOAD_FAILED,
+    ENGINE_ERROR,
+    MIN_PDF_BYTES,
+    TOO_SMALL,
+    Attempt,
+    chunk_pdf,
+    get_city_hint,
+    ladder_for_force_method,
+    set_city_hint,
+    summarize_runs,
+)
 from vendors.rate_limiter_async import get_rate_limiter
 from vendors.session_manager_async import AsyncSessionManager
 from exceptions import VendorHTTPError
@@ -81,6 +93,9 @@ class AsyncBaseAdapter:
         self.slug = city_slug
         self.vendor = vendor
         self.metrics = metrics or NullMetrics()
+        # chunker cascade audits collected during a fetch, keyed by vendor_id;
+        # fetch_meetings() stamps them onto the outgoing meeting dicts
+        self._chunk_audits: Dict[str, List[Dict[str, Any]]] = {}
 
         logger.info("initialized async adapter", vendor=vendor, city_slug=city_slug)
 
@@ -519,33 +534,38 @@ class AsyncBaseAdapter:
         to the actual contracts/exhibits on Legistar S3).
         """
         if agenda_url:
-            items = await self._parse_packet_pdf(agenda_url, vendor_id, force_method="v2_url")
-            if not items:
-                items = await self._parse_packet_pdf(agenda_url, vendor_id, force_method="url")
-            if items:
+            result = await self._chunk_packet_pdf(agenda_url, vendor_id, ladder="agenda")
+            if result.items:
                 # Only keep chunked items if at least one has attachments —
                 # items without attachments from a thin agenda are just text noise
-                items = await self._resolve_sub_attachments(items, vendor_id)
+                items = await self._resolve_sub_attachments(result.items, vendor_id)
                 if any(it.get("attachments") for it in items):
-                    items = [it for it in items if it.get("attachments")]
-                    return items
+                    return [it for it in items if it.get("attachments")]
 
         if packet_url:
-            items = await self._parse_packet_pdf(packet_url, vendor_id, force_method="toc")
-            if items:
-                return items
+            result = await self._chunk_packet_pdf(packet_url, vendor_id, ladder="packet")
+            if result.items:
+                return result.items
 
         return []
 
-    async def _parse_pdf_bytes(
+    async def _chunk_pdf_bytes(
         self,
         pdf_bytes: bytes,
         vendor_id: Optional[str] = None,
-        force_method: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Parse raw PDF bytes with the chunker. Returns items or empty list."""
-        if len(pdf_bytes) < 500:
-            return []
+        ladder: str = "auto",
+    ) -> ChunkResult:
+        """Run the chunker cascade on raw PDF bytes. Returns full ChunkResult.
+
+        Routing policy lives in router.LADDERS; every rung attempt and any
+        terminal failure reason ends up in the result's audit trail.
+        """
+        if len(pdf_bytes) < MIN_PDF_BYTES:
+            result = ChunkResult(failure_reason=TOO_SMALL, ladder=ladder)
+            self._record_chunk_audit(vendor_id, result)
+            return result
+
+        hint = get_city_hint(self.vendor, self.slug, ladder)
 
         tmp_path = None
         try:
@@ -553,49 +573,14 @@ class AsyncBaseAdapter:
                 tmp_path = tmp.name
                 tmp.write(pdf_bytes)
 
-            # TOC → v2 (strictly superior). URL → v1 (or v2_url for edge cases).
-            # Auto: v2 first (better TOC grouping), v1 fallback.
-            # force_method="url" prefers v1 (e.g. Ontario CA URL-anchored
-            # agendas where v2 misaligns), but falls back to v2 if v1 returns
-            # zero items — some Granicus cities (Winter Springs FL) use 3-digit
-            # item numbers that v1's `\d{1,2}\.` regex can't match.
-            if force_method == "toc":
-                parsed = await asyncio.to_thread(parse_agenda_pdf_v2, tmp_path, force_method="toc")
-            elif force_method == "v2_url":
-                parsed = await asyncio.to_thread(parse_agenda_pdf_v2, tmp_path, force_method="url")
-            elif force_method == "url":
-                parsed = await asyncio.to_thread(parse_agenda_pdf, tmp_path, force_method="url")
-                if not parsed.get("items"):
-                    parsed = await asyncio.to_thread(parse_agenda_pdf_v2, tmp_path)
-            else:
-                parsed = await asyncio.to_thread(parse_agenda_pdf_v2, tmp_path)
-                if not parsed.get("items"):
-                    parsed = await asyncio.to_thread(parse_agenda_pdf, tmp_path)
-
-            items = parsed.get("items", [])
-
-            if items:
-                logger.info(
-                    "chunker extracted items from pdf",
-                    vendor=self.vendor,
-                    slug=self.slug,
-                    vendor_id=vendor_id,
-                    item_count=len(items),
-                    parse_method=parsed.get("metadata", {}).get("parse_method", ""),
-                    force_method=force_method or "auto",
-                )
-
-            return items
+            result = await asyncio.to_thread(chunk_pdf, tmp_path, ladder, hint)
 
         except Exception as e:
-            logger.debug(
-                "pdf parse failed",
-                vendor=self.vendor,
-                slug=self.slug,
-                vendor_id=vendor_id,
-                error=str(e),
+            result = ChunkResult(failure_reason=ENGINE_ERROR, ladder=ladder)
+            result.attempts.append(
+                Attempt(rung="cascade", failure_reason=ENGINE_ERROR,
+                        error=f"{type(e).__name__}: {e}")
             )
-            return []
         finally:
             if tmp_path:
                 try:
@@ -603,17 +588,65 @@ class AsyncBaseAdapter:
                 except OSError:
                     pass
 
-    async def _parse_packet_pdf(
+        self._record_chunk_audit(vendor_id, result)
+
+        if result.winning_rung:
+            set_city_hint(self.vendor, self.slug, ladder, result.winning_rung)
+
+        if result.items:
+            logger.info(
+                "chunker extracted items from pdf",
+                vendor=self.vendor,
+                slug=self.slug,
+                vendor_id=vendor_id,
+                item_count=len(result.items),
+                parse_method=result.parse_method,
+                winning_rung=result.winning_rung,
+                ladder=ladder,
+            )
+        else:
+            logger.warning(
+                "chunker found no items",
+                vendor=self.vendor,
+                slug=self.slug,
+                vendor_id=vendor_id,
+                failure_reason=result.failure_reason,
+                ladder=ladder,
+                attempts=result.audit()["attempts"],
+            )
+
+        return result
+
+    def _record_chunk_audit(
+        self, vendor_id: Optional[str], result: ChunkResult
+    ) -> None:
+        """Accumulate cascade audits per meeting; fetch_meetings() stamps them
+        onto outgoing meeting dicts so they reach queue.processing_metadata."""
+        if vendor_id:
+            self._chunk_audits.setdefault(str(vendor_id), []).append(result.audit())
+
+    async def _parse_pdf_bytes(
         self,
-        pdf_url: str,
+        pdf_bytes: bytes,
         vendor_id: Optional[str] = None,
         force_method: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Download a PDF and run the chunker. Returns items or empty list."""
+        """Legacy shim: maps force_method to a ladder, returns bare items."""
+        result = await self._chunk_pdf_bytes(
+            pdf_bytes, vendor_id, ladder_for_force_method(force_method)
+        )
+        return result.items
+
+    async def _chunk_packet_pdf(
+        self,
+        pdf_url: str,
+        vendor_id: Optional[str] = None,
+        ladder: str = "auto",
+    ) -> ChunkResult:
+        """Download a PDF and run the chunker cascade. Returns full ChunkResult."""
         try:
             response = await self._get(pdf_url)
             pdf_bytes = await response.read()
-            return await self._parse_pdf_bytes(pdf_bytes, vendor_id, force_method)
         except Exception as e:
             logger.debug(
                 "pdf download failed",
@@ -622,7 +655,22 @@ class AsyncBaseAdapter:
                 vendor_id=vendor_id,
                 error=str(e),
             )
-            return []
+            result = ChunkResult(failure_reason=DOWNLOAD_FAILED, ladder=ladder)
+            self._record_chunk_audit(vendor_id, result)
+            return result
+        return await self._chunk_pdf_bytes(pdf_bytes, vendor_id, ladder)
+
+    async def _parse_packet_pdf(
+        self,
+        pdf_url: str,
+        vendor_id: Optional[str] = None,
+        force_method: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Legacy shim: download + cascade, returns items or empty list."""
+        result = await self._chunk_packet_pdf(
+            pdf_url, vendor_id, ladder_for_force_method(force_method)
+        )
+        return result.items
 
     # ------------------------------------------------------------------
     # 2nd-pass: resolve sub-attachments from staff report cover PDFs
@@ -838,10 +886,17 @@ class AsyncBaseAdapter:
         Callers can distinguish "no meetings" from "adapter broken".
         """
         try:
+            self._chunk_audits = {}
             meetings = await self._fetch_meetings_impl(days_back, days_forward)
             valid = [m for m in meetings if self._validate_meeting(m)]
             if len(valid) < len(meetings):
                 logger.warning("filtered invalid meetings", vendor=self.vendor, slug=self.slug, total=len(meetings), valid=len(valid))
+
+            # Attach chunker cascade audits to their meetings (by vendor_id)
+            for m in valid:
+                runs = self._chunk_audits.get(str(m.get("vendor_id")))
+                if runs:
+                    m["chunk_audit"] = summarize_runs(runs)
 
             # Resolve SharePoint sharing URLs to direct download URLs
             # across all items in all meetings before returning.

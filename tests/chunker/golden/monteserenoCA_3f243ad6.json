@@ -1,0 +1,16 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 74,
+  "item_count": 1,
+  "items": [
+    {
+      "number": "1",
+      "title": "Staff Report - SR-26-084 - Pdf",
+      "page_start": 4,
+      "attachments": 0
+    }
+  ]
+}

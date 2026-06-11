@@ -1,0 +1,28 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 21,
+  "item_count": 3,
+  "items": [
+    {
+      "number": "",
+      "title": "1_99421_9942 Resolution 6012 Final Adoption of the FY 2026-27 Budget and 2027-2036 CIP",
+      "page_start": 4,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Resolution No. 6012",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Auditor General Budget Schedules",
+      "page_start": 11,
+      "attachments": 0
+    }
+  ]
+}

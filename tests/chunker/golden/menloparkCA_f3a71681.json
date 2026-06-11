@@ -1,0 +1,58 @@
+{
+  "ladder": "agenda",
+  "winning_rung": "v1:url",
+  "parse_method": "url",
+  "failure_reason": null,
+  "page_count": 44,
+  "item_count": 8,
+  "items": [
+    {
+      "number": "(669)",
+      "title": "900-6833",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "C",
+      "title": "Reports and Announcements Under \u201cReports and Announcements,\u201d staff and Commissioners may communicate general",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "F",
+      "title": "Informational Items Update on major project status",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "G",
+      "title": "Committee/Subcommittee Reports",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "C",
+      "title": "Reports and Announcements The Commission received updates on City Council Capital Improvement Program study session and",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "F",
+      "title": "Informational Items F1.",
+      "page_start": 4,
+      "attachments": 0
+    },
+    {
+      "number": "G",
+      "title": "Committee/Subcommittee Reports The El Camino Real Bike Lanes Ad Hoc Subcommittee made a presentation (Attachment).",
+      "page_start": 4,
+      "attachments": 0
+    },
+    {
+      "number": "H",
+      "title": "Chair Ierokomos adjourned the meeting at 8:18 p.m. Senior Transportation Planner Catrine Machi",
+      "page_start": 4,
+      "attachments": 3
+    }
+  ]
+}

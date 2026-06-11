@@ -1,0 +1,124 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 28,
+  "item_count": 19,
+  "items": [
+    {
+      "number": "",
+      "title": "Slide 1",
+      "page_start": 10,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 2",
+      "page_start": 11,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 3",
+      "page_start": 12,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 4",
+      "page_start": 13,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 5",
+      "page_start": 14,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 6",
+      "page_start": 15,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 7: Nature & Outdoors",
+      "page_start": 16,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 8",
+      "page_start": 17,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 9",
+      "page_start": 18,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 10",
+      "page_start": 19,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 11",
+      "page_start": 20,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 12",
+      "page_start": 21,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 13",
+      "page_start": 22,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 14",
+      "page_start": 23,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 15",
+      "page_start": 24,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 16",
+      "page_start": 25,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 17",
+      "page_start": 26,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 18",
+      "page_start": 27,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Slide 19",
+      "page_start": 28,
+      "attachments": 0
+    }
+  ]
+}

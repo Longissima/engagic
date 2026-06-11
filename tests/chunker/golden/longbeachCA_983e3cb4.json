@@ -1,0 +1,52 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 2,
+  "item_count": 7,
+  "items": [
+    {
+      "number": "",
+      "title": "Agenda Notes",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "1",
+      "title": "- Recommendation to approve the minutes for the Transactions and Use Tax Citizens\u2019...",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "- Recommendation to receive and file an update on the Long Beach Police Department\u2019s use...",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "- Recommendation to receive and file a presentation from the Office of the City Attorney...",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "- Recommendation to receive and file a presentation from the Office of Ethics and...",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "- Recommendation to receive and file a report from current Ad Hoc Committee; discuss...",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "Certification Note",
+      "page_start": 2,
+      "attachments": 0
+    }
+  ]
+}

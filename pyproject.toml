@@ -88,6 +88,7 @@ dev = [
 
 [tool.pyright]
 include = ["vendors", "parsing", "analysis", "pipeline", "database", "server", "userland"]
+extraPaths = ["tests/chunker"]
 exclude = ["**/__pycache__", ".venv", "venv", "scripts", "docs", "motioncount"]
 typeCheckingMode = "basic"  # or "standard" or "strict"
 pythonVersion = "3.13"

@@ -1,0 +1,16 @@
+{
+  "ladder": "agenda",
+  "winning_rung": "v1:url",
+  "parse_method": "url",
+  "failure_reason": null,
+  "page_count": 1,
+  "item_count": 1,
+  "items": [
+    {
+      "number": "1",
+      "title": "An ordinance authorizing the approval of the ownership transfer pursuant to the Chicago Metered Parking System Concession",
+      "page_start": 1,
+      "attachments": 0
+    }
+  ]
+}

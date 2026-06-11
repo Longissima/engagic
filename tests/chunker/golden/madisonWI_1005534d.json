@@ -1,0 +1,16 @@
+{
+  "ladder": "agenda",
+  "winning_rung": "v2:url",
+  "parse_method": "v2_url",
+  "failure_reason": null,
+  "page_count": 5,
+  "item_count": 1,
+  "items": [
+    {
+      "number": "",
+      "title": "MINUTES FOR THE BOARD OF HEALTH FOR MADISON & DANE COUNTY 93478 BUDGET COMMITTEE FOR JULY 10, 2025.",
+      "page_start": 4,
+      "attachments": 1
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 6,
+  "item_count": 2,
+  "items": [
+    {
+      "number": "",
+      "title": "Town Council Agenda",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "4.a",
+      "title": "- Cover Page",
+      "page_start": 3,
+      "attachments": 0
+    }
+  ]
+}

@@ -184,7 +184,8 @@ class MeetingSyncOrchestrator:
 
             try:
                 await self._enqueue_if_needed(
-                    meeting_obj, meeting_date, agenda_items, items_data, stats
+                    meeting_obj, meeting_date, agenda_items, items_data, stats,
+                    chunk_audit=meeting_dict.get("chunk_audit"),
                 )
             except Exception as e:
                 enqueue_failures += 1
@@ -521,7 +522,8 @@ class MeetingSyncOrchestrator:
         meeting_date: Optional[datetime],
         agenda_items: List[AgendaItem],
         items_data: Optional[List[Dict[str, Any]]],
-        stats: MeetingStoreStats
+        stats: MeetingStoreStats,
+        chunk_audit: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Enqueue meeting for LLM processing if criteria are met."""
         should_enqueue, skip_reason = self.enqueue_decider.should_enqueue(stored_meeting, agenda_items, bool(agenda_items))
@@ -540,6 +542,7 @@ class MeetingSyncOrchestrator:
             meeting_id=stored_meeting.id,
             priority=priority,
             banana=stored_meeting.banana,
+            processing_metadata={"chunk": chunk_audit} if chunk_audit else None,
         )
 
         logger.info("enqueued meeting for processing", meeting_id=stored_meeting.id, priority=priority)

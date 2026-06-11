@@ -1,0 +1,34 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 28,
+  "item_count": 4,
+  "items": [
+    {
+      "number": "1",
+      "title": "Approval of Minutes from the December 1, 2025, Joint Water Climate Policy Board Meeting (B)",
+      "page_start": 4,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "2026-412 Agenda Item - Water Shortage Update 2026-0615.pdf",
+      "page_start": 8,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "2026-413 Agenda Item - Citywide Outdoor Drinking Water Fountain Initiative 20260615.pdf",
+      "page_start": 16,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "Recommendation: The Joint Water and Climate Policy Board approve the minutes from the December 01, 2025, meeting. D. BUSINESS DISCUSSION ITEMS",
+      "page_start": 27,
+      "attachments": 0
+    }
+  ]
+}

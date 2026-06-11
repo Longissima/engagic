@@ -1,0 +1,436 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 375,
+  "item_count": 71,
+  "items": [
+    {
+      "number": "",
+      "title": "1__Bid Award - Sewer Rehab - Rivershire Subdivision",
+      "page_start": 6,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Bid Award - King Solutions",
+      "page_start": 7,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "2__The Goodman Corporation Amendment",
+      "page_start": 42,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_The Goodman Corporation Amendment",
+      "page_start": 43,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Original Contract",
+      "page_start": 47,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "3__Discuss and consider approval of purchase of two (2) new Pierce Enforcer Pumpers.",
+      "page_start": 51,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Memo for Purchase of two Pierce Enforcer Pumpers",
+      "page_start": 52,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Siddons-Martin Emergency Group LLC proposal with HGAC pricing",
+      "page_start": 55,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "4__Discuss and consider approval of early access agreement with HF Holding Company, LLC",
+      "page_start": 59,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Access Agreement with HF Holdings Company, LLC",
+      "page_start": 60,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Development Agreement between City of Conroe and HF Management Development Company, LLC",
+      "page_start": 68,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "5__Presentation on Flock & ALPR Cameras",
+      "page_start": 141,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "6__Discuss and Consider the Department of Transportation and Mobility Services Update.",
+      "page_start": 142,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "7__Discuss and Consider bid award for OJJERC Playground Equipment.",
+      "page_start": 143,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Vendor Recommendation - OJJERC Playground Equipment",
+      "page_start": 144,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "8__Discuss and Consider Approval of a Purchase Order for Term 2 of Vertosoft for OpenGov Permitting and Procurement Software Modules.",
+      "page_start": 174,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Tabulation",
+      "page_start": 175,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Full Vertosoft Quote",
+      "page_start": 176,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Only Term 2 Vertosoft OpenGov",
+      "page_start": 180,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "9__Discuss and Consider Approval of a Purchase Order for the Renewal and Transition of NetMotion Secure Access to the Cloud-Based SaaS Platform.",
+      "page_start": 181,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Tabulation",
+      "page_start": 182,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Product Overview",
+      "page_start": 183,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Mobile Wireless Quote",
+      "page_start": 186,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_GTS Quote",
+      "page_start": 187,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Absolute Quote",
+      "page_start": 189,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "10__Civil Service Commission Appointment",
+      "page_start": 190,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_CS Resolution Morton",
+      "page_start": 191,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "14__MFSR - April 2026",
+      "page_start": 195,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_MFSR - April 2026",
+      "page_start": 196,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "16__Council Minutes",
+      "page_start": 223,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_04-23-26",
+      "page_start": 224,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_05-13-26",
+      "page_start": 229,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_05-14-26",
+      "page_start": 231,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_05-20-26",
+      "page_start": 235,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "17__Caldwell Country Chevrolet",
+      "page_start": 237,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Caldwell Country Chevrolet",
+      "page_start": 238,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "18__Caldwell Country Chevrolet",
+      "page_start": 248,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Caldwell Country Chevrolet",
+      "page_start": 249,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "19__Comal Payment of Statements",
+      "page_start": 252,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Comal Inv 2350",
+      "page_start": 253,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "20__Comal Payment of Statements",
+      "page_start": 262,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Comal Inv 2351",
+      "page_start": 263,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "21__Comal Payment of Statements",
+      "page_start": 272,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Comal Inv 2352",
+      "page_start": 273,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "22__OJJERC Interior Furniture and Installation",
+      "page_start": 282,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_LandM Invoice",
+      "page_start": 283,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_LM Purchase Order",
+      "page_start": 290,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "23__FY 25-26 Annual Water Fees",
+      "page_start": 291,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_LSGC",
+      "page_start": 292,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "24__PO and Payment for OpenGov Cartegraph Asset Management Software Module.",
+      "page_start": 295,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Tabulation",
+      "page_start": 296,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_2026-2028 Contract",
+      "page_start": 297,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_INV26755",
+      "page_start": 301,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "25__SLI Payment of Statements",
+      "page_start": 303,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_SLI Pay App 5",
+      "page_start": 304,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "26__Statewide Traffic Signal Payment of Statements",
+      "page_start": 315,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Statewide Traffic Signal Payment 5",
+      "page_start": 316,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "27__Stop Loss Insurance Premium",
+      "page_start": 323,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Stop Loss PO 2026",
+      "page_start": 324,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_June invoice",
+      "page_start": 325,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_PO Tabulation sheet",
+      "page_start": 326,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "28__T Construction Payment of Statement",
+      "page_start": 327,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_T Construction Payment 4",
+      "page_start": 328,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "29__Texkota Payment of Statements",
+      "page_start": 338,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Texkota Payment 5",
+      "page_start": 339,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "30__Purchase and Replacement of 16 UKG Timeclock Hardware and Support Due to End-of-Life.",
+      "page_start": 350,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Software the hardware uses",
+      "page_start": 351,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Tabulation",
+      "page_start": 362,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Q-425689 and Contract",
+      "page_start": 363,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "31__Weisinger Incorp.",
+      "page_start": 366,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Weisinger - Payment 11",
+      "page_start": 367,
+      "attachments": 0
+    }
+  ]
+}

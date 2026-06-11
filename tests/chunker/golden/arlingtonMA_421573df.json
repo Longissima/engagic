@@ -1,0 +1,16 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 1,
+  "item_count": 1,
+  "items": [
+    {
+      "number": "",
+      "title": "Town of Arlington, MA Finance Committee",
+      "page_start": 1,
+      "attachments": 0
+    }
+  ]
+}

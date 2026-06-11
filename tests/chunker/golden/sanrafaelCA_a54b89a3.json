@@ -1,0 +1,22 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 87,
+  "item_count": 2,
+  "items": [
+    {
+      "number": "",
+      "title": "BPAC Agenda Packet 20260610.pdf",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "San Rafael CBPP Public Draft (1)-compressed.pdf",
+      "page_start": 12,
+      "attachments": 0
+    }
+  ]
+}

@@ -1,0 +1,406 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 301,
+  "item_count": 66,
+  "items": [
+    {
+      "number": "2.a",
+      "title": "Minutes for the Month of April and May",
+      "page_start": 4,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A",
+      "page_start": 5,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit B",
+      "page_start": 18,
+      "attachments": 0
+    },
+    {
+      "number": "2.b",
+      "title": "Executive Session pursuant to Section 551.071",
+      "page_start": 35,
+      "attachments": 0
+    },
+    {
+      "number": "3.a",
+      "title": "Minutes for the Month of April",
+      "page_start": 36,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A",
+      "page_start": 37,
+      "attachments": 0
+    },
+    {
+      "number": "3.b",
+      "title": "Minutes for the Month of April",
+      "page_start": 39,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit B",
+      "page_start": 40,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A",
+      "page_start": 42,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit C",
+      "page_start": 55,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit D",
+      "page_start": 57,
+      "attachments": 0
+    },
+    {
+      "number": "4.a",
+      "title": "Present a proclamation recognizing the Friends of the Library's 75th Anniversary.",
+      "page_start": 74,
+      "attachments": 0
+    },
+    {
+      "number": "5.a",
+      "title": "First Public Hearing: Limited Purpose Annexation of Approximately 356.99 Acres",
+      "page_start": 75,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Strategic Partnership Agreement",
+      "page_start": 76,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Second Amendment to Development Agreement",
+      "page_start": 99,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Vicinity Map",
+      "page_start": 133,
+      "attachments": 0
+    },
+    {
+      "number": "5.b",
+      "title": "Second Public Hearing: Limited Purpose Annexation of Approximately 356.99 Acres",
+      "page_start": 134,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Strategic Partnership Agreement",
+      "page_start": 135,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Second Amendment to Development Agreement",
+      "page_start": 158,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Vicinity Map",
+      "page_start": 192,
+      "attachments": 0
+    },
+    {
+      "number": "6.a",
+      "title": "Voluntary annexation of approximately 0.998 acres",
+      "page_start": 193,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Resolution to Grant Annexation",
+      "page_start": 194,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A Annexation Petition",
+      "page_start": 195,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit B Metes and Bounds Description",
+      "page_start": 198,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit C Vicinity Map",
+      "page_start": 200,
+      "attachments": 0
+    },
+    {
+      "number": "7.a",
+      "title": "Receive the City of Baytown Single Audit for the fiscal year ending September 30, 2025",
+      "page_start": 201,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_FY25 Single Audit Report",
+      "page_start": 202,
+      "attachments": 0
+    },
+    {
+      "number": "8.a",
+      "title": "Approving Amendment No. 19 to the Interlocal Agreement with Harris County for Public Transportation Services",
+      "page_start": 215,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Ordinance - Interlocal Agreement for Transit",
+      "page_start": 216,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A - 19Am Transit ILA",
+      "page_start": 217,
+      "attachments": 0
+    },
+    {
+      "number": "8.b",
+      "title": "Consider an ordinance Exercising the Second Amendment to Slate Agreement for Graphic Design",
+      "page_start": 225,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Ordinance Authorizing 2nd Amendment to PSA with Slate Communications",
+      "page_start": 226,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A--Signed Slate Amendment",
+      "page_start": 227,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Code Ver",
+      "page_start": 230,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Indebtedness Certification",
+      "page_start": 231,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Aff of Ownership",
+      "page_start": 232,
+      "attachments": 0
+    },
+    {
+      "number": "8.c",
+      "title": "Consider an ordinance awarding the Annual Liquid Chlorine Contract",
+      "page_start": 235,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Ordinance Accepting Bid for Annual Liquid Chlorine Contract for Wastewater Treatment Plants",
+      "page_start": 236,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Brenntag Agreement",
+      "page_start": 238,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Bid Worksheet",
+      "page_start": 247,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Indebtedness Certification",
+      "page_start": 248,
+      "attachments": 0
+    },
+    {
+      "number": "8.d",
+      "title": "Authorizing Grant Application_FY20225AFG-Fire",
+      "page_start": 249,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Resolution Authorizing CM to Submit Application to the FY2025 Assistance to Firefighters Grant Program.vh",
+      "page_start": 251,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_FY25 AFG_Tanker Budget",
+      "page_start": 253,
+      "attachments": 0
+    },
+    {
+      "number": "8.e",
+      "title": "Auth Scoping Study Appl_FY24FMA",
+      "page_start": 254,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Resolution Authorizing CM to Submit Application to the FY2024 Flood Mitigation Assistance FMA.vh",
+      "page_start": 255,
+      "attachments": 0
+    },
+    {
+      "number": "8.f",
+      "title": "Consider an ordinance authorizing a professional services agreement for Construction Phase Services with HDR Engineering Inc., for the Market Street R",
+      "page_start": 257,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Ordinance - HDR-Mkt St",
+      "page_start": 258,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A - Agreement - HDR Engineering, Inc. - Market Street Revitalization Project",
+      "page_start": 259,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Indebtedness Certification",
+      "page_start": 276,
+      "attachments": 0
+    },
+    {
+      "number": "8.g",
+      "title": "Consider a resolution authorizing the submission of an Emerging Contaminants in Small or Disadvantaged Communities (EC-SDC) Grant Application for the",
+      "page_start": 277,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Resolution Draft",
+      "page_start": 278,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A - Texas Water Development Board  - Application Affidavit",
+      "page_start": 283,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit B - Texas Water Development Board  - Application Filing and Authorized Representative Resolution",
+      "page_start": 285,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit C - Texas Water Development Board - Application Resolution Certificate of Secretary",
+      "page_start": 286,
+      "attachments": 0
+    },
+    {
+      "number": "8.h",
+      "title": "Consider an ordinance authorizing a Lease Agreement with Goose Creek Consolidated Independent School District for the Use of Property Located at 2615",
+      "page_start": 287,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Ordinance - Library Lease Agt - GCCISD",
+      "page_start": 288,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A - Lease Agt",
+      "page_start": 289,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Attachment to Lease Agt",
+      "page_start": 293,
+      "attachments": 0
+    },
+    {
+      "number": "8.j",
+      "title": "Consider an ordinance authorizing emergency services to the Central, Northeast, and East District Wastewater Treatment Plants",
+      "page_start": 294,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Ordinance - Magna Flow",
+      "page_start": 295,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Exhibit A - Emergency Invoices FY26 - Magna Flow Environmental Services, Inc.",
+      "page_start": 297,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Indebtedness Certification",
+      "page_start": 298,
+      "attachments": 0
+    },
+    {
+      "number": "9.a",
+      "title": "Confirmation of the City Manager's appointment of an Assistant City Manager",
+      "page_start": 299,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "ATT_Resolution Confirming Appointment of Assistant City Manager",
+      "page_start": 300,
+      "attachments": 0
+    },
+    {
+      "number": "12.a",
+      "title": "Executive session - 551.071",
+      "page_start": 301,
+      "attachments": 0
+    }
+  ]
+}

@@ -231,3 +231,4 @@ prometheus/
 .bun/
 .zcompdump*
 .zsh_history
+tests/chunker/fixtures/

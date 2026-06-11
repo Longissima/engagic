@@ -1,0 +1,34 @@
+{
+  "ladder": "packet",
+  "winning_rung": "v2:toc",
+  "parse_method": "v2_toc",
+  "failure_reason": null,
+  "page_count": 6,
+  "item_count": 4,
+  "items": [
+    {
+      "number": "",
+      "title": "PUBLIC HEARINGS OPENED",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "PUBLIC HEARING ITEMS: LAND USE APPLICATIONS",
+      "page_start": 1,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "III. 1. Notice Virtual Hearing L2600081-SU_D",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "",
+      "title": "III.  Instructions for attending the virtual Public Hearings Officer",
+      "page_start": 6,
+      "attachments": 0
+    }
+  ]
+}

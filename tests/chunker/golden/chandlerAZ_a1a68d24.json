@@ -1,0 +1,9 @@
+{
+  "ladder": "packet",
+  "winning_rung": null,
+  "parse_method": "",
+  "failure_reason": "no_items",
+  "page_count": null,
+  "item_count": 0,
+  "items": []
+}

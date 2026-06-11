@@ -1,0 +1,76 @@
+{
+  "ladder": "agenda",
+  "winning_rung": "v1:url",
+  "parse_method": "url",
+  "failure_reason": null,
+  "page_count": 3,
+  "item_count": 11,
+  "items": [
+    {
+      "number": "1",
+      "title": "In person: You may attend the meeting in person in Council Chambers.",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "Remote attendance on the Zoom Webinar: You may provide oral public comment at the meeting by connecting to the meeting via phone or computer using the ZOOM application at",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "Announcement of Any Alternates Serving in Place of Regular Members",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "Approval of Minutes of May 21, 2026",
+      "page_start": 2,
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "Chair's Report",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "Director's Report Briefings",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "8",
+      "title": "Board membership and recruitment for 2027 Joy Carpine-Cazzanti, Board Administrator, Public Health \u2013 Seattle & King County",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "9",
+      "title": "Innovations in Sexual Health Christopher Archiopoli, Member, King County Board of Health",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "10",
+      "title": "Findings and Recommendations from Washington\u2019s Maternal Mortality Review Panel Report Quiana Daniels, Vice Chair, King County Board of Health",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "11",
+      "title": "Board Member Updates",
+      "page_start": 3,
+      "attachments": 0
+    },
+    {
+      "number": "12",
+      "title": "Other Business",
+      "page_start": 3,
+      "attachments": 0
+    }
+  ]
+}
