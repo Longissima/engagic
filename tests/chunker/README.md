@@ -16,6 +16,7 @@ to monolithic summaries ("fallback" — the chunker's hardest inputs).
 | `test_routing.py` | Same PDF must keep winning the same rung (`v2:toc` etc.) |
 | `test_behavior.py` | Item numbers/titles/pages/attachments match golden + sanity invariants |
 | `test_failures.py` | Zero-items results must carry a classified `failure_reason` |
+| `test_profile.py` | Morphology signal extraction (synthetic PDFs) + corpus invariants |
 
 ## Workflow
 

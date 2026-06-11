@@ -25,6 +25,7 @@ import fitz
 from config import get_logger
 from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf
 from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
+from vendors.adapters.parsers.pdf_profile import PdfProfile, profile_doc
 
 logger = get_logger(__name__)
 
@@ -163,6 +164,7 @@ class ChunkResult:
     attempts: List[Attempt] = field(default_factory=list)
     failure_reason: Optional[str] = None  # set iff no rung won
     ladder: Optional[str] = None  # ladder name when invoked with a named ladder
+    profile: Optional[PdfProfile] = None  # measured morphology signals
 
     @property
     def parse_method(self) -> str:
@@ -172,6 +174,7 @@ class ChunkResult:
         """Compact JSON-safe trail for logs / queue.processing_metadata."""
         return {
             "ladder": self.ladder,
+            "profile": self.profile.to_dict() if self.profile else None,
             "winning_rung": self.winning_rung,
             "parse_method": self.parse_method,
             "item_count": len(self.items),
@@ -198,10 +201,16 @@ def _run_rung(rung: str, pdf_path: str) -> Dict[str, Any]:
     return func(pdf_path, force_method=None if method == "auto" else method)
 
 
-def _classify_empty(pdf_path: str, attempts: List[Attempt]) -> str:
+def _classify_empty(
+    pdf_path: str,
+    attempts: List[Attempt],
+    profile: Optional[PdfProfile] = None,
+) -> str:
     """All rungs came back empty — figure out why."""
     if attempts and all(a.failure_reason == ENGINE_ERROR for a in attempts):
         return ENGINE_ERROR
+    if profile is not None:
+        return NO_ITEMS if profile.has_text_layer else NO_TEXT_LAYER
     try:
         doc = fitz.open(pdf_path)
         sample = min(5, doc.page_count)
@@ -231,6 +240,13 @@ def chunk_pdf(
     try:
         doc = fitz.open(pdf_path)
         needs_pass = doc.needs_pass
+        if not needs_pass:
+            # Measure morphology signals while the doc is open; the profile
+            # rides the audit so prod data records what each PDF *is*.
+            try:
+                result.profile = profile_doc(doc)
+            except Exception as e:
+                logger.debug("pdf profiling failed", error=str(e))
         doc.close()
     except Exception as e:
         result.failure_reason = OPEN_FAILED
@@ -278,7 +294,7 @@ def chunk_pdf(
             result.winning_rung = rung
             return result
 
-    result.failure_reason = _classify_empty(pdf_path, result.attempts)
+    result.failure_reason = _classify_empty(pdf_path, result.attempts, result.profile)
     return result
 
 

@@ -611,8 +611,7 @@ class AsyncBaseAdapter:
                 slug=self.slug,
                 vendor_id=vendor_id,
                 failure_reason=result.failure_reason,
-                ladder=ladder,
-                attempts=result.audit()["attempts"],
+                audit=result.audit(),
             )
 
         return result
