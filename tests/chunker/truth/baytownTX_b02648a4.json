@@ -1,0 +1,92 @@
+{
+  "read_by": "claude, from text dump of pages 1-3, 2026-06-11",
+  "notes": "Over-split case: real items present among 66 extracted, inflated by ATT_/exhibit bookmarks. Titles truncated at ~95 chars from the dump; matcher handles via containment.",
+  "items": [
+    {
+      "number": "2.a",
+      "title": "Consider approving the minutes of the Municipal Development District and City Council Regular J"
+    },
+    {
+      "number": "2.b",
+      "title": "Recess into and conduct an executive session pursuant to Section 551.071 of the Texas Governmen"
+    },
+    {
+      "number": "3.a",
+      "title": "Consider approving the minutes of the City Council Public Forum for ExxonMobil Baytown Event"
+    },
+    {
+      "number": "3.b",
+      "title": "Consider approving the minutes of the City Council Work Sessions and City Council Regular Joint"
+    },
+    {
+      "number": "4.a",
+      "title": "Present a proclamation recognizing the Friends of the Library's 75th Anniversary"
+    },
+    {
+      "number": "5.a",
+      "title": "Conduct the first public hearing regarding the proposed limited purpose annexation through a st"
+    },
+    {
+      "number": "5.b",
+      "title": "Conduct the second public hearing regarding the proposed limited purpose annexation through a s"
+    },
+    {
+      "number": "6.a",
+      "title": "Consider a resolution granting the petition for the proposed annexation of approximately 0.998"
+    },
+    {
+      "number": "7.a",
+      "title": "Receive the City of Baytown Single Audit for the fiscal year ending September 30, 2025"
+    },
+    {
+      "number": "8.a",
+      "title": "Consider an ordinance approving Amendment No. 19 to the Interlocal Agreement with Harris County"
+    },
+    {
+      "number": "8.b",
+      "title": "Consider an ordinance authorizing the Second Amendment to the Slate Agreement for Graphic Desig"
+    },
+    {
+      "number": "8.c",
+      "title": "Consider an ordinance awarding the Annual Liquid Chlorine to Brenntag Southwest LLC"
+    },
+    {
+      "number": "8.d",
+      "title": "Consider a resolution authorizing the City Manager to submit an application to the Fiscal Year"
+    },
+    {
+      "number": "8.e",
+      "title": "Consider a resolution authorizing an application for a scoping study through the Fiscal Year 20"
+    },
+    {
+      "number": "8.f",
+      "title": "Consider an ordinance authorizing a professional services agreement for Construction Phase Serv"
+    },
+    {
+      "number": "8.g",
+      "title": "Consider a resolution authorizing the submission of an Emerging Contaminants in Small or"
+    },
+    {
+      "number": "8.h",
+      "title": "Consider an ordinance authorizing, subject to the District's approval of a Lease Agreement, a L"
+    },
+    {
+      "number": "8.j",
+      "title": "Consider an ordinance ratifying emergency services to the Central, Northeast, and East District"
+    },
+    {
+      "number": "9.a",
+      "title": "Confirmation of the City Manager's appointment of an Assistant City Manager"
+    },
+    {
+      "number": "11.a",
+      "title": "Receive a report from Council Member James Franco regarding projects, programs and events in Di"
+    },
+    {
+      "number": "12.a",
+      "title": "Recess into and conduct an executive session pursuant to Texas Government Code Section 551.071"
+    }
+  ],
+  "expected_recall": 0.95,
+  "expected_precision": 0.36
+}

@@ -1,0 +1,20 @@
+{
+  "read_by": "claude, from PDF pages 1-2, 2026-06-11",
+  "notes": "TRUE under-split. Three public hearings; extraction produced section headers + one attachment label, missing hearings 2 and 3 entirely.",
+  "items": [
+    {
+      "number": "III.1",
+      "title": "Special Use and Development Review for a Special Recreation Use in the R-24 District for Stillwater Springs Wellness (L2600081-SU/D)"
+    },
+    {
+      "number": "III.2",
+      "title": "Preliminary Review for a 16-lot Subdivision, Planned Development Review, and a Property Line Adjustment (L2600049-S/PD/PLA)"
+    },
+    {
+      "number": "III.3",
+      "title": "Appeal of the Director's Approval of Special Use Review for a Preschool in an Existing Religious Institution in the INST District (L2600024-SU APPEAL)"
+    }
+  ],
+  "expected_recall": 0.0,
+  "expected_precision": 0.0
+}

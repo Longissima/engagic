@@ -1,0 +1,12 @@
+{
+  "read_by": "claude, from PDF pages 1-2, 2026-06-11",
+  "notes": "ONE substantive item (budget adoption resolution). Extraction over-split: ATT_ attachment bookmarks promoted to items. Item 1's mangled title still carries the substance. Seg smell said under_split \u2014 wrong direction; its numbered lines came from budget tables past the agenda.",
+  "items": [
+    {
+      "number": "1",
+      "title": "Resolution No. 6012, Adopting the Annual Budget; Setting Forth the Receipts and Expenditures; and the Amounts Proposed to be Raised by Direct Property Taxation for Fiscal Year 2026-27, and Adopting the 2027-2036 Capital Improvement Program (CIP)"
+    }
+  ],
+  "expected_recall": 1.0,
+  "expected_precision": 0.33
+}

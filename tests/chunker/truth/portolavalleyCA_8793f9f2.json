@@ -1,0 +1,16 @@
+{
+  "read_by": "claude, from PDF pages 1-2 + text dump, 2026-06-11",
+  "notes": "Control-ish. Two substantive items; extraction caught 4.a (after title repair from RE: line) and missed item 5, plus emitted a header artifact.",
+  "items": [
+    {
+      "number": "4.a",
+      "title": "Hold interviews and appoint one resident to the Board of Trustees of the San Mateo County Mosquito and Vector Control District"
+    },
+    {
+      "number": "5",
+      "title": "MEET AND GREET with New Sheriff's Office Captain Brandon Hensel"
+    }
+  ],
+  "expected_recall": 0.5,
+  "expected_precision": 0.5
+}

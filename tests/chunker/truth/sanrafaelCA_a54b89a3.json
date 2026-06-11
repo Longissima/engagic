@@ -1,0 +1,32 @@
+{
+  "read_by": "claude, from PDF pages 1-2, 2026-06-11",
+  "notes": "TRUE under-split, worst in corpus: six substantive items -> two garbage-titled document blobs.",
+  "items": [
+    {
+      "number": "1",
+      "title": "Approve special meeting minutes of April 21, 2025"
+    },
+    {
+      "number": "2.a",
+      "title": "Active Transportation Program (ATP) Cycle 8 Complete Streets Checklist - South Merrydale Road Civic Center Connector Pathway Project"
+    },
+    {
+      "number": "2.b",
+      "title": "Active Transportation Program (ATP) Cycle 8 Complete Streets Checklist - Manuel T. Frietas Active Transportation Gap Closure Project"
+    },
+    {
+      "number": "2.c",
+      "title": "Embarcadero Way One-Way Conversion Pilot Project Phase 1 & 2 Preliminary Data and Phase 3 Update"
+    },
+    {
+      "number": "2.d",
+      "title": "Citywide Bicycle and Pedestrian Plan (CBPP) Update: Draft Plan"
+    },
+    {
+      "number": "3",
+      "title": "Staff Liaison Report: Project Updates"
+    }
+  ],
+  "expected_recall": 0.0,
+  "expected_precision": 0.0
+}

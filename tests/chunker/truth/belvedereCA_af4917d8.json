@@ -1,0 +1,44 @@
+{
+  "read_by": "claude, from PDF pages 1-2, 2026-06-11",
+  "notes": "Control for text:auto. PARTIAL truth: items verified from pages 1-2 only (through 5.A); pages 3-4 items omitted, so recall is against the verified subset.",
+  "items": [
+    {
+      "number": "2.C.1",
+      "title": "Conference with Legal Counsel - Anticipated Litigation: Construction Time Limit penalty for project located at 431 Golden Gate Avenue"
+    },
+    {
+      "number": "3.A",
+      "title": "City Council Reports"
+    },
+    {
+      "number": "3.B",
+      "title": "City Manager Report"
+    },
+    {
+      "number": "3.C",
+      "title": "Update on the Marin/Sonoma Mosquito & Vector Board presented by Peter Bonkrude"
+    },
+    {
+      "number": "3.D",
+      "title": "Interviews of the Following Applicants for Appointment to the Following Commissions and Boards"
+    },
+    {
+      "number": "4.A",
+      "title": "Motion to Approve the Warrants for May 2026"
+    },
+    {
+      "number": "4.B",
+      "title": "Motion to Adopt a Resolution Establishing the Gann (Proposition 4) Appropriations Limit for Fiscal Year 2026/2027"
+    },
+    {
+      "number": "4.C",
+      "title": "Motion to Approve the Minutes of the May 11, 2026, Regular City Council Meeting"
+    },
+    {
+      "number": "5.A",
+      "title": "Motion to Approve a Revocable License for Existing Private Improvements in the Public Right-of-Way Along Belvedere Way for the property at 3 Belvedere Way"
+    }
+  ],
+  "expected_recall": 0.88,
+  "expected_precision": 0.25
+}
