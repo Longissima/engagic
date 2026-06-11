@@ -27,11 +27,7 @@ from bs4 import BeautifulSoup
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from vendors.adapters.parsers.granicus_parser import (
     parse_viewpublisher_listing,
-    parse_agendaonline_html,
-    parse_agendaviewer_html,
-    parse_generated_agendaviewer_html,
-    parse_granicus_s3_html,
-    parse_questys_html,
+    parse_granicus_html,
 )
 from pipeline.protocols import MetricsCollector
 
@@ -399,20 +395,10 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                     html = await self._read_text(accessible_response)
                     final_url = accessible_url
 
-            if "AgendaOnline" in final_url or "ViewAgenda" in final_url:
-                parsed = await asyncio.to_thread(parse_agendaonline_html, html, final_url)
-            elif "s3.amazonaws.com" in final_url or "cloudfront.net" in final_url:
-                parsed = await asyncio.to_thread(parse_granicus_s3_html, html)
-            elif "GeneratedAgendaViewer" in final_url:
-                parsed = await asyncio.to_thread(parse_generated_agendaviewer_html, html)
-            elif "questys" in final_url or "MsoNormal" in html[:2000]:
-                # Questys DMS redirect -- Word-exported HTML with mso-* styles
-                parsed = await asyncio.to_thread(parse_questys_html, html, final_url)
-            else:
-                # Legacy format first; fall back to S3 format if no items found
-                parsed = await asyncio.to_thread(parse_agendaviewer_html, html)
-                if not parsed.get("items"):
-                    parsed = await asyncio.to_thread(parse_granicus_s3_html, html)
+            # Dialect dispatch lives in the parser (parse_granicus_html);
+            # the pattern it chose rides the meeting's html audit.
+            parsed = await asyncio.to_thread(parse_granicus_html, html, final_url)
+            html_pattern = parsed.get("html_pattern")
 
             items = parsed.get("items", [])
 
@@ -448,11 +434,13 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 items = _ensure_attachment_portal_urls(items)
                 meeting["items"] = items
                 attachment_count = sum(len(item.get("attachments", [])) for item in items)
+                self._record_html_audit(event_id, html_pattern, items)
                 logger.debug(
                     "parsed meeting with items",
                     vendor="granicus",
                     slug=self.slug,
                     event_id=event_id,
+                    html_pattern=html_pattern,
                     item_count=len(items),
                     attachment_count=attachment_count
                 )

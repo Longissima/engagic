@@ -196,4 +196,7 @@ def parse_civicplus_html(html: str, base_url: str) -> Dict[str, Any]:
         item_count=len(pipeline_items),
     )
 
-    return {'items': pipeline_items}
+    return {
+        'items': pipeline_items,
+        'html_pattern': 'civicplus_flat' if is_flat_layout else 'civicplus_hierarchical',
+    }

@@ -96,6 +96,8 @@ class AsyncBaseAdapter:
         # chunker cascade audits collected during a fetch, keyed by vendor_id;
         # fetch_meetings() stamps them onto the outgoing meeting dicts
         self._chunk_audits: Dict[str, List[Dict[str, Any]]] = {}
+        # html parse audits (which dialect pattern matched), same lifecycle
+        self._html_audits: Dict[str, Dict[str, Any]] = {}
 
         logger.info("initialized async adapter", vendor=vendor, city_slug=city_slug)
 
@@ -627,6 +629,24 @@ class AsyncBaseAdapter:
         if vendor_id:
             self._chunk_audits.setdefault(str(vendor_id), []).append(result.audit())
 
+    def _record_html_audit(
+        self,
+        vendor_id: Optional[str],
+        pattern: Optional[str],
+        items: List[Dict[str, Any]],
+    ) -> None:
+        """Record which HTML dialect pattern parsed this meeting's items.
+        Stamped onto the meeting dict by fetch_meetings(), persisted in
+        queue.processing_metadata — dialect drift becomes queryable."""
+        if vendor_id:
+            self._html_audits[str(vendor_id)] = {
+                "pattern": pattern,
+                "item_count": len(items),
+                "attachment_count": sum(
+                    len(it.get("attachments") or []) for it in items
+                ),
+            }
+
     async def _parse_pdf_bytes(
         self,
         pdf_bytes: bytes,
@@ -889,16 +909,21 @@ class AsyncBaseAdapter:
         """
         try:
             self._chunk_audits = {}
+            self._html_audits = {}
             meetings = await self._fetch_meetings_impl(days_back, days_forward)
             valid = [m for m in meetings if self._validate_meeting(m)]
             if len(valid) < len(meetings):
                 logger.warning("filtered invalid meetings", vendor=self.vendor, slug=self.slug, total=len(meetings), valid=len(valid))
 
-            # Attach chunker cascade audits to their meetings (by vendor_id)
+            # Attach extraction audits to their meetings (by vendor_id)
             for m in valid:
-                runs = self._chunk_audits.get(str(m.get("vendor_id")))
+                vid = str(m.get("vendor_id"))
+                runs = self._chunk_audits.get(vid)
                 if runs:
                     m["chunk_audit"] = summarize_runs(runs)
+                html_audit = self._html_audits.get(vid)
+                if html_audit and "html_audit" not in m:
+                    m["html_audit"] = html_audit
 
             # Resolve SharePoint sharing URLs to direct download URLs
             # across all items in all meetings before returning.

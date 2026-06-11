@@ -1,0 +1,331 @@
+{
+  "fixtures": [
+    {
+      "meeting_id": "lawrenceMA_f07a315c",
+      "banana": "lawrenceMA",
+      "vendor": "civicplus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-18",
+      "url": "https://ma-lawrence.civicplus.com/AgendaCenter/ViewFile/Agenda/_06182026-1869?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "beverlyMA_419a68e6",
+      "banana": "beverlyMA",
+      "vendor": "civicplus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-18",
+      "url": "https://ma-beverly.civicplus.com/AgendaCenter/ViewFile/Agenda/_06182026-2788?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "westfieldMA_783bfe9c",
+      "banana": "westfieldMA",
+      "vendor": "civicplus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-18",
+      "url": "https://ma-westfield.civicplus.com/AgendaCenter/ViewFile/Agenda/_06182026-8546?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "lansdalePA_73b22286",
+      "banana": "lansdalePA",
+      "vendor": "civicplus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-16",
+      "url": "https://pa-lansdaleborough.civicplus.com/AgendaCenter/ViewFile/Agenda/_06162026-2040?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "wichitaKS_b2433ee9",
+      "banana": "wichitaKS",
+      "vendor": "civicplus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-16",
+      "url": "https://ks-wichita.civicplus.com/AgendaCenter/ViewFile/Agenda/_06162026-3202?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "cudahyCA_807baf4c",
+      "banana": "cudahyCA",
+      "vendor": "civicplus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-15",
+      "url": "https://ca-cudahy.civicplus.com/AgendaCenter/ViewFile/Agenda/_06152026-511?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "grantcountyWA_613c4968",
+      "banana": "grantcountyWA",
+      "vendor": "civicplus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-18",
+      "url": "https://www.grantcountywa.gov/AgendaCenter/ViewFile/Agenda/_06182026-584?html=true",
+      "filename": "grantcountyWA_613c4968.html",
+      "final_url": "https://www.grantcountywa.gov/AgendaCenter/ViewFile/Agenda/_06182026-584?html=true",
+      "sha256": "11fa594bf191e6145cba9c0e611fa3eccceee515f0ec92a4bc18a62272bd2eb1",
+      "size": 2072,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "yakimacountyWA_835fe37c",
+      "banana": "yakimacountyWA",
+      "vendor": "civicplus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-18",
+      "url": "https://www.yakimacounty.us/AgendaCenter/ViewFile/Agenda/_06182026-1910?html=true",
+      "filename": "yakimacountyWA_835fe37c.html",
+      "final_url": "https://www.yakimacounty.us/AgendaCenter/ViewFile/Agenda/_06182026-1910?html=true",
+      "sha256": "637f06c1109f9de60c0fceb98fe1c6001bccae0a2b66da04b896c83a96c064b0",
+      "size": 8727,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "schenectadyNY_f9a3f893",
+      "banana": "schenectadyNY",
+      "vendor": "civicplus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-17",
+      "url": "https://ny-schenectady.civicplus.com/AgendaCenter/ViewFile/Agenda/_06172026-1430?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "alhambraCA_858162bf",
+      "banana": "alhambraCA",
+      "vendor": "civicplus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-17",
+      "url": "https://www.alhambraca.gov/AgendaCenter/ViewFile/Agenda/_06172026-1586?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "woodsideCA_25663d25",
+      "banana": "woodsideCA",
+      "vendor": "civicplus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-17",
+      "url": "https://www.woodsidetown.org/AgendaCenter/ViewFile/Agenda/_06172026-666?html=true",
+      "filename": "woodsideCA_25663d25.html",
+      "final_url": "https://www.woodsidetown.org/AgendaCenter/ViewFile/Agenda/_06172026-666?html=true",
+      "sha256": "bcb1aa6e6837e63075a79d3614a315f0a0b9d43a64d0203b7a3b838e6768df91",
+      "size": 8701,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "charlestonSC_8c171fe2",
+      "banana": "charlestonSC",
+      "vendor": "civicplus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-17",
+      "url": "https://sc-charleston2.civicplus.com/AgendaCenter/ViewFile/Agenda/_06172026-10962?html=true",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "martinezCA_98c31413",
+      "banana": "martinezCA",
+      "vendor": "granicus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-17",
+      "url": "https://martinez.granicus.com/AgendaViewer.php?view_id=9&event_id=3180",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "oakleyCA_24173a96",
+      "banana": "oakleyCA",
+      "vendor": "granicus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-16",
+      "url": "https://oakley.granicus.com/AgendaViewer.php?view_id=1&event_id=464",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "fairfaxVA_bf263e2a",
+      "banana": "fairfaxVA",
+      "vendor": "granicus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-16",
+      "url": "https://fairfax.granicus.com/AgendaViewer.php?view_id=13&event_id=3615",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "sandcityCA_54f77285",
+      "banana": "sandcityCA",
+      "vendor": "granicus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-16",
+      "url": "https://sandcity.granicus.com/AgendaViewer.php?view_id=1&event_id=303",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "palmdaleCA_52a90f47",
+      "banana": "palmdaleCA",
+      "vendor": "granicus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-16",
+      "url": "https://palmdale.granicus.com/AgendaViewer.php?view_id=2&event_id=2468",
+      "fetch_status": "http_204"
+    },
+    {
+      "meeting_id": "coralspringsFL_94d900d5",
+      "banana": "coralspringsFL",
+      "vendor": "granicus",
+      "prod_outcome": "fallback",
+      "meeting_date": "2026-06-15",
+      "url": "https://coralsprings.granicus.com/AgendaViewer.php?view_id=1&event_id=2275",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "puntagordaFL_c148284d",
+      "banana": "puntagordaFL",
+      "vendor": "granicus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-19",
+      "url": "https://puntagorda.granicus.com/AgendaViewer.php?view_id=1&event_id=1028",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "topekaKS_a63230b5",
+      "banana": "topekaKS",
+      "vendor": "granicus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-16",
+      "url": "https://topeka.granicus.com/AgendaViewer.php?view_id=1&event_id=292",
+      "filename": "topekaKS_a63230b5.html",
+      "final_url": "https://topeka.granicus.com/AgendaViewer.php?view_id=1&event_id=292",
+      "sha256": "96075776f783fdd68189d7dfa02a8515d5697b6d76b632209342235e2f41e4a1",
+      "size": 218,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "acworthGA_382c6010",
+      "banana": "acworthGA",
+      "vendor": "granicus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-16",
+      "url": "https://acworth-ga.granicus.com/AgendaViewer.php?view_id=1&event_id=428",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "georgetownTX_5f98ce76",
+      "banana": "georgetownTX",
+      "vendor": "granicus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-16",
+      "url": "https://georgetown.granicus.com/AgendaViewer.php?view_id=1&event_id=1382",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "mooresvilleNC_b9539acb",
+      "banana": "mooresvilleNC",
+      "vendor": "granicus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-15",
+      "url": "https://mooresvillenc.granicus.com/AgendaViewer.php?view_id=1&event_id=934",
+      "fetch_status": "pdf_redirect"
+    },
+    {
+      "meeting_id": "marincountyCA_92b036c9",
+      "banana": "marincountyCA",
+      "vendor": "granicus",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-15",
+      "url": "https://marin.granicus.com/AgendaViewer.php?view_id=3&event_id=3604",
+      "filename": "marincountyCA_92b036c9.html",
+      "final_url": "https://marin.granicus.com/GeneratedAgendaViewer.php?view_id=3&event_id=3604",
+      "sha256": "3c8eb943f0a20668e45340fd8be5a62fe74f0bc3edaafd570e4146a0dfff5a78",
+      "size": 13433,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "losangelesCA_670644b8",
+      "banana": "losangelesCA",
+      "vendor": "primegov",
+      "prod_outcome": "fallback",
+      "meeting_date": "2025-12-12",
+      "url": "https://lacity.primegov.com/Portal/Meeting?meetingTemplateId=148073",
+      "filename": "losangelesCA_670644b8.html",
+      "final_url": "https://lacity.primegov.com/Portal/Meeting?meetingTemplateId=148073",
+      "sha256": "67bbd16725ba16b3e9b0e3a39cdf7f7eedc214f37a99f8d96cf5d9e3d9ad0883",
+      "size": 144353,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "willcountyIL_4a24b7e6",
+      "banana": "willcountyIL",
+      "vendor": "primegov",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-17",
+      "url": "https://willcountyil.primegov.com/Portal/Meeting?meetingTemplateId=19896",
+      "filename": "willcountyIL_4a24b7e6.html",
+      "final_url": "https://willcountyil.primegov.com/Portal/Meeting?meetingTemplateId=19896",
+      "sha256": "04f4fcc5bf6f215198b01ad8cbb20b06157f01435c18a73bc60f9ae62dc7d5ed",
+      "size": 380639,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "paloaltoCA_10fcc778",
+      "banana": "paloaltoCA",
+      "vendor": "primegov",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-15",
+      "url": "https://cityofpaloalto.primegov.com/Portal/Meeting?meetingTemplateId=18739",
+      "filename": "paloaltoCA_10fcc778.html",
+      "final_url": "https://cityofpaloalto.primegov.com/Portal/Meeting?meetingTemplateId=18739",
+      "sha256": "a7b7731c3038e1105ae0c09fcf76ce39d70f9edd31f18c65ea43aafbebd18010",
+      "size": 310612,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "renoNV_d990b307",
+      "banana": "renoNV",
+      "vendor": "primegov",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-15",
+      "url": "https://reno.primegov.com/Portal/Meeting?meetingTemplateId=8720",
+      "filename": "renoNV_d990b307.html",
+      "final_url": "https://reno.primegov.com/Portal/Meeting?meetingTemplateId=8720",
+      "sha256": "278c171daec99436aefb71f335f9ea6ac7afb81acd8443edfa3708638d257a38",
+      "size": 117941,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "oklahomacityOK_2148cf3a",
+      "banana": "oklahomacityOK",
+      "vendor": "primegov",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-11",
+      "url": "https://okc.primegov.com/Portal/Meeting?meetingTemplateId=67143",
+      "filename": "oklahomacityOK_2148cf3a.html",
+      "final_url": "https://okc.primegov.com/Portal/Meeting?meetingTemplateId=67143",
+      "sha256": "ebc6d76a0cd77f9b61885ae99928b96bbf35e0341bcd4122983e90ecc04eea99",
+      "size": 1797649,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "edmondsWA_d56861a0",
+      "banana": "edmondsWA",
+      "vendor": "primegov",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-11",
+      "url": "https://edmondswa.primegov.com/Portal/Meeting?meetingTemplateId=944",
+      "filename": "edmondsWA_d56861a0.html",
+      "final_url": "https://edmondswa.primegov.com/Portal/Meeting?meetingTemplateId=944",
+      "sha256": "225d742b3066d8beeea84d3088d0d414f96fc63dd36e747fedbdfb54850b0517",
+      "size": 427502,
+      "fetch_status": "ok"
+    },
+    {
+      "meeting_id": "longbeachCA_69b7a766",
+      "banana": "longbeachCA",
+      "vendor": "primegov",
+      "prod_outcome": "ok",
+      "meeting_date": "2026-06-11",
+      "url": "https://longbeach.primegov.com/Portal/Meeting?meetingTemplateId=35879",
+      "filename": "longbeachCA_69b7a766.html",
+      "final_url": "https://longbeach.primegov.com/Portal/Meeting?meetingTemplateId=35879",
+      "sha256": "ab2ce6fa1d8623c2cb16e9c852cacb935ec326c64b0bdb37af65716f5f289fc3",
+      "size": 1959862,
+      "fetch_status": "ok"
+    }
+  ]
+}

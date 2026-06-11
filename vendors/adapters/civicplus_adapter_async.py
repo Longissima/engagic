@@ -670,12 +670,14 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             items = parsed.get("items", [])
 
             if items:
+                self._record_html_audit(vendor_id, parsed.get("html_pattern"), items)
                 attachment_count = sum(len(item.get("attachments", [])) for item in items)
                 logger.info(
                     "parsed items from html agenda",
                     vendor="civicplus",
                     slug=self.slug,
                     vendor_id=vendor_id,
+                    html_pattern=parsed.get("html_pattern"),
                     item_count=len(items),
                     attachment_count=attachment_count,
                 )

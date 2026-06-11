@@ -132,6 +132,24 @@ bookmark); Chandler and Baytown revealed a previously invisible failure class
 0.89 recall. The next chunker pass has numeric acceptance criteria instead of
 vibes.
 
+### HTML Parser Telemetry + Corpus (the chunker playbook, applied laterally)
+
+The HTML layer had the same disease one level up: per-vendor dialect
+dispatch (PrimeGov's LA/Palo Alto/Boulder patterns, CivicPlus flat vs
+hierarchical, Granicus's SIX formats) decided silently or logged-and-lost.
+Now: every parse tags `html_pattern`; Granicus's URL-sniffing dispatch moved
+from the adapter into `parse_granicus_html()` (one testable entry point,
+conditions verbatim); audits collect on the base adapter keyed by vendor_id
+(same lifecycle as chunk audits) and land in queue.processing_metadata as
+`{"html": {pattern, item_count, attachment_count}}` beside `{"chunk": ...}`.
+Corpus: tests/html/ with 12 fixtures across the three vendors, goldens
+pinning pattern + items. First census finding: 18 of 31 seed rows
+pdf_redirect — most CivicPlus/Granicus fallback cities have NO HTML agenda
+rendering at all, which is structurally why those vendors lean on the PDF
+chunker. Two pattern-matched-but-zero-items fixtures (woodside CA
+hierarchical, topeka KS s3_fallback) are the named HTML-layer failure
+specimens for the next pass.
+
 ### Morphology Classifier, Shadow Mode (vendors/adapters/parsers/morphology.py)
 
 `classify(profile)` maps measured signals to named shapes (linked_agenda,

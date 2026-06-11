@@ -31,7 +31,7 @@ def parse_html_agenda(html: str) -> Dict[str, Any]:
     participation_info = parse_participation_info(page_text)
 
     # Extract agenda items
-    items = _extract_agenda_items(soup)
+    items, html_pattern = _extract_agenda_items(soup)
 
     # Get field names for logging
     participation_fields = list(participation_info.model_dump(exclude_none=True).keys()) if participation_info else []
@@ -48,11 +48,16 @@ def parse_html_agenda(html: str) -> Dict[str, Any]:
     return {
         'participation': participation,
         'items': items,
+        'html_pattern': html_pattern,
     }
 
 
-def _extract_agenda_items(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    """Extract agenda items from HTML (LA, Palo Alto, or Boulder patterns)."""
+def _extract_agenda_items(soup: BeautifulSoup) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Extract agenda items from HTML (LA, Palo Alto, or Boulder patterns).
+
+    Returns (items, html_pattern) — the pattern name rides the extract
+    audit into processing_metadata so dialect drift is queryable in prod.
+    """
     items = []
 
     # Try newer pattern first (LA): meeting-item wrappers
@@ -64,7 +69,7 @@ def _extract_agenda_items(soup: BeautifulSoup) -> List[Dict[str, Any]]:
             item_dict = _extract_la_pattern_item(meeting_item_div, soup, sequence)
             if item_dict:
                 items.append(item_dict)
-        return items
+        return items, "primegov_la"
 
     # Try Palo Alto pattern: direct agenda-item divs
     agenda_items = soup.find_all('div', class_='agenda-item')
@@ -74,7 +79,7 @@ def _extract_agenda_items(soup: BeautifulSoup) -> List[Dict[str, Any]]:
             item_dict = _extract_palo_alto_pattern_item(item_div, soup, sequence)
             if item_dict:
                 items.append(item_dict)
-        return items
+        return items, "primegov_palo_alto"
 
     # Fallback to Boulder pattern: table elements with data-itemid
     table_items = soup.find_all('table', attrs={'data-itemid': True})
@@ -84,8 +89,9 @@ def _extract_agenda_items(soup: BeautifulSoup) -> List[Dict[str, Any]]:
             item_dict = _extract_boulder_pattern_item(table, soup, sequence)
             if item_dict:
                 items.append(item_dict)
+        return items, "primegov_boulder"
 
-    return items
+    return items, None
 
 
 def _extract_la_pattern_item(meeting_item_div, soup: BeautifulSoup, sequence: int) -> Optional[Dict[str, Any]]:

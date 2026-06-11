@@ -1367,3 +1367,32 @@ def parse_questys_html(html: str, base_url: str) -> Dict[str, Any]:
 
 # Alias for backward compatibility
 parse_html_agenda = parse_agendaviewer_html
+
+
+def parse_granicus_html(html: str, final_url: str) -> Dict[str, Any]:
+    """Unified dispatch over Granicus's HTML dialects, keyed by where the
+    AgendaViewer redirect chain landed. Conditions are verbatim from the
+    adapter's former inline dispatch — moving them here gives one testable
+    entry point and tags every parse with its html_pattern.
+    """
+    if "AgendaOnline" in final_url or "ViewAgenda" in final_url:
+        parsed = parse_agendaonline_html(html, final_url)
+        parsed.setdefault("html_pattern", "granicus_agendaonline")
+    elif "s3.amazonaws.com" in final_url or "cloudfront.net" in final_url:
+        parsed = parse_granicus_s3_html(html)
+        parsed.setdefault("html_pattern", "granicus_s3")
+    elif "GeneratedAgendaViewer" in final_url:
+        parsed = parse_generated_agendaviewer_html(html)
+        parsed.setdefault("html_pattern", "granicus_generated")
+    elif "questys" in final_url or "MsoNormal" in html[:2000]:
+        # Questys DMS redirect -- Word-exported HTML with mso-* styles
+        parsed = parse_questys_html(html, final_url)
+        parsed.setdefault("html_pattern", "granicus_questys")
+    else:
+        # Legacy format first; fall back to S3 format if no items found
+        parsed = parse_agendaviewer_html(html)
+        parsed.setdefault("html_pattern", "granicus_agendaviewer")
+        if not parsed.get("items"):
+            parsed = parse_granicus_s3_html(html)
+            parsed["html_pattern"] = "granicus_s3_fallback"
+    return parsed

@@ -1,0 +1,36 @@
+{
+  "html_pattern": "civicplus_flat",
+  "item_count": 6,
+  "items": [
+    {
+      "number": "2",
+      "title": "PUBLIC COMMENT",
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "AGENDA ITEM REVIEW (10 Minutes)",
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "FACILITIES AND LANDFILL MAINTENANCE TASKS AND BILLING (10 Minutes) - Brian Carlson, David Haws, and Blake Erickson",
+      "attachments": 0
+    },
+    {
+      "number": "5",
+      "title": "FACILITIES SERVICES (30 Minutes)",
+      "attachments": 0
+    },
+    {
+      "number": "6",
+      "title": "COMMISSIONER UPDATES/ GENERAL DISCUSSION",
+      "attachments": 0
+    },
+    {
+      "number": "7",
+      "title": "NEW BUSINESS",
+      "attachments": 0
+    }
+  ]
+}

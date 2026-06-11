@@ -272,12 +272,15 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         seen_ids = set()
         merged_items = []
         participation = {}
+        html_patterns = []
 
         for items_data in results:
             if isinstance(items_data, Exception):
                 continue
             if items_data.get("participation") and not participation:
                 participation = items_data["participation"]
+            if items_data.get("html_pattern"):
+                html_patterns.append(items_data["html_pattern"])
             for item in items_data.get("items", []):
                 item_id = item.get("vendor_item_id")
                 if item_id and item_id not in seen_ids:
@@ -286,6 +289,11 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
 
         if merged_items:
             result["items"] = merged_items
+            self._record_html_audit(
+                str(meeting["id"]),
+                "+".join(dict.fromkeys(html_patterns)) or None,
+                merged_items,
+            )
             logger.info(
                 "merged agenda items",
                 slug=self.slug,

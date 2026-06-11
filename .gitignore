@@ -232,3 +232,4 @@ prometheus/
 .zcompdump*
 .zsh_history
 tests/chunker/fixtures/
+tests/html/fixtures/

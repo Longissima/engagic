@@ -1,0 +1,56 @@
+{
+  "html_pattern": "granicus_generated",
+  "item_count": 10,
+  "items": [
+    {
+      "number": "1",
+      "title": "INITIAL TRANSACTIONS",
+      "attachments": 0
+    },
+    {
+      "number": "a",
+      "title": "Call to order and roll call",
+      "attachments": 0
+    },
+    {
+      "number": "b",
+      "title": "Minutes \u2013 May 28, 2026",
+      "attachments": 0
+    },
+    {
+      "number": "c",
+      "title": "Communications",
+      "attachments": 0
+    },
+    {
+      "number": "2",
+      "title": "DIRECTOR\u2019S REPORT",
+      "attachments": 0
+    },
+    {
+      "number": "a",
+      "title": "Preliminary Agenda Discussion Items",
+      "attachments": 0
+    },
+    {
+      "number": "b",
+      "title": "Recent and upcoming Board hearing items",
+      "attachments": 0
+    },
+    {
+      "number": "3",
+      "title": "OPEN TIME FOR PUBLIC EXPRESSION (LIMITED TO THREE MINUTES PER SPEAKER)",
+      "attachments": 0
+    },
+    {
+      "number": "4",
+      "title": "LCP AMENDMENTS",
+      "attachments": 6
+    },
+    {
+      "number": "5",
+      "title": "SOUANG APPEAL OF ENVIRONMENTAL PLANNING DETERMINATION",
+      "attachments": 9
+    }
+  ]
+}
