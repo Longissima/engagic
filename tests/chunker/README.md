@@ -19,6 +19,9 @@ to monolithic summaries ("fallback" — the chunker's hardest inputs).
 | `test_profile.py` | Morphology signal extraction (synthetic PDFs) + corpus invariants |
 | `test_text_chunker.py` | Flat-text extractor guards and item shape |
 | `test_morphology.py` | Classifier rule table + corpus blast-radius pinning |
+| `test_quality.py` | Garbage-title lint, repair strategies, segmentation smell |
+| `test_ground_truth.py` | Extraction vs `truth/*.json` — recall/precision ratchets |
+| `truth/` | Item lists read directly from the PDFs (committed; see `read_by`) |
 
 ## Workflow
 
@@ -37,3 +40,13 @@ take a different branch; that's either the fix you intended or a regression.
 URLs rot (see `pipeline/url_refresh.py` for why). `manifest.json` pins sha256 of
 what the goldens were generated against; if a refetch returns different bytes,
 the goldens may legitimately disagree — treat the city as a new fixture.
+
+## Goldens vs ground truth
+
+Goldens pin *stability* (same PDF → same output), including yesterday's
+mistakes. `truth/*.json` pins *correctness*: item lists read directly from
+the rendered PDF pages (Claude can do this — `read_by` records provenance).
+`expected_recall`/`expected_precision` are ratchets — chunker changes may
+only move them up; when extraction improves, bump the pin and the diff
+documents the win. Grow coverage by reading more fixtures and adding truth
+files; no other tooling needed.

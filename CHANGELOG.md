@@ -98,6 +98,40 @@ whose 36 nav-chrome links the URL path had rightly refused for months);
 Also fixed: `_chunk_agenda_then_packet` used to drop attachment-less agenda
 items entirely; they now survive as a last resort when the packet also fails.
 
+### Quality Layer: Blame the Right Layer (vendors/adapters/parsers/quality.py)
+
+Bad items come from two distinct layers and the audit now distinguishes them.
+*Extraction-layer*: boundaries right, title garbage (TOC bookmark labels,
+attachment filenames, phone-number fragments) — detected by pattern and
+repaired from trustworthy sources only: filename-shaped titles are cleaned in
+place (the filename contains the title: "2026-412 Agenda Item - Water Shortage
+Update 2026-0615.pdf" → "Water Shortage Update"), everything else harvests the
+SUBJECT:/RE: line from the item's own memo page (handling label-on-own-line
+layouts). No generic first-line fallback — that scraped letterhead in testing
+and was killed. *Chunking-layer*: boundaries wrong — cheap smell is divergence
+between the document's numbered heading lines and extracted item count.
+Corpus: 5 of 6 garbage titles repaired correctly, 1 honestly left flagged.
+Known limitation (proven by ground truth, below): the smell counts numbered
+lines across the first 15 pages, so packet attachments with numbered tables
+(fee schedules, budgets) produce false positives — needs agenda-page-bounded
+counting.
+
+### Ground Truth: Reading the PDFs (tests/chunker/truth/)
+
+The only suite layer validating *correctness* rather than stability — golden
+snapshots pin yesterday's output, including yesterday's mistakes. Seven
+fixtures ground-truthed by reading the rendered pages directly (provenance in
+each truth file's `read_by`); recall/precision pinned as ratchets that chunker
+changes may only move up. Findings that rewrote our beliefs: San Rafael BPAC
+(6 substantive items → 2 garbage blobs, recall 0.00) and Washington County OR
+(3 public hearings → section headers, recall 0.00) are confirmed under-splits;
+Monte Sereno's seg-smell flag was a false positive (count correct, title is a
+bookmark); Chandler and Baytown revealed a previously invisible failure class
+— v2:toc promotes ATT_/exhibit attachment bookmarks into items (recall
+0.95-1.00, precision 0.33-0.36); Belvedere validated the text extractor at
+0.89 recall. The next chunker pass has numeric acceptance criteria instead of
+vibes.
+
 ### Morphology Classifier, Shadow Mode (vendors/adapters/parsers/morphology.py)
 
 `classify(profile)` maps measured signals to named shapes (linked_agenda,

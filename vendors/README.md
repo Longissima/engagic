@@ -46,6 +46,7 @@ vendors/
 │       ├── router.py                  # Chunking cascade: ladders, audit, hints
 │       ├── pdf_profile.py             # Morphology signal measurement
 │       ├── morphology.py              # Profile -> named shape classifier
+│       ├── quality.py                 # Title lint/repair, segmentation smell
 │       ├── agenda_chunker.py          # v1 engine: URL + hardcoded-TOC paths
 │       ├── agenda_chunker_v2.py       # v2 engine: anchor-first, relative TOC
 │       └── text_chunker.py            # text engine: numbered-heading splitting
@@ -448,6 +449,16 @@ lines, text layer); `morphology.py` classifies the profile into a named shape
 `flat_text_agenda`, `scanned`, `monolith`) with **all detection thresholds in
 one table**. Classification + agreement-with-winner land in the audit (shadow
 mode = passive confusion matrix in prod).
+
+**Quality signals (`quality.py`), by failure layer:** every winning chunk's
+audit carries `quality: {garbage_titles, repaired_titles, seg_smell}`.
+Garbage-pattern titles (bookmark labels, filenames) are an *extraction-layer*
+problem and get repaired from trustworthy sources only (filename cleaning;
+SUBJECT:/RE: harvest from the item's own page). `seg_smell` flags
+*chunking-layer* problems — extracted count diverging from the document's own
+numbered headings (known false-positive mode: numbered tables in packet
+attachments). Ground truth in `tests/chunker/truth/` is the correctness
+backstop with recall/precision ratchets.
 
 **Routing hints (reorder-only, cascade always intact):**
 1. *Sticky per-city*: last winning rung per (vendor, slug, ladder), seeded at
