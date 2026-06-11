@@ -101,6 +101,24 @@ class Config:
         # Exceeding this marks the queue row failed and the worker moves on.
         self.JOB_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_JOB_TIMEOUT_SECONDS", "1500"))
 
+        # Gemini Batch API lane. Meeting jobs whose date falls outside the
+        # urgent window [now - PAST_DAYS, now + FUTURE_DAYS] go through the
+        # Batch API: 50% token discount AND a separate quota pool from
+        # interactive calls, so bulk processing doesn't compete with fresh
+        # meetings for TPM. The 1-day urgent window exists for one reason:
+        # special meetings only require ~24h posted notice (Brown Act etc.)
+        # and batch's worst-case turnaround is 24h -- those summaries must
+        # not land after the meeting happened. Everything else batches.
+        self.BATCH_API_ENABLED = os.getenv("ENGAGIC_BATCH_API_ENABLED", "true").lower() == "true"
+        self.BATCH_URGENT_PAST_DAYS = int(os.getenv("ENGAGIC_BATCH_URGENT_PAST_DAYS", "0"))
+        self.BATCH_URGENT_FUTURE_DAYS = int(os.getenv("ENGAGIC_BATCH_URGENT_FUTURE_DAYS", "1"))
+        # Batch lane slots are separate from JOB_CONCURRENCY so parked polls
+        # never starve the streaming lane.
+        self.BATCH_JOB_CONCURRENCY = int(os.getenv("ENGAGIC_BATCH_JOB_CONCURRENCY", "3"))
+        # Batch jobs park on Gemini poll loops (30min/chunk worst case,
+        # multi-chunk meetings exist) -- needs its own generous ceiling.
+        self.BATCH_JOB_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_BATCH_JOB_TIMEOUT_SECONDS", "7200"))
+
         # Payment processing
         self.STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
         self.STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")

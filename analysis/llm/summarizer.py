@@ -488,7 +488,11 @@ class GeminiSummarizer:
                         config=types.CreateCachedContentConfig(
                             display_name=f"meeting-{meeting_id}-shared-docs",
                             contents=[types.Content(parts=[types.Part(text=shared_context)])],
-                            ttl="3600s"  # 1 hour TTL (sufficient for batch processing)
+                            # 4h TTL: batch jobs queue + poll for up to 30min
+                            # per chunk and multi-chunk meetings exist; an
+                            # expired cache fails every request referencing it.
+                            # Storage cost at this size is pennies.
+                            ttl="14400s"
                         )
                     )
                     cache_name = cache.name
@@ -840,6 +844,17 @@ class GeminiSummarizer:
             await asyncio.sleep(poll_interval)
             waited_time += poll_interval
 
+        # Don't pay twice: a timed-out job keeps running (and billing)
+        # server-side unless cancelled, while the retry submits a fresh one.
+        try:
+            self.client.batches.cancel(name=batch_name)
+            logger.warning("cancelled timed-out batch job", batch_name=batch_name)
+        except Exception as e:
+            logger.warning(
+                "failed to cancel timed-out batch job",
+                batch_name=batch_name,
+                error=str(e),
+            )
         raise TimeoutError(f"Batch timed out after {max_wait_time}s")
 
     async def _process_batch_chunk(
@@ -901,6 +916,17 @@ class GeminiSummarizer:
                         "maxOutputTokens": 8192,
                         "responseMimeType": "application/json",
                     }
+                    # Same structured-output enforcement as the streaming path
+                    response_schema = self.prompts["item"][prompt_type].get("response_schema")
+                    if response_schema:
+                        generation_config["responseSchema"] = response_schema
+
+                    # Same adaptive thinking tiers as the streaming path
+                    thinking = self._thinking_config_json(
+                        page_count, len(text), self.primary_model
+                    )
+                    if thinking:
+                        generation_config["thinkingConfig"] = thinking
 
                     logger.info(
                         "batch request details",
@@ -950,19 +976,29 @@ class GeminiSummarizer:
                 logger.info("submitting batch job", chunk_num=chunk_num)
                 batch_start_time = time.time()
 
-                batch_job = self.client.batches.create(
-                    model=self.primary_model,
-                    src=uploaded_file.name,
-                    config={"display_name": f"chunk-{chunk_num}-{time.time()}"},
-                )
+                try:
+                    batch_job = self.client.batches.create(
+                        model=self.primary_model,
+                        src=uploaded_file.name,
+                        config={"display_name": f"chunk-{chunk_num}-{time.time()}"},
+                    )
+                except Exception:
+                    # Don't leak the uploaded JSONL into the Files quota
+                    try:
+                        self.client.files.delete(name=uploaded_file.name)
+                    except Exception:
+                        pass
+                    raise
 
                 if not batch_job.name:
                     raise ValueError("Batch job created but no name returned")
 
                 logger.info("submitted batch", batch_name=batch_job.name)
 
-                # Wait for batch completion
-                await self._wait_for_batch_completion(batch_job.name)
+                # Wait for batch completion. 1h per chunk: the batch lane's
+                # job ceiling allows it, and slow Gemini days are exactly when
+                # cancel-and-retry churn wastes the most money.
+                await self._wait_for_batch_completion(batch_job.name, max_wait_time=3600)
 
                 # Download and parse results
                 batch_job = self.client.batches.get(name=batch_job.name)
@@ -1103,6 +1139,22 @@ class GeminiSummarizer:
             result = result.replace("{" + key + "}", str(value))
 
         return result
+
+    def _thinking_config_json(
+        self, page_count: int, text_size: int, model_name: str
+    ) -> Dict[str, Any]:
+        """REST-JSON form of _get_thinking_config's adaptive tiering.
+
+        Batch JSONL requests bypass the SDK config objects, so the same
+        three complexity tiers are mirrored in camelCase. Gemini 3.x takes
+        thinkingLevel, 2.5 takes thinkingBudget -- mixing the two errors.
+        """
+        is_gemini3 = "3." in model_name or "3-" in model_name
+        if page_count <= 10 and text_size <= 30000:
+            return {"thinkingLevel": "MINIMAL"} if is_gemini3 else {"thinkingBudget": 0}
+        if page_count <= 50 and text_size <= 150000:
+            return {"thinkingLevel": "MEDIUM"} if is_gemini3 else {"thinkingBudget": 2048}
+        return {"thinkingLevel": "HIGH"} if is_gemini3 else {"thinkingBudget": -1}
 
     def _get_thinking_config(
         self, page_count: int, text_size: int, model_name: str

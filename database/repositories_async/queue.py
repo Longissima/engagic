@@ -182,8 +182,20 @@ class QueueRepository(BaseRepository):
                 "retry_count": row["retry_count"],
             }
 
+    # Meeting jobs whose date falls outside the urgent window are batch-lane
+    # eligible: nobody is waiting on them minute-to-minute, so they can take
+    # the Gemini Batch API's multi-hour turnaround for the 50% discount.
+    # Matter jobs, undated meetings, and orphaned meeting_ids stay streaming.
+    _BATCH_ELIGIBLE_SQL = """q.job_type = 'meeting' AND m.date IS NOT NULL
+                  AND (m.date < NOW() - make_interval(days => $__PAST__)
+                       OR m.date > NOW() + make_interval(days => $__FUTURE__))"""
+
     async def get_next_for_processing(
-        self, banana: Optional[str] = None
+        self,
+        banana: Optional[str] = None,
+        lane: Optional[str] = None,
+        urgent_past_days: int = 0,
+        urgent_future_days: int = 1,
     ) -> Optional[QueueJob]:
         """Get next typed job from processing queue
 
@@ -192,23 +204,52 @@ class QueueRepository(BaseRepository):
 
         Args:
             banana: Optional city filter
+            lane: None claims any job (legacy behavior). 'streaming' claims
+                jobs needing fresh summaries (urgent-window meetings, matters,
+                undated). 'batch' claims meeting jobs outside the urgent
+                window [now - urgent_past_days, now + urgent_future_days].
+            urgent_past_days / urgent_future_days: urgent window bounds
 
         Returns:
             QueueJob object or None if queue empty
         """
+        conditions = ["q.status = 'pending'"]
+        params: list = []
+        if banana:
+            params.append(banana)
+            conditions.append(f"q.banana = ${len(params)}")
+
+        join = ""
+        if lane:
+            join = "LEFT JOIN meetings m ON q.meeting_id = m.id"
+            params.append(urgent_past_days)
+            past_idx = len(params)
+            params.append(urgent_future_days)
+            future_idx = len(params)
+            eligible = self._BATCH_ELIGIBLE_SQL.replace(
+                "$__PAST__", f"${past_idx}"
+            ).replace("$__FUTURE__", f"${future_idx}")
+            if lane == "batch":
+                conditions.append(f"({eligible})")
+            elif lane == "streaming":
+                conditions.append(f"NOT ({eligible})")
+            else:
+                raise ValueError(f"unknown lane: {lane!r}")
+
         async with self.transaction() as conn:
-            # Atomic SELECT-UPDATE with optional city filter
-            where_clause = "status = 'pending' AND banana = $1" if banana else "status = 'pending'"
-            params = (banana,) if banana else ()
+            # Atomic SELECT-UPDATE; FOR UPDATE OF q so the meetings join
+            # doesn't take row locks on the meetings table
             row = await conn.fetchrow(
                 f"""
-                SELECT id, source_url, meeting_id, banana, job_type, payload,
-                       priority, retry_count, status, created_at, started_at
-                FROM queue
-                WHERE {where_clause}
-                ORDER BY priority DESC, created_at ASC
+                SELECT q.id, q.source_url, q.meeting_id, q.banana, q.job_type,
+                       q.payload, q.priority, q.retry_count, q.status,
+                       q.created_at, q.started_at
+                FROM queue q
+                {join}
+                WHERE {" AND ".join(conditions)}
+                ORDER BY q.priority DESC, q.created_at ASC
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF q SKIP LOCKED
                 """,
                 *params,
             )
@@ -248,6 +289,21 @@ class QueueRepository(BaseRepository):
                 created_at=row.get("created_at").isoformat() if row.get("created_at") else None,
                 started_at=row.get("started_at").isoformat() if row.get("started_at") else None
             )
+
+    async def heartbeat_job(self, queue_id: int) -> None:
+        """Refresh a processing job's claim so the stale sweep doesn't reclaim it.
+
+        Batch-lane jobs legitimately park on Gemini poll loops far past
+        STALE_SWEEP_MINUTES; bumping started_at marks them alive.
+        """
+        await self._execute(
+            """
+            UPDATE queue
+            SET started_at = NOW()
+            WHERE id = $1 AND status = 'processing'
+            """,
+            queue_id,
+        )
 
     async def mark_processing_complete(self, queue_id: int) -> None:
         """Mark job as completed

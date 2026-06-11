@@ -127,6 +127,12 @@ class Processor:
         # this picks them up periodically.
         self._stale_sweep_task: Optional[asyncio.Task] = None
 
+        # Batch API lane: a small worker pool that drains non-urgent meeting
+        # jobs through Gemini's Batch endpoint (50% cost, separate quota).
+        # Separate slots from JOB_CONCURRENCY -- batch jobs park on poll
+        # loops for minutes-to-hours and must never starve the streaming lane.
+        self._batch_lane_task: Optional[asyncio.Task] = None
+
         if analyzer is not None:
             self.analyzer = analyzer
         else:
@@ -186,6 +192,124 @@ class Processor:
                                  error=str(e), error_type=type(e).__name__)
         finally:
             logger.info("stale sweep stopped")
+
+    def _streaming_lane_kwargs(self) -> dict:
+        """Dequeue kwargs for the streaming lane (no-op when batch lane is off)."""
+        if not config.BATCH_API_ENABLED:
+            return {}
+        return {
+            "lane": "streaming",
+            "urgent_past_days": config.BATCH_URGENT_PAST_DAYS,
+            "urgent_future_days": config.BATCH_URGENT_FUTURE_DAYS,
+        }
+
+    def _ensure_batch_lane_running(self) -> None:
+        """Start the Batch API worker lane if enabled and not already running."""
+        if not config.BATCH_API_ENABLED or not self.analyzer:
+            return
+        if self._batch_lane_task is not None and not self._batch_lane_task.done():
+            return
+        self._batch_lane_task = asyncio.create_task(self._batch_lane_loop())
+
+    async def _batch_lane_loop(self) -> None:
+        """Drain non-urgent meeting jobs through the Gemini Batch API.
+
+        Claims meeting jobs whose date falls outside the urgent window and
+        runs them with use_batch=True: 50% token cost, separate quota pool,
+        turnaround measured in minutes-to-hours. Lazy poll cadence -- nothing
+        in this lane is time-sensitive by definition.
+        """
+        logger.info(
+            "batch lane started",
+            concurrency=config.BATCH_JOB_CONCURRENCY,
+            urgent_window_days=(config.BATCH_URGENT_PAST_DAYS, config.BATCH_URGENT_FUTURE_DAYS),
+            timeout_seconds=config.BATCH_JOB_TIMEOUT_SECONDS,
+        )
+        try:
+            while self.is_running:
+                batch = []
+                for _ in range(config.BATCH_JOB_CONCURRENCY):
+                    job = await self.db.queue.get_next_for_processing(
+                        lane="batch",
+                        urgent_past_days=config.BATCH_URGENT_PAST_DAYS,
+                        urgent_future_days=config.BATCH_URGENT_FUTURE_DAYS,
+                    )
+                    if not job:
+                        break
+                    batch.append(job)
+
+                if not batch:
+                    if await self._wait_with_shutdown_check(60):
+                        break
+                    continue
+
+                logger.info("batch lane claimed jobs", count=len(batch))
+                await asyncio.gather(*[self._run_batch_job(j) for j in batch])
+        except asyncio.CancelledError:
+            pass
+        finally:
+            logger.info("batch lane stopped")
+
+    async def _run_batch_job(self, job) -> None:
+        """Run one meeting job through the Batch API path, heartbeating the
+        queue row so the stale sweep doesn't reclaim it mid-poll."""
+        queue_id = job.id
+        job_start = time.time()
+        heartbeat = asyncio.create_task(self._job_heartbeat(queue_id))
+        try:
+            from pipeline.models import MeetingJob
+            if not isinstance(job.payload, MeetingJob):
+                raise ValueError(f"batch lane claimed non-meeting payload: {type(job.payload)}")
+            meeting = await self.db.meetings.get_meeting(job.payload.meeting_id)
+            if not meeting:
+                await self.db.queue.mark_processing_failed(
+                    queue_id, "Meeting not found in database", increment_retry=False
+                )
+                return
+
+            await asyncio.wait_for(
+                self.process_meeting(meeting, use_batch=True),
+                timeout=config.BATCH_JOB_TIMEOUT_SECONDS,
+            )
+            await self.db.queue.mark_processing_complete(queue_id)
+            self.metrics.queue_jobs_processed.labels(job_type="meeting_batch", status="completed").inc()
+            logger.info(
+                "batch lane job completed",
+                meeting_id=job.payload.meeting_id,
+                duration_seconds=round(time.time() - job_start, 1),
+            )
+
+        except asyncio.TimeoutError:
+            await self.db.queue.mark_processing_failed(
+                queue_id, f"Batch job exceeded {config.BATCH_JOB_TIMEOUT_SECONDS}s wall-clock timeout"
+            )
+            self.metrics.queue_jobs_processed.labels(job_type="meeting_batch", status="failed").inc()
+            logger.error("batch lane job timed out", queue_id=queue_id)
+
+        except Exception as e:
+            await self.db.queue.mark_processing_failed(queue_id, str(e))
+            self.metrics.queue_jobs_processed.labels(job_type="meeting_batch", status="failed").inc()
+            self.metrics.record_error(component="processor", error=e)
+            logger.error(
+                "batch lane job failed",
+                queue_id=queue_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+        finally:
+            heartbeat.cancel()
+
+    async def _job_heartbeat(self, queue_id: int, interval: int = 300) -> None:
+        """Keep a long-running job's claim fresh against the stale sweep."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.db.queue.heartbeat_job(queue_id)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                # transient DB hiccup: keep beating, the next tick may succeed
+                logger.warning("job heartbeat failed", queue_id=queue_id, error=str(e))
 
     def _filter_document_versions(self, urls: List[str]) -> List[str]:
         """Keep only latest versions (Ver2 > Ver1, etc.)."""
@@ -275,15 +399,18 @@ class Processor:
         Most job time is network I/O, so overlapping gives significant throughput.
         """
         concurrency = config.JOB_CONCURRENCY
-        logger.info("starting queue processor", concurrency=concurrency)
+        logger.info("starting queue processor", concurrency=concurrency,
+                    batch_lane=config.BATCH_API_ENABLED)
         self._ensure_stale_sweep_running()
+        self._ensure_batch_lane_running()
 
         while self.is_running:
             try:
-                # Claim up to `concurrency` jobs
+                # Claim up to `concurrency` jobs (streaming lane only when the
+                # batch lane is on -- it claims the non-urgent meetings itself)
                 batch = []
                 for _ in range(concurrency):
-                    job = await self.db.queue.get_next_for_processing()
+                    job = await self.db.queue.get_next_for_processing(**self._streaming_lane_kwargs())
                     if not job:
                         break
                     batch.append(job)
@@ -413,10 +540,13 @@ class Processor:
         # Claim and run jobs in batches of JOB_CONCURRENCY
         concurrency = config.JOB_CONCURRENCY
         while True:
-            # Claim up to `concurrency` jobs atomically
+            # Claim up to `concurrency` jobs atomically (streaming lane only;
+            # the global batch lane handles this city's non-urgent meetings)
             batch = []
             for _ in range(concurrency):
-                job = await self.db.queue.get_next_for_processing(banana=city_banana)
+                job = await self.db.queue.get_next_for_processing(
+                    banana=city_banana, **self._streaming_lane_kwargs()
+                )
                 if not job:
                     break
                 batch.append(job)
@@ -660,8 +790,14 @@ class Processor:
         _release_memory_to_os()
         return {"items_processed": len(items), "items_new": filled, "items_skipped": len(items) - filled, "items_failed": 0}
 
-    async def process_meeting(self, meeting: Meeting):
-        """Process summary for a single meeting (items > packet fallback)."""
+    async def process_meeting(self, meeting: Meeting, use_batch: bool = False):
+        """Process summary for a single meeting (items > packet fallback).
+
+        use_batch routes item summarization through the Gemini Batch API
+        (50% cost, separate quota, slow turnaround) instead of concurrent
+        streaming calls. The monolithic packet fallback always streams --
+        it's a single LLM call either way.
+        """
         empty_stats = {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 0}
 
         try:
@@ -677,7 +813,7 @@ class Processor:
                     if not self.analyzer:
                         logger.warning("analyzer not available")
                         return empty_stats
-                    return await self._process_meeting_with_items(meeting, agenda_items)
+                    return await self._process_meeting_with_items(meeting, agenda_items, use_batch=use_batch)
                 else:
                     logger.info("items exist but lack content, falling through to packet", item_count=len(agenda_items), meeting_title=meeting.title)
 
@@ -934,7 +1070,8 @@ class Processor:
         batch_requests: List[Dict],
         item_map: Dict,
         shared_context: Optional[str],
-        meeting_id: str
+        meeting_id: str,
+        use_batch: bool = False,
     ) -> tuple[List[Dict], List[str]]:
         """Process batch requests incrementally, saving after each chunk."""
         processed_items = []
@@ -943,9 +1080,20 @@ class Processor:
         if not batch_requests or not self.analyzer:
             return processed_items, failed_items
 
-        logger.info("submitting batch to Gemini", item_count=len(batch_requests))
+        # Both generators yield chunks of {item_id, success, summary, topics}
+        # in the same shape; only the transport (and the bill) differs.
+        if use_batch:
+            logger.info("submitting items via Batch API", item_count=len(batch_requests))
+            result_gen = self.analyzer.summarizer.summarize_batch(
+                batch_requests, shared_context=shared_context, meeting_id=meeting_id
+            )
+        else:
+            logger.info("submitting batch to Gemini", item_count=len(batch_requests))
+            result_gen = self.analyzer.process_batch_items_async(
+                batch_requests, shared_context=shared_context, meeting_id=meeting_id
+            )
 
-        async for chunk_results in self.analyzer.process_batch_items_async(batch_requests, shared_context=shared_context, meeting_id=meeting_id):
+        async for chunk_results in result_gen:
             logger.debug("saving results from completed chunk", result_count=len(chunk_results))
 
             for result in chunk_results:
@@ -1005,8 +1153,8 @@ class Processor:
         logger.info("aggregated meeting topics", unique_topic_count=len(meeting_topics), item_count=len(processed_items))
         return meeting_topics
 
-    async def _process_meeting_with_items(self, meeting: Meeting, agenda_items: List):
-        """Process meeting at item-level granularity using batch API."""
+    async def _process_meeting_with_items(self, meeting: Meeting, agenda_items: List, use_batch: bool = False):
+        """Process meeting at item-level granularity."""
         start_time = time.time()
 
         if not self.analyzer:
@@ -1057,7 +1205,7 @@ class Processor:
             )
 
             if batch_requests:
-                new_processed, new_failed = await self._process_batch_incrementally(batch_requests, item_map, shared_context, meeting.id)
+                new_processed, new_failed = await self._process_batch_incrementally(batch_requests, item_map, shared_context, meeting.id, use_batch=use_batch)
                 processed_items.extend(new_processed)
                 failed_items.extend(new_failed)
 
@@ -1099,6 +1247,12 @@ class Processor:
 
     async def close(self):
         """Cleanup resources (HTTP sessions, background tasks)"""
+        if self._batch_lane_task is not None and not self._batch_lane_task.done():
+            self._batch_lane_task.cancel()
+            try:
+                await self._batch_lane_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._stale_sweep_task is not None and not self._stale_sweep_task.done():
             self._stale_sweep_task.cancel()
             try:
