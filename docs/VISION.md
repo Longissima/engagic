@@ -91,6 +91,11 @@ Features (to build):
 
 ## Current State (December 2025)
 
+> **Drift note (June 2026):** counts below are stale — 23 adapters now, plus
+> the chunking cascade, extraction telemetry, ground-truth corpora, and the
+> Gemini batch lane. See CHANGELOG 2026-06-11 and vendors/README for current
+> reality.
+
 **What Works:**
 - ✅ 500+ cities, 374+ with item-level processing (58% coverage)
 - ✅ Item-based frontend (navigable, scannable agendas, collapsible items)
@@ -442,6 +447,62 @@ pipeline/processor.py    # Stays stable
 **The Unlock:**
 
 This transforms Engagic from "nice civic tool" to "civic intelligence platform that shows you what's actually happening."
+
+---
+
+## Next Frontiers (June 2026)
+
+Four directions identified after the extraction-telemetry arc (CHANGELOG
+2026-06-11). Each builds on infrastructure that already exists; none are
+scheduled — they're the shelf to pull from when the current layer settles.
+
+### Spatial Layer — proximity-based civic alerts
+
+PostGIS is installed and idle: `jurisdictions.geom`, `census_places`,
+`zipcodes` all exist, and nothing extracts locations from items. Land-use
+items — the highest-stakes civic category — are inherently spatial (hearing
+notices carry literal `Location:` fields and street addresses). The cheap
+unlock: Gemini already reads every item, so adding a `location` field to the
+existing response schema costs **zero extra LLM calls**. Geocode, store as
+geometry, and "new development within 1km of your home" becomes an alert
+type no other civic platform offers. Likely the highest product-value-per-
+effort item on this list.
+
+### Amendment Diffing — the late-addition detector
+
+Agendas get amended (the ground-truth corpus contains a literal "Amended
+Agenda"), and the daily re-sync sees both versions but silently overwrites.
+The diff is accountability gold: an item added inside the 72h/24h notice
+window is the classic move for business someone hopes goes unnoticed.
+Machinery shape already exists (attachment hashes, item-level storage,
+re-sync flow): detect items added/removed between syncs, flag
+`late_addition` inside the notice window, route through the existing alert
+system.
+
+### Aftermath Axis — what actually happened
+
+Agendas are pre-meeting; engagic currently says nothing about outcomes
+except for API-rich vendors' vote records. Minutes (already visible to
+adapters) and Granicus closed captions carry the rest: passed/failed/
+continued, tallies, public comment themes. Parsing minutes for outcomes
+closes the loop from "this is coming" to "this is what they did" for every
+vendor. Same pipeline shape as everything else: fetch → extract → audit →
+summarize. Biggest expansion, most work.
+
+### Self-Running Corpus Growth
+
+The extraction-quality method (query the prod failure pool → pull failing
+documents → add fixtures → ground-truth by reading the rendered pages →
+ratchet recall pins) is a standing loop that an agent can run. A scheduled
+weekly routine harvesting `processing_metadata` audits would grow the
+chunker/HTML corpora and report ratchets ready to bump — the playbook
+becomes a process instead of a session.
+
+**B2B note:** the `tenants` / `tenant_coverage` / `tenant_keywords` tables
+mean the Phase 5/6 commercial layer is half-built in the schema already.
+Spatial alerts and amendment detection are precisely the features policy
+shops, housing orgs, and newsrooms would pay for — they slot into Phase 6's
+intelligence layer rather than competing with it.
 
 ---
 
