@@ -24,8 +24,8 @@ from userland.email.emailer import EmailService
 from userland.scripts.weekly_digest import (
     build_digest_email,
     get_city_name,
+    get_editorial_picks,
     get_upcoming_meetings,
-    find_keyword_matches
 )
 
 
@@ -96,39 +96,57 @@ async def send_test_digest(email: str):
         # Get REAL upcoming meetings (next 10 days)
         upcoming_meetings = await get_upcoming_meetings(db, city_banana, days_ahead=10)
 
-        # Get REAL keyword matches (next 10 days)
-        keywords = ['housing', 'zoning', 'transit', 'development']
-        keyword_matches = await find_keyword_matches(db, city_banana, keywords, days_ahead=10)
+        # Substantive item count across the window (mirrors the real digest)
+        meeting_ids = [m['id'] for m in upcoming_meetings]
+        substantive_count = 0
+        if meeting_ids:
+            async with db.pool.acquire() as conn:
+                substantive_count = await conn.fetchval("""
+                    SELECT COUNT(*) FROM items
+                    WHERE meeting_id = ANY($1) AND filter_reason IS NULL
+                """, meeting_ids) or 0
 
-        # Build digest HTML using actual template function with REAL data
-        html = build_digest_email(
-            user_name="Test User",
-            city_name=city_name,
-            city_banana=city_banana,
-            keyword_matches=keyword_matches,
-            keywords=keywords,
-            upcoming_meetings=upcoming_meetings,
-            app_url=app_url,
-            unsubscribe_token="test-unsubscribe-token"
+        # REAL editorial picks: happening_items -> LLM -> bare titles,
+        # whichever the environment supports
+        editorial_picks = await get_editorial_picks(
+            db, city_banana, city_name, upcoming_meetings
         )
 
-        # Send email
         email_service = EmailService()
-        match_count = len(keyword_matches)
         meeting_count = len(upcoming_meetings)
 
-        subject = f"This week in {city_name}"
-        if match_count > 0:
-            subject += f" - {match_count} keyword match{'es' if match_count != 1 else ''}"
+        def render(keywords: list) -> str:
+            return build_digest_email(
+                city_name=city_name,
+                city_banana=city_banana,
+                keywords=keywords,
+                headline_groups=[],
+                meeting_count=meeting_count,
+                upcoming_meetings=upcoming_meetings,
+                substantive_item_count=substantive_count,
+                app_url=app_url,
+                unsubscribe_token="test-unsubscribe-token",
+                editorial_picks=editorial_picks,
+            )
 
-        result = await email_service.send_email(
+        # Variant A: no keywords -> the editorial digest
+        result_a = await email_service.send_email(
             to_email=email,
-            subject=subject,
-            html_body=html
+            subject=f"[test:editorial] This week in {city_name}",
+            html_body=render([]),
         )
 
-        print(f"   Status: {'Sent' if result else 'Failed'}")
-        print(f"   Real data: {match_count} keyword matches, {meeting_count} upcoming meetings\n")
+        # Variant B: keywords with no hits -> "No items matched" + editorial
+        result_b = await email_service.send_email(
+            to_email=email,
+            subject=f"[test:no-hits] This week in {city_name}",
+            html_body=render(["heliports"]),
+        )
+
+        print(f"   Status: editorial={'Sent' if result_a else 'Failed'}, "
+              f"no-hits={'Sent' if result_b else 'Failed'}")
+        print(f"   Real data: {len(editorial_picks)} editorial picks, "
+              f"{meeting_count} upcoming meetings, {substantive_count} substantive items\n")
     finally:
         await pool.close()
 

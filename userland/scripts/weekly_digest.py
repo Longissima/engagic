@@ -14,12 +14,16 @@ Cron:
 """
 
 import asyncio
+import json
+import math
 import os
 import re
 import sys
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+
+import asyncpg
 
 from google import genai
 from google.genai import types
@@ -364,6 +368,316 @@ def _build_day_summary(meetings: List[Dict[str, Any]]) -> str:
     return ", ".join(f"{count} {day}" for day, count in by_day.items())
 
 
+# ---------------------------------------------------------------------------
+# Editorial picks: the "your city is planning X, Y and Z" lane for digests
+# with no keyword headlines.
+#
+# Selection and wording are deliberately split:
+#   - SELECTION prefers motioncount's extraction facts (dollars, profiles,
+#     stage — read-only from the motioncount Postgres, same cluster) scored
+#     with a digest-lens cousin of spygov's importanceScore. A wrong
+#     extraction can only misrank an item, never misstate a fact.
+#   - WORDING always comes from the item's own engagic summary via one
+#     Flash-Lite call (same discipline as keyword headlines), because
+#     motioncount's precision gates aren't labeled yet and a hallucinated
+#     dollar figure in an inbox is unrecoverable.
+# Fallbacks: no extraction coverage -> LLM picks over all candidates;
+# no LLM -> ranked (or agenda-ordered) bare titles.
+# Computed once per city, shared across that city's keywordless users.
+# ---------------------------------------------------------------------------
+
+EDITORIAL_MAX_PICKS = 4
+EDITORIAL_MAX_CANDIDATES = 40
+MC_SHORTLIST_SIZE = 8       # ranked items handed to the sentence-writer
+MC_MIN_COVERAGE = 3         # fewer extracted items than this = no real signal
+MC_MIN_CONFIDENCE = 0.5     # ignore extraction rows the model itself doubts
+
+# Digest-lens cousin of spygov's importanceScore (matters.ts): money on a
+# log scale so $40M and $700M both surface, profile boosts for what a
+# resident actually feels, and a bump for decision stages — a first reading
+# or adoption this week is exactly when showing up still matters. No
+# recency/contested terms: everything here is 0-10 days out and unvoted.
+MC_PROFILE_WEIGHTS = {
+    "surveillance_tech": 1.2,
+    "housing": 1.0,
+    "development": 0.8,
+    "land_use": 0.7,
+    "budget_fiscal": 0.6,
+    "legal_settlement": 0.6,
+    "bond_finance": 0.5,
+    "infrastructure": 0.5,
+    "procurement": 0.2,
+}
+MC_DECISION_STAGES = {"first_reading", "adoption", "award"}
+
+
+def _mc_dsn() -> Optional[str]:
+    """Read-only DSN for the motioncount extraction store, if provisioned.
+    SPYGOV_MC_DATABASE_URL already exists on the VPS with the spygov_ro
+    role; ENGAGIC_MC_DATABASE_URL allows a digest-specific override."""
+    return (
+        os.getenv("ENGAGIC_MC_DATABASE_URL")
+        or os.getenv("SPYGOV_MC_DATABASE_URL")
+        or os.getenv("MOTIONCOUNT_DATABASE_URL")
+    )
+
+
+def _mc_score(rows: List[Dict[str, Any]]) -> float:
+    """Importance of one item from its extraction rows (one per profile)."""
+    dollars = max((r["dollars"] or 0 for r in rows), default=0)
+    score = math.log10(float(dollars) + 1)
+    score += max(MC_PROFILE_WEIGHTS.get(r["profile"], 0.3) for r in rows)
+    if any(r["stage"] in MC_DECISION_STAGES for r in rows):
+        score += 0.4
+    return score
+
+
+async def _mc_importance(item_ids: List[str]) -> Dict[str, float]:
+    """{item_id: importance} from motioncount extractions; {} when the
+    store is unconfigured, unreachable, or has no rows for these items."""
+    dsn = _mc_dsn()
+    if not dsn or not item_ids:
+        return {}
+    conn = None
+    try:
+        conn = await asyncpg.connect(dsn, timeout=10)
+        rows = await conn.fetch(
+            """
+            SELECT item_id, profile, confidence,
+                   COALESCE((attrs->>'amount')::numeric,
+                            (attrs->>'amount_max')::numeric) AS dollars,
+                   facets->>'stage' AS stage
+            FROM extractions
+            WHERE item_id = ANY($1::text[])
+            """,
+            item_ids,
+        )
+    except Exception as e:
+        logger.warning("motioncount extraction lookup failed", error=str(e))
+        return {}
+    finally:
+        if conn is not None:
+            await conn.close()
+
+    by_item: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        if r["confidence"] is not None and r["confidence"] < MC_MIN_CONFIDENCE:
+            continue
+        by_item.setdefault(r["item_id"], []).append(dict(r))
+    return {item_id: _mc_score(item_rows) for item_id, item_rows in by_item.items()}
+
+
+async def _editorial_candidates(
+    db: Database,
+    meeting_ids: List[str],
+    meetings_by_id: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Substantive items across the week's meetings, agenda order."""
+    if not meeting_ids:
+        return []
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT i.id, i.meeting_id, i.title, i.summary, i.agenda_number, i.matter_file
+            FROM items i
+            WHERE i.meeting_id = ANY($1::text[])
+              AND i.filter_reason IS NULL
+            ORDER BY array_position($1::text[], i.meeting_id), i.sequence
+            LIMIT $2
+        """, meeting_ids, EDITORIAL_MAX_CANDIDATES)
+
+    candidates = []
+    for r in rows:
+        meeting = meetings_by_id.get(r['meeting_id'])
+        if not meeting:
+            continue
+        candidates.append({
+            'item_id': r['id'],
+            'meeting_id': r['meeting_id'],
+            'title': r['title'],
+            'summary': r['summary'] or '',
+            'agenda_number': r['agenda_number'],
+            'matter_file': r['matter_file'],
+            'meeting_title': meeting['title'],
+            'meeting_date': meeting['date'],
+            'banana': meeting['banana'],
+        })
+    return candidates
+
+
+async def _llm_editorial_picks(
+    candidates: List[Dict[str, Any]], city_name: str
+) -> Optional[List[Dict[str, Any]]]:
+    """One Flash-Lite call: the week's most consequential items, one line each."""
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("LLM_API_KEY")
+    summarized = [c for c in candidates if c['summary']]
+    if not api_key or not summarized:
+        return None
+    client = genai.Client(api_key=api_key)
+
+    blocks = []
+    for n, c in enumerate(summarized):
+        day = datetime.fromisoformat(c['meeting_date']).strftime('%A')
+        blocks.append(
+            f"[{n}] ({day}, {c['meeting_title']}) {c['title']}\n"
+            f"{_extract_summary_section(c['summary'])[:600]}"
+        )
+
+    prompt = (
+        f"Agenda items coming before {city_name} city government this week:\n\n"
+        + "\n---\n".join(blocks)
+        + f"\n\nPick the {min(EDITORIAL_MAX_PICKS, len(summarized))} items a typical resident "
+        "would most want to know about: money, land use, housing, public safety, "
+        "utilities, anything hard to reverse. Skip procedural and ceremonial business.\n"
+        "For each pick write ONE sentence stating the most concrete thing being "
+        "decided, with numbers, and the day it happens. Never predict whether it "
+        "will pass. No hedging words like 'may', 'aims to', 'seeks to'. 30 words max."
+    )
+    schema = {
+        "type": "OBJECT",
+        "properties": {
+            "picks": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "index": {"type": "INTEGER", "description": "the candidate's [n]"},
+                        "sentence": {"type": "STRING"},
+                    },
+                    "required": ["index", "sentence"],
+                },
+            }
+        },
+        "required": ["picks"],
+    }
+
+    try:
+        resp = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.5-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=800,
+                response_mime_type="application/json",
+                response_schema=schema,
+            ),
+        )
+        parsed = json.loads(resp.text or "{}")
+    except Exception as e:
+        logger.warning("editorial pick generation failed", city=city_name, error=str(e))
+        return None
+
+    picks = []
+    seen: set = set()
+    for p in parsed.get("picks", []):
+        idx = p.get("index")
+        if not isinstance(idx, int) or not (0 <= idx < len(summarized)) or idx in seen:
+            continue
+        seen.add(idx)
+        sentence = (p.get("sentence") or "").strip().strip('"')
+        pick = dict(summarized[idx])
+        pick["why"] = sentence or None
+        picks.append(pick)
+        if len(picks) >= EDITORIAL_MAX_PICKS:
+            break
+    return picks or None
+
+
+async def get_editorial_picks(
+    db: Database,
+    banana: str,
+    city_name: str,
+    upcoming_meetings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """General-interest headlines for a city's week (may be empty)."""
+    meetings_by_id = {m['id']: m for m in upcoming_meetings}
+    candidates = await _editorial_candidates(
+        db, [m['id'] for m in upcoming_meetings], meetings_by_id
+    )
+    if not candidates:
+        return []
+
+    # Selection: motioncount importance when the week has real extraction
+    # coverage. The ranked shortlist still goes through the sentence-writer
+    # so the words come from engagic's own summaries.
+    scores = await _mc_importance([c['item_id'] for c in candidates])
+    if len(scores) >= MC_MIN_COVERAGE:
+        ranked = sorted(
+            candidates,
+            key=lambda c: scores.get(c['item_id'], -1.0),
+            reverse=True,
+        )
+        shortlist = [c for c in ranked if c['item_id'] in scores][:MC_SHORTLIST_SIZE]
+        llm_picks = await _llm_editorial_picks(shortlist, city_name)
+        if llm_picks:
+            logger.info("editorial picks from motioncount+llm",
+                        city=banana, scored=len(scores), count=len(llm_picks))
+            return llm_picks
+        top = shortlist[:EDITORIAL_MAX_PICKS]
+        logger.info("editorial picks from motioncount ranking",
+                    city=banana, scored=len(scores), count=len(top))
+        return [dict(c, why=None) for c in top]
+
+    # No extraction coverage: LLM picks over all candidates
+    llm_picks = await _llm_editorial_picks(candidates, city_name)
+    if llm_picks:
+        logger.info("editorial picks from llm", city=banana, count=len(llm_picks))
+        return llm_picks
+
+    # Floor: titles only, summary-bearing items first (agenda order otherwise)
+    floor = sorted(candidates, key=lambda c: not c['summary'])[:EDITORIAL_MAX_PICKS]
+    return [dict(c, why=None) for c in floor]
+
+
+def _render_editorial_rows(
+    picks: List[Dict[str, Any]],
+    app_url: str,
+    font: str,
+    indigo: str,
+    gray: str,
+    dark: str,
+) -> str:
+    """Editorial picks in the same visual grammar as keyword headlines:
+    a sentence, then a linked meta line (item · meeting · day)."""
+    html = ""
+    for pick in picks:
+        m_url = _meeting_url(app_url, pick['banana'], pick['meeting_id'], pick['meeting_date'])
+        item_url = f"{m_url}#{generate_anchor_id(pick)}"
+        meta = f"{pick['meeting_title']} &nbsp;&middot;&nbsp; {_format_date(pick['meeting_date'])}"
+
+        if pick.get('why'):
+            why = pick['why'].strip()
+            if not why.endswith('.'):
+                why += '.'
+            html += f"""
+    <tr><td style="padding: 0 0 6px 0;">
+        <p style="margin: 0; font-size: 17px; color: {dark}; font-family: {font}; line-height: 1.55;">
+            {why}
+        </p>
+    </td></tr>
+    <tr><td style="padding: 0 0 20px 0;">
+        <p style="margin: 0; font-size: 14px; color: {gray}; font-family: {font};">
+            <a href="{item_url}" style="color: {indigo}; text-decoration: none; font-weight: 600;">{_truncate_title(pick['title'])}</a>
+            &nbsp;&middot;&nbsp; {meta}
+        </p>
+    </td></tr>
+"""
+        else:
+            html += f"""
+    <tr><td style="padding: 0 0 6px 0;">
+        <p style="margin: 0; font-size: 17px; color: {dark}; font-family: {font}; line-height: 1.55;">
+            <a href="{item_url}" style="color: {dark}; text-decoration: none;">{_truncate_title(pick['title'], 90)}</a>
+        </p>
+    </td></tr>
+    <tr><td style="padding: 0 0 20px 0;">
+        <p style="margin: 0; font-size: 14px; color: {gray}; font-family: {font};">
+            {meta}
+        </p>
+    </td></tr>
+"""
+    return html
+
+
 def build_digest_email(
     city_name: str,
     city_banana: str,
@@ -375,6 +689,7 @@ def build_digest_email(
     app_url: str,
     unsubscribe_token: str,
     is_donor: bool = False,
+    editorial_picks: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Build HTML email for weekly digest. Single font, content-first.
@@ -494,16 +809,41 @@ def build_digest_email(
 """
 
     elif keywords:
+        lead_in = " Meanwhile, on the agenda:" if editorial_picks else ""
         html += f"""
     <tr><td style="padding: 0 0 16px 0;">
         <p style="margin: 0; font-size: 16px; color: {gray}; font-family: {font}; line-height: 1.55;">
-            No items matched your keywords this week.
+            No items matched your keywords this week.{lead_in}
         </p>
     </td></tr>
+"""
+        if editorial_picks:
+            html += _render_editorial_rows(editorial_picks, app_url, font, indigo, gray, dark)
+        html += f"""
     <tr><td style="padding: 0 0 24px 0;">
         <p style="margin: 0; font-size: 14px; color: {gray}; font-family: {font};">
             {meeting_count} meeting{'s' if meeting_count != 1 else ''} scheduled &mdash;
             <a href="{city_url}" style="color: {indigo}; text-decoration: none; font-weight: 600;">browse on engagic.org</a>
+        </p>
+    </td></tr>
+    <tr><td style="padding: 0 0 24px 0;">
+        <div style="border-bottom: 1px solid #e5e7eb;"></div>
+    </td></tr>
+"""
+
+    elif editorial_picks:
+        # No keywords: the editorial digest. What the city is planning,
+        # picked for general interest — same grammar as keyword headlines.
+        html += _render_editorial_rows(editorial_picks, app_url, font, indigo, gray, dark)
+        more_items = max(substantive_item_count - len(editorial_picks), 0)
+        context = f"{meeting_count} meeting{'s' if meeting_count != 1 else ''} this week"
+        if more_items:
+            context += f" &middot; {more_items} more item{'s' if more_items != 1 else ''} on the agendas"
+        html += f"""
+    <tr><td style="padding: 0 0 24px 0;">
+        <p style="margin: 0; font-size: 14px; color: {gray}; font-family: {font};">
+            {context} &mdash;
+            <a href="{city_url}" style="color: {indigo}; text-decoration: none; font-weight: 600;">browse them all</a>
         </p>
     </td></tr>
     <tr><td style="padding: 0 0 24px 0;">
@@ -643,6 +983,19 @@ async def send_weekly_digest():
                     pairs=len(headline_cache),
                     matches=len(all_matches))
 
+            # Editorial picks for everyone whose digest would otherwise be a
+            # bare meeting count (no keywords, or keywords with no hits).
+            # Once per city; only costs an LLM call when happening_items is
+            # empty for the window.
+            editorial_picks: List[Dict[str, Any]] = []
+            if upcoming:
+                try:
+                    editorial_picks = await get_editorial_picks(
+                        db, banana, city_name, upcoming
+                    )
+                except Exception as e:
+                    logger.warning("editorial picks failed", city=banana, error=str(e))
+
             city_data[banana] = {
                 'city_name': city_name,
                 'all_matches': all_matches,
@@ -650,6 +1003,7 @@ async def send_weekly_digest():
                 'meeting_count': len(upcoming),
                 'upcoming_meetings': upcoming,
                 'substantive_item_count': substantive_count,
+                'editorial_picks': editorial_picks,
             }
 
         # Phase 3: Build and send per-user emails
@@ -688,6 +1042,7 @@ async def send_weekly_digest():
                         app_url=app_url,
                         unsubscribe_token=unsubscribe_token,
                         is_donor=user.is_donor,
+                        editorial_picks=data['editorial_picks'],
                     )
 
                     subject = f"This week in {data['city_name']}"

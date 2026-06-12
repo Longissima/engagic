@@ -6,6 +6,40 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-06-11] Editorial Digests: "Your City Is Planning X, Y and Z"
+
+The keywordless weekly digest said "7 meetings coming up: 2 Monday, 1
+Tuesday... comprising 70 substantive agenda items" — a count, not a reason
+to care. It now leads with editorial picks: the 3-4 most consequential
+items on the week's agendas, one concrete sentence each, deep-linked to
+the item anchor. Keyword users with hits keep their personalized
+headlines; keyword users with *no* hits get the editorial picks after
+"No items matched" instead of a dead end.
+
+Picks are computed once per city and shared across its users. Selection
+and wording are split on purpose. SELECTION prefers motioncount's
+extraction facts — read-only against the motioncount Postgres (the
+spygov_ro DSN already on the box; absent/unreachable degrades cleanly) —
+scored with a digest-lens cousin of spygov's importanceScore: log-scale
+dollars, resident-relevant profile boosts (housing, surveillance_tech,
+development...), a bump for decision stages (first_reading/adoption/award
+this week = public input still matters). WORDING always comes from the
+item's own engagic summary via one Flash-Lite call (same no-hedging,
+concrete-numbers discipline as keyword headlines, JSON-schema enforced):
+motioncount's precision gates aren't labeled yet, so extraction facts may
+rank items but never speak in the email — a wrong extraction can only
+misrank, never misstate. Fallbacks: no extraction coverage for the week's
+items → LLM picks over all candidates; no LLM → ranked bare titles.
+(happening_items was the original curated source; it's deprecated and out
+of the cascade.) Worst case cost: one LLM call per subscribed city per
+week.
+
+Also: `test_emails.py`'s digest section had drifted (passed `user_name`/
+`keyword_matches`, parameters that no longer exist — it would have crashed
+on next use); rebuilt to send both new variants with real data.
+
+---
+
 ## [2026-06-11] Wiring the Primitives: Matters for Everyone, Retroactive Reprocessing, Amendment Capture
 
 Seven connections between things that already existed. The week's primitives
