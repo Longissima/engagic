@@ -290,6 +290,27 @@ class QueueRepository(BaseRepository):
                 started_at=row.get("started_at").isoformat() if row.get("started_at") else None
             )
 
+    async def get_chunk_quality(self, meeting_id: str) -> Optional[Dict[str, Any]]:
+        """Latest persisted chunk-audit quality signals for a meeting.
+
+        Lets the processor read extraction-quality verdicts (seg_smell,
+        garbage_titles) at summarization time — e.g. diverting under-split
+        meetings to the monolithic packet path before paying for item
+        summaries of wrong slices.
+        """
+        row = await self._fetchrow(
+            """
+            SELECT processing_metadata->'chunk'->'quality' AS quality
+            FROM queue
+            WHERE meeting_id = $1
+              AND processing_metadata->'chunk'->'quality' IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            meeting_id,
+        )
+        return row["quality"] if row else None
+
     async def heartbeat_job(self, queue_id: int) -> None:
         """Refresh a processing job's claim so the stale sweep doesn't reclaim it.
 

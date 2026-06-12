@@ -4,6 +4,7 @@
   "quality": {
     "garbage_titles": 0,
     "repaired_titles": 0,
+    "matter_files": 0,
     "seg_smell": "over_split"
   },
   "winning_rung": "v2:toc",

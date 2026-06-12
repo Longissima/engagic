@@ -6,6 +6,139 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-06-11] Wiring the Primitives: Matters for Everyone, Retroactive Reprocessing, Amendment Capture
+
+Seven connections between things that already existed. The week's primitives
+(audit exhaust, the half-price batch lane, the corpus method) plus the old
+assets (matters graph, revision-shaped upserts, normalized votes/topics) —
+none of these built new machinery; they wired existing machinery together.
+
+### Matter linkage for chunker vendors (quality.py, router.py)
+
+The quality layer was already *finding* legislative file numbers — and
+deleting them as filename noise. `extract_matter_files()` now captures the
+leading token ("2026-412 Approve...") into `item.matter_file` before title
+repair strips it, conservative by construction (year-shaped prefixes only,
+year+MMDD rejected as dates, bare numerics never link). From there the
+existing meeting_sync machinery does everything: city_matters row, appearance
+tracking, cross-meeting summary copying when attachments are unchanged. The
+matters graph — previously API-vendor-only — extends to all 23 adapters at
+the cost of one captured regex group. Capture counts ride the chunk audit
+(`quality.matter_files`); goldens regenerated (one-line diff per fixture).
+
+### Retroactive reprocessing (migration 022, scripts/resummarize_items.py)
+
+`items.prompts_version` stamps every summary write (meeting chunk saves,
+matter canonical fills, sync-time copies propagate their source's version).
+NULL marks the pre-provenance cohort. `resummarize_items.py --below vN`
+unfreezes matching summaries and re-enqueues their meetings at low priority —
+past-dated meetings drain through the batch lane at half price. Every future
+prompt/schema improvement is now "for all time," not "from now on."
+
+### Amendment capture (migration 023 — zero pipeline code)
+
+The daily re-sync sees every agenda change and silently overwrote it.
+Postgres triggers now record what changed: `meeting_revisions` (title, date,
+agenda_url, packet_url, status — the blind-overwrite fields) and
+`item_revisions` (title, agenda_number, attachment_hash, body_text lengths —
+fires only on unfrozen rows, by construction of the freeze CASEs). The
+`late_additions` view surfaces items that appeared on an already-known agenda
+inside the 72h notice window. The accountability features come later; the
+data they need starts accumulating now.
+
+### Under-split diversion (processor.py, queue.get_chunk_quality)
+
+A meeting whose chunk audit smells under-split (document numbering far
+exceeds extracted items) was about to get N confidently-wrong item
+summaries. The processor now reads the persisted quality verdict at
+summarization time and diverts to the monolithic packet path when one
+exists — items stay stored, only the strategy changes.
+
+### Extraction scorecard + drift watch (monitoring routes)
+
+`GET /api/extraction-scorecard`: per-vendor win rates, failure-reason
+breakdowns, html dialect mix, matter files captured, titles repaired —
+the cross-vendor machine-readability ranking, straight from
+processing_metadata. `GET /api/extraction-drift`: cities whose latest html
+pattern or winning rung differs from the previous sync — vendor-redesign
+detection before silent breakage.
+
+### Member × topic voting profiles (votes route)
+
+`GET /api/council-members/{id}/topic-profile`: votes joined to the canonical
+topic vocabulary through both topic homes (matter_topics + item_topics via
+the matter), per-topic tallies with yes_rate over decided votes. The
+"votes yes on housing 94% of the time" query, one LATERAL join.
+
+### Self-running corpus growth (tests/chunker/grow_truth.py)
+
+The ground-truth method, automated: Gemini reads a fixture's front pages
+into a truth file (same shape, provenance in `read_by`), the chunker is
+scored against the reading, and recall/precision pins are set at measured
+values. With the audit pool as the selection query (README documents the
+loop), extraction-quality coverage grows at the speed of the failure pool.
+Truth files remain a reviewed diff — the reading is a draft of reality.
+
+Deliberately not done: generalizing the sticky-hint store to learned
+per-city proxy/fetch config — premature without failure data showing the
+hardcoded Akamai list misses cities.
+
+---
+
+## [2026-06-11] Audit Follow-up: Collision-Proof Item IDs, Batch Lane Hardening
+
+Post-review fixes for the cascade/batch arc below, ordered by blast radius.
+
+**Item-ID collisions no longer lose items.** `generate_item_id` builds
+`{meeting_id}_{vendor_item_id}`, and the items upsert's ON CONFLICT silently
+merged duplicates — section-scoped numbering (consent and regular business
+both starting at "1.") made this real: 4 of 9 flat-text goldens carry
+duplicate numbers. Two-sided fix: text_chunker stopped emitting
+vendor_item_id (a positional heading number is not a vendor identifier; the
+sequence fallback is the right identity), and `_process_agenda_items` now
+disambiguates any remaining duplicate id deterministically (`_dup2`, `_dup3`
+by agenda order) with a warning — covering v1/v2 chunker and HTML-adapter
+duplicates too.
+
+**The batch lane survives transient errors and never idles slots.** The
+claim-3-then-gather barrier (one slow meeting parked the other two slots)
+became one independent worker per slot, each claiming its next job as soon
+as it finishes the last. Workers contain per-iteration errors with backoff,
+mirroring the streaming loop — previously a single DB hiccup during a claim
+killed the lane task silently and forever. process_queue now re-ensures the
+lane every iteration, so even an unexpected death logs and restarts instead
+of stranding batch-eligible jobs (which streaming, lane-filtered, never
+claims). Batch-enabled-but-no-analyzer warns loudly instead of failing dark.
+
+**Batch requests carry SDK-normalized response schemas.** The prompts file
+holds JSON-schema style types ("object"); the streaming path gets
+"object"→"OBJECT" enum normalization from the SDK for free, but raw batch
+JSONL bypasses the SDK entirely. Schemas now round-trip through
+types.Schema before serialization, so the first real batch run can't 400 on
+an enum case the streaming path never sees.
+
+**Abandoned server-side batch jobs get cancelled.** The poll loop already
+cancelled its Gemini job on its own timeout; now it also cancels on
+CancelledError (the job-level wall-clock timeout, shutdown) before
+re-raising — no more orphaned jobs billing in the background. With
+incremental chunk saves, each retry resumes where the last attempt stopped,
+so the 2h job ceiling only dead-letters meetings needing >6 chunk-hours.
+
+**City timeline ordering aligned with migration 021.** get_meetings_for_city
+now orders `date DESC NULLS LAST` like every other timeline consumer —
+undated meetings sink to the bottom instead of floating above next week's
+agenda, and the query rides the new index's ordered scan. Migration 021 also
+drops the now-redundant `idx_meetings_banana_date` (the NULLS LAST composite
+serves the remaining banana+date-range scan identically), halving index
+maintenance on meetings writes.
+
+Smaller: chunker hint seeding retries next sync after a failed read instead
+of staying cold until restart; title repair isolates failures per item (one
+unreadable page no longer aborts the remaining repairs); the cache-created
+log now reports the TTL it actually sets (4h).
+
+---
+
 ## [2026-06-11] Chunker Cascade Router, Morphology Telemetry, Gemini Batch Lane
 
 The chunker's dispatch went from string-keyed if/elif folklore to declarative,

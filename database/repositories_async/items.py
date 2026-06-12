@@ -388,7 +388,11 @@ class ItemRepository(BaseRepository):
             ]
 
     async def bulk_fill_null_item_summaries(
-        self, item_ids: List[str], summary: str, topics: List[str]
+        self,
+        item_ids: List[str],
+        summary: str,
+        topics: List[str],
+        prompts_version: Optional[str] = None,
     ) -> int:
         """Fill in item summaries for items that do not yet have one.
 
@@ -409,13 +413,14 @@ class ItemRepository(BaseRepository):
             result = await conn.execute(
                 """
                 UPDATE items
-                SET summary = $1, topics = $2
+                SET summary = $1, topics = $2, prompts_version = $4
                 WHERE id = ANY($3::text[])
                   AND summary IS NULL
                 """,
                 summary,
                 topics,
                 item_ids,
+                prompts_version,
             )
 
             updated_count = self._parse_row_count(result)
@@ -465,7 +470,7 @@ class ItemRepository(BaseRepository):
         async with self._ensure_conn(conn) as c:
             row = await c.fetchrow(
                 """
-                SELECT i.summary, i.topics
+                SELECT i.summary, i.topics, i.prompts_version
                 FROM items i
                 JOIN meetings m ON m.id = i.meeting_id
                 JOIN meetings target_m ON target_m.id = $3
@@ -492,15 +497,17 @@ class ItemRepository(BaseRepository):
             prior_summary = row["summary"]
             prior_topics = row["topics"] or []
 
+            # The copy carries its source's provenance — it IS that version's text
             result = await c.execute(
                 """
                 UPDATE items
-                SET summary = $1, topics = $2
+                SET summary = $1, topics = $2, prompts_version = $4
                 WHERE id = $3 AND summary IS NULL
                 """,
                 prior_summary,
                 prior_topics,
                 target_item_id,
+                row["prompts_version"],
             )
 
             if self._parse_row_count(result) == 0:

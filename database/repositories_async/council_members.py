@@ -724,6 +724,53 @@ class CouncilMemberRepository(BaseRepository):
             for row in rows
         ]
 
+    async def get_member_topic_profile(self, council_member_id: str) -> List[Dict]:
+        """Per-topic voting profile for a member.
+
+        Joins votes to the canonical topic vocabulary through both topic
+        homes — matter_topics (canonical) and item_topics via the matter's
+        items — so chunker-vendor matters without canonical summaries still
+        contribute. "Votes yes on housing 94% of the time" is this query.
+        """
+        rows = await self._fetch(
+            """
+            SELECT t.topic, v.vote, COUNT(*) AS cnt
+            FROM votes v
+            JOIN LATERAL (
+                SELECT mt.topic FROM matter_topics mt
+                WHERE mt.matter_id = v.matter_id
+                UNION
+                SELECT it.topic
+                FROM items i
+                JOIN item_topics it ON it.item_id = i.id
+                WHERE i.matter_id = v.matter_id
+            ) t ON TRUE
+            WHERE v.council_member_id = $1
+            GROUP BY t.topic, v.vote
+            ORDER BY t.topic
+            """,
+            council_member_id,
+        )
+
+        profile: Dict[str, Dict] = {}
+        for row in rows:
+            entry = profile.setdefault(row["topic"], {
+                "topic": row["topic"],
+                "yes": 0, "no": 0, "abstain": 0, "absent": 0, "other": 0,
+                "total": 0,
+            })
+            bucket = row["vote"] if row["vote"] in ("yes", "no", "abstain", "absent") else "other"
+            entry[bucket] += row["cnt"]
+            entry["total"] += row["cnt"]
+
+        out = []
+        for entry in profile.values():
+            decided = entry["yes"] + entry["no"]
+            entry["yes_rate"] = round(entry["yes"] / decided, 3) if decided else None
+            out.append(entry)
+        out.sort(key=lambda e: e["total"], reverse=True)
+        return out
+
     async def get_vote_tally_for_matter(
         self,
         matter_id: str,

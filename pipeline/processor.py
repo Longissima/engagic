@@ -132,6 +132,7 @@ class Processor:
         # Separate slots from JOB_CONCURRENCY -- batch jobs park on poll
         # loops for minutes-to-hours and must never starve the streaming lane.
         self._batch_lane_task: Optional[asyncio.Task] = None
+        self._batch_lane_warned = False
 
         if analyzer is not None:
             self.analyzer = analyzer
@@ -204,11 +205,35 @@ class Processor:
         }
 
     def _ensure_batch_lane_running(self) -> None:
-        """Start the Batch API worker lane if enabled and not already running."""
-        if not config.BATCH_API_ENABLED or not self.analyzer:
+        """(Re)start the Batch API worker lane if enabled.
+
+        Called every main-loop iteration: a lane that died on an unexpected
+        error gets logged and restarted instead of leaving batch-eligible
+        jobs pending forever while streaming hums along.
+        """
+        if not config.BATCH_API_ENABLED:
             return
-        if self._batch_lane_task is not None and not self._batch_lane_task.done():
+        if not self.analyzer:
+            # Streaming (lane-filtered) never claims batch-eligible jobs, so
+            # without an analyzer they'd sit pending invisibly. Warn once.
+            if not self._batch_lane_warned:
+                self._batch_lane_warned = True
+                logger.warning(
+                    "batch lane enabled but analyzer unavailable; "
+                    "batch-eligible jobs will not be claimed"
+                )
             return
+        if self._batch_lane_task is not None:
+            if not self._batch_lane_task.done():
+                return
+            if not self._batch_lane_task.cancelled():
+                exc = self._batch_lane_task.exception()
+                if exc is not None:
+                    logger.error(
+                        "batch lane died unexpectedly, restarting",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
         self._batch_lane_task = asyncio.create_task(self._batch_lane_loop())
 
     async def _batch_lane_loop(self) -> None:
@@ -216,8 +241,9 @@ class Processor:
 
         Claims meeting jobs whose date falls outside the urgent window and
         runs them with use_batch=True: 50% token cost, separate quota pool,
-        turnaround measured in minutes-to-hours. Lazy poll cadence -- nothing
-        in this lane is time-sensitive by definition.
+        turnaround measured in minutes-to-hours. One independent worker per
+        slot — each claims its next job as soon as it finishes the last, so
+        one slow meeting never idles the other slots behind a barrier.
         """
         logger.info(
             "batch lane started",
@@ -226,29 +252,49 @@ class Processor:
             timeout_seconds=config.BATCH_JOB_TIMEOUT_SECONDS,
         )
         try:
-            while self.is_running:
-                batch = []
-                for _ in range(config.BATCH_JOB_CONCURRENCY):
-                    job = await self.db.queue.get_next_for_processing(
-                        lane="batch",
-                        urgent_past_days=config.BATCH_URGENT_PAST_DAYS,
-                        urgent_future_days=config.BATCH_URGENT_FUTURE_DAYS,
-                    )
-                    if not job:
-                        break
-                    batch.append(job)
-
-                if not batch:
-                    if await self._wait_with_shutdown_check(60):
-                        break
-                    continue
-
-                logger.info("batch lane claimed jobs", count=len(batch))
-                await asyncio.gather(*[self._run_batch_job(j) for j in batch])
+            await asyncio.gather(
+                *[self._batch_lane_worker(slot)
+                  for slot in range(config.BATCH_JOB_CONCURRENCY)]
+            )
         except asyncio.CancelledError:
             pass
         finally:
             logger.info("batch lane stopped")
+
+    async def _batch_lane_worker(self, slot: int) -> None:
+        """Claim-and-run loop for one batch lane slot.
+
+        Mirrors the streaming loop's per-iteration error containment: a
+        transient claim failure (or an escaped failure-marking error) backs
+        off and continues instead of killing the worker.
+        """
+        while self.is_running:
+            try:
+                job = await self.db.queue.get_next_for_processing(
+                    lane="batch",
+                    urgent_past_days=config.BATCH_URGENT_PAST_DAYS,
+                    urgent_future_days=config.BATCH_URGENT_FUTURE_DAYS,
+                )
+                if not job:
+                    # Lazy poll cadence — nothing in this lane is time-sensitive
+                    if await self._wait_with_shutdown_check(60):
+                        break
+                    continue
+
+                logger.info("batch lane claimed job", slot=slot, queue_id=job.id)
+                await self._run_batch_job(job)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    "batch lane worker error",
+                    slot=slot,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                if await self._wait_with_shutdown_check(QUEUE_FATAL_ERROR_BACKOFF):
+                    break
 
     async def _run_batch_job(self, job) -> None:
         """Run one meeting job through the Batch API path, heartbeating the
@@ -267,6 +313,9 @@ class Processor:
                 )
                 return
 
+            # A timeout here is not lost work: chunks save incrementally, so
+            # each retry (3 before dead-letter) resumes where the last attempt
+            # stopped. Only meetings needing >6 chunk-hours total can DLQ.
             await asyncio.wait_for(
                 self.process_meeting(meeting, use_batch=True),
                 timeout=config.BATCH_JOB_TIMEOUT_SECONDS,
@@ -406,6 +455,8 @@ class Processor:
 
         while self.is_running:
             try:
+                self._ensure_batch_lane_running()
+
                 # Claim up to `concurrency` jobs (streaming lane only when the
                 # batch lane is on -- it claims the non-urgent meetings itself)
                 batch = []
@@ -775,7 +826,10 @@ class Processor:
         # prior matter run) are left untouched.
         item_ids = [item.id for item in items]
         filled = await self.db.items.bulk_fill_null_item_summaries(
-            item_ids=item_ids, summary=summary, topics=topics
+            item_ids=item_ids,
+            summary=summary,
+            topics=topics,
+            prompts_version=self.analyzer.summarizer.prompts_version if self.analyzer else None,
         )
 
         logger.info(
@@ -789,6 +843,23 @@ class Processor:
         # Big matters with many attachments can balloon peak RSS; this returns it promptly.
         _release_memory_to_os()
         return {"items_processed": len(items), "items_new": filled, "items_skipped": len(items) - filled, "items_failed": 0}
+
+    async def _diverts_to_packet(self, meeting: Meeting) -> bool:
+        """True when the chunk audit smells under-split and a packet exists.
+
+        Under-split = the document's own numbered headings far outnumber the
+        extracted items, so the slices are probably wrong merges. One honest
+        monolithic summary beats N confident summaries of wrong slices. Items
+        stay stored (unsummarized); only the summarization strategy diverts.
+        """
+        if not meeting.packet_url:
+            return False
+        try:
+            quality = await self.db.queue.get_chunk_quality(meeting.id)
+        except Exception as e:
+            logger.debug("chunk quality lookup failed", meeting_id=meeting.id, error=str(e))
+            return False
+        return bool(quality) and quality.get("seg_smell") == "under_split"
 
     async def process_meeting(self, meeting: Meeting, use_batch: bool = False):
         """Process summary for a single meeting (items > packet fallback).
@@ -808,7 +879,13 @@ class Processor:
                 # Bare HTML titles without content cannot produce summaries -- fall through
                 # to packet processing instead.
                 has_content = any(item.attachments or item.body_text for item in agenda_items)
-                if has_content:
+                if has_content and await self._diverts_to_packet(meeting):
+                    logger.info(
+                        "chunk audit smells under-split, preferring monolithic packet summary",
+                        item_count=len(agenda_items),
+                        meeting_title=meeting.title,
+                    )
+                elif has_content:
                     logger.info("found items for meeting", item_count=len(agenda_items), meeting_title=meeting.title)
                     if not self.analyzer:
                         logger.warning("analyzer not available")
@@ -1105,7 +1182,12 @@ class Processor:
 
                 if result["success"]:
                     normalized_topics = get_normalizer().normalize(result.get("topics", []))
-                    await self.db.items.update_agenda_item(item_id=item_id, summary=result["summary"], topics=normalized_topics)
+                    await self.db.items.update_agenda_item(
+                        item_id=item_id,
+                        summary=result["summary"],
+                        topics=normalized_topics,
+                        prompts_version=self.analyzer.summarizer.prompts_version,
+                    )
 
                     if item.matter_id:
                         await self._store_canonical_summary(item=item, summary=result["summary"], topics=normalized_topics)

@@ -301,12 +301,31 @@ class MeetingSyncOrchestrator:
         existing_items_map = {item.id: item for item in existing_items}
 
         agenda_items = []
+        seen_item_ids: set[str] = set()
         for idx, item_data in enumerate(items_data):
             # Centralized item ID generation - all adapters return vendor_item_id
             # Use 'or' to handle both missing key AND explicit 0/None from vendors
             sequence = item_data.get("sequence") or (idx + 1)
             vendor_item_id = item_data.get("vendor_item_id")
             item_id = generate_item_id(stored_meeting.id, sequence, vendor_item_id)
+            if item_id in seen_item_ids:
+                # Section-scoped vendor numbering ("1." in consent AND regular
+                # business) duplicates ids, which the items upsert's ON CONFLICT
+                # would collapse into one row. Suffix by agenda order — as
+                # stable as the sequence fallback.
+                base_id = item_id
+                n = 2
+                while item_id in seen_item_ids:
+                    item_id = f"{base_id}_dup{n}"
+                    n += 1
+                logger.warning(
+                    "duplicate item id within meeting, disambiguated",
+                    meeting_id=stored_meeting.id,
+                    vendor_item_id=vendor_item_id,
+                    item_id=item_id,
+                    title=(item_data.get("title") or "")[:80],
+                )
+            seen_item_ids.add(item_id)
 
             item_attachments = deserialize_attachments(item_data.get("attachments"))
             matter_file = item_data.get("matter_file")

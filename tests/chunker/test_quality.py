@@ -53,6 +53,33 @@ class TestSubjectHarvest:
         assert q._title_from_subject_line(text) is None
 
 
+class TestExtractMatterFile:
+    @pytest.mark.parametrize("title,expected", [
+        ("2026-412 Approve Water Shortage Contract", "2026-412"),
+        ("24-0123 Ordinance amending Title 9", "24-0123"),
+        ("2026-412: Approve Water Shortage Contract", "2026-412"),
+        ("2026-1387 Adopt the FY27 Budget", "2026-1387"),  # 13 = invalid month
+        ("2026-0615 City Council Minutes", None),   # year + valid MMDD = date
+        ("03-25 Memo to Council", None),            # date shape, 2-digit suffix
+        ("2026-412", None),                         # no word after the token
+        ("Approve Budget Amendment", None),         # no token
+        ("90210-1234 Annexation Request", None),    # 5-digit prefix
+    ])
+    def test_patterns(self, title, expected):
+        assert q.extract_matter_file(title) == expected
+
+    def test_sets_only_absent_and_counts(self):
+        items = [
+            {"title": "2026-412 Water Contract"},
+            {"title": "2026-413 Sewer Contract", "matter_file": "PRE-SET"},
+            {"title": "Adjournment"},
+        ]
+        assert q.extract_matter_files(items) == 1
+        assert items[0]["matter_file"] == "2026-412"
+        assert items[1]["matter_file"] == "PRE-SET"
+        assert "matter_file" not in items[2]
+
+
 class TestSegmentationSmell:
     @pytest.mark.parametrize("lines,items,smell", [
         (32, 1, "under_split"),    # monteserenoCA shape

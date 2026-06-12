@@ -1,0 +1,12 @@
+-- Which prompts-file version produced each item summary.
+--
+-- The batch lane made historical reprocessing affordable (50% cost,
+-- separate quota), but without provenance a backfill can't target "items
+-- summarized under an older prompt" — it can only nuke everything. This
+-- column makes every future schema/prompt improvement retroactive:
+-- scripts/resummarize_items.py selects below-version rows, unfreezes them,
+-- and re-enqueues their meetings (old dates land in the batch lane).
+--
+-- NULL = summarized before this column existed (pre-2026-06-11), which is
+-- exactly the oldest cohort a backfill wants to target first.
+ALTER TABLE items ADD COLUMN IF NOT EXISTS prompts_version TEXT;

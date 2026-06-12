@@ -233,3 +233,5 @@ prometheus/
 .zsh_history
 tests/chunker/fixtures/
 tests/html/fixtures/
+# scratch PDFs in the repo root (ground-truth sources, research reports)
+/*.pdf

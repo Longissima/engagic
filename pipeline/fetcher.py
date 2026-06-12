@@ -98,20 +98,21 @@ class Fetcher:
     async def _ensure_chunker_hints(self) -> None:
         """Seed the router's sticky per-city rungs from persisted audits.
 
-        Once per Fetcher lifetime; afterwards the registry self-updates
-        in-process as cities chunk, and each win re-persists via the
-        queue audit trail.
+        Once per Fetcher lifetime on success; a failed read retries on the
+        next sync run instead of leaving hints cold until restart. After
+        seeding, the registry self-updates in-process as cities chunk, and
+        each win re-persists via the queue audit trail.
         """
         if self._chunker_hints_seeded:
             return
-        self._chunker_hints_seeded = True
         try:
             rows = await self.db.queue.get_chunker_hints()
             count = seed_city_hints(rows)
+            self._chunker_hints_seeded = True
             if count:
                 logger.info("seeded chunker routing hints", count=count)
         except Exception as e:
-            logger.warning("chunker hint seeding failed", error=str(e))
+            logger.warning("chunker hint seeding failed, will retry next sync", error=str(e))
 
     @property
     def is_running(self) -> bool:

@@ -500,7 +500,7 @@ class GeminiSummarizer:
                         "cache created",
                         cache_name=cache_name,
                         token_count=token_count,
-                        ttl="1h"
+                        ttl="4h"
                     )
                 except (ValueError, TypeError, AttributeError, LLMError) as e:
                     logger.warning(
@@ -817,45 +817,60 @@ class GeminiSummarizer:
         }
 
         waited_time = 0
-        while waited_time < max_wait_time:
-            batch_job = self.client.batches.get(name=batch_name)
+        try:
+            while waited_time < max_wait_time:
+                batch_job = self.client.batches.get(name=batch_name)
 
-            if batch_job.state and batch_job.state.name in completed_states:
-                logger.info(
-                    "batch completed",
-                    batch_name=batch_name,
-                    state=batch_job.state.name
-                )
+                if batch_job.state and batch_job.state.name in completed_states:
+                    logger.info(
+                        "batch completed",
+                        batch_name=batch_name,
+                        state=batch_job.state.name
+                    )
 
-                # Check for success
-                if batch_job.state.name != "JOB_STATE_SUCCEEDED":
-                    raise RuntimeError(f"Batch failed: {batch_job.state.name}")
+                    # Check for success
+                    if batch_job.state.name != "JOB_STATE_SUCCEEDED":
+                        raise RuntimeError(f"Batch failed: {batch_job.state.name}")
 
-                return
+                    return
 
-            state_name = batch_job.state.name if batch_job.state else "unknown"
-            if waited_time % 30 == 0:  # Log every 30s
-                logger.info(
-                    "batch processing",
-                    waited_time_seconds=waited_time,
-                    state=state_name
-                )
+                state_name = batch_job.state.name if batch_job.state else "unknown"
+                if waited_time % 30 == 0:  # Log every 30s
+                    logger.info(
+                        "batch processing",
+                        waited_time_seconds=waited_time,
+                        state=state_name
+                    )
 
-            await asyncio.sleep(poll_interval)
-            waited_time += poll_interval
+                await asyncio.sleep(poll_interval)
+                waited_time += poll_interval
+        except asyncio.CancelledError:
+            # The job-level wait_for timeout or a shutdown cancels us mid-poll;
+            # the server-side job keeps running (and billing) unless cancelled.
+            self._cancel_batch_job(batch_name, reason="poll cancelled")
+            raise
 
         # Don't pay twice: a timed-out job keeps running (and billing)
         # server-side unless cancelled, while the retry submits a fresh one.
+        self._cancel_batch_job(batch_name, reason="poll timeout")
+        raise TimeoutError(f"Batch timed out after {max_wait_time}s")
+
+    def _cancel_batch_job(self, batch_name: str, reason: str) -> None:
+        """Best-effort server-side cancel for an abandoned batch job."""
         try:
             self.client.batches.cancel(name=batch_name)
-            logger.warning("cancelled timed-out batch job", batch_name=batch_name)
+            logger.warning(
+                "cancelled abandoned batch job",
+                batch_name=batch_name,
+                reason=reason,
+            )
         except Exception as e:
             logger.warning(
-                "failed to cancel timed-out batch job",
+                "failed to cancel abandoned batch job",
                 batch_name=batch_name,
+                reason=reason,
                 error=str(e),
             )
-        raise TimeoutError(f"Batch timed out after {max_wait_time}s")
 
     async def _process_batch_chunk(
         self,
@@ -916,10 +931,15 @@ class GeminiSummarizer:
                         "maxOutputTokens": 8192,
                         "responseMimeType": "application/json",
                     }
-                    # Same structured-output enforcement as the streaming path
+                    # Same structured-output enforcement as the streaming path:
+                    # there the SDK normalizes JSON-schema types ("object") into
+                    # REST enums ("OBJECT"); raw JSONL bypasses it, so mirror.
                     response_schema = self.prompts["item"][prompt_type].get("response_schema")
                     if response_schema:
-                        generation_config["responseSchema"] = response_schema
+                        generation_config["responseSchema"] = (
+                            types.Schema.model_validate(response_schema)
+                            .model_dump(mode="json", exclude_none=True)
+                        )
 
                     # Same adaptive thinking tiers as the streaming path
                     thinking = self._thinking_config_json(

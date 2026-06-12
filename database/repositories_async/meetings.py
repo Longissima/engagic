@@ -95,7 +95,11 @@ class MeetingRepository(BaseRepository):
         limit: int = 50,
         offset: int = 0
     ) -> List[Meeting]:
-        """Get meetings for a city, ordered by date descending."""
+        """Get meetings for a city, newest first, undated meetings last.
+
+        NULLS LAST matches idx_meetings_banana_date_nl (migration 021) so
+        the timeline stays an ordered index scan with LIMIT early-exit.
+        """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -105,7 +109,7 @@ class MeetingRepository(BaseRepository):
                     processing_method, processing_time, committee_id
                 FROM meetings
                 WHERE banana = $1
-                ORDER BY date DESC
+                ORDER BY date DESC NULLS LAST
                 LIMIT $2 OFFSET $3
                 """,
                 banana,

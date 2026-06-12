@@ -25,6 +25,8 @@ chunking layer; these are the automatable approximations.
 import re
 from typing import Any, Dict, List, Optional
 
+import fitz
+
 from config import get_logger
 
 logger = get_logger(__name__)
@@ -110,39 +112,104 @@ def repair_titles(items: List[Dict[str, Any]], pdf_path: str) -> int:
     filename-shaped titles are cleaned in place; other garbage harvests
     the SUBJECT:/RE: line from the item's own first page. No acceptable
     candidate -> title kept (the lint keeps flagging it). Repaired items
-    keep the original under metadata.original_title."""
+    keep the original under metadata.original_title.
+
+    Failures are isolated per item: one unreadable page skips that repair,
+    not the rest. A failed document open disables page harvesting but
+    filename repairs (no doc needed) still run."""
     doc = None
+    doc_failed = False
     repaired = 0
+
+    def page_text(page_start: int) -> Optional[str]:
+        """Lazy-open the doc once; None when unopenable or out of range."""
+        nonlocal doc, doc_failed
+        if doc is None and not doc_failed:
+            try:
+                doc = fitz.open(pdf_path)
+            except Exception as e:
+                doc_failed = True
+                logger.debug("title repair: pdf open failed", error=str(e))
+        if doc is None or not (1 <= page_start <= doc.page_count):
+            return None
+        return str(doc[page_start - 1].get_text("text"))
+
     try:
         for idx in garbage_titles(items):
             item = items[idx]
             title = item.get("title") or ""
-            cand = None
-
-            if classify_title(title) == "filename":
-                cand = _title_from_filename(title)
-
-            if cand is None:
-                page_start = (item.get("metadata") or {}).get("page_start")
-                if page_start:
-                    if doc is None:
-                        import fitz
-                        doc = fitz.open(pdf_path)
-                    if 1 <= page_start <= doc.page_count:
-                        cand = _title_from_subject_line(
-                            str(doc[page_start - 1].get_text("text"))
-                        )
-
-            if cand:
-                item.setdefault("metadata", {})["original_title"] = title
-                item["title"] = cand
-                repaired += 1
-    except Exception as e:
-        logger.debug("title repair failed", error=str(e))
+            try:
+                cand = None
+                if classify_title(title) == "filename":
+                    cand = _title_from_filename(title)
+                if cand is None:
+                    page_start = (item.get("metadata") or {}).get("page_start")
+                    text = page_text(page_start) if page_start else None
+                    if text is not None:
+                        cand = _title_from_subject_line(text)
+                if cand:
+                    item.setdefault("metadata", {})["original_title"] = title
+                    item["title"] = cand
+                    repaired += 1
+            except Exception as e:
+                logger.debug(
+                    "title repair failed for item", index=idx, error=str(e)
+                )
     finally:
         if doc is not None:
             doc.close()
     return repaired
+
+
+# --- matter file numbers ------------------------------------------------------
+
+# Leading legislative file tokens ("2026-412 Approve...", "24-0123 Ordinance
+# amending..."). Conservative by design: 4-digit-year or 2-digit-year prefix
+# only, so "03-25" (a date) can never match. \b stops partial captures from
+# longer digit runs.
+_MATTER_FILE_RE = re.compile(r"^\s*((?:19|20)\d{2}-\d{1,6}|\d{2}-\d{3,6})\b")
+
+
+def extract_matter_file(title: Optional[str]) -> Optional[str]:
+    """Leading legislative file number from an item title, or None.
+
+    Chunker engines put whatever the document says into the title, and for
+    many cities that starts with the matter file. Capturing it (separately
+    from title repair, which strips it as noise) lets meeting_sync link the
+    item into the matters graph — the same store_matter / appearance-count /
+    summary-copy machinery API vendors use.
+    """
+    m = _MATTER_FILE_RE.match(title or "")
+    if not m:
+        return None
+    token = m.group(1)
+    # The remainder must carry a real word — bare numerics never link.
+    if not _WORD_RE.search((title or "")[m.end():]):
+        return None
+    # A year + valid-MMDD shape ("2026-0615") is a probable date, not a file.
+    first, _, second = token.partition("-")
+    if len(first) == 4 and len(second) == 4:
+        mm, dd = int(second[:2]), int(second[2:])
+        if 1 <= mm <= 12 and 1 <= dd <= 31:
+            return None
+    return token
+
+
+def extract_matter_files(items: List[Dict[str, Any]]) -> int:
+    """Set item['matter_file'] from leading title tokens where absent.
+
+    Runs before repair_titles — repair strips the very prefix this captures.
+    Returns how many items gained a matter_file (rides the chunk audit).
+    """
+    captured = 0
+    for it in items:
+        if it.get("matter_file"):
+            continue
+        matter_file = extract_matter_file(it.get("title"))
+        if matter_file:
+            it["matter_file"] = matter_file
+            captured += 1
+    return captured
 
 
 # --- chunking-layer: segmentation smell ---------------------------------------

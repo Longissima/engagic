@@ -173,6 +173,26 @@ async def get_member_votes(
     }
 
 
+@router.get("/council-members/{member_id}/topic-profile")
+async def get_member_topic_profile(member_id: str, db: Database = Depends(get_db)):
+    """Per-topic voting profile for a council member.
+
+    Aggregates the member's votes against the canonical topic vocabulary
+    (matter topics plus item topics linked through the matter), with a
+    yes_rate over decided (yes/no) votes per topic.
+    """
+    member = await require_council_member(db, member_id)
+
+    profile = await db.council_members.get_member_topic_profile(member_id)
+
+    return {
+        "success": True,
+        "member": member.to_dict(),
+        "topics": profile,
+        "topic_count": len(profile),
+    }
+
+
 @router.get("/city/{banana}/council-members")
 async def get_city_council(banana: str, db: Database = Depends(get_db)):
     """Get city council roster with vote counts.

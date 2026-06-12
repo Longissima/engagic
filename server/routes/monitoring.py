@@ -711,3 +711,156 @@ async def get_civic_infrastructure_by_city(db: Database = Depends(get_db)):
     except Exception as e:
         logger.error("civic infrastructure endpoint failed", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to fetch civic infrastructure")
+
+
+@router.get("/api/extraction-scorecard")
+async def get_extraction_scorecard(db: Database = Depends(get_db)):
+    """Per-vendor extraction health from the persisted chunk/html audits.
+
+    The cross-vendor machine-readability ranking: which platforms publish
+    structured agendas and which publish blobs. All numbers fall out of
+    queue.processing_metadata — no new instrumentation.
+    """
+    try:
+        async with db.pool.acquire() as conn:
+            vendor_rows = await conn.fetch("""
+                SELECT j.vendor,
+                       COUNT(DISTINCT q.banana) AS cities,
+                       COUNT(*) AS chunk_runs,
+                       COUNT(*) FILTER (
+                           WHERE q.processing_metadata->'chunk'->>'winning_rung' IS NOT NULL
+                       ) AS wins,
+                       SUM(COALESCE((q.processing_metadata->'chunk'->'quality'->>'matter_files')::int, 0))
+                           AS matter_files_captured,
+                       SUM(COALESCE((q.processing_metadata->'chunk'->'quality'->>'repaired_titles')::int, 0))
+                           AS titles_repaired,
+                       COUNT(*) FILTER (
+                           WHERE q.processing_metadata->'chunk'->'quality'->>'seg_smell' = 'under_split'
+                       ) AS under_split
+                FROM queue q
+                JOIN jurisdictions j USING (banana)
+                WHERE q.processing_metadata ? 'chunk'
+                GROUP BY j.vendor
+                ORDER BY chunk_runs DESC
+            """)
+
+            failure_rows = await conn.fetch("""
+                SELECT j.vendor,
+                       q.processing_metadata->'chunk'->>'failure_reason' AS reason,
+                       COUNT(*) AS cnt
+                FROM queue q
+                JOIN jurisdictions j USING (banana)
+                WHERE q.processing_metadata->'chunk'->>'failure_reason' IS NOT NULL
+                GROUP BY j.vendor, reason
+            """)
+
+            html_rows = await conn.fetch("""
+                SELECT j.vendor,
+                       q.processing_metadata->'html'->>'pattern' AS pattern,
+                       COUNT(*) AS cnt
+                FROM queue q
+                JOIN jurisdictions j USING (banana)
+                WHERE q.processing_metadata->'html'->>'pattern' IS NOT NULL
+                GROUP BY j.vendor, pattern
+            """)
+
+        failures: Dict[str, Dict[str, int]] = {}
+        for r in failure_rows:
+            failures.setdefault(r["vendor"], {})[r["reason"]] = r["cnt"]
+        html_patterns: Dict[str, Dict[str, int]] = {}
+        for r in html_rows:
+            html_patterns.setdefault(r["vendor"], {})[r["pattern"]] = r["cnt"]
+
+        vendors = []
+        for r in vendor_rows:
+            runs = r["chunk_runs"] or 0
+            vendors.append({
+                "vendor": r["vendor"],
+                "cities": r["cities"],
+                "chunk_runs": runs,
+                "wins": r["wins"],
+                "win_rate": round(r["wins"] / runs, 3) if runs else None,
+                "failure_reasons": failures.get(r["vendor"], {}),
+                "html_patterns": html_patterns.get(r["vendor"], {}),
+                "matter_files_captured": r["matter_files_captured"],
+                "titles_repaired": r["titles_repaired"],
+                "under_split_meetings": r["under_split"],
+            })
+
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "vendors": vendors,
+        }
+
+    except Exception as e:
+        logger.error("extraction scorecard failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to build extraction scorecard")
+
+
+@router.get("/api/extraction-drift")
+async def get_extraction_drift(db: Database = Depends(get_db)):
+    """Cities whose extraction shape just changed — redesign detection
+    before silent breakage.
+
+    Compares each city's two most recent audits: html dialect pattern, and
+    winning chunk rung per ladder. A smell list, not an alarm — committees
+    within one city can legitimately alternate shapes.
+    """
+    try:
+        async with db.pool.acquire() as conn:
+            html_drift = await conn.fetch("""
+                WITH ranked AS (
+                    SELECT j.vendor, j.slug, q.banana,
+                           q.processing_metadata->'html'->>'pattern' AS pattern,
+                           q.created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY q.banana ORDER BY q.created_at DESC
+                           ) AS rn
+                    FROM queue q
+                    JOIN jurisdictions j USING (banana)
+                    WHERE q.processing_metadata->'html'->>'pattern' IS NOT NULL
+                )
+                SELECT a.vendor, a.slug, a.banana,
+                       b.pattern AS previous, a.pattern AS latest,
+                       a.created_at AS seen_at
+                FROM ranked a
+                JOIN ranked b ON a.banana = b.banana AND b.rn = 2
+                WHERE a.rn = 1 AND a.pattern IS DISTINCT FROM b.pattern
+                ORDER BY a.created_at DESC
+            """)
+
+            rung_drift = await conn.fetch("""
+                WITH ranked AS (
+                    SELECT j.vendor, j.slug, q.banana,
+                           q.processing_metadata->'chunk'->>'winning_ladder' AS ladder,
+                           q.processing_metadata->'chunk'->>'winning_rung' AS rung,
+                           q.created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY q.banana,
+                                            q.processing_metadata->'chunk'->>'winning_ladder'
+                               ORDER BY q.created_at DESC
+                           ) AS rn
+                    FROM queue q
+                    JOIN jurisdictions j USING (banana)
+                    WHERE q.processing_metadata->'chunk'->>'winning_rung' IS NOT NULL
+                )
+                SELECT a.vendor, a.slug, a.banana, a.ladder,
+                       b.rung AS previous, a.rung AS latest,
+                       a.created_at AS seen_at
+                FROM ranked a
+                JOIN ranked b ON a.banana = b.banana AND a.ladder = b.ladder AND b.rn = 2
+                WHERE a.rn = 1 AND a.rung IS DISTINCT FROM b.rung
+                ORDER BY a.created_at DESC
+            """)
+
+        return {
+            "success": True,
+            "timestamp": datetime.now().isoformat(),
+            "html_pattern_drift": [dict(r) for r in html_drift],
+            "winning_rung_drift": [dict(r) for r in rung_drift],
+        }
+
+    except Exception as e:
+        logger.error("extraction drift endpoint failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to compute extraction drift")

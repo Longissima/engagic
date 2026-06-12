@@ -28,6 +28,7 @@ from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
 from vendors.adapters.parsers.morphology import classify
 from vendors.adapters.parsers.pdf_profile import PdfProfile, profile_doc
 from vendors.adapters.parsers.quality import (
+    extract_matter_files,
     garbage_titles,
     repair_titles,
     segmentation_smell,
@@ -334,11 +335,14 @@ def chunk_pdf(
 
             # Quality signals, by failure layer: garbage titles = extraction
             # problem (repairable from the item's own page); count diverging
-            # from the document's own numbering = chunking problem.
+            # from the document's own numbering = chunking problem. Matter
+            # files harvest before repair, which strips the same prefix.
+            matter_files = extract_matter_files(items)
             repaired = repair_titles(items, pdf_path)
             result.quality = {
                 "garbage_titles": len(garbage_titles(items)),  # post-repair
                 "repaired_titles": repaired,
+                "matter_files": matter_files,
                 "seg_smell": segmentation_smell(
                     result.profile.item_number_lines if result.profile else 0,
                     len(items),

@@ -91,8 +91,10 @@ def parse_agenda_pdf_text(
         body = "\n".join(t for _, t in lines[idx + 1 : end_idx]).strip()
         end_page = lines[end_idx - 1][0] if end_idx > idx + 1 else page_idx
 
+        # No vendor_item_id: heading numbers restart per section ("1." in
+        # consent AND regular business), and generate_item_id would collapse
+        # duplicates into one row. The sequence fallback is the real identity.
         item: Dict[str, Any] = {
-            "vendor_item_id": number,
             "title": title,
             "sequence": seq + 1,
             "agenda_number": number,
