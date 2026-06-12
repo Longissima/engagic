@@ -476,11 +476,18 @@ async def _editorial_candidates(
     if not meeting_ids:
         return []
     async with db.pool.acquire() as conn:
+        # Minutes are excluded here, not via filter_reason: approving them is
+        # procedural prospectively (the decisions they recount are closed, so
+        # there is nothing to show up for), but their content is substantive
+        # and belongs to retrospective consumers — search, summaries, and the
+        # aftermath axis. Content-based importance scoring can't make that
+        # distinction: minutes inherit the dollars of everything they recount.
         rows = await conn.fetch("""
             SELECT i.id, i.meeting_id, i.title, i.summary, i.agenda_number, i.matter_file
             FROM items i
             WHERE i.meeting_id = ANY($1::text[])
               AND i.filter_reason IS NULL
+              AND i.title !~* '\\yminutes\\y'
             ORDER BY array_position($1::text[], i.meeting_id), i.sequence
             LIMIT $2
         """, meeting_ids, EDITORIAL_MAX_CANDIDATES)
