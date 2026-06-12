@@ -184,6 +184,26 @@ class MatterRepository(BaseRepository):
 
         logger.debug("updated matter with canonical summary", matter_id=matter_id)
 
+    async def update_attachment_hash(self, matter_id: str, attachment_hash: str) -> None:
+        """Rewrite only metadata.attachment_hash (hash-format upgrades).
+
+        Used when a stored legacy-format hash is confirmed equal to the
+        current-format hash of the same attachments: a semantic no-op that
+        retires the legacy value without touching summary or tracking fields.
+        """
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                UPDATE city_matters
+                SET metadata = COALESCE(metadata, '{}'::jsonb)
+                        || jsonb_build_object('attachment_hash', $2::text),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                matter_id,
+                attachment_hash,
+            )
+
     async def update_matter_tracking(
         self,
         matter_id: str,
