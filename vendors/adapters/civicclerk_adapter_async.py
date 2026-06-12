@@ -415,11 +415,17 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             if blob in seen_blobs:
                 continue
             seen_blobs.add(blob)
-            attachments.append({
+            # Reports carry no per-attachment id, so cc_agenda_id is the only
+            # durable ref we can store. url_refresh renews them by matching
+            # the (stable) blob path within the re-fetched agenda.
+            report_entry = {
                 "name": report.get("agendaObjItemReportName") or "Report",
                 "url": url,
                 "type": "pdf",
-            })
+            }
+            if agenda_id is not None:
+                report_entry["cc_agenda_id"] = int(agenda_id)
+            attachments.append(report_entry)
 
         result = {
             "vendor_item_id": str(item_id),

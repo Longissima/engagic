@@ -6,6 +6,100 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-06-11] Manual Process Runs Drain Both Lanes
+
+`process`, `sync-and-process`, and the watchlist commands only claimed
+streaming-lane jobs; batch-eligible meetings (outside the urgent window)
+sat pending forever because the global batch lane only exists inside the
+`processor`/`daemon` services — which are disabled in favor of manual
+sessions. A manual run looked complete while silently leaving the
+non-urgent majority unprocessed.
+
+`process_cities` now spawns a batch drain alongside the streaming city
+workers: BATCH_JOB_CONCURRENCY slots claim batch-lane jobs scoped to the
+run's bananas (new `bananas` ANY-filter on get_next_for_processing) and
+exit when the lane is dry, so the command returns only after both lanes'
+summaries have landed. Failed jobs requeue as immediately-claimable
+pending rows, so the worker that failed one reclaims it on its next
+iteration until it completes or dead-letters — an empty claim genuinely
+means dry. The drain reuses _run_batch_job (heartbeat, timeout,
+metrics), which now reports completed/failed so the CLI summary can say
+"N streaming + M batch meetings". Claim errors give up after 3
+consecutive failures instead of inheriting the daemon lane's
+retry-forever posture, so a dead DB can't hang a terminal session.
+
+## [2026-06-11] CivicClerk Reports Become Refreshable
+
+Follow-up to the signature work below. CivicClerk "reports" (Staff Memo,
+Resolution, Notice — the documents that explain an item) ship in
+reportsList with no per-attachment id, so the adapter stored them with no
+durable refs at all: once their SAS signature expired (~7 days), the stored
+URL was dead and url_refresh had nothing to re-resolve them with. In
+production that's 16,101 of 47,239 stored CivicClerk attachment entries —
+every one a guaranteed extraction failure for any matter or meeting
+processed more than a week after scrape.
+
+The adapter now stamps cc_agenda_id on report entries, and url_refresh
+grew a second matching pass: alongside the existing by-attachment-id
+lookup, it builds a {blob path: fresh url} map from each re-fetched agenda
+(attachmentsList + reportsList) and renews anything whose query-stripped
+path matches. Verified against a live tenant (Vallejo): re-fetching the
+same /v1/Meetings/{agendaId} rotates every signature while blob paths stay
+byte-identical, so path equality is an exact join. The path pass also
+heals pre-fix rows — a stored report with no refs at all gets refreshed
+(and learns its cc_agenda_id for next time) whenever a sibling attachment
+from the same agenda is in the batch, which is the normal shape of
+process_meeting and process_matter calls.
+
+## [2026-06-11] Attachment Hashes Stop Chasing Signatures
+
+The attachments-unchanged gate — the thing that decides whether a matter
+re-appearance gets a free summary copy or a fresh LLM run — hashed verbatim
+(url, name) pairs. CivicClerk re-signs its Azure SAS URLs on every API
+request, so for CivicClerk cities the stored hash could never match the
+next scrape: every sync re-enqueued every matter on the meeting and
+process_matter re-summarized it wholesale. Worse, the hash written back
+after processing was computed over *refreshed* (freshly re-signed) URLs,
+so it could never converge. Item snapshots are frozen, so users never saw
+the churn — only the Gemini bill did.
+
+Hashes are now computed over a stable identity: when a URL carries a
+signature marker (sig / X-Amz-Signature / Signature / AWSAccessKeyId) the
+whole query string is treated as an auth envelope and stripped; everything
+else keeps its query verbatim, because for Legistar/Granicus-style vendors
+the params ARE the identity (View.ashx?ID=..., MetaViewer.php?meta_id=...).
+Identity is invariant under url_refresh, so the post-processing hash equals
+the sync-time hash and the gate closes for good.
+
+The output is version-tagged ("sv1:<hex>"). The old WARNING in
+hash_substantive_attachments said any filter tweak would silently
+invalidate every stored hash; format changes are now explicit. Stored
+pre-sv1 hashes compare through a byte-exact legacy path in
+MatterEnqueueDecider, so stable-URL vendors see no reprocess wave; their
+stored hashes upgrade in place on the next confirmed-unchanged sync.
+CivicClerk matters never matched under the old algorithm anyway, so they
+take one final reprocess and then settle.
+
+Two adjacent leaks fixed in the same pass. (1) Sync used to overwrite the
+stored hash *before* deciding whether to enqueue: if attachments genuinely
+changed and the matter job then died, the next sync compared new-vs-new,
+concluded "unchanged", and copied the stale summary forward — permanently.
+The stored hash now only moves on a confirmed-unchanged scrape or a
+successful matter job, so a failed job re-enqueues on the next sync instead
+of going silent. (Tradeoff: a permanently-broken attachment retries per
+sync instead of failing once; visible in dead_letter either way.) (2) The
+monolithic packet path had no in-job guard — process_agenda_with_cache_async's
+"cache" is vestigial — so a retried or hand-requeued packet meeting
+re-burned the most expensive single call in the pipeline. It now re-reads
+meetings.summary and skips; deliberate re-summarization means nulling the
+summary first.
+
+Not touched, deliberately: meeting IDs still hash date+title (reschedules
+mint new meetings — identity migration, separate decision), sequence-fallback
+item IDs still shift on agenda reorders, and CivicClerk reportsList
+attachments still lack durable refresh IDs (stored URLs die in ~7 days;
+url_refresh can't renew them — known gap).
+
 ## [2026-06-11] Editorial Digests: "Your City Is Planning X, Y and Z"
 
 The keywordless weekly digest said "7 meetings coming up: 2 Monday, 1

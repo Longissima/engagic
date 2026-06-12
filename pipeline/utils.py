@@ -10,26 +10,82 @@ import json
 import requests
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from config import get_logger
 
 logger = get_logger(__name__).bind(component="engagic")
 
+# Version tag prefixed onto attachment hashes ("sv1:<hex>"). Bump whenever the
+# hash inputs change (identity rules, substantive filter, pair shape) so a
+# stored hash can never silently compare equal against a differently-computed
+# one. The matter enqueue decider keeps a legacy (untagged) comparison path so
+# pre-sv1 stored hashes from stable-URL vendors don't trigger a reprocess
+# wave; stored values upgrade to the current format on the next
+# confirmed-unchanged sync or successful matter job.
+ATTACHMENT_HASH_VERSION = "sv1"
+
+# Query keys that mark a signed URL (Azure SAS / S3 presigned). When any of
+# these is present the whole query string is an auth envelope that rotates on
+# every scrape (CivicClerk re-signs SAS tokens per API request), so identity
+# is the bare scheme://host/path. URLs without these markers keep their query
+# verbatim -- for Legistar/Granicus-style vendors the query params ARE the
+# identity (View.ashx?ID=...&GUID=..., MetaViewer.php?meta_id=...).
+_SIGNED_URL_MARKERS = frozenset({"sig", "x-amz-signature", "signature", "awsaccesskeyid"})
+
+
+def attachment_identity(url: str) -> str:
+    """Stable identity for an attachment URL across re-scrapes.
+
+    Strips the query string iff it carries a recognized signature marker;
+    otherwise returns the URL unchanged. Invariant under url_refresh, which
+    only swaps the signature portion of signed URLs.
+    """
+    if not url or "?" not in url:
+        return url
+    try:
+        parsed = urlsplit(url)
+        keys = {k.lower() for k, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    except ValueError:
+        return url
+    if keys & _SIGNED_URL_MARKERS:
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return url
+
 
 def hash_attachments_fast(attachments: List[Any]) -> str:
     """
-    Hash attachments using URL and name only (pure function, no I/O).
+    Hash attachments using stable URL identity and name only (pure function, no I/O).
 
-    This is the fast path for deduplication. Uses only local data
-    without making network requests.
+    This is the fast path for change detection. Signed-URL query strings are
+    stripped via attachment_identity() so the hash is stable across re-scrapes
+    and across pre/post-url_refresh states of the same attachments.
 
     Args:
         attachments: List of AttachmentInfo objects with 'url' and 'name' attrs
 
     Returns:
-        SHA256 hex digest, or empty string if no attachments
+        Version-tagged digest "sv1:<sha256 hex>", or empty string if no attachments
 
-    Confidence: 7/10 - Works but misses CDN rotations where URL stays same
+    Confidence: 8/10 - Still misses same-URL content edits (no metadata in the
+    fast path) and rotations where the path itself changes.
+    """
+    if not attachments:
+        return ""
+    pairs = [(attachment_identity(att.url or ""), att.name or "") for att in attachments]
+    pairs.sort()
+    content = json.dumps(pairs, sort_keys=True)
+    return f"{ATTACHMENT_HASH_VERSION}:{hashlib.sha256(content.encode()).hexdigest()}"
+
+
+def hash_attachments_fast_legacy(attachments: List[Any]) -> str:
+    """Byte-exact pre-sv1 algorithm: verbatim (url, name) pairs, no version tag.
+
+    Kept so the matter enqueue decider can recognize stored hashes written
+    before signature-stripping landed. For stable-URL vendors a legacy match
+    means "unchanged" (only the hash format moved underneath); signed-URL
+    vendors never matched under this algorithm anyway, since the stored URL
+    carried a rotating signature.
     """
     if not attachments:
         return ""
@@ -64,22 +120,25 @@ def hash_attachments_with_metadata(attachments: List[Any], timeout: int = 3) -> 
         url = att.url or ""
         name = att.name or ""
 
+        identity = attachment_identity(url)
+
         if not url:
-            tuples.append((url, name, "", ""))
+            tuples.append((identity, name, "", ""))
             continue
 
-        # Try to fetch metadata via HEAD request
+        # Try to fetch metadata via HEAD request (against the real URL --
+        # signed URLs only fetch while the signature is valid)
         try:
             metadata = _fetch_attachment_metadata(url, timeout)
-            tuples.append((url, name, metadata['content_length'], metadata['last_modified']))
+            tuples.append((identity, name, metadata['content_length'], metadata['last_modified']))
         except requests.RequestException as e:
-            # Fallback to URL-only if metadata fetch fails
+            # Fallback to identity-only if metadata fetch fails
             logger.warning("failed to fetch metadata", url=url, error=str(e))
-            tuples.append((url, name, "", ""))
+            tuples.append((identity, name, "", ""))
 
     tuples.sort()
     content = json.dumps(tuples, sort_keys=True)
-    return hashlib.sha256(content.encode()).hexdigest()
+    return f"{ATTACHMENT_HASH_VERSION}:{hashlib.sha256(content.encode()).hexdigest()}"
 
 
 def hash_attachments(
@@ -112,11 +171,12 @@ def hash_substantive_attachments(
     Confidence: 8/10 - filter coverage depends on is_public_comment_attachment
     being kept current as new ceremonial patterns emerge.
 
-    WARNING: any change to is_public_comment_attachment silently invalidates
-    every stored matter.metadata.attachment_hash, causing a full reprocess
-    wave on next sync. If you tune the filter, expect and plan for the burst.
-    Alternative: version-tag the hash output (e.g. "sv1:<hash>") so future
-    filter changes can be rolled out explicitly. Not implemented yet.
+    WARNING: any change to is_public_comment_attachment (or to
+    attachment_identity) changes what every matter hashes to. Hashes are
+    version-tagged (ATTACHMENT_HASH_VERSION) precisely so this is explicit:
+    bump the version when you change the inputs, and if a reprocess wave is
+    unacceptable, teach MatterEnqueueDecider a fallback comparison for the
+    outgoing format (see current_attachment_hash_legacy).
     """
     from pipeline.filters.item_filters import is_public_comment_attachment
 
@@ -128,6 +188,25 @@ def hash_substantive_attachments(
         if not is_public_comment_attachment(att.name or "")
     ]
     return hash_attachments(substantive, include_metadata=include_metadata, timeout=timeout)
+
+
+def hash_substantive_attachments_legacy(attachments: List[Any]) -> str:
+    """Legacy-format counterpart of hash_substantive_attachments (fast path only).
+
+    Computes what hash_substantive_attachments would have produced before
+    version tagging and signature-stripping. Used by MatterEnqueueDecider to
+    compare against stored hashes written before sv1.
+    """
+    from pipeline.filters.item_filters import is_public_comment_attachment
+
+    if not attachments:
+        return ""
+
+    substantive = [
+        att for att in attachments
+        if not is_public_comment_attachment(att.name or "")
+    ]
+    return hash_attachments_fast_legacy(substantive)
 
 
 def _fetch_attachment_metadata(url: str, timeout: int = 3) -> Dict[str, str]:

@@ -296,9 +296,12 @@ class Processor:
                 if await self._wait_with_shutdown_check(QUEUE_FATAL_ERROR_BACKOFF):
                     break
 
-    async def _run_batch_job(self, job) -> None:
+    async def _run_batch_job(self, job) -> str:
         """Run one meeting job through the Batch API path, heartbeating the
-        queue row so the stale sweep doesn't reclaim it mid-poll."""
+        queue row so the stale sweep doesn't reclaim it mid-poll.
+
+        Returns 'completed' or 'failed' so finite callers (drain_batch_jobs)
+        can tally; the daemon lane ignores the outcome."""
         queue_id = job.id
         job_start = time.time()
         heartbeat = asyncio.create_task(self._job_heartbeat(queue_id))
@@ -311,7 +314,7 @@ class Processor:
                 await self.db.queue.mark_processing_failed(
                     queue_id, "Meeting not found in database", increment_retry=False
                 )
-                return
+                return "failed"
 
             # A timeout here is not lost work: chunks save incrementally, so
             # each retry (3 before dead-letter) resumes where the last attempt
@@ -327,6 +330,7 @@ class Processor:
                 meeting_id=job.payload.meeting_id,
                 duration_seconds=round(time.time() - job_start, 1),
             )
+            return "completed"
 
         except asyncio.TimeoutError:
             await self.db.queue.mark_processing_failed(
@@ -334,6 +338,7 @@ class Processor:
             )
             self.metrics.queue_jobs_processed.labels(job_type="meeting_batch", status="failed").inc()
             logger.error("batch lane job timed out", queue_id=queue_id)
+            return "failed"
 
         except Exception as e:
             await self.db.queue.mark_processing_failed(queue_id, str(e))
@@ -345,6 +350,7 @@ class Processor:
                 error=str(e),
                 error_type=type(e).__name__,
             )
+            return "failed"
         finally:
             heartbeat.cancel()
 
@@ -359,6 +365,76 @@ class Processor:
             except Exception as e:
                 # transient DB hiccup: keep beating, the next tick may succeed
                 logger.warning("job heartbeat failed", queue_id=queue_id, error=str(e))
+
+    @property
+    def batch_drain_available(self) -> bool:
+        """True when this process can claim batch-lane jobs."""
+        return bool(config.BATCH_API_ENABLED and self.analyzer)
+
+    async def drain_batch_jobs(self, bananas: List[str]) -> dict:
+        """Drain batch-lane jobs for specific cities, returning when empty.
+
+        CLI companion to _batch_lane_loop: same claim filter and Batch API
+        path, but scoped to the given bananas and finite — each worker exits
+        on an empty claim instead of polling forever, so a `process` run
+        delivers both lanes' summaries before it returns. Failed jobs requeue
+        as pending immediately (until dead-letter at 3 retries), so a worker
+        that fails a job reclaims it on its own next iteration; an empty
+        claim therefore means the lane is genuinely dry for these cities.
+        """
+        self._ensure_stale_sweep_running()
+        stats: Counter = Counter()
+
+        async def drain_worker(slot: int) -> None:
+            consecutive_errors = 0
+            while self.is_running:
+                try:
+                    job = await self.db.queue.get_next_for_processing(
+                        bananas=bananas,
+                        lane="batch",
+                        urgent_past_days=config.BATCH_URGENT_PAST_DAYS,
+                        urgent_future_days=config.BATCH_URGENT_FUTURE_DAYS,
+                    )
+                    if not job:
+                        return
+                    logger.info("batch drain claimed job", slot=slot, queue_id=job.id)
+                    stats[await self._run_batch_job(job)] += 1
+                    consecutive_errors = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Unlike the daemon lane, don't retry forever: a dead DB
+                    # would otherwise hang the CLI run indefinitely. A row
+                    # left 'processing' by an escaped error gets reclaimed
+                    # by the stale sweep.
+                    consecutive_errors += 1
+                    logger.error(
+                        "batch drain worker error",
+                        slot=slot,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+                    if consecutive_errors >= 3:
+                        logger.error("batch drain worker giving up", slot=slot)
+                        return
+                    if await self._wait_with_shutdown_check(QUEUE_FATAL_ERROR_BACKOFF):
+                        return
+
+        logger.info(
+            "batch drain started",
+            cities=len(bananas),
+            concurrency=config.BATCH_JOB_CONCURRENCY,
+            urgent_window_days=(config.BATCH_URGENT_PAST_DAYS, config.BATCH_URGENT_FUTURE_DAYS),
+        )
+        await asyncio.gather(
+            *[drain_worker(slot) for slot in range(config.BATCH_JOB_CONCURRENCY)]
+        )
+        logger.info(
+            "batch drain complete",
+            completed=stats["completed"],
+            failed=stats["failed"],
+        )
+        return {"batch_processed": stats["completed"], "batch_failed": stats["failed"]}
 
     def _filter_document_versions(self, urls: List[str]) -> List[str]:
         """Keep only latest versions (Ver2 > Ver1, etc.)."""
@@ -895,6 +971,17 @@ class Processor:
                     logger.info("items exist but lack content, falling through to packet", item_count=len(agenda_items), meeting_title=meeting.title)
 
             if meeting.packet_url:
+                # Item-level processing has a per-item guard (_filter_processed_items);
+                # the monolithic packet call's only guard is the sync-time enqueue
+                # gate. Retried or manually requeued jobs can arrive here with a
+                # summary already stored -- re-read and skip rather than re-burn
+                # the most expensive single call in the pipeline. Deliberate
+                # re-summarization requires nulling meetings.summary first.
+                stored = await self.db.meetings.get_meeting(meeting.id)
+                if stored and stored.summary:
+                    logger.info("packet already summarized, skipping", meeting_title=meeting.title)
+                    return {"items_processed": 1, "items_new": 0, "items_skipped": 1, "items_failed": 0}
+
                 logger.info("processing packet as monolithic unit - no items found", meeting_title=meeting.title)
                 if not self.analyzer:
                     logger.warning("skipping meeting - analyzer not available", packet_url=meeting.packet_url)

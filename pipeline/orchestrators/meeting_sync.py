@@ -10,7 +10,7 @@ from database.id_generation import generate_meeting_id, generate_matter_id, gene
 from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
-from pipeline.utils import hash_substantive_attachments
+from pipeline.utils import hash_substantive_attachments, hash_substantive_attachments_legacy
 from pipeline.orchestrators.matter_filter import MatterFilter
 from pipeline.orchestrators.enqueue_decider import EnqueueDecider, MatterEnqueueDecider
 from pipeline.orchestrators.vote_processor import VoteProcessor
@@ -410,11 +410,32 @@ class MeetingSyncOrchestrator:
 
             if existing_matter:
                 appearance_exists = await self.db.matters.has_appearance(agenda_item.matter_id, meeting.id)
+
+                # Decide BEFORE updating tracking: the decider compares the
+                # stored hash (what the canonical summary was computed from)
+                # against this scrape. Writing the new hash first would erase
+                # the change signal if the resulting matter job later failed.
+                should_enqueue, skip_reason = False, None
+                if not is_procedural:
+                    should_enqueue, skip_reason = self.matter_enqueue_decider.should_enqueue_matter(
+                        existing_matter=existing_matter,
+                        current_attachment_hash=attachment_hash,
+                        has_attachments=bool(agenda_item.attachments),
+                        current_attachment_hash_legacy=hash_substantive_attachments_legacy(
+                            agenda_item.attachments or []
+                        ),
+                    )
+
+                # Persist the hash only on a confirmed-unchanged scrape: a
+                # semantic no-op that upgrades legacy-format hashes in place.
+                # On change (or failure to summarize), the stored hash keeps
+                # pointing at the summarized state until process_matter
+                # succeeds and writes the new one.
                 await self.db.matters.update_matter_tracking(
                     matter_id=agenda_item.matter_id,
                     meeting_date=meeting.date,
                     attachments=agenda_item.attachments,
-                    attachment_hash=attachment_hash,
+                    attachment_hash=attachment_hash if skip_reason == "attachments_unchanged" else None,
                     increment_appearance_count=not appearance_exists,
                     conn=conn
                 )
@@ -426,11 +447,6 @@ class MeetingSyncOrchestrator:
                 if is_procedural:
                     continue
 
-                should_enqueue, skip_reason = self.matter_enqueue_decider.should_enqueue_matter(
-                    existing_matter=existing_matter,
-                    current_attachment_hash=attachment_hash,
-                    has_attachments=bool(agenda_item.attachments)
-                )
                 if should_enqueue:
                     item_ids = await self._collect_item_ids_for_matter(agenda_item.matter_id)
                     stats['pending_jobs'].append({

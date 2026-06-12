@@ -34,10 +34,12 @@ _CC_PORTAL_RE = re.compile(
 )
 
 
-def _civicclerk_identity(att: AttachmentInfo) -> Optional[Tuple[Optional[int], int, Optional[int]]]:
+def _civicclerk_identity(att: AttachmentInfo) -> Optional[Tuple[Optional[int], Optional[int], Optional[int]]]:
     """Return (agenda_id, attachment_id, event_id) if this looks like a CivicClerk attachment.
 
     Falls back to parsing portal_url for rows scraped before durable IDs were stored.
+    Reports carry no per-attachment id -- (agenda_id, None, None) marks them as
+    refreshable by blob-path match within their re-fetched agenda.
     Returns None if the attachment isn't a CivicClerk one (or can't be identified).
     """
     if att.cc_attachment_id is not None:
@@ -50,6 +52,10 @@ def _civicclerk_identity(att: AttachmentInfo) -> Optional[Tuple[Optional[int], i
             event_id = int(m.group(2))
             att_id = int(m.group(3))
             return (None, att_id, event_id)
+
+    # Reports: agenda ref only, renewed by path match.
+    if att.cc_agenda_id is not None:
+        return (att.cc_agenda_id, None, None)
 
     return None
 
@@ -87,8 +93,13 @@ async def _resolve_agenda_id_for_event(
 
 async def _fetch_fresh_attachment_urls(
     session: aiohttp.ClientSession, slug: str, agenda_id: int
-) -> Dict[int, str]:
-    """Hit /v1/Meetings/{agenda_id} and return {attachment_id: fresh pdf URL}.
+) -> Tuple[Dict[int, str], Dict[str, str]]:
+    """Hit /v1/Meetings/{agenda_id} and return fresh-URL maps.
+
+    Returns ({attachment_id: fresh url}, {blob_path: fresh url}). The path map
+    covers reportsList entries too -- reports have no per-attachment id, but
+    SAS re-signing only rotates the query string, so the bare blob path is a
+    stable join key between a stored URL and its freshly-signed counterpart.
 
     The CivicClerk API re-signs SAS tokens on every request, so the URLs in
     this response are always good for ~7 days from the moment of the call.
@@ -103,30 +114,40 @@ async def _fetch_fresh_attachment_urls(
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
                 logger.warning("meeting lookup failed", slug=slug, agenda_id=agenda_id, status=resp.status)
-                return {}
+                return {}, {}
             data = await resp.json()
     except (aiohttp.ClientError, OSError) as e:
         logger.warning("meeting lookup error", slug=slug, agenda_id=agenda_id, error=str(e))
-        return {}
+        return {}, {}
 
-    out: Dict[int, str] = {}
+    by_id: Dict[int, str] = {}
+    by_path: Dict[str, str] = {}
 
     def walk(items: List[Dict]) -> None:
         for it in items:
             for a in it.get("attachmentsList", []):
                 aid = a.get("id")
                 fresh = a.get("pdfVersionFullPath") or a.get("mediaFullPath")
-                if aid is not None and fresh:
+                if not fresh:
+                    continue
+                by_path[fresh.split("?", 1)[0]] = fresh
+                if aid is not None:
                     try:
-                        out[int(aid)] = fresh
+                        by_id[int(aid)] = fresh
                     except (TypeError, ValueError):
                         continue
+            for r in it.get("reportsList", []) or []:
+                if r.get("isDeleted"):
+                    continue
+                fresh = r.get("pdfMediaFullPath")
+                if fresh:
+                    by_path[fresh.split("?", 1)[0]] = fresh
             children = it.get("childItems") or []
             if children:
                 walk(children)
 
     walk(data.get("items", []))
-    return out
+    return by_id, by_path
 
 
 async def refresh_civicclerk_urls(
@@ -136,16 +157,21 @@ async def refresh_civicclerk_urls(
 
     Returns: number of attachments refreshed.
 
+    Two passes: attachments with a stored attachment id are matched directly;
+    everything else (reports, pre-fix rows with no durable refs at all) is
+    matched by bare blob path against every agenda fetched in this call --
+    SAS re-signing only rotates the query string, so path equality is exact.
+    A path-pass hit on a row missing cc_agenda_id backfills it for next time.
+
     Cost: at most one /v1/Meetings/{agenda_id} call per unique agenda_id, plus
     one /v1/Events?$filter call per unique event_id that lacks a stored agenda_id
     (backfill path for pre-fix rows).
     """
     # Snapshot once -- callers may pass a generator
-    targets: List[AttachmentInfo] = []
-    for att in attachments:
-        ident = _civicclerk_identity(att)
-        if ident is not None:
-            targets.append(att)
+    all_atts: List[AttachmentInfo] = list(attachments)
+    targets: List[AttachmentInfo] = [
+        att for att in all_atts if _civicclerk_identity(att) is not None
+    ]
 
     if not targets:
         return 0
@@ -175,7 +201,8 @@ async def refresh_civicclerk_urls(
             agenda_ids.add(agenda_id)
 
     # Phase 3: fetch fresh URL maps in parallel, one per agenda_id
-    fresh_maps: Dict[int, Dict[int, str]] = {}
+    fresh_by_id: Dict[int, Dict[int, str]] = {}
+    path_to_fresh: Dict[str, Tuple[int, str]] = {}  # blob path -> (agenda_id, fresh url)
     if agenda_ids:
         results = await asyncio.gather(
             *[_fetch_fresh_attachment_urls(session, slug, aid) for aid in agenda_ids],
@@ -185,20 +212,25 @@ async def refresh_civicclerk_urls(
             if isinstance(res, BaseException):
                 logger.warning("agenda fetch raised", slug=slug, agenda_id=aid, error=str(res))
                 continue
-            fresh_maps[aid] = res
+            by_id, by_path = res
+            fresh_by_id[aid] = by_id
+            for path, fresh in by_path.items():
+                path_to_fresh[path] = (aid, fresh)
 
-    # Phase 4: assign fresh URLs, mutating attachments in place
+    # Phase 4a: direct id match, mutating attachments in place
     refreshed = 0
     for att in targets:
         ident = _civicclerk_identity(att)
         if ident is None:
             continue
         agenda_id, att_id, event_id = ident
+        if att_id is None:
+            continue  # id-less rows are handled by the path pass below
         if agenda_id is None and event_id is not None:
             agenda_id = event_to_agenda.get(event_id)
         if agenda_id is None:
             continue
-        fresh_url = fresh_maps.get(agenda_id, {}).get(att_id)
+        fresh_url = fresh_by_id.get(agenda_id, {}).get(att_id)
         if fresh_url and fresh_url != att.url:
             att.url = fresh_url
             # Also remember the agenda_id for next time, if we backfilled it
@@ -206,6 +238,23 @@ async def refresh_civicclerk_urls(
                 att.cc_agenda_id = agenda_id
             if att.cc_attachment_id is None:
                 att.cc_attachment_id = att_id
+            refreshed += 1
+
+    # Phase 4b: blob-path match for everything still stale. Catches reports
+    # (agenda ref but no attachment id) and pre-fix rows with no durable refs
+    # at all, as long as a sibling's agenda got fetched above. Rows already
+    # refreshed in 4a compare equal to the fresh URL and fall through.
+    for att in all_atts:
+        if not att.url:
+            continue
+        hit = path_to_fresh.get(att.url.split("?", 1)[0])
+        if hit is None:
+            continue
+        hit_agenda_id, fresh_url = hit
+        if fresh_url != att.url:
+            att.url = fresh_url
+            if att.cc_agenda_id is None:
+                att.cc_agenda_id = hit_agenda_id  # self-heal: durable ref for next refresh
             refreshed += 1
 
     if refreshed:

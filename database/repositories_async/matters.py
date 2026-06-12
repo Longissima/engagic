@@ -189,11 +189,18 @@ class MatterRepository(BaseRepository):
         matter_id: str,
         meeting_date: Optional[datetime],
         attachments: Optional[List[AttachmentInfo]],
-        attachment_hash: str,
+        attachment_hash: Optional[str],
         increment_appearance_count: bool = False,
         conn: Optional[Connection] = None
     ) -> Optional[int]:
-        """Update matter tracking fields with atomic increment to prevent race conditions."""
+        """Update matter tracking fields with atomic increment to prevent race conditions.
+
+        attachment_hash=None leaves metadata.attachment_hash untouched. The stored
+        hash records what the canonical summary was computed from; sync passes a
+        value only on a confirmed-unchanged scrape (format upgrade), never on a
+        changed one -- otherwise a failed matter job would erase the change signal
+        and every later sync would skip as "unchanged" with a stale summary.
+        """
         async with self._ensure_conn(conn) as c:
             if increment_appearance_count:
                 new_count = await c.fetchval(
@@ -201,7 +208,10 @@ class MatterRepository(BaseRepository):
                     UPDATE city_matters
                     SET last_seen = $2,
                         attachments = $3::jsonb,
-                        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment_hash', $4::text),
+                        metadata = CASE
+                            WHEN $4::text IS NULL THEN metadata
+                            ELSE COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment_hash', $4::text)
+                        END,
                         updated_at = CURRENT_TIMESTAMP,
                         appearance_count = appearance_count + 1
                     WHERE id = $1
@@ -220,7 +230,10 @@ class MatterRepository(BaseRepository):
                     UPDATE city_matters
                     SET last_seen = $2,
                         attachments = $3::jsonb,
-                        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment_hash', $4::text),
+                        metadata = CASE
+                            WHEN $4::text IS NULL THEN metadata
+                            ELSE COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment_hash', $4::text)
+                        END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1
                     """,

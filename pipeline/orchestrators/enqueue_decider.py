@@ -57,7 +57,8 @@ class MatterEnqueueDecider:
         self,
         existing_matter: Optional["Matter"],
         current_attachment_hash: str,
-        has_attachments: bool
+        has_attachments: bool,
+        current_attachment_hash_legacy: Optional[str] = None,
     ) -> tuple[bool, Optional[str]]:
         if not has_attachments:
             return False, "no_attachments"
@@ -70,6 +71,19 @@ class MatterEnqueueDecider:
 
         stored_hash = existing_matter.metadata.attachment_hash if existing_matter.metadata else None
         if stored_hash == current_attachment_hash:
+            return False, "attachments_unchanged"
+
+        # Stored hashes written before version tagging carry no "sv1:" prefix.
+        # Compare those against the legacy algorithm: a match means the
+        # attachments are unchanged and only the hash format moved underneath
+        # them. The caller persists the current-format hash on this signal,
+        # retiring the legacy value without a reprocess.
+        if (
+            stored_hash
+            and ":" not in stored_hash
+            and current_attachment_hash_legacy is not None
+            and stored_hash == current_attachment_hash_legacy
+        ):
             return False, "attachments_unchanged"
 
         return True, None

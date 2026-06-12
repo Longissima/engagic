@@ -193,6 +193,7 @@ class QueueRepository(BaseRepository):
     async def get_next_for_processing(
         self,
         banana: Optional[str] = None,
+        bananas: Optional[List[str]] = None,
         lane: Optional[str] = None,
         urgent_past_days: int = 0,
         urgent_future_days: int = 1,
@@ -203,7 +204,9 @@ class QueueRepository(BaseRepository):
         Uses atomic UPDATE-RETURNING to prevent race conditions.
 
         Args:
-            banana: Optional city filter
+            banana: Optional single-city filter
+            bananas: Optional multi-city filter (used by the CLI batch drain,
+                which serves one worker pool across all cities in the run)
             lane: None claims any job (legacy behavior). 'streaming' claims
                 jobs needing fresh summaries (urgent-window meetings, matters,
                 undated). 'batch' claims meeting jobs outside the urgent
@@ -218,6 +221,9 @@ class QueueRepository(BaseRepository):
         if banana:
             params.append(banana)
             conditions.append(f"q.banana = ${len(params)}")
+        if bananas:
+            params.append(list(bananas))
+            conditions.append(f"q.banana = ANY(${len(params)})")
 
         join = ""
         if lane:

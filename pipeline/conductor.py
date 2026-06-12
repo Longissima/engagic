@@ -278,6 +278,15 @@ class Conductor:
                 })
 
         with self.enable_processing():
+            # Batch-eligible jobs (meetings outside the urgent window) are
+            # invisible to the per-city streaming claims above. Drain them
+            # concurrently so a manual `process` run delivers both lanes —
+            # the run isn't done until the Batch API results land.
+            batch_task = None
+            if self.processor.batch_drain_available:
+                batch_task = asyncio.create_task(
+                    self.processor.drain_batch_jobs(city_bananas)
+                )
             tasks = [asyncio.create_task(process_one_city(b)) for b in city_bananas]
             completed = 0
             total = len(city_bananas)
@@ -285,6 +294,11 @@ class Conductor:
                 result = await results_queue.get()
                 completed += 1
                 yield result
+            if batch_task is not None:
+                if not batch_task.done():
+                    logger.info("streaming lane complete, waiting on batch lane drain")
+                batch_stats = await batch_task
+                yield {"phase": "batch_complete", **batch_stats}
 
     async def sync_and_process_cities(self, city_bananas: List[str]) -> AsyncGenerator[Dict[str, Any], None]:
         """Sync multiple cities and immediately process all their meetings.
@@ -500,7 +514,8 @@ def main():
 
         async def run():
             db = await Database.create()
-            totals = {"processed": 0, "failed": 0, "items_processed": 0, "items_new": 0}
+            totals = {"processed": 0, "failed": 0, "items_processed": 0, "items_new": 0,
+                      "batch_processed": 0, "batch_failed": 0}
             try:
                 # Recovery: reset jobs stuck in 'processing' from previous crash/OOM
                 stale_count = await db.queue.reset_stale_processing_jobs()
@@ -511,6 +526,10 @@ def main():
                 click.echo(f"Processing queued jobs for {len(expanded)} jurisdictions: {', '.join(expanded)}")
                 async with Conductor(db) as conductor:
                     async for result in conductor.process_cities(expanded):
+                        if result.get("phase") == "batch_complete":
+                            totals["batch_processed"] += result.get("batch_processed", 0)
+                            totals["batch_failed"] += result.get("batch_failed", 0)
+                            continue
                         # Stream results - log each city as it completes
                         city = result.get("city_banana", "unknown")
                         logger.info("city complete",
@@ -529,7 +548,10 @@ def main():
                 await db.close()
 
         results = asyncio.run(run())
-        click.echo(f"Complete: {results['processed']} meetings, {results['items_new']} new items")
+        click.echo(
+            f"Complete: {results['processed']} streaming + {results['batch_processed']} batch meetings, "
+            f"{results['items_new']} new items"
+        )
 
     @cli.command("sync-and-process")
     @click.argument("targets")
@@ -545,7 +567,8 @@ def main():
 
         async def run():
             db = await Database.create()
-            totals = {"processed": 0, "failed": 0, "items_processed": 0, "items_new": 0, "meetings_found": 0}
+            totals = {"processed": 0, "failed": 0, "items_processed": 0, "items_new": 0,
+                      "meetings_found": 0, "batch_processed": 0, "batch_failed": 0}
             try:
                 expanded = await _expand_jurisdictions(db, city_list)
                 click.echo(f"Syncing and processing {len(expanded)} jurisdictions: {', '.join(expanded)}")
@@ -555,6 +578,9 @@ def main():
                             # Sync phase complete
                             totals["meetings_found"] = result.get("total_meetings_found", 0)
                             logger.info("sync complete", meetings_found=totals["meetings_found"])
+                        elif result.get("phase") == "batch_complete":
+                            totals["batch_processed"] += result.get("batch_processed", 0)
+                            totals["batch_failed"] += result.get("batch_failed", 0)
                         else:
                             # Per-city processing result
                             city = result.get("city_banana", "unknown")
@@ -573,7 +599,11 @@ def main():
                 await db.close()
 
         results = asyncio.run(run())
-        click.echo(f"Complete: {results['meetings_found']} found, {results['processed']} processed, {results['items_new']} new items")
+        click.echo(
+            f"Complete: {results['meetings_found']} found, "
+            f"{results['processed']} streaming + {results['batch_processed']} batch processed, "
+            f"{results['items_new']} new items"
+        )
 
     @cli.command("full-sync")
     def full_sync():
@@ -673,6 +703,8 @@ def main():
                     async for result in conductor.sync_and_process_cities(valid_cities):
                         if result.get("phase") == "sync_complete":
                             logger.info("sync complete", meetings_found=result.get("total_meetings_found", 0))
+                        elif result.get("phase") == "batch_complete":
+                            totals["processed"] += result.get("batch_processed", 0)
                         elif result.get("city_banana"):
                             totals["processed"] += result.get("processed", 0)
                             totals["items_new"] += result.get("items_new", 0)
@@ -726,7 +758,9 @@ def main():
                 totals = {"processed": 0, "items_new": 0}
                 async with Conductor(db) as conductor:
                     async for result in conductor.process_cities(valid_cities):
-                        if result.get("city_banana"):
+                        if result.get("phase") == "batch_complete":
+                            totals["processed"] += result.get("batch_processed", 0)
+                        elif result.get("city_banana"):
                             totals["processed"] += result.get("processed", 0)
                             totals["items_new"] += result.get("items_new", 0)
                 return {"cities_processed": len(valid_cities), "totals": totals}
