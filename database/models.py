@@ -74,10 +74,24 @@ class MatterMetadata(BaseModel):
     """
     Typed JSONB for city_matters.metadata field.
 
-    Contains attachment_hash for change detection and deduplication.
+    attachment_hash: change detection / deduplication. Records the
+    attachment set the matter's current resolution (canonical summary,
+    disposition, or failed attempts) was computed from.
+
+    disposition: terminal verdict for matters that will never produce a
+    canonical summary from the current attachments (e.g. the processing
+    filter rejects the title). Scoped to attachment_hash -- a later
+    attachment change makes the matter eligible again.
+
+    attempts: consecutive failed summarization attempts against the
+    current attachment_hash. The enqueue decider stops re-enqueueing at
+    MATTER_MAX_ATTEMPTS; resets when attachments change, cleared by a
+    successful store_matter.
     """
     model_config = ConfigDict(extra="forbid")
     attachment_hash: Optional[str] = None
+    disposition: Optional[str] = None
+    attempts: int = 0
 
 
 class AttachmentInfo(BaseModel):

@@ -913,6 +913,25 @@ class Processor:
             logger.info("promoted item snapshot to canonical summary", matter_id=matter_id)
             return {"items_processed": 1, "items_new": 0, "items_skipped": 1, "items_failed": 0}
 
+        # Terminal disposition: the processing-time title filter is stricter
+        # than the sync-time MatterFilter, so a matter can pass enqueueing yet
+        # never be summarizable. Without a recorded verdict it re-enqueues at
+        # every sync and burns a queue cycle forever (observed: 142 such
+        # matters in one city). The disposition is scoped to this attachment
+        # set -- changed attachments re-open the matter.
+        skip_reason = get_skip_reason(representative_item.title)
+        if skip_reason:
+            await self.db.items.update_filter_reason(representative_item.id, skip_reason)
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, disposition=f"filtered_{skip_reason}"
+            )
+            logger.info(
+                "matter filtered, disposition recorded",
+                matter_id=matter_id,
+                reason=skip_reason,
+            )
+            return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
+
         # Refresh ephemeral signed URLs before extraction. See _process_meeting_with_items.
         city = await self.db.jurisdictions.get_city(banana)
         if city and city.vendor:
@@ -926,9 +945,15 @@ class Processor:
         except ProcessingError as e:
             logger.error("matter processing failed", matter_id=matter_id, error=str(e))
             self.metrics.record_error("processor", e)
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, increment_attempts=True
+            )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
 
         if not result:
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, increment_attempts=True
+            )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
 
         summary = result.get("summary")
@@ -936,6 +961,9 @@ class Processor:
 
         if not summary:
             logger.warning("no summary generated for matter", matter_id=matter_id)
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, increment_attempts=True
+            )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
 
         matter_obj = Matter(

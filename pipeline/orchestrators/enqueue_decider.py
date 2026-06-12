@@ -47,6 +47,13 @@ class EnqueueDecider:
 
 MATTER_PRIORITY_BASE_SCORE = 50
 
+# Consecutive failed summarization attempts against one attachment set before
+# the decider stops re-enqueueing. Without a bound, a matter that always fails
+# (dead links, unextractable scans) re-enqueues at every sync and re-pays
+# download + OCR + LLM attempts forever. An attachment change resets the
+# budget (see MatterRepository.record_matter_outcome).
+MATTER_MAX_ATTEMPTS = 3
+
 
 class MatterEnqueueDecider:
     """Enqueue new matters with attachments, or existing matters with changed attachments.
@@ -66,25 +73,35 @@ class MatterEnqueueDecider:
         if existing_matter is None:
             return True, None
 
-        if not existing_matter.canonical_summary:
+        md = existing_matter.metadata
+        stored_hash = md.attachment_hash if md else None
+
+        # Unchanged = stored hash matches this scrape under the current
+        # algorithm, or under the legacy algorithm for pre-sv1 stored values
+        # (format moved underneath unchanged attachments; the caller persists
+        # the current format on this signal, retiring the legacy value).
+        unchanged = stored_hash is not None and (
+            stored_hash == current_attachment_hash
+            or (
+                ":" not in stored_hash
+                and current_attachment_hash_legacy is not None
+                and stored_hash == current_attachment_hash_legacy
+            )
+        )
+        if not unchanged:
+            # New or never-hashed content: always worth (re)processing.
             return True, None
 
-        stored_hash = existing_matter.metadata.attachment_hash if existing_matter.metadata else None
-        if stored_hash == current_attachment_hash:
+        if existing_matter.canonical_summary:
             return False, "attachments_unchanged"
 
-        # Stored hashes written before version tagging carry no "sv1:" prefix.
-        # Compare those against the legacy algorithm: a match means the
-        # attachments are unchanged and only the hash format moved underneath
-        # them. The caller persists the current-format hash on this signal,
-        # retiring the legacy value without a reprocess.
-        if (
-            stored_hash
-            and ":" not in stored_hash
-            and current_attachment_hash_legacy is not None
-            and stored_hash == current_attachment_hash_legacy
-        ):
-            return False, "attachments_unchanged"
+        # No canonical summary, but processing already rendered a verdict on
+        # exactly this attachment set: either a terminal disposition (will
+        # never summarize, e.g. filtered title) or an exhausted retry budget.
+        if md and md.disposition:
+            return False, f"disposition_{md.disposition}"
+        if md and md.attempts >= MATTER_MAX_ATTEMPTS:
+            return False, "max_attempts"
 
         return True, None
 

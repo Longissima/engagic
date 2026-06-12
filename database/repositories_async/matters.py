@@ -204,6 +204,50 @@ class MatterRepository(BaseRepository):
                 attachment_hash,
             )
 
+    async def record_matter_outcome(
+        self,
+        matter_id: str,
+        attachment_hash: str,
+        disposition: Optional[str] = None,
+        increment_attempts: bool = False,
+    ) -> None:
+        """Record a non-success processing outcome in matter metadata.
+
+        Stores the hash that was attempted so the enqueue decider can scope
+        the verdict: a disposition or exhausted attempt count only suppresses
+        re-enqueueing while the attachments still hash to this value. The
+        attempt counter restarts at 1 when the hash changed since the last
+        recorded outcome (new content deserves a fresh budget). A later
+        successful store_matter replaces metadata wholesale, clearing both
+        fields.
+        """
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                UPDATE city_matters
+                SET metadata = COALESCE(metadata, '{}'::jsonb)
+                        || jsonb_build_object(
+                            'attachment_hash', $2::text,
+                            'attempts',
+                            CASE
+                                WHEN $4::bool THEN
+                                    CASE WHEN COALESCE(metadata->>'attachment_hash', '') = $2::text
+                                         THEN COALESCE((metadata->>'attempts')::int, 0) + 1
+                                         ELSE 1 END
+                                ELSE COALESCE((metadata->>'attempts')::int, 0)
+                            END
+                        )
+                        || CASE WHEN $3::text IS NULL THEN '{}'::jsonb
+                                ELSE jsonb_build_object('disposition', $3::text) END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                matter_id,
+                attachment_hash,
+                disposition,
+                increment_attempts,
+            )
+
     async def update_matter_tracking(
         self,
         matter_id: str,
