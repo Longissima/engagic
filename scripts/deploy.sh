@@ -494,6 +494,40 @@ sync() {
     uv run engagic-conductor sync "$TARGETS"
 }
 
+# Screen sessions for manual process jobs. Several can run at once: the queue
+# dequeues with FOR UPDATE SKIP LOCKED and `process <target>` scopes its claim
+# (and batch drain) to that target's cities, so concurrent workers never
+# double-claim. Each job gets a target-derived name with a numeric suffix on
+# collision -- e.g. engagic-process-school-districts, engagic-process-GA-2.
+PROCESS_SCREEN_PREFIX="engagic-process"
+
+# Live session names matching the process prefix, one per line.
+list_process_sessions() {
+    screen -list 2>/dev/null \
+        | grep -oE "[0-9]+\.${PROCESS_SCREEN_PREFIX}[^[:space:]]*" \
+        | sed 's/^[0-9]*\.//'
+}
+
+# True if a screen session with exactly this name is live.
+process_session_exists() {
+    list_process_sessions | grep -qx "$1"
+}
+
+# Build a unique screen name from the resolved targets.
+process_screen_name() {
+    local slug
+    slug=$(echo "$1" | sed -E 's#^@?[a-zA-Z0-9_]+/##; s/\.txt$//; s/[^a-zA-Z0-9]+/-/g; s/^-+//; s/-+$//')
+    [ -z "$slug" ] && slug="job"
+    slug="${slug:0:24}"
+    local base="${PROCESS_SCREEN_PREFIX}-${slug}"
+    local name="$base" n=2
+    while process_session_exists "$name"; do
+        name="${base}-${n}"
+        n=$((n + 1))
+    done
+    echo "$name"
+}
+
 process() {
     if [ -z "$1" ]; then
         error "Targets required (banana, state code, @file, or a name like 'processed'/'schools')"
@@ -502,22 +536,17 @@ process() {
     local TARGETS
     TARGETS=$(resolve_targets "$1")
 
-    local SCREEN_NAME="engagic-process"
+    local SCREEN_NAME
+    SCREEN_NAME=$(process_screen_name "$TARGETS")
 
-    if screen -list | grep -q "$SCREEN_NAME"; then
-        warn "Process session already running!"
-        echo "  Attach with: $0 attach"
-        echo "  Or kill it:  $0 kill-process"
-        return 1
-    fi
-
-    log "Starting process in detachable screen session..."
+    log "Starting process in detachable screen session: $SCREEN_NAME"
     log "Targets: $TARGETS"
     echo ""
     info "Commands:"
-    echo "  Ctrl-A D     - Detach (process keeps running)"
-    echo "  $0 attach    - Reattach to view logs"
-    echo "  $0 kill-process - Stop processing"
+    echo "  Ctrl-A D                       - Detach (process keeps running)"
+    echo "  $0 attach $SCREEN_NAME         - Reattach to view logs"
+    echo "  $0 kill-process $SCREEN_NAME   - Stop this job"
+    echo "  $0 attach                      - List all running jobs"
     echo ""
     sleep 2
 
@@ -541,25 +570,80 @@ process() {
 }
 
 attach_process() {
-    local SCREEN_NAME="engagic-process"
-    if screen -list | grep -q "$SCREEN_NAME"; then
-        log "Attaching to process session (Ctrl-A D to detach)..."
-        screen -r "$SCREEN_NAME"
-    else
+    local want="$1" sessions count
+    sessions=$(list_process_sessions)
+
+    if [ -z "$sessions" ]; then
         warn "No process session running"
-        echo "Start one with: $0 process @regions/file.txt"
+        echo "Start one with: $0 process <targets>   (e.g. $0 process schools)"
+        return
+    fi
+
+    if [ -n "$want" ]; then
+        if process_session_exists "$want"; then
+            log "Attaching to $want (Ctrl-A D to detach)..."
+            screen -r "$want"
+        else
+            warn "No session named '$want'. Running sessions:"
+            echo "$sessions" | sed 's/^/  /'
+        fi
+        return
+    fi
+
+    count=$(echo "$sessions" | grep -c .)
+    if [ "$count" -eq 1 ]; then
+        log "Attaching to $sessions (Ctrl-A D to detach)..."
+        screen -r "$sessions"
+    else
+        warn "Multiple process sessions running:"
+        echo "$sessions" | sed 's/^/  /'
+        echo "Attach one with: $0 attach <name>"
     fi
 }
 
 kill_process() {
-    local SCREEN_NAME="engagic-process"
-    if screen -list | grep -q "$SCREEN_NAME"; then
-        warn "Killing process session..."
-        screen -S "$SCREEN_NAME" -X quit
+    local want="$1" sessions count
+    sessions=$(list_process_sessions)
+
+    if [ -z "$sessions" ]; then
+        info "No process session running"
+        return
+    fi
+
+    if [ "$want" = "all" ]; then
+        warn "Killing ALL process sessions..."
+        echo "$sessions" | while read -r s; do
+            [ -n "$s" ] && screen -S "$s" -X quit
+        done
+        pkill -f "engagic-conductor process" 2>/dev/null || true
+        log "All process sessions terminated"
+        return
+    fi
+
+    if [ -n "$want" ]; then
+        if process_session_exists "$want"; then
+            warn "Killing $want..."
+            # Quit just this session; its child conductor dies with it. No global
+            # pkill here -- with concurrent jobs that would kill sibling sessions.
+            screen -S "$want" -X quit
+            log "$want terminated"
+        else
+            warn "No session named '$want'. Running sessions:"
+            echo "$sessions" | sed 's/^/  /'
+        fi
+        return
+    fi
+
+    count=$(echo "$sessions" | grep -c .)
+    if [ "$count" -eq 1 ]; then
+        warn "Killing process session $sessions..."
+        screen -S "$sessions" -X quit
         pkill -f "engagic-conductor process" 2>/dev/null || true
         log "Process session terminated"
     else
-        info "No process session running"
+        warn "Multiple process sessions running:"
+        echo "$sessions" | sed 's/^/  /'
+        echo "Kill one with: $0 kill-process <name>   |   all: $0 kill-process all"
     fi
 }
 
@@ -860,10 +944,10 @@ show_help() {
     echo "                                    <name>   -> munis/<name>.txt   (e.g. processed, bay-area)"
     echo "                                    knowns   -> munis/processed.txt"
     echo "                                    schools  -> all active type='school_district' (from DB)"
-    echo "    process TARGETS           - Process in screen (survives SSH disconnect). Same TARGETS as sync."
+    echo "    process TARGETS           - Process in a named screen (survives SSH disconnect; run several at once)."
     echo "    sync-and-process TARGETS  - Fetch + process. Same TARGETS as sync."
-    echo "    attach                    - Reattach to running process session"
-    echo "    kill-process              - Stop running process session"
+    echo "    attach [NAME]             - Reattach to a process session (lists them if NAME omitted and >1 running)"
+    echo "    kill-process [NAME|all]   - Stop a process session (or 'all'; lists them if NAME omitted and >1 running)"
     echo "    process-unprocessed       - Process all unprocessed meetings in queue"
     echo ""
     echo "  Watchlist:"
@@ -980,8 +1064,8 @@ case "$COMMAND" in
     sync)                sync "$2" ;;
     process)             process "$2" ;;
     sync-and-process)    sync_and_process "$2" ;;
-    attach)              attach_process ;;
-    kill-process)        kill_process ;;
+    attach)              attach_process "$2" ;;
+    kill-process)        kill_process "$2" ;;
     process-unprocessed) process_unprocessed ;;
 
     # Watchlist and users

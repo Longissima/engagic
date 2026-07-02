@@ -202,6 +202,35 @@ CREATE TABLE IF NOT EXISTS queue (
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
 
+-- Batch jobs: durable record of submitted Gemini Batch API jobs (see
+-- migration 024). The submit path writes a row and releases its lane slot; a
+-- collector polls open rows and ingests results on Gemini's terminal verdict.
+-- Running jobs are never cancelled. One row per submitted chunk.
+CREATE TABLE IF NOT EXISTS batch_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    gemini_job_name TEXT NOT NULL UNIQUE,
+    meeting_id TEXT NOT NULL,
+    banana TEXT,
+    chunk_num INTEGER NOT NULL DEFAULT 1,
+    item_ids JSONB NOT NULL,
+    cache_name TEXT,
+    prompts_version TEXT,
+    meeting_meta JSONB,
+    status TEXT NOT NULL DEFAULT 'submitted'
+        CHECK (status IN ('submitted', 'collected', 'failed')),
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_polled_at TIMESTAMP,
+    collected_at TIMESTAMP,
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+    FOREIGN KEY (banana) REFERENCES jurisdictions(banana) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_batch_jobs_open
+    ON batch_jobs (created_at)
+    WHERE status = 'submitted';
+CREATE INDEX IF NOT EXISTS idx_batch_jobs_meeting
+    ON batch_jobs (meeting_id);
+
 -- Tenants table: B2B customers (Phase 5)
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,

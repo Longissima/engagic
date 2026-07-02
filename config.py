@@ -115,9 +115,12 @@ class Config:
         # Batch lane slots are separate from JOB_CONCURRENCY so parked polls
         # never starve the streaming lane.
         self.BATCH_JOB_CONCURRENCY = int(os.getenv("ENGAGIC_BATCH_JOB_CONCURRENCY", "3"))
-        # Batch jobs park on Gemini poll loops (30min/chunk worst case,
-        # multi-chunk meetings exist) -- needs its own generous ceiling.
-        self.BATCH_JOB_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_BATCH_JOB_TIMEOUT_SECONDS", "7200"))
+        # Wall-clock bound for the batch-lane SUBMIT step only. Submission is
+        # fire-and-forget (build JSONL, upload, create the job) and returns in
+        # seconds-to-minutes; a decoupled collector polls the running job later
+        # and never kills it. This timer just stops a wedged upload from pinning
+        # a lane slot -- the job's own multi-hour lifetime no longer lives here.
+        self.BATCH_JOB_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_BATCH_JOB_TIMEOUT_SECONDS", "1800"))
 
         # Morphology classifier suggestions fill the chunker's hint slot for
         # cities with no sticky routing history. Hints only reorder rungs
