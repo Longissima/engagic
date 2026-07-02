@@ -231,6 +231,41 @@ CREATE INDEX IF NOT EXISTS idx_batch_jobs_open
 CREATE INDEX IF NOT EXISTS idx_batch_jobs_meeting
     ON batch_jobs (meeting_id);
 
+-- Ground-truth corpus index (see migration 025 / docs/CORPUS_ARCHITECTURE.md).
+-- Original bytes and extracted text live in R2 (engagic-corpus bucket),
+-- content-addressed by sha256(source bytes); these rows are the pointer +
+-- provenance layer. No FKs into meetings/items: the corpus is an append-only
+-- archive that outlives any particular meeting row.
+CREATE TABLE IF NOT EXISTS document_blob (
+    content_sha256 TEXT PRIMARY KEY,
+    bytes BIGINT NOT NULL,
+    content_type TEXT,
+    original_key TEXT,              -- R2 key of archived source bytes; NULL until archived
+    text_key TEXT,                  -- R2 key of extracted text; NULL until extracted
+    extract_method TEXT,            -- 'pymupdf' | 'pymupdf+ocr' | 'antiword' | ...
+    extract_version TEXT,           -- bump corpus.store.EXTRACT_VERSION to force re-extraction
+    page_count INTEGER,
+    ocr_page_count INTEGER,
+    text_chars BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    text_extracted_at TIMESTAMP
+);
+
+-- Where these bytes have been seen: source_identity is the signature-stripped
+-- attachment URL (pipeline.utils.attachment_identity), stable across re-signing.
+CREATE TABLE IF NOT EXISTS document_source (
+    content_sha256 TEXT NOT NULL REFERENCES document_blob(content_sha256) ON DELETE CASCADE,
+    source_identity TEXT NOT NULL,
+    banana TEXT,
+    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (content_sha256, source_identity)
+);
+CREATE INDEX IF NOT EXISTS idx_document_source_identity
+    ON document_source (source_identity, first_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_document_blob_untexted
+    ON document_blob (created_at)
+    WHERE text_key IS NULL;
+
 -- Tenants table: B2B customers (Phase 5)
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,

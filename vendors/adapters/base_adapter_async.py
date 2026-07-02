@@ -16,19 +16,14 @@ from bs4 import BeautifulSoup
 import aiohttp
 
 from config import config, get_logger
+from pipeline.ground_truth import archive_bytes, produce_ground_truth
 from pipeline.protocols import MetricsCollector, NullMetrics
 from vendors.adapters.parsers.agenda_chunker import _normalize_link_url
 from vendors.adapters.parsers.router import (
     ChunkResult,
+    DEFERRED,
     DOWNLOAD_FAILED,
-    ENGINE_ERROR,
-    MIN_PDF_BYTES,
-    TOO_SMALL,
-    Attempt,
-    chunk_pdf,
-    get_city_hint,
     ladder_for_force_method,
-    set_city_hint,
     summarize_runs,
 )
 from vendors.rate_limiter_async import get_rate_limiter
@@ -92,6 +87,11 @@ class AsyncBaseAdapter:
 
         self.slug = city_slug
         self.vendor = vendor
+        # Adapters are constructed from (vendor, slug) and legitimately don't
+        # know their jurisdiction; the fetcher stamps this after construction
+        # so corpus provenance (document_source.banana) knows which government
+        # produced the bytes. None is fine -- provenance degrades, tee still works.
+        self.banana: Optional[str] = None
         self.metrics = metrics or NullMetrics()
         # chunker cascade audits collected during a fetch, keyed by vendor_id;
         # fetch_meetings() stamps them onto the outgoing meeting dicts
@@ -559,44 +559,38 @@ class AsyncBaseAdapter:
         pdf_bytes: bytes,
         vendor_id: Optional[str] = None,
         ladder: str = "auto",
+        source_url: Optional[str] = None,
     ) -> ChunkResult:
         """Run the chunker cascade on raw PDF bytes. Returns full ChunkResult.
 
         Routing policy lives in router.LADDERS; every rung attempt and any
         terminal failure reason ends up in the result's audit trail.
         """
-        if len(pdf_bytes) < MIN_PDF_BYTES:
-            result = ChunkResult(failure_reason=TOO_SMALL, ladder=ladder)
+        # Shape deferral: with SYNC_CHUNKING off, sync does stage-1 only --
+        # archive the bytes to the corpus and store the meeting's URLs; the
+        # processor manufactures items at claim time from the archived bytes
+        # (same producer, later call). Adapters' probe logic reads this as
+        # "no items" and falls through its URL ladder, archiving each
+        # candidate on the way -- which is exactly stage 1's job.
+        if not config.SYNC_CHUNKING:
+            await archive_bytes(pdf_bytes, source_url, self.banana)
+            result = ChunkResult(failure_reason=DEFERRED, ladder=ladder)
             self._record_chunk_audit(vendor_id, result)
             return result
 
-        hint = get_city_hint(self.vendor, self.slug, ladder)
-
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp_path = tmp.name
-                tmp.write(pdf_bytes)
-
-            result = await asyncio.to_thread(chunk_pdf, tmp_path, ladder, hint)
-
-        except Exception as e:
-            result = ChunkResult(failure_reason=ENGINE_ERROR, ladder=ladder)
-            result.attempts.append(
-                Attempt(rung="cascade", failure_reason=ENGINE_ERROR,
-                        error=f"{type(e).__name__}: {e}")
-            )
-        finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+        # The single producer (pipeline/ground_truth.py): archive tee +
+        # guarded chunk + provably-complete text persist, shared with the
+        # processor's shape-manufacturing step.
+        result = await produce_ground_truth(
+            pdf_bytes,
+            vendor=self.vendor,
+            slug=self.slug,
+            ladder=ladder,
+            source_url=source_url,
+            banana=self.banana,
+        )
 
         self._record_chunk_audit(vendor_id, result)
-
-        if result.winning_rung:
-            set_city_hint(self.vendor, self.slug, ladder, result.winning_rung)
 
         if result.items:
             logger.info(
@@ -680,7 +674,7 @@ class AsyncBaseAdapter:
             result = ChunkResult(failure_reason=DOWNLOAD_FAILED, ladder=ladder)
             self._record_chunk_audit(vendor_id, result)
             return result
-        return await self._chunk_pdf_bytes(pdf_bytes, vendor_id, ladder)
+        return await self._chunk_pdf_bytes(pdf_bytes, vendor_id, ladder, source_url=pdf_url)
 
     async def _parse_packet_pdf(
         self,

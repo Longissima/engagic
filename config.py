@@ -122,11 +122,54 @@ class Config:
         # a lane slot -- the job's own multi-hour lifetime no longer lives here.
         self.BATCH_JOB_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_BATCH_JOB_TIMEOUT_SECONDS", "1800"))
 
+        # Ground-truth corpus (docs/CORPUS_ARCHITECTURE.md): original document
+        # bytes and extracted text archived to R2, content-addressed by
+        # sha256(bytes). Reuses the R2-scoped Cloudflare token the tile deploy
+        # already ships in .llm_secrets. CORPUS_ENABLED is the kill switch for
+        # every tee/read path; the corpus degrades to off when creds are absent.
+        self.CORPUS_ENABLED = os.getenv("ENGAGIC_CORPUS_ENABLED", "true").lower() == "true"
+        self.CORPUS_BUCKET = os.getenv("ENGAGIC_CORPUS_BUCKET", "engagic-corpus")
+        self.CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+        self.CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+        # R2 S3 data-plane credentials (<account>.r2.cloudflarestorage.com).
+        # Still Cloudflare: derived from the R2-scoped API token (access key =
+        # token id, secret = sha256 of the token value). The data plane exists
+        # because the REST management API caps at ~1200 req/5min globally --
+        # object traffic at pipeline volume belongs on the S3 endpoint.
+        self.R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+        self.R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+        # The Cloudflare REST object endpoint caps uploads around 300MB;
+        # oversized originals are indexed (hash, size, sources) but not
+        # archived until a multipart path exists.
+        self.CORPUS_MAX_ORIGINAL_BYTES = int(
+            os.getenv("ENGAGIC_CORPUS_MAX_ORIGINAL_BYTES", str(256 * 1024 * 1024))
+        )
+
         # Morphology classifier suggestions fill the chunker's hint slot for
         # cities with no sticky routing history. Hints only reorder rungs
         # within a ladder (cascade still runs), so worst case = one wasted
         # attempt. Classification itself always runs and lands in the audit.
         self.CHUNKER_CLASSIFIER_HINTS = os.getenv("ENGAGIC_CHUNKER_CLASSIFIER_HINTS", "true").lower() == "true"
+
+        # Sync chunker guard (parsing/subprocess_guard.py). chunk_pdf runs in
+        # a resource-capped subprocess: prod telemetry puts the p99 cascade at
+        # ~2.2s and the 2026-06-29 freeze at 902s, so 300s bounds the
+        # pathological tail (which now includes the ground-truth text pass on
+        # monster packets) without ever touching legitimate work. Concurrency
+        # caps simultaneous chunker children across all vendors -- sync fans
+        # out to CITY_SYNC_CONCURRENCY per vendor, and without a gate a busy
+        # sync could spawn dozens of children on a 3.8GB box.
+        self.CHUNKER_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_CHUNKER_TIMEOUT_SECONDS", "300"))
+        self.CHUNKER_SUBPROCESS_CONCURRENCY = int(os.getenv("ENGAGIC_CHUNKER_SUBPROCESS_CONCURRENCY", "4"))
+
+        # Where PDF shape gets manufactured. True (default) = adapters chunk
+        # at sync, the historical behavior. False = sync only archives bytes
+        # to the corpus (stage 1) and stores the meeting's URLs; the processor
+        # manufactures items at claim time from corpus bytes via the same
+        # produce_ground_truth stage. Sync becomes pure network breadth --
+        # chunking-at-sync only ever existed to satisfy the "processing
+        # receives perfect shape" contract, which the corpus dissolved.
+        self.SYNC_CHUNKING = os.getenv("ENGAGIC_SYNC_CHUNKING", "true").lower() == "true"
 
         # Payment processing
         self.STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")

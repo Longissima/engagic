@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import fitz
 
 from config import config, get_logger
+from parsing.pdf import PdfExtractor
 from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf
 from vendors.adapters.parsers.agenda_chunker_v2 import parse_agenda_pdf_v2
 from vendors.adapters.parsers.morphology import classify
@@ -45,6 +46,8 @@ ENCRYPTED = "encrypted"            # password-protected
 NO_TEXT_LAYER = "no_text_layer"    # scanned/image-only, nothing to anchor on
 NO_ITEMS = "no_items"              # parsed fine, no item structure found
 ENGINE_ERROR = "engine_error"      # chunker raised
+TIMEOUT = "timeout"                # guard killed a wedged/runaway chunk (set by dispatch)
+DEFERRED = "deferred_to_processing"  # sync archived the bytes; the processor manufactures shape
 
 MIN_PDF_BYTES = 500
 
@@ -183,6 +186,14 @@ class ChunkResult:
     suggested_rung: Optional[str] = None  # classifier's pick (None = no opinion)
     suggestion_used: bool = False  # suggestion actually filled the hint slot
     quality: Dict[str, Any] = field(default_factory=dict)  # extraction vs chunking layer signals
+    # Ground-truth text manufactured alongside chunking (stage 2 of
+    # docs/CORPUS_ARCHITECTURE.md): the full PdfExtractor result dict
+    # (text/method/page_count/ocr_pages/ocr_pending), produced with OCR
+    # disabled while the child already holds the document. ocr_pending == 0
+    # means the text is exactly what the OCR-enabled process extractor would
+    # produce, so the base adapter persists it to the corpus. Never part of
+    # audit() -- the text can be megabytes and audits land in queue metadata.
+    extraction: Optional[Dict[str, Any]] = None
 
     @property
     def parse_method(self) -> str:
@@ -226,6 +237,31 @@ def _run_rung(rung: str, pdf_path: str) -> Dict[str, Any]:
     if func is None or method not in _VALID_METHODS[engine]:
         raise ValueError(f"invalid rung: {rung!r}")
     return func(pdf_path, force_method=None if method == "auto" else method)
+
+
+def _attach_ground_truth(result: ChunkResult, pdf_path: str) -> None:
+    """Manufacture full raw text while this child already holds the document.
+
+    The stage-2 write-once law: sync is one of the two places bytes get
+    parsed, so producing the corpus text here means process never re-extracts
+    what sync already read. OCR stays disabled -- pure scans and mixed docs
+    belong to the OCR-owning process path -- and the profile gates the pass so
+    obviously scanned documents don't pay a full-document read for nothing.
+    A failure here costs only the text; the chunk items already stand.
+    """
+    if result.profile is None or not result.profile.has_text_layer:
+        return
+    try:
+        t0 = time.monotonic()
+        # Defaults match the process extractor (ocr_threshold=100,
+        # detect_legislative_formatting=True): with ocr_pending == 0 the
+        # output is identical to what process extraction would produce,
+        # which is what makes persisting it sound.
+        extractor = PdfExtractor(ocr_enabled=False)
+        result.extraction = extractor.extract_from_path(pdf_path)
+        result.extraction["extraction_time"] = round(time.monotonic() - t0, 3)
+    except Exception as e:
+        logger.debug("ground-truth text pass failed", error=str(e), error_type=type(e).__name__)
 
 
 def _classify_empty(
@@ -348,9 +384,13 @@ def chunk_pdf(
                     len(items),
                 ),
             }
+            _attach_ground_truth(result, pdf_path)
             return result
 
     result.failure_reason = _classify_empty(pdf_path, result.attempts, result.profile)
+    # No items is not no text: a flat agenda that defeated every rung still
+    # carries corpus-worthy ground truth.
+    _attach_ground_truth(result, pdf_path)
     return result
 
 

@@ -23,12 +23,14 @@ from database.repositories_async import (
     MatterRepository,
     QueueRepository,
     BatchJobRepository,
+    DocumentBlobRepository,
     SearchRepository,
 )
 from database.repositories_async.deliberation import DeliberationRepository
 from database.repositories_async.engagement import EngagementRepository
 from database.repositories_async.feedback import FeedbackRepository
 from database.repositories_async.userland import UserlandRepository
+from corpus.store import close_corpus, init_corpus
 from exceptions import DatabaseConnectionError
 
 logger = get_logger(__name__).bind(component="database_postgres")
@@ -60,6 +62,7 @@ class Database:
     matters: MatterRepository
     queue: QueueRepository
     batch_jobs: BatchJobRepository
+    document_blobs: DocumentBlobRepository
     search: SearchRepository
     userland: UserlandRepository
     deliberation: DeliberationRepository
@@ -76,11 +79,16 @@ class Database:
         self.matters = MatterRepository(pool)
         self.queue = QueueRepository(pool)
         self.batch_jobs = BatchJobRepository(pool)
+        self.document_blobs = DocumentBlobRepository(pool)
         self.search = SearchRepository(pool)
         self.userland = UserlandRepository(pool)
         self.engagement = EngagementRepository(pool)
         self.feedback = FeedbackRepository(pool)
         self.deliberation = DeliberationRepository(pool)
+
+        # The corpus singleton rides the DB lifecycle: adapters and the
+        # analyzer reach it via corpus.get_corpus() since neither holds a DB.
+        init_corpus(self.document_blobs)
 
         logger.info("database initialized with repositories", pool_size=f"{pool._minsize}-{pool._maxsize}")
 
@@ -127,6 +135,9 @@ class Database:
             raise DatabaseConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
 
     async def close(self):
+        # The corpus store closes first: it holds an aiohttp session, not pool
+        # connections, but its repository dies with this pool either way.
+        await close_corpus()
         # Graceful close waits to reset each connection; one left mid-operation
         # can't be reset and blocks indefinitely. Bound it, then force-terminate.
         try:

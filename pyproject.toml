@@ -11,7 +11,7 @@ database = ["schema.sql", "migrations/*.sql"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vendors*", "parsing*", "analysis*", "pipeline*", "database*", "server*", "userland*"]
+include = ["vendors*", "parsing*", "analysis*", "pipeline*", "database*", "server*", "userland*", "corpus*"]
 exclude = ["tests*", "scripts*", "docs*", "frontend*"]
 
 [project]
@@ -87,7 +87,7 @@ dev = [
 ]
 
 [tool.pyright]
-include = ["vendors", "parsing", "analysis", "pipeline", "database", "server", "userland"]
+include = ["vendors", "parsing", "analysis", "pipeline", "database", "server", "userland", "corpus"]
 extraPaths = ["tests/chunker"]
 exclude = ["**/__pycache__", ".venv", "venv", "scripts", "docs", "motioncount"]
 typeCheckingMode = "basic"  # or "standard" or "strict"

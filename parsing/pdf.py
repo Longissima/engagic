@@ -361,7 +361,7 @@ class PdfExtractor:
             cls._instance = cls()
         return cls._instance
 
-    def __init__(self, ocr_threshold: int = 100, ocr_dpi: int = 200, detect_legislative_formatting: bool = True, max_ocr_workers: int | None = None):
+    def __init__(self, ocr_threshold: int = 100, ocr_dpi: int = 200, detect_legislative_formatting: bool = True, max_ocr_workers: int | None = None, ocr_enabled: bool = True):
         """Initialize PDF extractor
 
         Args:
@@ -373,9 +373,16 @@ class PdfExtractor:
                     Only activates if document contains legislative formatting legend. Default: True (safe for all PDFs)
             max_ocr_workers: Maximum parallel OCR workers. Default: CPU count (min 1, max 4).
                     OCR is CPU-bound so more workers than cores causes thrashing.
+            ocr_enabled: If False, pages below ocr_threshold keep their (thin) text-layer
+                    text and are COUNTED in the result's ocr_pending instead of OCR'd.
+                    This is the sync-side ground-truth mode (docs/CORPUS_ARCHITECTURE.md):
+                    ocr_pending == 0 proves the output is identical to what the OCR-enabled
+                    extractor would produce, so it is safe to persist to the corpus;
+                    ocr_pending > 0 means the document belongs to the OCR-owning path.
         """
         self.ocr_threshold = ocr_threshold
         self.ocr_dpi = ocr_dpi
+        self.ocr_enabled = ocr_enabled
         self.detect_legislative_formatting = detect_legislative_formatting
 
         # Auto-detect optimal worker count based on CPU cores
@@ -625,6 +632,7 @@ class PdfExtractor:
         page_texts = {}  # page_num -> text
         all_links = []
         ocr_tasks = []  # List of (page_num, png_bytes, original_text)
+        ocr_pending = 0  # below-threshold pages skipped because ocr_enabled=False
 
         # Check for legislative legend once (if formatting detection enabled)
         use_formatting = self.detect_legislative_formatting and _has_legislative_legend(doc)
@@ -662,20 +670,26 @@ class PdfExtractor:
 
             # If page has minimal text, queue for OCR
             if initial_char_count < self.ocr_threshold:
-                logger.debug(
-                    "page queued for OCR",
-                    page_num=page_num + 1,
-                    char_count=initial_char_count,
-                    threshold=self.ocr_threshold
-                )
-                # Render page to PNG (main thread, PyMuPDF not thread-safe)
-                rendered = self._render_page_for_ocr(page)
-                if rendered:
-                    png_bytes, _, _ = rendered
-                    ocr_tasks.append((page_num + 1, png_bytes, page_text))
-                else:
-                    # Rendering failed, keep original
+                if not self.ocr_enabled:
+                    # Ground-truth mode: count instead of OCR. The caller uses
+                    # ocr_pending to decide whether this text is complete.
+                    ocr_pending += 1
                     page_texts[page_num + 1] = page_text
+                else:
+                    logger.debug(
+                        "page queued for OCR",
+                        page_num=page_num + 1,
+                        char_count=initial_char_count,
+                        threshold=self.ocr_threshold
+                    )
+                    # Render page to PNG (main thread, PyMuPDF not thread-safe)
+                    rendered = self._render_page_for_ocr(page)
+                    if rendered:
+                        png_bytes, _, _ = rendered
+                        ocr_tasks.append((page_num + 1, png_bytes, page_text))
+                    else:
+                        # Rendering failed, keep original
+                        page_texts[page_num + 1] = page_text
             else:
                 page_texts[page_num + 1] = page_text
 
@@ -730,12 +744,34 @@ class PdfExtractor:
             "page_count": page_count,
             "extraction_time": extraction_time,
             "ocr_pages": ocr_pages,
+            "ocr_pending": ocr_pending,
         }
 
         if extract_links:
             result["links"] = all_links
 
         return result
+
+    def extract_from_path(self, pdf_path: str, extract_links: bool = False) -> Dict[str, Any]:
+        """Extract text from a PDF on disk without loading bytes into memory.
+
+        PDF-only (no format sniffing): fitz maps the file directly, so this
+        is the memory-lean entry for guarded subprocess children that already
+        hold a temp file. Mixed formats (docx/rtf/pptx) go through
+        extract_from_bytes.
+        """
+        start_time = time.time()
+        try:
+            with fitz.open(pdf_path) as doc:
+                return self._extract_from_document(doc, extract_links, start_time)
+        except Exception as e:  # Intentionally broad: API boundary, convert to typed error
+            extraction_time = time.time() - start_time
+            logger.error("[PyMuPDF] extraction from path failed", error=str(e), error_type=type(e).__name__, extraction_time=round(extraction_time, 2))
+            raise ExtractionError(
+                f"PDF extraction failed after {extraction_time:.1f}s",
+                document_type="pdf",
+                original_error=e
+            ) from e
 
     def extract_from_url(self, url: str, extract_links: bool = False) -> Dict[str, Any]:
         """Extract text and optionally links from PDF URL
@@ -861,3 +897,19 @@ class PdfExtractor:
             return False
 
         return True
+
+
+def extract_document_file(pdf_path: str, ocr_threshold: int, ocr_dpi: int,
+                          detect_legislative_formatting: bool, max_ocr_workers: int | None) -> Dict[str, Any]:
+    """Guard-child target for process extraction (parsing.subprocess_guard).
+
+    Module-level on purpose: forkserver children import the target's module,
+    and this one costs a parsing-stack import instead of the analyzer's
+    HTTP/LLM stack. Reads the document from disk (parent wrote a temp file
+    and released the bytes) and routes through extract_from_bytes for
+    format sniffing -- process attachments arrive as PDF/DOCX/RTF/PPTX.
+    """
+    with open(pdf_path, "rb") as f:
+        data = f.read()
+    extractor = PdfExtractor(ocr_threshold, ocr_dpi, detect_legislative_formatting, max_ocr_workers)
+    return extractor.extract_from_bytes(data)

@@ -6,6 +6,188 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-07-02] One Write Path: Shape Manufacturing Moves to Claim Time
+
+Two producers coordinating through first-writer-wins was a treaty, not an
+architecture. This finishes the thought: chunking-at-sync only ever
+existed to satisfy the early "processing receives perfect shape"
+contract, and the corpus dissolved that contract -- sync can hand
+processing a meeting plus archived bytes instead of a finished item list.
+
+**pipeline/ground_truth.py is now THE producer.** produce_ground_truth
+(archive tee -> guarded chunk -> provably-complete text persist -> rung
+hint update) was extracted from the base adapter; the adapter's
+_chunk_pdf_bytes is a thin delegate and the processor calls the same
+function. One write path, two call sites, zero duplicated policy.
+
+**The processor manufactures shape at claim time.** process_meeting, on a
+meeting with zero items, now runs the same agenda->packet ladder the
+adapters encode (attachment-bearing agenda items win, packet TOC second,
+body-text items as last resort), sources bytes corpus-first (sync
+archived them; download only on a miss), and stores through the exact
+sync item funnel via MeetingSyncOrchestrator.attach_items -- ID
+generation, junk-title filter, matter tracking, snapshot-preserving
+store, prior-appearance copies, appearances, matter-job enqueue.
+Downstream cannot tell where shape was born. Gated to zero existing
+items on purpose: chunk-derived item IDs would coexist with, not
+replace, a different-shaped existing set (verified empirically). Handles
+packet_url being a list (multi-packet vendors).
+
+**ENGAGIC_SYNC_CHUNKING (default true) is the migration valve.** False
+means sync does stage 1 only: archive the bytes, record the DEFERRED
+outcome in the chunk audit, store the meeting's URLs, enqueue. Adapters'
+probe logic ("did this URL chunk?") reads deferral as no-items and falls
+through its URL ladder, archiving each candidate -- which is exactly
+stage 1's job. The processor manufactures shape when it claims the job.
+Default stays true until deferred mode has soaked per-vendor; flipping
+is one env var, and granicus (whose six chunk sites double as URL
+probes) deserves a watchful eye when it flips.
+
+Verified on prod: a chunk-born meeting re-manufactured 4 items through
+the full path; four genuinely flat committee agendas correctly produced
+no shape while still persisting their full text to the corpus (no items
+is not no text); deferral unit-verified (archives + DEFERRED audit).
+Suite: 154 passed.
+
+Sync-side chunking is now legacy behavior behind a flag, not a
+structural necessity. When the flag flips for good, the sync freeze
+class stops being guarded-against and starts being impossible: sync
+never opens a PDF again.
+
+## [2026-07-02] Corpus Grows Up: Data-Plane Transport and True Provenance
+
+Two hardening follow-ups, same day:
+
+**R2 transport moved to the S3 data plane.** The corpus client now speaks
+SigV4 against <account>.r2.cloudflarestorage.com instead of the
+api.cloudflare.com management API. Still Cloudflare, same bucket -- but
+the management API is globally capped at ~1200 requests/5min per token,
+which a fleet sync plus a backfill would exhaust, silently thinning
+corpus coverage (the store degrades to warnings by design, so nobody
+would notice). The data plane has no such cap. No new secrets: the S3
+credentials are DERIVED from the existing R2-scoped token (access key =
+token id, secret = sha256 of the token value -- documented Cloudflare
+equivalence), appended to .llm_secrets as
+R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY. SigV4 is hand-rolled over aiohttp
+(~40 lines, three verbs, one endpoint) rather than importing the sync
+and heavyweight botocore stack; payload hashes are signed for real
+because content addressing already computed them -- the object key IS
+the body digest.
+
+**Banana threads from truth into provenance.** document_source.banana now
+populates at both tee sites, sourced from authoritative rows only: the
+fetcher stamps adapter.banana from the jurisdictions table after
+construction (adapters only know vendor+slug); process paths pass
+meeting.banana (meetings row) or process_matter's validated banana --
+never parsed out of strings at the tee. record_source upgraded to
+COALESCE-fill: a row first seen without provenance gains it on the next
+sighting from a caller that knows, and never overwrites. Verified live:
+a Martinez staff report archived with banana='martinezCA' straight from
+the jurisdictions row, then served from_corpus on second pass through
+the new transport.
+
+## [2026-07-02] The Collapse: One Guarded Surface, Sync Manufactures Ground Truth
+
+Same day, second slice: the two extraction sites stop being strangers.
+Three moves, in the order CORPUS_ARCHITECTURE.md forces:
+
+**One guard.** parsing/subprocess_guard.py is now the single containment
+for crash-prone PDF work: forkserver child, RLIMIT_AS, oom_score_adj
++500, kill-on-timeout, queue-drain-before-join. Extracted from
+analyzer_async's private guard (DEBT_CLASS_RADAR item 2, the "siloed"
+flavor) and improved in the move: the old guard did one blocking
+queue.get, so a segfaulted child silently ate the full 600s timeout
+before anyone noticed -- run_guarded polls in 1s slices and reports
+GuardCrashed (with exit code) the moment the child dies. The analyzer's
+guard-child target moved to parsing.pdf (extract_document_file), so
+extraction children import the parsing stack instead of the analyzer's
+HTTP/LLM stack.
+
+**The chunker is guarded.** chunk_pdf now runs through run_guarded (300s
+timeout vs the 2.2s p99 cascade and the 902s freeze; 1GB cap -- chunking
+is text-layer work, OCR never runs in the chunker child) behind a
+per-event-loop semaphore (CHUNKER_SUBPROCESS_CONCURRENCY=4) so a wide
+vendor-parallel sync can't spawn dozens of children. Guard timeouts get
+their own failure_reason ("timeout") in the chunk audit -- the freeze
+class is now queryable telemetry instead of an outage.
+
+**Sync manufactures ground truth.** With the guard in place, the chunker
+child produces the corpus text while it already holds the document:
+PdfExtractor gained ocr_enabled=False, which keeps thin pages' text and
+COUNTS them as ocr_pending instead of OCR'ing. ocr_pending == 0 proves
+the output is byte-identical to what the OCR-enabled process extractor
+would produce (same threshold, same formatting detection, same code
+path), so the base adapter persists it; ocr_pending > 0 means the
+document belongs to the OCR-owning process path and sync persists
+nothing -- no quality downgrade is possible. persist_extraction became
+first-writer-wins per extract_version so a later text-layer pass can
+never clobber OCR text for the same bytes. The text pass also runs when
+the cascade found no items: a flat agenda that defeated every rung still
+carries corpus-worthy text.
+
+Verified on prod: a real packet chunked through the guarded dispatch (34
+items + 32,744 chars persisted, ocr_pending=0), then process extraction
+of the same bytes served from_corpus without extracting -- the first
+cross-site read. Guard contract suite (6 tests: roundtrip, >64KB pipe
+results, child exception typing, timeout-kill, silent-crash exit codes,
+RLIMIT containment) plus text-pass suite (4: production, blank-PDF gate,
+guard pickling, mixed-document ocr_pending) all green; full fast suite
+108 passed.
+
+PyMuPDF now executes in exactly two module-level child targets --
+chunk_pdf and extract_document_file -- both behind one guard, both
+writing one corpus. What remains for the full collapse: OCR off-box
+(phase 0 Mistral), motioncount reading the corpus instead of refetching,
+and eventually merging the two targets into one produce-ground-truth
+stage.
+
+## [2026-07-02] The Corpus Exists: Extraction Writes Once
+
+First shipped slice of docs/CORPUS_ARCHITECTURE.md: original document
+bytes and extracted text now persist to R2 (engagic-corpus bucket,
+originals/<sha256> and text/<sha256>.txt), content-addressed by
+sha256(source bytes) -- the identity primitive the codebase never had
+(everything else hashes URL+name metadata). Postgres carries the pointer
+and provenance index (migration 025: document_blob with
+extract_method/extract_version, document_source mapping
+signature-stripped URL identities to hashes), so "have we extracted this
+exact artifact" is a row lookup, not a guess.
+
+Two tee points, per the doc's interim plan, both safe under concurrent
+writers because content addressing makes identical bytes converge:
+
+- **Process extraction** (analyzer.extract_pdf_async): after download,
+  hash; on corpus hit, serve the stored text and skip extraction
+  entirely (from_corpus=True, shaped exactly like a fresh result). On
+  miss, archive the original from the temp file BEFORE extracting --
+  pathological documents that time out still enter the archive for a
+  better extractor later -- then persist the text after.
+- **Sync chunker** (base adapter _chunk_pdf_bytes): archive original
+  bytes regardless of chunk outcome; unchanged packets dedup to a hash
+  lookup on re-scrape.
+
+The corpus is a passenger, never the driver: every store method traps
+its own failures and degrades to "no corpus" with a warning. R2 access
+rides the existing R2-scoped Cloudflare token over the REST object API
+(aiohttp, no boto3, no new secrets); the store is a module-level
+singleton initialized with the Database (adapters have no DB handle to
+thread it through). ENGAGIC_CORPUS_ENABLED is the kill switch;
+originals past the REST endpoint's ~300MB cap are indexed but not
+uploaded. lookup_extraction treats a stale extract_version as a miss,
+so bumping EXTRACT_VERSION re-extracts lazily exactly where documents
+are touched again.
+
+Verified end-to-end on prod: same attachment extracted then served from
+corpus on second pass; adapter packet chunk (34 items) archived its
+bytes with identity lookup resolving. Unit suite covers roundtrip,
+dedup-skip, version-miss, oversize, and R2-outage paths.
+
+Not in this slice: chunker text is not yet persisted (the sync side
+archives originals only -- full text there awaits the stage-2 collapse
+of the two extraction sites), motioncount still fetches its own bytes
+(the read path get_blob_for_identity + lookup_extraction is ready for
+it), and OCR still runs on-box.
+
 ## [2026-06-12] Unsummarizable Matters Get a Terminal State
 
 Counted on prod: 142 Palo Alto matters with attachments but no canonical
