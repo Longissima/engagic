@@ -46,7 +46,8 @@ ENCRYPTED = "encrypted"            # password-protected
 NO_TEXT_LAYER = "no_text_layer"    # scanned/image-only, nothing to anchor on
 NO_ITEMS = "no_items"              # parsed fine, no item structure found
 ENGINE_ERROR = "engine_error"      # chunker raised
-TIMEOUT = "timeout"                # guard killed a wedged/runaway chunk (set by base adapter)
+TIMEOUT = "timeout"                # guard killed a wedged/runaway chunk (set by dispatch)
+DEFERRED = "deferred_to_processing"  # sync archived the bytes; the processor manufactures shape
 
 MIN_PDF_BYTES = 500
 

@@ -1,16 +1,20 @@
 # Ground-Truth Corpus & Pipeline Restaging
 
-**Status:** Proposal (2026-06-29); slices 1+2 SHIPPED (2026-07-02, see
-CHANGELOG "The Corpus Exists" and "The Collapse"). Live now: the sha256(bytes)
-primitive, document_blob/document_source (migration 025), the engagic-corpus
-R2 bucket, the `corpus/` package, the shared subprocess guard
-(parsing/subprocess_guard.py) containing BOTH extraction sites, the guarded
-sync chunker producing full ground-truth text in-child (ocr_pending gate), and
-the cross-site dedup-read (process serves sync-manufactured text from the
-corpus). PyMuPDF executes in exactly two guarded child targets: chunk_pdf and
-parsing.pdf.extract_document_file. Still pending: OCR offload (phase 0
-Mistral), motioncount reading from the corpus, merging the two child targets
-into one produce-ground-truth stage.
+**Status:** Proposal (2026-06-29); slices 1-3 SHIPPED (2026-07-02, see
+CHANGELOG "The Corpus Exists", "The Collapse", "One Write Path"). Live now:
+the sha256(bytes) primitive, document_blob/document_source (migration 025),
+the engagic-corpus R2 bucket over the S3 data plane, the `corpus/` package,
+the shared subprocess guard (parsing/subprocess_guard.py), and ONE producer
+function (pipeline/ground_truth.py: archive -> guarded chunk -> text persist)
+called by both the sync adapters and the processor's claim-time shape
+manufacturing (_manufacture_items -> attach_items funnel). Sync-side chunking
+is legacy behavior behind ENGAGIC_SYNC_CHUNKING (default true); deferred mode
+makes sync pure stage 1 (archive + enqueue) with shape born at claim time
+from corpus bytes. PyMuPDF executes in exactly two guarded child targets
+(chunk_pdf, parsing.pdf.extract_document_file) behind one guard and one
+producer. Still pending: flip SYNC_CHUNKING per-vendor (granicus last -- its
+chunk sites double as URL probes), OCR offload (phase 0 Mistral), motioncount
+reading from the corpus, merging the two child targets.
 **Motivation:** (1) a single pathological PDF froze the whole sync for ~15 min on
 2026-06-29 (unguarded `get_text` in the sync chunker); (2) extraction work is
 re-done on every reanalysis because we extract-and-discard; (3) the OCR RAM bomb

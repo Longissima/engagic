@@ -235,6 +235,29 @@ class CorpusStore:
             )
             return None
 
+    async def get_original_by_identity(self, source_url: str) -> Optional[bytes]:
+        """Fetch archived original bytes for a URL identity -- the well.
+
+        The processor's shape-manufacturing step drinks from here instead of
+        re-downloading what sync already archived. Resolves to the NEWEST
+        blob seen at the identity (a URL that served revised bytes gets its
+        latest revision). None on unknown identity, unarchived blob, or any
+        corpus trouble -- callers fall back to downloading.
+        """
+        try:
+            blob = await self.blobs.get_blob_for_identity(attachment_identity(source_url))
+            if not blob or not blob.get("original_key"):
+                return None
+            return await self.r2.get(blob["original_key"])
+        except Exception as e:
+            logger.warning(
+                "corpus original fetch failed, caller falls back to download",
+                url=source_url[:120],
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return None
+
     async def record_sighting(
         self, content_sha256: str, source_url: Optional[str], banana: Optional[str] = None
     ) -> None:

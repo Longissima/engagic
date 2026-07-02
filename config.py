@@ -162,6 +162,15 @@ class Config:
         self.CHUNKER_TIMEOUT_SECONDS = int(os.getenv("ENGAGIC_CHUNKER_TIMEOUT_SECONDS", "300"))
         self.CHUNKER_SUBPROCESS_CONCURRENCY = int(os.getenv("ENGAGIC_CHUNKER_SUBPROCESS_CONCURRENCY", "4"))
 
+        # Where PDF shape gets manufactured. True (default) = adapters chunk
+        # at sync, the historical behavior. False = sync only archives bytes
+        # to the corpus (stage 1) and stores the meeting's URLs; the processor
+        # manufactures items at claim time from corpus bytes via the same
+        # produce_ground_truth stage. Sync becomes pure network breadth --
+        # chunking-at-sync only ever existed to satisfy the "processing
+        # receives perfect shape" contract, which the corpus dissolved.
+        self.SYNC_CHUNKING = os.getenv("ENGAGIC_SYNC_CHUNKING", "true").lower() == "true"
+
         # Payment processing
         self.STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
         self.STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")

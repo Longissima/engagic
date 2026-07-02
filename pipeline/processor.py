@@ -10,6 +10,9 @@ from typing import List, Optional, Dict, Any
 from database.db_postgres import Database
 from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
+from corpus.store import get_corpus
+from pipeline.ground_truth import produce_ground_truth
+from pipeline.orchestrators.meeting_sync import MeetingSyncOrchestrator
 from pipeline.utils import hash_substantive_attachments, hash_substantive_attachments_legacy
 from pipeline.url_refresh import refresh_attachment_urls
 from exceptions import ProcessingError, ExtractionError, LLMError
@@ -1347,6 +1350,96 @@ class Processor:
         _release_memory_to_os()
         return {"items_processed": len(items), "items_new": filled, "items_skipped": len(items) - filled, "items_failed": 0}
 
+    async def _manufacture_items(self, meeting: Meeting) -> int:
+        """Manufacture item shape at claim time -- the stage-2 call sync used to make.
+
+        Mirrors the base adapter's agenda->packet policy: chunk the agenda
+        PDF first (short, hyperlinked -- attachment-bearing items win), fall
+        back to the packet (compiled TOC document -- body_text items), and
+        keep attachment-less agenda items as a last-resort text fallback.
+        Bytes come corpus-first (sync archived them even when it deferred
+        chunking), download only on a corpus miss. Manufactured shape enters
+        the DB through the same funnel sync uses (attach_items: junk filter,
+        matter tracking, snapshot-preserving store), so downstream cannot
+        tell where shape was born. Returns stored item count; 0 means no
+        shape and the caller falls through to the monolithic packet path.
+        """
+        if not self.analyzer:
+            return 0
+        city = await self.db.jurisdictions.get_city(banana=meeting.banana)
+        vendor = city.vendor if city else ""
+        slug = city.slug if city else ""
+        corpus_store = get_corpus()
+
+        candidates: List[tuple[str, str]] = []
+        if meeting.agenda_url:
+            candidates.append((meeting.agenda_url, "agenda"))
+        packet_urls = meeting.packet_url  # str | List[str] | None (multi-packet vendors)
+        for packet_url in [packet_urls] if isinstance(packet_urls, str) else (packet_urls or []):
+            candidates.append((packet_url, "packet"))
+
+        chosen: Optional[List[Dict[str, Any]]] = None
+        text_fallback: List[Dict[str, Any]] = []
+        for url, ladder in candidates:
+            pdf_bytes = None
+            if corpus_store:
+                pdf_bytes = await corpus_store.get_original_by_identity(url)
+            if pdf_bytes is None:
+                try:
+                    pdf_bytes = await self.analyzer.download_pdf_async(url)
+                except Exception as e:
+                    logger.warning(
+                        "shape manufacture download failed",
+                        meeting_id=meeting.id,
+                        url=url[:120],
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+                    continue
+
+            result = await produce_ground_truth(
+                pdf_bytes,
+                vendor=vendor,
+                slug=slug,
+                ladder=ladder,
+                source_url=url,
+                banana=meeting.banana,
+            )
+            if not result.items:
+                continue
+            if ladder == "agenda":
+                with_attachments = [it for it in result.items if it.get("attachments")]
+                if with_attachments:
+                    chosen = with_attachments
+                    break
+                text_fallback = [it for it in result.items if it.get("body_text")]
+            else:
+                chosen = result.items
+                break
+
+        items_data = chosen or text_fallback
+        if not items_data:
+            return 0
+
+        stored = await self._sync_orchestrator.attach_items(meeting, items_data)
+        if stored:
+            logger.info(
+                "manufactured item shape at claim time",
+                meeting_id=meeting.id,
+                items_stored=stored,
+            )
+        return stored
+
+    @property
+    def _sync_orchestrator(self) -> MeetingSyncOrchestrator:
+        """Lazy shared orchestrator: the processor enters the item funnel
+        through the same code sync uses, one instance per processor."""
+        orchestrator = getattr(self, "_sync_orchestrator_instance", None)
+        if orchestrator is None:
+            orchestrator = MeetingSyncOrchestrator(self.db)
+            self._sync_orchestrator_instance = orchestrator
+        return orchestrator
+
     async def _diverts_to_packet(self, meeting: Meeting) -> bool:
         """True when the chunk audit smells under-split and a packet exists.
 
@@ -1396,6 +1489,23 @@ class Processor:
                     return await self._process_meeting_with_items(meeting, agenda_items, use_batch=use_batch)
                 else:
                     logger.info("items exist but lack content, falling through to packet", item_count=len(agenda_items), meeting_title=meeting.title)
+
+            # Manufacture shape at claim time (the collapse: chunking is a
+            # produce-ground-truth concern, not a sync concern). Meetings
+            # arrive here item-less either because sync deferred chunking
+            # (SYNC_CHUNKING=false) or because the vendor exposes only
+            # documents and sync's chunk found nothing. Same producer, same
+            # item funnel -- shape born here is indistinguishable from shape
+            # born at sync. Gated to ZERO existing items: manufactured item
+            # IDs are chunk-derived and would coexist with, not replace, a
+            # different-shaped existing set. Falls through to the monolithic
+            # packet path when no shape can be manufactured.
+            if not agenda_items:
+                manufactured = await self._manufacture_items(meeting)
+                if manufactured:
+                    agenda_items = await self.db.items.get_agenda_items(meeting.id)
+                    if agenda_items and self.analyzer:
+                        return await self._process_meeting_with_items(meeting, agenda_items, use_batch=use_batch)
 
             if meeting.packet_url:
                 # Item-level processing has a per-item guard (_filter_processed_items);

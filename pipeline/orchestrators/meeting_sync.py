@@ -291,6 +291,84 @@ class MeetingSyncOrchestrator:
         committee = await self.db.committees.find_or_create_committee(banana, committee_name)
         return committee.id
 
+    async def attach_items(
+        self,
+        stored_meeting: Meeting,
+        items_data: List[Dict[str, Any]],
+    ) -> int:
+        """Attach freshly-manufactured items to an already-stored meeting.
+
+        The processor's entry into the item funnel: when shape is produced at
+        claim time (sync deferred chunking, or sync's chunk found nothing),
+        the exact same pipeline runs -- ID generation, junk-title filter,
+        matter tracking, snapshot-preserving store, prior-appearance summary
+        copies, appearances -- minus the meeting store and meeting-job
+        enqueue, which already happened. Matter jobs discovered here still
+        enqueue, so the matter lane behaves identically regardless of where
+        shape was born. Returns the number of items stored.
+        """
+        stats: MeetingStoreStats = {
+            'items_stored': 0,
+            'items_skipped_procedural': 0,
+            'matters_tracked': 0,
+            'matters_duplicate': 0,
+            'meetings_skipped': 0,
+            'appearances_created': 0,
+            'skip_reason': None,
+        }
+        agenda_items = await self._process_agenda_items(items_data, stored_meeting, stats)
+        agenda_items = self.db.items.dedupe_items_by_matter(agenda_items)
+        if not agenda_items:
+            return 0
+
+        pending_jobs = []
+        async with self.db.pool.acquire() as conn:
+            async with conn.transaction():
+                matters_stats = await self._track_matters(
+                    stored_meeting, items_data or [], agenda_items, conn=conn
+                )
+                pending_jobs = matters_stats.get('pending_jobs', [])
+
+                stored_count = await self.db.items.store_agenda_items(
+                    stored_meeting.id, agenda_items, conn=conn
+                )
+
+                for pending in matters_stats.get('pending_copies', []):
+                    copied = await self.db.items.copy_summary_from_prior_appearance(
+                        matter_id=pending['matter_id'],
+                        target_item_id=pending['target_item_id'],
+                        target_meeting_id=pending['target_meeting_id'],
+                        conn=conn,
+                    )
+                    if copied:
+                        logger.debug(
+                            "reused prior-appearance summary (attachments unchanged)",
+                            matter=pending['matter_label'],
+                        )
+
+                await self._create_matter_appearances(
+                    stored_meeting, agenda_items, conn=conn
+                )
+
+        for job in pending_jobs:
+            try:
+                await self._enqueue_matter_job(**job)
+            except Exception as e:
+                logger.warning(
+                    "failed to enqueue matter job from attach_items",
+                    matter_id=job.get('matter_id'),
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+
+        logger.info(
+            "attached manufactured items to meeting",
+            meeting_id=stored_meeting.id,
+            items_stored=stored_count,
+            matters_tracked=matters_stats.get('tracked', 0),
+        )
+        return stored_count
+
     async def _process_agenda_items(
         self,
         items_data: List[Dict[str, Any]],

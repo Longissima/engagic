@@ -6,6 +6,54 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-07-02] One Write Path: Shape Manufacturing Moves to Claim Time
+
+Two producers coordinating through first-writer-wins was a treaty, not an
+architecture. This finishes the thought: chunking-at-sync only ever
+existed to satisfy the early "processing receives perfect shape"
+contract, and the corpus dissolved that contract -- sync can hand
+processing a meeting plus archived bytes instead of a finished item list.
+
+**pipeline/ground_truth.py is now THE producer.** produce_ground_truth
+(archive tee -> guarded chunk -> provably-complete text persist -> rung
+hint update) was extracted from the base adapter; the adapter's
+_chunk_pdf_bytes is a thin delegate and the processor calls the same
+function. One write path, two call sites, zero duplicated policy.
+
+**The processor manufactures shape at claim time.** process_meeting, on a
+meeting with zero items, now runs the same agenda->packet ladder the
+adapters encode (attachment-bearing agenda items win, packet TOC second,
+body-text items as last resort), sources bytes corpus-first (sync
+archived them; download only on a miss), and stores through the exact
+sync item funnel via MeetingSyncOrchestrator.attach_items -- ID
+generation, junk-title filter, matter tracking, snapshot-preserving
+store, prior-appearance copies, appearances, matter-job enqueue.
+Downstream cannot tell where shape was born. Gated to zero existing
+items on purpose: chunk-derived item IDs would coexist with, not
+replace, a different-shaped existing set (verified empirically). Handles
+packet_url being a list (multi-packet vendors).
+
+**ENGAGIC_SYNC_CHUNKING (default true) is the migration valve.** False
+means sync does stage 1 only: archive the bytes, record the DEFERRED
+outcome in the chunk audit, store the meeting's URLs, enqueue. Adapters'
+probe logic ("did this URL chunk?") reads deferral as no-items and falls
+through its URL ladder, archiving each candidate -- which is exactly
+stage 1's job. The processor manufactures shape when it claims the job.
+Default stays true until deferred mode has soaked per-vendor; flipping
+is one env var, and granicus (whose six chunk sites double as URL
+probes) deserves a watchful eye when it flips.
+
+Verified on prod: a chunk-born meeting re-manufactured 4 items through
+the full path; four genuinely flat committee agendas correctly produced
+no shape while still persisting their full text to the corpus (no items
+is not no text); deferral unit-verified (archives + DEFERRED audit).
+Suite: 154 passed.
+
+Sync-side chunking is now legacy behavior behind a flag, not a
+structural necessity. When the flag flips for good, the sync freeze
+class stops being guarded-against and starts being impossible: sync
+never opens a PDF again.
+
 ## [2026-07-02] Corpus Grows Up: Data-Plane Transport and True Provenance
 
 Two hardening follow-ups, same day:
