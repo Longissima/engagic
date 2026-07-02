@@ -10,7 +10,7 @@ from typing import List, Optional, Dict, Any
 from database.db_postgres import Database
 from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
-from pipeline.utils import hash_substantive_attachments
+from pipeline.utils import hash_substantive_attachments, hash_substantive_attachments_legacy
 from pipeline.url_refresh import refresh_attachment_urls
 from exceptions import ProcessingError, ExtractionError, LLMError
 from analysis.analyzer_async import AsyncAnalyzer
@@ -1170,6 +1170,96 @@ class Processor:
             logger.debug("matter skipped - no attachments", matter_id=matter_id)
             return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
 
+        # sv1 identity is invariant under url_refresh, so hashing before the
+        # refresh below sees the same value the enqueue decider compared.
+        attachment_hash = hash_substantive_attachments(all_attachments)
+        existing_matter = await self.db.matters.get_matter(matter_id)
+        stored_hash = (
+            existing_matter.metadata.attachment_hash
+            if existing_matter and existing_matter.metadata
+            else None
+        )
+        hash_current = stored_hash is not None and (
+            stored_hash == attachment_hash
+            or (
+                ":" not in stored_hash
+                and stored_hash == hash_substantive_attachments_legacy(all_attachments)
+            )
+        )
+
+        # Unchanged gate: the enqueue decider applies this same comparison at
+        # sync time, but a job claimed today may have been enqueued weeks ago
+        # under conditions another run has since resolved. Re-checking here
+        # costs one row read; summarizing costs extraction + LLM.
+        if existing_matter and existing_matter.canonical_summary and hash_current:
+            if ":" not in (stored_hash or ""):
+                # Legacy-format match: persist the current format so future
+                # syncs compare directly.
+                await self.db.matters.update_attachment_hash(matter_id, attachment_hash)
+            filled = await self.db.items.bulk_fill_null_item_summaries(
+                item_ids=[item.id for item in items],
+                summary=existing_matter.canonical_summary,
+                topics=existing_matter.canonical_topics or [],
+                prompts_version=self.analyzer.summarizer.prompts_version if self.analyzer else None,
+            )
+            logger.info(
+                "canonical summary current, skipping summarization",
+                matter_id=matter_id,
+                snapshots_filled=filled,
+            )
+            return {"items_processed": len(items), "items_new": filled, "items_skipped": len(items) - filled, "items_failed": 0}
+
+        # Promotion: a single-appearance matter whose one snapshot is already
+        # summarized needs no LLM run -- the freeze-on-summary invariant
+        # (store_agenda_items) guarantees the snapshot's attachments are
+        # exactly what its summary was computed from, and with one appearance
+        # the aggregate set IS the snapshot set. Copy the summary upward
+        # instead of regenerating it from the same documents.
+        if (
+            (existing_matter is None or not existing_matter.canonical_summary)
+            and len(items) == 1
+            and (existing_matter is None or existing_matter.appearance_count <= 1)
+            and items[0].summary
+        ):
+            matter_obj = Matter(
+                id=matter_id,
+                banana=banana,
+                matter_id=existing_matter.matter_id if existing_matter else None,
+                matter_file=representative_item.matter_file,
+                matter_type=representative_item.matter_type,
+                title=representative_item.title,
+                sponsors=getattr(representative_item, 'sponsors', []),
+                canonical_summary=items[0].summary,
+                canonical_topics=items[0].topics or [],
+                attachments=representative_item.attachments,
+                metadata=MatterMetadata(attachment_hash=attachment_hash),
+                first_seen=existing_matter.first_seen if existing_matter else None,
+                last_seen=existing_matter.last_seen if existing_matter else None,
+                appearance_count=existing_matter.appearance_count if existing_matter else 1,
+            )
+            await self.db.matters.store_matter(matter_obj)
+            logger.info("promoted item snapshot to canonical summary", matter_id=matter_id)
+            return {"items_processed": 1, "items_new": 0, "items_skipped": 1, "items_failed": 0}
+
+        # Terminal disposition: the processing-time title filter is stricter
+        # than the sync-time MatterFilter, so a matter can pass enqueueing yet
+        # never be summarizable. Without a recorded verdict it re-enqueues at
+        # every sync and burns a queue cycle forever (observed: 142 such
+        # matters in one city). The disposition is scoped to this attachment
+        # set -- changed attachments re-open the matter.
+        skip_reason = get_skip_reason(representative_item.title)
+        if skip_reason:
+            await self.db.items.update_filter_reason(representative_item.id, skip_reason)
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, disposition=f"filtered_{skip_reason}"
+            )
+            logger.info(
+                "matter filtered, disposition recorded",
+                matter_id=matter_id,
+                reason=skip_reason,
+            )
+            return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
+
         # Refresh ephemeral signed URLs before extraction. See _process_meeting_with_items.
         city = await self.db.jurisdictions.get_city(banana)
         if city and city.vendor:
@@ -1183,9 +1273,15 @@ class Processor:
         except ProcessingError as e:
             logger.error("matter processing failed", matter_id=matter_id, error=str(e))
             self.metrics.record_error("processor", e)
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, increment_attempts=True
+            )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
 
         if not result:
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, increment_attempts=True
+            )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
 
         summary = result.get("summary")
@@ -1193,10 +1289,10 @@ class Processor:
 
         if not summary:
             logger.warning("no summary generated for matter", matter_id=matter_id)
+            await self.db.matters.record_matter_outcome(
+                matter_id, attachment_hash, increment_attempts=True
+            )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
-
-        attachment_hash = hash_substantive_attachments(representative_item.attachments)
-        existing_matter = await self.db.matters.get_matter(matter_id)
 
         matter_obj = Matter(
             id=matter_id,

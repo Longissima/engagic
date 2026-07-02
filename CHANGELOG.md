@@ -6,6 +6,80 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+## [2026-06-12] Unsummarizable Matters Get a Terminal State
+
+Counted on prod: 142 Palo Alto matters with attachments but no canonical
+summary. Every one re-enqueues at every sync that sees its meeting,
+because the enqueue decider's only notion of "resolved" was a canonical
+summary — a matter that *cannot* produce one (title rejected by the
+processing-time filter, which is stricter than sync's MatterFilter) or
+that keeps failing (dead links, unextractable scans) retried forever.
+process_matter even marked those queue jobs completed, so the churn was
+invisible outside the logs.
+
+MatterMetadata grows two fields, both scoped to the attachment hash they
+were recorded against, so changed attachments always re-open the matter:
+
+- **disposition** — terminal verdict ("filtered_<reason>"): recorded when
+  the title filter rejects the representative item. The decider skips
+  these outright.
+- **attempts** — consecutive failures against one attachment set
+  (extraction raised, no result, empty summary). The decider stops
+  re-enqueueing at MATTER_MAX_ATTEMPTS=3; the counter resets to 1 when
+  the hash changes (new content, fresh budget) and is cleared wholesale
+  by a successful store_matter (metadata is replaced, not merged, on
+  success — the two writers compose).
+
+New MatterRepository.record_matter_outcome does the metadata merge in
+one UPDATE (verified against prod in a rolled-back transaction:
+reset/increment/preserve all behave). The decider was restructured to
+compare hashes first — unchanged-ness now scopes every verdict, where
+previously a missing canonical summary short-circuited straight to
+re-enqueue. Twelve-case truth table exercised in-memory.
+
+Not addressed here: failing *items* (169 in Palo Alto with no summary
+and no filter_reason) still re-extract on every meeting-job run; their
+churn is bounded by sync windows rather than unbounded like matters
+were, and an item-level attempt budget needs schema it doesn't have yet.
+
+## [2026-06-12] Matter Jobs Stop Re-Buying Summaries They Already Own
+
+Confirmed against prod data (Palo Alto, 2026-06-12 run): a matter job
+re-extracted and re-summarized three PDFs whose item snapshot already
+carried a summary of exactly that content — single appearance, identical
+attachment sets, one LLM call to write the item summary in a prior run
+and a second to write the canonical. process_matter gained two
+short-circuits, checked in order:
+
+1. **Unchanged gate.** Once attachments are aggregated, compare the
+   stored attachment hash (sv1, with the legacy-format fallback) against
+   the aggregate before paying for anything. A queued job claimed weeks
+   after enqueue may target a matter another run already resolved; the
+   enqueue decider can't see that, the processor can. On a hit, fill any
+   NULL snapshots from the existing canonical, upgrade legacy hashes to
+   sv1 in place (new MatterRepository.update_attachment_hash), and
+   return.
+
+2. **Promotion.** Canonical missing, single appearance, snapshot already
+   summarized → copy the snapshot's summary and topics up to canonical
+   and store the aggregate hash, no extraction, no LLM. Sound because of
+   the freeze-on-summary invariant in store_agenda_items: a summarized
+   snapshot's attachments are immutable, so they are exactly what its
+   summary was computed from, and with one appearance the aggregate set
+   IS the snapshot set. Multi-appearance matters still get a real
+   aggregated run; the canonical there must cover the union.
+
+The aggregate hash now gets computed before url_refresh rather than
+after — equivalent under sv1 identity (signature-stripped), and it
+matches what the sync-side decider compares.
+
+Known limitation, pre-existing: if a vendor revises attachments after a
+snapshot is summarized, the frozen snapshot never sees the new set, so
+sync's scrape hash and the stored hash disagree forever and the matter
+re-enqueues on every sync. The unchanged gate makes each of those cycles
+nearly free (one row read), but the loop itself is a frozen-snapshot
+design tension for another day.
+
 ## [2026-06-11] Manual Process Runs Drain Both Lanes
 
 `process`, `sync-and-process`, and the watchlist commands only claimed
