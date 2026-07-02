@@ -16,6 +16,8 @@ from bs4 import BeautifulSoup
 import aiohttp
 
 from config import config, get_logger
+from corpus.store import get_corpus, sha256_hex
+from parsing.subprocess_guard import GuardTimeout, run_guarded
 from pipeline.protocols import MetricsCollector, NullMetrics
 from vendors.adapters.parsers.agenda_chunker import _normalize_link_url
 from vendors.adapters.parsers.router import (
@@ -23,6 +25,7 @@ from vendors.adapters.parsers.router import (
     DOWNLOAD_FAILED,
     ENGINE_ERROR,
     MIN_PDF_BYTES,
+    TIMEOUT,
     TOO_SMALL,
     Attempt,
     chunk_pdf,
@@ -36,6 +39,26 @@ from vendors.session_manager_async import AsyncSessionManager
 from exceptions import VendorHTTPError
 
 logger = get_logger(__name__).bind(component="vendor")
+
+# Chunker subprocess budget. Chunking is text-layer work (OCR never runs in
+# the chunker child), so 1GB catches runaway parses -- a broken CMap spewing
+# gigabytes -- without touching legitimate big packets. The concurrency gate
+# is global across adapter instances and lives per event loop: sync fans out
+# CITY_SYNC_CONCURRENCY wide per vendor across parallel vendors, and without
+# this gate a busy sync could spawn dozens of children on a 3.8GB box.
+_CHUNK_RLIMIT_BYTES = 1024 * 1024 * 1024
+_chunk_guard_sems: Dict[Any, asyncio.Semaphore] = {}
+
+
+def _chunk_guard_semaphore() -> asyncio.Semaphore:
+    """The per-loop chunker-children gate (CLI runs and tests each get their
+    own loop; an asyncio.Semaphore cannot cross loops)."""
+    loop = asyncio.get_running_loop()
+    sem = _chunk_guard_sems.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(config.CHUNKER_SUBPROCESS_CONCURRENCY)
+        _chunk_guard_sems[loop] = sem
+    return sem
 
 
 def _get_pdf_link_display_text(page, link_rect) -> str:
@@ -92,6 +115,11 @@ class AsyncBaseAdapter:
 
         self.slug = city_slug
         self.vendor = vendor
+        # Adapters are constructed from (vendor, slug) and legitimately don't
+        # know their jurisdiction; the fetcher stamps this after construction
+        # so corpus provenance (document_source.banana) knows which government
+        # produced the bytes. None is fine -- provenance degrades, tee still works.
+        self.banana: Optional[str] = None
         self.metrics = metrics or NullMetrics()
         # chunker cascade audits collected during a fetch, keyed by vendor_id;
         # fetch_meetings() stamps them onto the outgoing meeting dicts
@@ -559,6 +587,7 @@ class AsyncBaseAdapter:
         pdf_bytes: bytes,
         vendor_id: Optional[str] = None,
         ladder: str = "auto",
+        source_url: Optional[str] = None,
     ) -> ChunkResult:
         """Run the chunker cascade on raw PDF bytes. Returns full ChunkResult.
 
@@ -570,6 +599,24 @@ class AsyncBaseAdapter:
             self._record_chunk_audit(vendor_id, result)
             return result
 
+        # Corpus tee (stage 1, docs/CORPUS_ARCHITECTURE.md): sync is one of
+        # the two places original bytes flow through, so archive them here,
+        # content-addressed -- unchanged packets dedup to a hash lookup on
+        # re-scrape. Chunk outcome is irrelevant: bytes we failed to chunk
+        # are exactly the ones a better extractor wants later. The store
+        # swallows its own failures; sync never breaks on corpus trouble.
+        corpus_store = get_corpus()
+        content_sha256 = None
+        if corpus_store:
+            content_sha256 = await asyncio.to_thread(sha256_hex, pdf_bytes)
+            await corpus_store.archive_original(
+                content_sha256,
+                byte_count=len(pdf_bytes),
+                data=pdf_bytes,
+                source_url=source_url,
+                banana=self.banana,
+            )
+
         hint = get_city_hint(self.vendor, self.slug, ladder)
 
         tmp_path = None
@@ -578,9 +625,28 @@ class AsyncBaseAdapter:
                 tmp_path = tmp.name
                 tmp.write(pdf_bytes)
 
-            result = await asyncio.to_thread(chunk_pdf, tmp_path, ladder, hint)
+            # The guarded dispatch (parsing/subprocess_guard.py): chunk_pdf --
+            # and its ground-truth text pass -- runs in a resource-capped
+            # child. A pathological page wedges one child for at most the
+            # timeout, never the pipeline (the 2026-06-29 freeze class).
+            async with _chunk_guard_semaphore():
+                result = await asyncio.to_thread(
+                    run_guarded,
+                    chunk_pdf,
+                    (tmp_path, ladder, hint),
+                    timeout=config.CHUNKER_TIMEOUT_SECONDS,
+                    rlimit_bytes=_CHUNK_RLIMIT_BYTES,
+                )
 
+        except GuardTimeout as e:
+            # Distinct from ENGINE_ERROR: timeouts are the freeze telemetry.
+            result = ChunkResult(failure_reason=TIMEOUT, ladder=ladder)
+            result.attempts.append(
+                Attempt(rung="cascade", failure_reason=TIMEOUT, error=str(e))
+            )
         except Exception as e:
+            # GuardCrashed/GuardTaskError and anything else: the cascade
+            # failed as a unit. Same classification as a chunker raise today.
             result = ChunkResult(failure_reason=ENGINE_ERROR, ladder=ladder)
             result.attempts.append(
                 Attempt(rung="cascade", failure_reason=ENGINE_ERROR,
@@ -594,6 +660,18 @@ class AsyncBaseAdapter:
                     pass
 
         self._record_chunk_audit(vendor_id, result)
+
+        # Stage-2 write-once: persist the child's ground-truth text when it is
+        # provably complete (ocr_pending == 0 -- no page would have OCR'd in
+        # the process extractor either). Process extraction then serves these
+        # bytes from the corpus instead of re-extracting.
+        if (
+            corpus_store
+            and content_sha256
+            and result.extraction
+            and result.extraction.get("ocr_pending", 0) == 0
+        ):
+            await corpus_store.persist_extraction(content_sha256, result.extraction)
 
         if result.winning_rung:
             set_city_hint(self.vendor, self.slug, ladder, result.winning_rung)
@@ -680,7 +758,7 @@ class AsyncBaseAdapter:
             result = ChunkResult(failure_reason=DOWNLOAD_FAILED, ladder=ladder)
             self._record_chunk_audit(vendor_id, result)
             return result
-        return await self._chunk_pdf_bytes(pdf_bytes, vendor_id, ladder)
+        return await self._chunk_pdf_bytes(pdf_bytes, vendor_id, ladder, source_url=pdf_url)
 
     async def _parse_packet_pdf(
         self,

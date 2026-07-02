@@ -1,6 +1,16 @@
 # Ground-Truth Corpus & Pipeline Restaging
 
-**Status:** Proposal (2026-06-29). Grounded in current code; not yet implemented.
+**Status:** Proposal (2026-06-29); slices 1+2 SHIPPED (2026-07-02, see
+CHANGELOG "The Corpus Exists" and "The Collapse"). Live now: the sha256(bytes)
+primitive, document_blob/document_source (migration 025), the engagic-corpus
+R2 bucket, the `corpus/` package, the shared subprocess guard
+(parsing/subprocess_guard.py) containing BOTH extraction sites, the guarded
+sync chunker producing full ground-truth text in-child (ocr_pending gate), and
+the cross-site dedup-read (process serves sync-manufactured text from the
+corpus). PyMuPDF executes in exactly two guarded child targets: chunk_pdf and
+parsing.pdf.extract_document_file. Still pending: OCR offload (phase 0
+Mistral), motioncount reading from the corpus, merging the two child targets
+into one produce-ground-truth stage.
 **Motivation:** (1) a single pathological PDF froze the whole sync for ~15 min on
 2026-06-29 (unguarded `get_text` in the sync chunker); (2) extraction work is
 re-done on every reanalysis because we extract-and-discard; (3) the OCR RAM bomb

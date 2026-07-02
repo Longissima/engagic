@@ -17,9 +17,7 @@ Rate limiting is handled by the summarizer via Gemini's retry instructions.
 
 import asyncio
 import html as html_module
-import multiprocessing
 import os
-import resource
 import re
 import tempfile
 import time
@@ -28,8 +26,10 @@ from urllib.parse import urljoin
 
 import aiohttp
 
+from corpus.store import get_corpus, sha256_hex
 from exceptions import ExtractionError, LLMError
-from parsing.pdf import PdfExtractor
+from parsing.pdf import PdfExtractor, extract_document_file
+from parsing.subprocess_guard import GuardCrashed, GuardTaskError, GuardTimeout, run_guarded
 from parsing.participation import parse_participation_info
 from analysis.llm.summarizer import GeminiSummarizer
 from pipeline.protocols import MetricsCollector, NullMetrics
@@ -38,9 +38,6 @@ from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 from config import config, get_logger
 
 logger = get_logger(__name__).bind(component="pipeline")
-
-# Pre-warm forkserver once at import time so subprocess spawns are fast
-_forkserver_ctx = multiprocessing.get_context("forkserver")
 
 # Patterns for extracting PDF links from HTML attachment pages.
 # Ordered by specificity: direct .pdf links first, then vendor-specific patterns.
@@ -84,18 +81,15 @@ def _extract_best_pdf_link(html_bytes: bytes, base_url: str) -> Optional[str]:
     return None
 
 
-def _extract_pdf_worker(result_queue, pdf_path, ocr_threshold, ocr_dpi,
-                        detect_legislative_formatting, max_ocr_workers):
-    """Worker target for subprocess PDF extraction. Runs in child process.
+def _extract_pdf_in_subprocess(pdf_path, ocr_threshold, ocr_dpi,
+                               detect_legislative_formatting, max_ocr_workers):
+    """Run PDF extraction in an isolated, resource-capped subprocess.
 
-    Reads PDF from a temp file (written by parent) instead of receiving bytes
-    via pipe. This avoids doubling memory: parent writes to disk and releases
-    bytes before the child starts extracting.
-
-    Sets RLIMIT_AS to cap virtual memory at 1GB. If a single PDF (e.g. 2000+
-    page packet with OCR) exceeds this, the child gets MemoryError and dies
-    cleanly. The parent catches it as ExtractionError. Other attachments for
-    the same item are unaffected -- each attachment gets its own child.
+    Thin translation over parsing.subprocess_guard.run_guarded -- the shared
+    containment used by every heavy PDF path (this one and the sync chunker).
+    The guard owns the forkserver, RLIMIT_AS, oom_score_adj, kill-on-timeout,
+    and queue-drain-before-join mechanics; this wrapper owns only the
+    extraction-flavored budget and error surface.
 
     1.5GB budget rationale (3.8GB RAM + 6GB swap box):
     - Parent no longer holds PDF bytes during extraction (tempfile handoff)
@@ -104,94 +98,25 @@ def _extract_pdf_worker(result_queue, pdf_path, ocr_threshold, ocr_dpi,
     - Parent (~200-300MB) + postgres (~700MB) + system (~200MB) = ~1.2GB
     - Total: ~10.2GB vs ~9.7GB available -- safe because not all 6 hit ceiling
     - Normal PDFs use 200-350MB; only monster 1000+ page OCR jobs hit the cap
+
+    The child imports parsing.pdf (the guard target's module), not this
+    module -- spawns no longer pay for the analyzer's HTTP/LLM import stack.
     """
-    # Cap virtual address space at 1.5GB to prevent OOM-killing the parent
-    _limit = int(1.5 * 1024 * 1024 * 1024)
-    resource.setrlimit(resource.RLIMIT_AS, (_limit, _limit))
-
-    # Mark this child as a preferred OOM victim. Parent sets itself to -500 in
-    # conductor.main(); we override here to +500 so under system-wide memory
-    # pressure the kernel kills these PDF/OCR workers (the actual memory hogs)
-    # instead of orphaning the conductor. Always permitted -- raising your own
-    # oom_score_adj toward more-killable never requires capabilities.
     try:
-        with open("/proc/self/oom_score_adj", "w") as f:
-            f.write("500")
-    except OSError:
-        pass  # Non-Linux or restricted /proc -- worker still functions, just less protected
-    try:
-        with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
-        from parsing.pdf import PdfExtractor
-        extractor = PdfExtractor(ocr_threshold, ocr_dpi, detect_legislative_formatting, max_ocr_workers)
-        result = extractor.extract_from_bytes(pdf_bytes)
-        result_queue.put(("ok", result))
-    except Exception as e:
-        result_queue.put(("error", str(e) or type(e).__name__, type(e).__name__))
-
-
-def _extract_pdf_in_subprocess(pdf_path, ocr_threshold, ocr_dpi,
-                               detect_legislative_formatting, max_ocr_workers):
-    """Run PDF extraction in an isolated subprocess. Segfault-safe.
-
-    PyMuPDF is a C extension that can segfault on malformed PDFs.
-    Running in a subprocess means a segfault kills only the child,
-    not the main process.
-
-    Receives a temp file path (not bytes) so the forkserver pipe doesn't
-    serialize the full PDF. The child reads from disk instead.
-
-    IMPORTANT: We must drain the result queue BEFORE calling proc.join().
-    The queue uses a pipe (64KB buffer on Linux). If the result exceeds
-    the buffer, put() blocks waiting for the parent to read. But if the
-    parent is blocked on join() waiting for the child to exit, both sides
-    deadlock until the timeout.
-    """
-    result_queue = _forkserver_ctx.Queue()
-    proc = _forkserver_ctx.Process(
-        target=_extract_pdf_worker,
-        args=(result_queue, pdf_path, ocr_threshold, ocr_dpi,
-              detect_legislative_formatting, max_ocr_workers),
-    )
-    try:
-        proc.start()
-
-        # Drain queue BEFORE join -- prevents deadlock when result > 64KB pipe buffer
-        try:
-            result_msg = result_queue.get(timeout=600)
-        except Exception:
-            # Timeout or empty queue -- child is stuck or crashed
-            if proc.is_alive():
-                proc.kill()
-            proc.join(timeout=10)
-            raise ExtractionError("PDF extraction subprocess timed out after 600s")
-
-        proc.join(timeout=30)
-        if proc.is_alive():
-            proc.kill()
-            proc.join()
-
-        if proc.exitcode != 0 and proc.exitcode is not None:
-            raise ExtractionError(
-                f"PDF extraction subprocess crashed (exit code {proc.exitcode}, likely segfault on malformed PDF)"
-            )
-
-        status, *data = result_msg
-        if status == "error":
-            raise ExtractionError(f"PDF extraction failed: {data[0]} ({data[1]})")
-
-        return data[0]
-    finally:
-        # Release Queue pipe fds, lock/condition semaphores, and stop the feeder thread.
-        # Without explicit close, each extraction leaks ~4 fds and 2 semaphores until
-        # non-deterministic GC runs. Over thousands of extractions in a long process-cities
-        # run, the accumulated resource and memory footprint is a significant contributor
-        # to the parent conductor's RSS bloat observed in 2026-04-10 OOM.
-        try:
-            result_queue.close()
-            result_queue.join_thread()
-        except Exception:
-            pass
+        return run_guarded(
+            extract_document_file,
+            (pdf_path, ocr_threshold, ocr_dpi, detect_legislative_formatting, max_ocr_workers),
+            timeout=600,
+            rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
+        )
+    except GuardTimeout:
+        raise ExtractionError("PDF extraction subprocess timed out after 600s")
+    except GuardCrashed as e:
+        raise ExtractionError(
+            f"PDF extraction subprocess crashed (exit code {e.exitcode}, likely segfault on malformed PDF)"
+        )
+    except GuardTaskError as e:
+        raise ExtractionError(f"PDF extraction failed: {e} ({e.error_type})")
 
 
 class AnalysisError(Exception):
@@ -384,7 +309,7 @@ class AsyncAnalyzer:
         finally:
             self._in_flight -= 1
 
-    async def extract_pdf_async(self, url: str) -> Dict[str, Any]:
+    async def extract_pdf_async(self, url: str, banana: Optional[str] = None) -> Dict[str, Any]:
         """
         Extract text from PDF asynchronously.
 
@@ -394,6 +319,8 @@ class AsyncAnalyzer:
 
         Args:
             url: PDF URL
+            banana: Jurisdiction for corpus provenance (document_source.banana);
+                    extraction itself doesn't need it
 
         Returns:
             Dict with keys: success, text, page_count, etc.
@@ -402,6 +329,28 @@ class AsyncAnalyzer:
             ExtractionError: If extraction fails, times out, or subprocess crashes
         """
         pdf_bytes = await self.download_pdf_async(url)
+
+        # Corpus dedup gate (docs/CORPUS_ARCHITECTURE.md): identity comes from
+        # the bytes themselves. If the corpus already holds text for this exact
+        # content, serve it and skip extraction entirely -- re-summarization,
+        # matter aggregation, and packet-vs-attachment overlaps all stop
+        # re-paying extraction. Hash in a thread: big packets would stall the
+        # loop for hundreds of ms.
+        corpus_store = get_corpus()
+        content_sha256 = None
+        byte_count = len(pdf_bytes)
+        if corpus_store:
+            content_sha256 = await asyncio.to_thread(sha256_hex, pdf_bytes)
+            cached = await corpus_store.lookup_extraction(content_sha256)
+            if cached:
+                await corpus_store.record_sighting(content_sha256, url, banana)
+                logger.info(
+                    "extraction served from corpus",
+                    url=url[:100],
+                    sha=content_sha256[:16],
+                    chars=len(cached.get("text") or ""),
+                )
+                return cached
 
         # Write to temp file and release bytes before subprocess starts.
         # Without this, parent holds bytes for the full extraction duration
@@ -414,6 +363,20 @@ class AsyncAnalyzer:
         # Run in subprocess via thread (proc.join is blocking)
         # Subprocess isolates against PyMuPDF segfaults on malformed PDFs
         try:
+            # Archive the original first, streaming from the temp file so the
+            # parent never re-holds the bytes. Before extraction on purpose:
+            # a pathological document that times out below still enters the
+            # archive, ready for a better extractor later. Failures inside the
+            # store are logged and swallowed -- the corpus never fails a job.
+            if corpus_store and content_sha256:
+                with open(pdf_path, "rb") as original:
+                    await corpus_store.archive_original(
+                        content_sha256,
+                        byte_count=byte_count,
+                        file_obj=original,
+                        source_url=url,
+                        banana=banana,
+                    )
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     _extract_pdf_in_subprocess,
@@ -436,6 +399,11 @@ class AsyncAnalyzer:
 
         if not result.get("success"):
             raise ExtractionError(f"PDF extraction failed: {result.get('error', 'Unknown error')}")
+
+        # Write-once: the freshly manufactured ground truth enters the corpus.
+        # Every future encounter with these bytes is a lookup, not an extraction.
+        if corpus_store and content_sha256:
+            await corpus_store.persist_extraction(content_sha256, result)
 
         logger.debug("pdf extracted", url=url, pages=result.get("page_count", 0))
         return result
@@ -462,7 +430,9 @@ class AsyncAnalyzer:
 
         try:
             # Process the agenda (returns summary, method, participation)
-            summary, method, participation = await self.process_agenda_async(packet_url)
+            summary, method, participation = await self.process_agenda_async(
+                packet_url, banana=meeting_data.get("city_banana")
+            )
 
             processing_time = time.time() - start_time
             meeting_id = meeting_data.get("meeting_id")
@@ -495,12 +465,13 @@ class AsyncAnalyzer:
                 "cached": False,
             }
 
-    async def process_agenda_async(self, url: str) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+    async def process_agenda_async(self, url: str, banana: Optional[str] = None) -> Tuple[str, str, Optional[Dict[str, Any]]]:
         """
         Process agenda using PyMuPDF + Gemini (async, fail fast approach).
 
         Args:
             url: PDF URL
+            banana: Jurisdiction for corpus provenance
 
         Returns:
             Tuple of (summary, method_used, participation_info)
@@ -510,7 +481,7 @@ class AsyncAnalyzer:
         """
         try:
             # Extract PDF text (async download + thread pool extraction)
-            result = await self.extract_pdf_async(url)
+            result = await self.extract_pdf_async(url, banana=banana)
 
             if result.get("success") and result.get("text"):
                 extracted_text = result["text"]

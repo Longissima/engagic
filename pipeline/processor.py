@@ -1023,8 +1023,11 @@ class Processor:
             "items_failed": stats["items_failed"],
         }
 
-    async def _process_single_item(self, item):
-        """Process a single agenda item. Returns dict with success/summary/topics or None."""
+    async def _process_single_item(self, item, banana: Optional[str] = None):
+        """Process a single agenda item. Returns dict with success/summary/topics or None.
+
+        banana is corpus provenance only, passed from process_matter's validated
+        jurisdiction (the item row itself doesn't carry one)."""
         if not self.analyzer:
             raise ProcessingError(
                 "Analyzer not initialized",
@@ -1062,7 +1065,7 @@ class Processor:
         async def extract_attachment(att_url: str, att_name: Optional[str]) -> Optional[tuple[str, str, int]]:
             async with semaphore:
                 try:
-                    result = await self.analyzer.extract_pdf_async(att_url)
+                    result = await self.analyzer.extract_pdf_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
                         if is_likely_public_comment_compilation(result, att_name or att_url):
                             logger.info("skipping public comment compilation", name=att_name or att_url)
@@ -1269,7 +1272,7 @@ class Processor:
                 logger.warning("url refresh failed, falling back to stored urls", matter_id=matter_id, error=str(e))
 
         try:
-            result = await self._process_single_item(representative_item)
+            result = await self._process_single_item(representative_item, banana=banana)
         except ProcessingError as e:
             logger.error("matter processing failed", matter_id=matter_id, error=str(e))
             self.metrics.record_error("processor", e)
@@ -1454,7 +1457,7 @@ class Processor:
                 if not self.analyzer:
                     logger.warning("analyzer not initialized, skipping participation extraction")
                     return {}
-                agenda_result = await self.analyzer.extract_pdf_async(meeting.agenda_url)
+                agenda_result = await self.analyzer.extract_pdf_async(meeting.agenda_url, banana=meeting.banana)
                 if agenda_result.get("success") and agenda_result.get("text"):
                     agenda_participation = parse_participation_info(agenda_result["text"][:5000])
                     if agenda_participation:
@@ -1503,8 +1506,10 @@ class Processor:
 
         return already_processed, need_processing
 
-    async def _build_document_cache(self, need_processing: List) -> tuple[Dict, Dict, set]:
-        """Build meeting-level document cache with version filtering and deduplication."""
+    async def _build_document_cache(self, need_processing: List, banana: Optional[str] = None) -> tuple[Dict, Dict, set]:
+        """Build meeting-level document cache with version filtering and deduplication.
+
+        banana is corpus provenance only, from the meeting row (DB truth)."""
         logger.info("building meeting-level document cache")
         document_cache = {}
         item_attachments = {}
@@ -1548,7 +1553,7 @@ class Processor:
         async def extract_with_limit(att_url: str, att_name: str) -> tuple[str, Optional[Dict]]:
             async with semaphore:
                 try:
-                    result = await self.analyzer.extract_pdf_async(att_url)
+                    result = await self.analyzer.extract_pdf_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
                         if is_likely_public_comment_compilation(result, att_name or att_url):
                             logger.info("skipping public comment compilation", attachment=att_name or att_url)
@@ -1839,7 +1844,7 @@ class Processor:
                     except (OSError, RuntimeError) as e:
                         logger.warning("url refresh failed, falling back to stored urls", banana=meeting.banana, error=str(e))
 
-            document_cache, item_attachments, shared_urls = await self._build_document_cache(need_processing)
+            document_cache, item_attachments, shared_urls = await self._build_document_cache(need_processing, banana=meeting.banana)
 
             shared_context = None
             if shared_urls:

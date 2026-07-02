@@ -457,9 +457,10 @@ def main():
     )
 
     # Bias the OOM killer away from the conductor parent. Forkserver children
-    # (which actually consume the memory during PDF/OCR work) override this to
-    # +500 in _extract_pdf_worker, so under memory pressure the kernel picks
-    # the actual hogs first instead of orphaning the whole pipeline.
+    # (which actually consume the memory during PDF/OCR/chunk work) override
+    # this to +500 in parsing.subprocess_guard._guard_worker, so under memory
+    # pressure the kernel picks the actual hogs first instead of orphaning
+    # the whole pipeline.
     # -500 (not -1000) keeps us still killable as a last resort, so we can't
     # lock the box out by starving postgres or sshd.
     try:

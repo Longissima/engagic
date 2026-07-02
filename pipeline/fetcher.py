@@ -286,6 +286,9 @@ class Fetcher:
 
         try:
             adapter = get_async_adapter(vendor, slug, **kwargs)
+            # Corpus provenance: adapters only know (vendor, slug); stamp the
+            # jurisdiction so archived bytes record which government they're from.
+            adapter.banana = city.banana
         except (VendorError, ValueError) as e:
             result.status = SyncStatus.SKIPPED
             result.error_message = str(e)
