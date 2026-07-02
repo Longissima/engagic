@@ -14,6 +14,7 @@ from pipeline.utils import hash_substantive_attachments, hash_substantive_attach
 from pipeline.orchestrators.matter_filter import MatterFilter
 from pipeline.orchestrators.enqueue_decider import EnqueueDecider, MatterEnqueueDecider
 from pipeline.orchestrators.vote_processor import VoteProcessor
+from vendors.adapters.parsers.quality import classify_title
 
 logger = get_logger(__name__).bind(component="meeting_sync")
 
@@ -302,7 +303,17 @@ class MeetingSyncOrchestrator:
 
         agenda_items = []
         seen_item_ids: set[str] = set()
+        filtered_garbage = 0
         for idx, item_data in enumerate(items_data):
+            # Junk-title guard. Financial/tabular content (check registers, GL-code
+            # tables, rate sheets) explodes into one item per row, and it can arrive
+            # from any engine in the chunker ladder or a vendor's HTML parser. Filter
+            # here -- the single funnel every adapter/chunker's items pass through --
+            # using the existing garbage-title classifier, rather than patching each
+            # chunker. Promotes quality.classify_title from audit-only to an actual filter.
+            if classify_title(item_data.get("title")):
+                filtered_garbage += 1
+                continue
             # Centralized item ID generation - all adapters return vendor_item_id
             # Use 'or' to handle both missing key AND explicit 0/None from vendors
             sequence = item_data.get("sequence") or (idx + 1)
@@ -367,6 +378,13 @@ class MeetingSyncOrchestrator:
 
             agenda_items.append(agenda_item)
 
+        if filtered_garbage:
+            logger.info(
+                "filtered garbage-titled items",
+                meeting_id=stored_meeting.id,
+                filtered=filtered_garbage,
+                kept=len(agenda_items),
+            )
         return agenda_items
 
     async def _track_matters(

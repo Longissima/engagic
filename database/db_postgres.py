@@ -22,6 +22,7 @@ from database.repositories_async import (
     ItemRepository,
     MatterRepository,
     QueueRepository,
+    BatchJobRepository,
     SearchRepository,
 )
 from database.repositories_async.deliberation import DeliberationRepository
@@ -58,6 +59,7 @@ class Database:
     items: ItemRepository
     matters: MatterRepository
     queue: QueueRepository
+    batch_jobs: BatchJobRepository
     search: SearchRepository
     userland: UserlandRepository
     deliberation: DeliberationRepository
@@ -73,6 +75,7 @@ class Database:
         self.items = ItemRepository(pool)
         self.matters = MatterRepository(pool)
         self.queue = QueueRepository(pool)
+        self.batch_jobs = BatchJobRepository(pool)
         self.search = SearchRepository(pool)
         self.userland = UserlandRepository(pool)
         self.engagement = EngagementRepository(pool)

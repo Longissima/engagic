@@ -26,6 +26,16 @@ logger = get_logger(__name__).bind(component="processor")
 QUEUE_POLL_INTERVAL = 5
 QUEUE_FATAL_ERROR_BACKOFF = 10
 
+# Batch collector cadence. Batch turnaround is minutes-to-hours, so a quiet
+# poll keeps GET volume low while still draining jobs promptly once Gemini
+# finishes them. BATCH_SIZE caps how many open jobs one tick polls.
+BATCH_COLLECTOR_POLL_INTERVAL = 60
+BATCH_COLLECTOR_BATCH_SIZE = 100
+
+# Priority for a meeting re-enqueued after its batch job failed terminally on
+# Gemini. Mid-band: ahead of brand-new non-urgent work, behind urgent meetings.
+QUEUE_PRIORITY_BATCH_RETRY = 100
+
 # How often to sweep zombie processing rows back to pending, and what counts
 # as "stuck." Anything claimed but not heartbeating for STALE_MINUTES gets
 # reset on each sweep tick. Keep STALE_MINUTES > the longest legitimate job
@@ -133,6 +143,12 @@ class Processor:
         # loops for minutes-to-hours and must never starve the streaming lane.
         self._batch_lane_task: Optional[asyncio.Task] = None
         self._batch_lane_warned = False
+
+        # Batch collector: polls submitted batch_jobs rows and ingests results
+        # once Gemini reports a terminal state. Decoupled from the submit lane
+        # so a slow job never pins a slot -- the submit path writes a durable
+        # row and returns; this loop owns completion (and survives restarts).
+        self._collector_task: Optional[asyncio.Task] = None
 
         if analyzer is not None:
             self.analyzer = analyzer
@@ -316,9 +332,11 @@ class Processor:
                 )
                 return "failed"
 
-            # A timeout here is not lost work: chunks save incrementally, so
-            # each retry (3 before dead-letter) resumes where the last attempt
-            # stopped. Only meetings needing >6 chunk-hours total can DLQ.
+            # The timeout is a wedged-coroutine backstop, not a kill timer: it
+            # sits past Gemini's ~48h job lifecycle, so a healthy job always
+            # reaches a terminal state and returns first. If it ever does fire,
+            # it's not lost work -- chunks save incrementally and the enqueue
+            # gate re-runs any still-unsummarized items on the next sync.
             await asyncio.wait_for(
                 self.process_meeting(meeting, use_batch=True),
                 timeout=config.BATCH_JOB_TIMEOUT_SECONDS,
@@ -366,21 +384,286 @@ class Processor:
                 # transient DB hiccup: keep beating, the next tick may succeed
                 logger.warning("job heartbeat failed", queue_id=queue_id, error=str(e))
 
+    def _ensure_collector_running(self) -> None:
+        """(Re)start the batch collector loop if the Batch API is enabled.
+
+        Called every main-loop iteration alongside the batch lane: a collector
+        that died on an unexpected error gets logged and restarted, so submitted
+        jobs never strand uncollected while the rest of the pipeline hums along.
+        """
+        if not config.BATCH_API_ENABLED or not self.analyzer:
+            return  # the batch lane's warn-once already covers the no-analyzer case
+        if self._collector_task is not None:
+            if not self._collector_task.done():
+                return
+            if not self._collector_task.cancelled():
+                exc = self._collector_task.exception()
+                if exc is not None:
+                    logger.error(
+                        "batch collector died unexpectedly, restarting",
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
+        self._collector_task = asyncio.create_task(self._collector_loop())
+
+    async def _collector_loop(self) -> None:
+        """Poll submitted batch jobs until shutdown, ingesting terminal ones."""
+        logger.info("batch collector started", poll_interval=BATCH_COLLECTOR_POLL_INTERVAL)
+        try:
+            while self.is_running:
+                try:
+                    open_jobs = await self.db.batch_jobs.list_open(
+                        limit=BATCH_COLLECTOR_BATCH_SIZE
+                    )
+                    for job in open_jobs:
+                        if not self.is_running:
+                            break
+                        await self._collect_one_job(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # Intentionally broad: the loop must outlive any single hiccup
+                    logger.error(
+                        "batch collector tick failed",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+                if await self._wait_with_shutdown_check(BATCH_COLLECTOR_POLL_INTERVAL):
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            logger.info("batch collector stopped")
+
+    async def _collect_one_job(self, job: Dict[str, Any]) -> None:
+        """Poll one submitted batch job; ingest, re-enqueue, or leave running.
+
+        Never cancels: a still-running job is simply re-polled next tick. A
+        transient poll/download/ingest error is swallowed (the row stays
+        'submitted' and we retry next tick) -- only Gemini's own terminal
+        verdict moves a job out of flight.
+        """
+        job_id = job["id"]
+        meeting_id = job["meeting_id"]
+        try:
+            state, results = await self.analyzer.summarizer.collect_item_batch(
+                job["gemini_job_name"], job["item_ids"]
+            )
+        except Exception as e:
+            logger.warning(
+                "batch collect poll failed",
+                job_id=job_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return
+
+        if state == "running":
+            await self.db.batch_jobs.mark_polled(job_id)
+            return
+
+        if state == "failed":
+            # Gemini's terminal failure. Mark the row failed and re-enqueue the
+            # meeting so the enqueue gate re-runs its still-unsummarized items.
+            await self.db.batch_jobs.mark_failed(job_id, "Gemini terminal failure")
+            await self._requeue_batch_meeting(meeting_id, job.get("banana"))
+            return
+
+        # succeeded -- ingest, then finalize once this meeting's last chunk lands
+        try:
+            processed, failed = await self._ingest_batch_results(meeting_id, results or [])
+        except Exception as e:
+            # Don't mark collected if ingest blew up mid-flight; retry next tick.
+            logger.error(
+                "batch ingest failed",
+                job_id=job_id,
+                meeting_id=meeting_id,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return
+
+        await self.db.batch_jobs.mark_collected(job_id)
+        logger.info(
+            "batch chunk ingested",
+            job_id=job_id,
+            meeting_id=meeting_id,
+            processed=processed,
+            failed=failed,
+        )
+
+        remaining = await self.db.batch_jobs.count_open_for_meeting(meeting_id)
+        if remaining == 0:
+            await self._finalize_batch_meeting(meeting_id, job.get("meeting_meta") or {})
+            self.analyzer.summarizer.delete_shared_context_cache(job.get("cache_name"))
+
+    async def _ingest_batch_results(
+        self, meeting_id: str, results: List[Dict[str, Any]]
+    ) -> tuple[int, int]:
+        """Write summaries/topics for a collected chunk's results.
+
+        Re-fetches each item by id (the collector holds no in-memory item_map,
+        and may even be a different process than the one that submitted), then
+        mirrors the streaming path's per-item save: item summary + topics, plus
+        the canonical matter summary when the item carries a matter_id.
+        """
+        processed = 0
+        failed = 0
+        normalizer = get_normalizer()
+        for result in results:
+            item_id = result["item_id"]
+            if not result.get("success"):
+                failed += 1
+                logger.warning("item processing failed", item_id=item_id, error=result.get("error"))
+                self.metrics.record_llm_call(
+                    model="flash", prompt_type="item_batch", duration_seconds=0,
+                    input_tokens=0, output_tokens=0, cost_dollars=0, success=False,
+                )
+                continue
+
+            item = await self.db.items.get_agenda_item(item_id)
+            if not item:
+                logger.warning("no item found for batch result", item_id=item_id, meeting_id=meeting_id)
+                continue
+            if item.meeting_id != meeting_id:
+                # The job's item_ids should only ever resolve to this meeting;
+                # a mismatch means a stale/crossed job. Don't write into the
+                # wrong meeting's item.
+                logger.warning(
+                    "batch result item belongs to a different meeting, skipping",
+                    item_id=item_id,
+                    expected_meeting=meeting_id,
+                    actual_meeting=item.meeting_id,
+                )
+                continue
+
+            # Isolate per-item writes: one poison item (bad summary, DB
+            # constraint) must not throw out of the whole chunk -- that would
+            # block mark_collected and re-ingest the chunk forever. It stays
+            # unsummarized and the enqueue gate re-runs it on the next sync.
+            try:
+                normalized_topics = normalizer.normalize(result.get("topics", []))
+                await self.db.items.update_agenda_item(
+                    item_id=item_id,
+                    summary=result["summary"],
+                    topics=normalized_topics,
+                    prompts_version=self.analyzer.summarizer.prompts_version,
+                )
+                if item.matter_id:
+                    await self._store_canonical_summary(
+                        item=item, summary=result["summary"], topics=normalized_topics
+                    )
+            except Exception as e:
+                failed += 1
+                logger.error(
+                    "failed to persist batch item summary",
+                    item_id=item_id,
+                    meeting_id=meeting_id,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                self.metrics.record_llm_call(
+                    model="flash", prompt_type="item_batch", duration_seconds=0,
+                    input_tokens=0, output_tokens=0, cost_dollars=0, success=False,
+                )
+                continue
+
+            self.metrics.record_llm_call(
+                model="flash", prompt_type="item_batch", duration_seconds=0,
+                input_tokens=0, output_tokens=0, cost_dollars=0, success=True,
+            )
+            processed += 1
+        return processed, failed
+
+    async def _finalize_batch_meeting(
+        self, meeting_id: str, meeting_meta: Dict[str, Any]
+    ) -> None:
+        """Roll a fully-collected meeting up to meeting-level summary metadata.
+
+        Runs once the meeting's last batch chunk is ingested. Re-reads the
+        meeting's now-summarized items from the DB (rather than threading an
+        in-memory list through submit->collect, which a restart would lose),
+        aggregates topics, merges the submit-time participation, and stamps the
+        meeting processed -- the same finalization the inline path does at the
+        tail of _process_meeting_with_items.
+        """
+        meeting = await self.db.meetings.get_meeting(meeting_id)
+        if not meeting:
+            logger.warning("batch finalize: meeting gone", meeting_id=meeting_id)
+            return
+
+        items = await self.db.items.get_agenda_items(meeting_id)
+        processed_items = [
+            {"sequence": it.sequence, "title": it.title, "summary": it.summary, "topics": it.topics or []}
+            for it in items if it.summary
+        ]
+        if not processed_items:
+            logger.warning("batch finalize: no summarized items", meeting_id=meeting_id)
+            return
+
+        meeting_topics = self._aggregate_meeting_topics(processed_items)
+
+        participation_data = (meeting_meta or {}).get("participation") or {}
+        merged_participation = None
+        if participation_data or meeting.participation:
+            merged_dict = meeting.participation.model_dump(exclude_none=True) if meeting.participation else {}
+            if participation_data:
+                merged_dict.update(participation_data)
+            merged_participation = ParticipationInfo(**merged_dict) if merged_dict else None
+
+        await self.db.meetings.update_meeting_summary(
+            meeting_id=meeting_id,
+            summary=None,
+            processing_method=f"item_level_{len(processed_items)}_items",
+            processing_time=0.0,
+            topics=meeting_topics,
+            participation=merged_participation,
+        )
+        logger.info("batch meeting finalized", meeting_id=meeting_id, item_count=len(processed_items))
+
+    async def _requeue_batch_meeting(self, meeting_id: str, banana: Optional[str]) -> None:
+        """Re-enqueue a meeting whose batch job failed terminally on Gemini.
+
+        Idempotent via the meeting:// source_url -- the enqueue gate skips items
+        that already have summaries, so this re-runs only what's still missing.
+        Routed to whichever lane fits the meeting's date at claim time.
+        """
+        try:
+            await self.db.queue.enqueue_job(
+                source_url=f"meeting://{meeting_id}",
+                job_type="meeting",
+                payload={"meeting_id": meeting_id},
+                meeting_id=meeting_id,
+                banana=banana,
+                priority=QUEUE_PRIORITY_BATCH_RETRY,
+            )
+            logger.info("re-enqueued meeting after batch failure", meeting_id=meeting_id)
+        except Exception as e:
+            logger.error(
+                "failed to re-enqueue meeting after batch failure",
+                meeting_id=meeting_id,
+                error=str(e),
+            )
+
     @property
     def batch_drain_available(self) -> bool:
         """True when this process can claim batch-lane jobs."""
         return bool(config.BATCH_API_ENABLED and self.analyzer)
 
     async def drain_batch_jobs(self, bananas: List[str]) -> dict:
-        """Drain batch-lane jobs for specific cities, returning when empty.
+        """Drain batch-lane jobs for specific cities, returning when done.
 
-        CLI companion to _batch_lane_loop: same claim filter and Batch API
-        path, but scoped to the given bananas and finite — each worker exits
-        on an empty claim instead of polling forever, so a `process` run
-        delivers both lanes' summaries before it returns. Failed jobs requeue
-        as pending immediately (until dead-letter at 3 retries), so a worker
-        that fails a job reclaims it on its own next iteration; an empty
-        claim therefore means the lane is genuinely dry for these cities.
+        CLI companion to _batch_lane_loop + _collector_loop, scoped to the
+        given bananas and finite. Two phases, so a `process` run still delivers
+        batch summaries before it returns:
+
+          1. Submit: each worker claims meeting jobs and submits them to the
+             Batch API (fire-and-forget), exiting on an empty claim.
+          2. Collect: poll the submitted jobs until every one reaches a
+             terminal state, ingesting results as they land. Running jobs are
+             re-polled, never cancelled -- we wait for the paid compute.
+
+        Submit failures requeue as pending immediately (until dead-letter at 3
+        retries); an empty claim means the lane is genuinely dry for these cities.
         """
         self._ensure_stale_sweep_running()
         stats: Counter = Counter()
@@ -429,12 +712,55 @@ class Processor:
         await asyncio.gather(
             *[drain_worker(slot) for slot in range(config.BATCH_JOB_CONCURRENCY)]
         )
+        logger.info("batch submit phase complete", submitted_jobs=stats["completed"], submit_failed=stats["failed"])
+
+        # Collect phase: poll this run's submitted jobs to a terminal state.
+        # The daemon collector (if one is running) may ingest some first; this
+        # just guarantees the CLI doesn't return while its own work is pending.
+        collected = await self._drain_collect(bananas)
+
         logger.info(
             "batch drain complete",
-            completed=stats["completed"],
-            failed=stats["failed"],
+            submitted_jobs=stats["completed"],
+            submit_failed=stats["failed"],
+            collected_chunks=collected,
         )
-        return {"batch_processed": stats["completed"], "batch_failed": stats["failed"]}
+        return {
+            "batch_processed": stats["completed"],
+            "batch_failed": stats["failed"],
+            "batch_collected": collected,
+        }
+
+    async def _drain_collect(self, bananas: List[str]) -> int:
+        """Poll this run's submitted batch jobs until none remain in flight.
+
+        Foreground companion to the daemon's _collector_loop, scoped to the
+        given cities. Returns the number of chunks that reached a terminal state
+        (collected or failed) during this drain. Returns early on shutdown --
+        the rows are durable, so a later collector run resumes them.
+        """
+        collected = 0
+        while self.is_running:
+            open_jobs = await self.db.batch_jobs.list_open_for_bananas(bananas)
+            if not open_jobs:
+                return collected
+
+            open_before = len(open_jobs)
+            for job in open_jobs:
+                if not self.is_running:
+                    return collected
+                await self._collect_one_job(job)
+
+            # Open count only falls as jobs reach a terminal state and leave
+            # 'submitted'; the drop is what this round actually collected.
+            open_after = len(await self.db.batch_jobs.list_open_for_bananas(bananas))
+            collected += max(0, open_before - open_after)
+
+            # Anything still running on Gemini's clock -- wait, then re-poll.
+            if open_after > 0:
+                if await self._wait_with_shutdown_check(BATCH_COLLECTOR_POLL_INTERVAL):
+                    return collected
+        return collected
 
     def _filter_document_versions(self, urls: List[str]) -> List[str]:
         """Keep only latest versions (Ver2 > Ver1, etc.)."""
@@ -528,10 +854,12 @@ class Processor:
                     batch_lane=config.BATCH_API_ENABLED)
         self._ensure_stale_sweep_running()
         self._ensure_batch_lane_running()
+        self._ensure_collector_running()
 
         while self.is_running:
             try:
                 self._ensure_batch_lane_running()
+                self._ensure_collector_running()
 
                 # Claim up to `concurrency` jobs (streaming lane only when the
                 # batch lane is on -- it claims the non-urgent meetings itself)
@@ -1331,27 +1659,23 @@ class Processor:
         item_map: Dict,
         shared_context: Optional[str],
         meeting_id: str,
-        use_batch: bool = False,
     ) -> tuple[List[Dict], List[str]]:
-        """Process batch requests incrementally, saving after each chunk."""
+        """Stream item summaries inline, saving after each chunk.
+
+        This is the streaming lane only -- the Batch API path no longer flows
+        through here: it submits fire-and-forget (see _submit_batch_for_meeting)
+        and the collector ingests results later via _ingest_batch_results.
+        """
         processed_items = []
         failed_items = []
 
         if not batch_requests or not self.analyzer:
             return processed_items, failed_items
 
-        # Both generators yield chunks of {item_id, success, summary, topics}
-        # in the same shape; only the transport (and the bill) differs.
-        if use_batch:
-            logger.info("submitting items via Batch API", item_count=len(batch_requests))
-            result_gen = self.analyzer.summarizer.summarize_batch(
-                batch_requests, shared_context=shared_context, meeting_id=meeting_id
-            )
-        else:
-            logger.info("submitting batch to Gemini", item_count=len(batch_requests))
-            result_gen = self.analyzer.process_batch_items_async(
-                batch_requests, shared_context=shared_context, meeting_id=meeting_id
-            )
+        logger.info("submitting batch to Gemini", item_count=len(batch_requests))
+        result_gen = self.analyzer.process_batch_items_async(
+            batch_requests, shared_context=shared_context, meeting_id=meeting_id
+        )
 
         async for chunk_results in result_gen:
             logger.debug("saving results from completed chunk", result_count=len(chunk_results))
@@ -1382,6 +1706,57 @@ class Processor:
                     logger.warning("item processing failed", title=item.title[:60], error=result.get('error'))
 
         return processed_items, failed_items
+
+    async def _submit_batch_for_meeting(
+        self,
+        meeting: Meeting,
+        batch_requests: List[Dict],
+        shared_context: Optional[str],
+        participation_data: Optional[Dict[str, Any]],
+    ) -> int:
+        """Submit a meeting's items to the Batch API and persist the job rows.
+
+        Fire-and-forget: creates the shared-context cache (if any), submits one
+        batch job per chunk, and writes a durable batch_jobs row per chunk so
+        the collector can ingest results later -- even across a restart. The
+        slot and document cache are freed by the caller immediately after.
+
+        Returns the number of chunks successfully submitted (0 on total
+        failure, which leaves items unsummarized for the enqueue gate to retry).
+        The submit-time participation rides along in meeting_meta so the
+        collector can apply it at finalization without re-deriving it.
+        """
+        cache_name = await self.analyzer.summarizer.create_shared_context_cache(
+            shared_context, meeting.id
+        )
+        submitted = await self.analyzer.summarizer.submit_item_batches(
+            batch_requests, cache_name=cache_name, shared_context=shared_context
+        )
+        if not submitted:
+            # Nothing made it to Gemini (API down, quota, etc.). Raise so the
+            # queue job fails and retries promptly, rather than silently
+            # completing and waiting for the next scrape to re-enqueue.
+            self.analyzer.summarizer.delete_shared_context_cache(cache_name)
+            raise ProcessingError(
+                "batch submission produced no jobs",
+                context={"meeting_id": meeting.id, "items": len(batch_requests)},
+            )
+
+        meeting_meta = {"participation": participation_data or {}}
+        for descriptor in submitted:
+            await self.db.batch_jobs.record_submission(
+                gemini_job_name=descriptor["gemini_job_name"],
+                meeting_id=meeting.id,
+                item_ids=descriptor["item_ids"],
+                chunk_num=descriptor["chunk_num"],
+                banana=meeting.banana,
+                # Same cache_name on every chunk row; the collector deletes it
+                # once the meeting's last chunk is collected (whichever that is).
+                cache_name=cache_name,
+                prompts_version=self.analyzer.summarizer.prompts_version,
+                meeting_meta=meeting_meta,
+            )
+        return len(submitted)
 
     async def _store_canonical_summary(self, item, summary: str, topics: List[str]) -> None:
         """Store canonical summary for matter deduplication across meetings."""
@@ -1442,6 +1817,14 @@ class Processor:
         if not need_processing:
             logger.info("all items already processed", item_count=len(already_processed))
         else:
+            # Batch double-submit guard: if this meeting already has chunks in
+            # flight, don't re-extract or re-submit -- the collector owns their
+            # completion. A meeting can be re-enqueued while a slow batch is
+            # still running; this is what keeps us from paying for it twice.
+            if use_batch and await self.db.batch_jobs.count_open_for_meeting(meeting.id):
+                logger.info("meeting batch already in flight, skipping submit", meeting_id=meeting.id)
+                return {"items_processed": 0, "items_new": 0, "items_skipped": len(already_processed), "items_failed": 0, "items_submitted": 0}
+
             logger.info("extracting text from items for batch processing", item_count=len(need_processing))
 
             # Refresh ephemeral signed URLs (CivicClerk SAS, etc.) just before fetch.
@@ -1469,8 +1852,33 @@ class Processor:
                 participation_data, first_sequence, last_sequence, city_has_participation
             )
 
+            if batch_requests and use_batch:
+                # Decoupled Batch API path: submit fire-and-forget and hand off
+                # to the collector. The meeting is intentionally NOT finalized
+                # here -- its items have no summaries yet; the collector writes
+                # them and runs meeting-level finalization once the last chunk
+                # lands (see _collect_one_job -> _finalize_batch_meeting).
+                submitted_chunks = await self._submit_batch_for_meeting(
+                    meeting, batch_requests, shared_context, participation_data
+                )
+                document_cache.clear()
+                _release_memory_to_os()
+                logger.info(
+                    "batch submitted, deferring summaries to collector",
+                    meeting_id=meeting.id,
+                    chunks=submitted_chunks,
+                    items=len(batch_requests),
+                )
+                return {
+                    "items_processed": 0,
+                    "items_new": 0,
+                    "items_skipped": len(already_processed),
+                    "items_failed": len(failed_items),
+                    "items_submitted": len(batch_requests) if submitted_chunks else 0,
+                }
+
             if batch_requests:
-                new_processed, new_failed = await self._process_batch_incrementally(batch_requests, item_map, shared_context, meeting.id, use_batch=use_batch)
+                new_processed, new_failed = await self._process_batch_incrementally(batch_requests, item_map, shared_context, meeting.id)
                 processed_items.extend(new_processed)
                 failed_items.extend(new_failed)
 
@@ -1516,6 +1924,14 @@ class Processor:
             self._batch_lane_task.cancel()
             try:
                 await self._batch_lane_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._collector_task is not None and not self._collector_task.done():
+            # Cancelling mid-poll only abandons the GET loop; submitted jobs are
+            # durable rows, so the next process to run the collector resumes them.
+            self._collector_task.cancel()
+            try:
+                await self._collector_task
             except (asyncio.CancelledError, Exception):
                 pass
         if self._stale_sweep_task is not None and not self._stale_sweep_task.done():

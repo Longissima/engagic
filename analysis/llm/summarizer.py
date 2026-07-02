@@ -427,168 +427,120 @@ class GeminiSummarizer:
                 original_error=e
             ) from e
 
-    async def summarize_batch(
+    async def create_shared_context_cache(
+        self, shared_context: Optional[str], meeting_id: Optional[str]
+    ) -> Optional[str]:
+        """Create a Gemini cache for meeting-level shared documents.
+
+        Returns the cache name, or None when there's no shared context, it's
+        below the caching threshold, or creation fails (callers then inline the
+        context per request instead).
+
+        The TTL covers the full decoupled job lifecycle. A batch job can sit on
+        Gemini's queue for up to ~24h, and every request in it references this
+        cache -- an expiry mid-flight fails the whole job. Storage at this size
+        is pennies, so we size the TTL past the job ceiling rather than gamble.
+        """
+        if not shared_context:
+            return None
+
+        # Rough estimate: 1 token ~ 4 chars
+        token_count = len(shared_context) // 4
+        min_tokens = 1024  # Minimum for Flash caching
+        if token_count < min_tokens:
+            logger.info(
+                "shared context too small for caching",
+                token_count=token_count,
+                min_tokens=min_tokens,
+            )
+            return None
+
+        try:
+            logger.info("creating gemini cache for shared context", token_count=token_count)
+            cache = self.client.caches.create(
+                model=self.primary_model,
+                config=types.CreateCachedContentConfig(
+                    display_name=f"meeting-{meeting_id}-shared-docs",
+                    contents=[types.Content(parts=[types.Part(text=shared_context)])],
+                    ttl="172800s",  # 48h -- past Gemini's batch job lifecycle
+                ),
+            )
+            logger.info("cache created", cache_name=cache.name, token_count=token_count, ttl="48h")
+            return cache.name
+        except (ValueError, TypeError, AttributeError, LLMError) as e:
+            logger.warning(
+                "failed to create cache proceeding without caching",
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return None
+
+    def delete_shared_context_cache(self, cache_name: Optional[str]) -> None:
+        """Best-effort cache deletion once a meeting's last chunk is collected.
+
+        Not load-bearing: if this is skipped (e.g. a crash between collect and
+        cleanup) the cache expires on its own TTL. Pennies either way.
+        """
+        if not cache_name:
+            return
+        try:
+            self.client.caches.delete(name=cache_name)
+            logger.info("cache deleted", cache_name=cache_name)
+        except (ValueError, AttributeError, LLMError) as e:
+            logger.warning(
+                "failed to delete cache",
+                cache_name=cache_name,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+    async def submit_item_batches(
         self,
         item_requests: List[Dict[str, Any]],
+        cache_name: Optional[str] = None,
         shared_context: Optional[str] = None,
-        meeting_id: Optional[str] = None
-    ):
-        """Process multiple agenda items using Gemini Batch API, yielding results per chunk
+    ) -> List[Dict[str, Any]]:
+        """Submit item summarization to the Gemini Batch API, fire-and-forget.
 
-        Generator that yields chunk results immediately after each chunk completes.
-        This enables incremental saving to prevent data loss on crashes.
-
-        Uses chunked processing to respect rate limits:
-        - 30 items per chunk (Flash Lite: 4M TPM)
-        - 10-second delays between chunks
-        - Exponential backoff on 429 errors
+        Chunks items to respect TPM, submits each chunk as its own batch job,
+        and returns one descriptor per submitted chunk. Does NOT wait for
+        results -- a collector polls the jobs later (see collect_item_batch).
+        This is the decoupled replacement for the old poll-inline summarize_batch.
 
         Args:
-            item_requests: List of dicts with structure:
-                [{
-                    'item_id': str,
-                    'title': str,
-                    'text': str,  # Item-specific text only (shared docs excluded)
-                    'sequence': int,
-                    'page_count': int or None  # Actual PDF page count if available
-                }, ...]
-            shared_context: Optional meeting-level shared document context (for caching)
-            meeting_id: Optional meeting ID (for cache naming)
+            item_requests: [{'item_id', 'title', 'text', 'sequence',
+                             'page_count'?}, ...]
+            cache_name: Gemini cache for shared context, if one was created
+            shared_context: shared text inlined per request when not cached
 
-        Yields:
-            List of results per chunk: [{
-                'item_id': str,
-                'success': bool,
-                'summary': str,
-                'topics': List[str],
-                'error': str (if failed)
-            }, ...]
+        Returns:
+            [{'gemini_job_name': str, 'item_ids': List[str], 'chunk_num': int}]
+            -- one entry per chunk that submitted successfully.
         """
         if not item_requests:
-            return
+            return []
 
         total_items = len(item_requests)
-        logger.info("processing batch", total_items=total_items, batch_enabled=True, cost_savings_percent=50)
+        logger.info("submitting batch", total_items=total_items, batch_enabled=True, cost_savings_percent=50)
 
-        # Create Gemini cache for shared context if available and meets minimum threshold
-        cache_name = None
-        if shared_context:
-            # Estimate token count (rough: 1 token = 4 chars)
-            token_count = len(shared_context) // 4
-            min_tokens = 1024  # Minimum for Flash caching
-
-            if token_count >= min_tokens:
-                try:
-                    logger.info(
-                        "creating gemini cache for shared context",
-                        token_count=token_count
-                    )
-                    cache = self.client.caches.create(
-                        model=self.primary_model,
-                        config=types.CreateCachedContentConfig(
-                            display_name=f"meeting-{meeting_id}-shared-docs",
-                            contents=[types.Content(parts=[types.Part(text=shared_context)])],
-                            # 4h TTL: batch jobs queue + poll for up to 30min
-                            # per chunk and multi-chunk meetings exist; an
-                            # expired cache fails every request referencing it.
-                            # Storage cost at this size is pennies.
-                            ttl="14400s"
-                        )
-                    )
-                    cache_name = cache.name
-                    logger.info(
-                        "cache created",
-                        cache_name=cache_name,
-                        token_count=token_count,
-                        ttl="4h"
-                    )
-                except (ValueError, TypeError, AttributeError, LLMError) as e:
-                    logger.warning(
-                        "failed to create cache proceeding without caching",
-                        error=str(e),
-                        error_type=type(e).__name__
-                    )
-                    cache_name = None
-            else:
-                logger.info(
-                    "shared context too small for caching",
-                    token_count=token_count,
-                    min_tokens=min_tokens
-                )
-
-        # Chunk items to respect TPM (tokens-per-minute) limits
-        # Flash Lite models: 4M TPM limit - large PDFs can use 50K+ tokens each
-        # At 4M TPM, 30 items × 50K tokens = 1.5M tokens (37% of limit, safe margin)
-        # Most items are well under 50K, so this covers nearly all meetings in one batch
+        # Chunk to respect TPM. Flash Lite 4M TPM: 30 items x 50K tokens = 1.5M
+        # (37% of limit). Most items are well under 50K, so most meetings fit
+        # one chunk.
         chunk_size = 30
         chunks = [
             item_requests[i : i + chunk_size]
             for i in range(0, total_items, chunk_size)
         ]
+        logger.info("split into chunks", num_chunks=len(chunks), chunk_size=chunk_size)
 
-        logger.info(
-            "split into chunks",
-            num_chunks=len(chunks),
-            chunk_size=chunk_size
-        )
-
-        total_successful = 0
-        total_processed = 0
-
-        try:
-            for chunk_idx, chunk in enumerate(chunks):
-                chunk_num = chunk_idx + 1
-                logger.info(
-                    "processing chunk",
-                    chunk_num=chunk_num,
-                    total_chunks=len(chunks),
-                    items_in_chunk=len(chunk)
-                )
-
-                # Process chunk with retry logic (pass cache_name and shared_context)
-                chunk_results = await self._process_batch_chunk(chunk, chunk_num, cache_name, shared_context)
-
-                # Track stats
-                chunk_successful = sum(1 for r in chunk_results if r.get("success"))
-                total_successful += chunk_successful
-                total_processed += len(chunk_results)
-
-                logger.info(
-                    "chunk complete",
-                    chunk_num=chunk_num,
-                    successful=chunk_successful,
-                    total=len(chunk_results),
-                    cumulative_successful=total_successful,
-                    cumulative_total=total_processed
-                )
-
-                # Yield results immediately for incremental saving
-                yield chunk_results
-
-                # Delay between chunks (except after last chunk)
-                if chunk_idx < len(chunks) - 1:
-                    delay = 10  # 10s between chunks (Flash Lite: 4M TPM, chunks use <40% of quota)
-                    logger.info(
-                        "waiting before next chunk for quota refill",
-                        delay_seconds=delay
-                    )
-                    await asyncio.sleep(delay)
-
-        finally:
-            # Cleanup: Delete cache after all chunks processed
-            if cache_name:
-                try:
-                    logger.info("cleaning up cache", cache_name=cache_name)
-                    self.client.caches.delete(name=cache_name)
-                    logger.info("cache deleted successfully")
-                except (ValueError, AttributeError, LLMError) as e:
-                    logger.warning("failed to delete cache", cache_name=cache_name, error=str(e), error_type=type(e).__name__)
-
-            logger.info(
-                "batch complete",
-                successful=total_successful,
-                total=total_processed
+        submitted: List[Dict[str, Any]] = []
+        for chunk_idx, chunk in enumerate(chunks):
+            descriptor = await self._submit_one_chunk(
+                chunk, chunk_idx + 1, cache_name, shared_context
             )
+            if descriptor:
+                submitted.append(descriptor)
+        return submitted
 
     def _extract_response_text(self, response_data: Dict[str, Any]) -> Optional[str]:
         """Extract text from nested Gemini response structure
@@ -792,103 +744,95 @@ class GeminiSummarizer:
                 "error": str(e),
             }
 
-    async def _wait_for_batch_completion(
-        self,
-        batch_name: str,
-        max_wait_time: int = 1800,
-        poll_interval: int = 5
-    ) -> None:
-        """Poll batch job until completion
+    async def collect_item_batch(
+        self, gemini_job_name: str, item_ids: List[str]
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        """Poll a submitted batch job once and, if terminal, return its results.
 
-        Args:
-            batch_name: Batch job identifier
-            max_wait_time: Maximum wait time in seconds (default 30 minutes)
-            poll_interval: Polling interval in seconds (default 10 seconds)
+        Single GET -- no blocking loop. The collector calls this on its own
+        cadence and decides what to do with each verdict. We never cancel: a
+        running job is simply re-polled next tick. Gemini's terminal state is
+        the only authority on done-ness, since the compute is already paid for.
 
-        Raises:
-            TimeoutError: If batch doesn't complete within max_wait_time
-            RuntimeError: If batch job fails
+        Returns:
+            ('running', None)      -- not yet terminal; poll again later
+            ('succeeded', results) -- terminal SUCCEEDED; results parsed
+            ('failed', None)       -- Gemini FAILED/CANCELLED/EXPIRED, or
+                                      SUCCEEDED with no output file
+        results match the old per-chunk shape:
+            [{'item_id', 'success', 'summary'?, 'topics'?, 'error'?}, ...]
         """
-        completed_states = {
+        terminal_states = {
             "JOB_STATE_SUCCEEDED",
             "JOB_STATE_FAILED",
             "JOB_STATE_CANCELLED",
             "JOB_STATE_EXPIRED",
         }
 
-        waited_time = 0
-        try:
-            while waited_time < max_wait_time:
-                batch_job = self.client.batches.get(name=batch_name)
+        batch_job = self.client.batches.get(name=gemini_job_name)
+        state = batch_job.state.name if batch_job.state else "unknown"
 
-                if batch_job.state and batch_job.state.name in completed_states:
-                    logger.info(
-                        "batch completed",
-                        batch_name=batch_name,
-                        state=batch_job.state.name
-                    )
+        if state not in terminal_states:
+            return "running", None
 
-                    # Check for success
-                    if batch_job.state.name != "JOB_STATE_SUCCEEDED":
-                        raise RuntimeError(f"Batch failed: {batch_job.state.name}")
-
-                    return
-
-                state_name = batch_job.state.name if batch_job.state else "unknown"
-                if waited_time % 30 == 0:  # Log every 30s
-                    logger.info(
-                        "batch processing",
-                        waited_time_seconds=waited_time,
-                        state=state_name
-                    )
-
-                await asyncio.sleep(poll_interval)
-                waited_time += poll_interval
-        except asyncio.CancelledError:
-            # The job-level wait_for timeout or a shutdown cancels us mid-poll;
-            # the server-side job keeps running (and billing) unless cancelled.
-            self._cancel_batch_job(batch_name, reason="poll cancelled")
-            raise
-
-        # Don't pay twice: a timed-out job keeps running (and billing)
-        # server-side unless cancelled, while the retry submits a fresh one.
-        self._cancel_batch_job(batch_name, reason="poll timeout")
-        raise TimeoutError(f"Batch timed out after {max_wait_time}s")
-
-    def _cancel_batch_job(self, batch_name: str, reason: str) -> None:
-        """Best-effort server-side cancel for an abandoned batch job."""
-        try:
-            self.client.batches.cancel(name=batch_name)
+        if state != "JOB_STATE_SUCCEEDED":
+            # Gemini's own terminal failure -- not us killing it.
             logger.warning(
-                "cancelled abandoned batch job",
-                batch_name=batch_name,
-                reason=reason,
+                "batch job terminal non-success",
+                gemini_job_name=gemini_job_name,
+                state=state,
             )
-        except Exception as e:
-            logger.warning(
-                "failed to cancel abandoned batch job",
-                batch_name=batch_name,
-                reason=reason,
-                error=str(e),
-            )
+            return "failed", None
 
-    async def _process_batch_chunk(
+        if not batch_job.dest or not batch_job.dest.file_name:
+            logger.error("batch succeeded but no response file", gemini_job_name=gemini_job_name)
+            return "failed", None
+
+        response_file_name = batch_job.dest.file_name
+        logger.info("downloading response file", file_name=response_file_name)
+        response_content = self.client.files.download(file=response_file_name)
+        response_text = response_content.decode("utf-8")
+
+        # Response parsing keys off the per-line 'key' (== item_id); the minimal
+        # map below is all _parse_batch_response_line needs to re-associate.
+        request_map = {iid: {"item_id": iid} for iid in item_ids}
+        results: List[Dict[str, Any]] = []
+        for line_num, line in enumerate(response_text.strip().split("\n")):
+            result = self._parse_batch_response_line(line, line_num, request_map)
+            if result:
+                results.append(result)
+
+        successful = sum(1 for r in results if r.get("success"))
+        logger.info(
+            "batch chunk collected",
+            gemini_job_name=gemini_job_name,
+            successful=successful,
+            total=len(results),
+        )
+        return "succeeded", results
+
+    async def _submit_one_chunk(
         self,
         chunk_requests: List[Dict[str, Any]],
         chunk_num: int,
         cache_name: Optional[str] = None,
         shared_context: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Process a single chunk of batch requests with retry logic using JSONL file method
+    ) -> Optional[Dict[str, Any]]:
+        """Build, upload, and submit one chunk as a Gemini batch job.
+
+        Fire-and-forget: returns as soon as the job is created. Does NOT wait
+        for or download results -- that's the collector's job (collect_item_batch).
 
         Args:
-            chunk_requests: List of item requests for this chunk
-            chunk_num: Chunk number for logging
-            cache_name: Optional Gemini cache name for shared context
-            shared_context: Optional shared context text (used inline if not cached)
+            chunk_requests: item requests for this chunk
+            chunk_num: chunk number for logging/display
+            cache_name: Gemini cache for shared context, if created
+            shared_context: shared text inlined per request when not cached
 
         Returns:
-            List of results for this chunk
+            {'gemini_job_name', 'item_ids', 'chunk_num'} on success, or None if
+            submission failed after retries (items stay unsummarized; the
+            enqueue gate re-runs the meeting on the next sync).
         """
         max_retries = 3
         retry_delay = 30  # Start with 30s delay (Flash Lite: 4M TPM)
@@ -897,12 +841,11 @@ class GeminiSummarizer:
             temp_path = None
 
             try:
-                # Build request map and JSONL file
-                request_map = {}
                 temp_file = tempfile.NamedTemporaryFile(
                     mode='w', suffix='.json', delete=False
                 )
                 temp_path = temp_file.name
+                item_ids: List[str] = []
 
                 for i, req in enumerate(chunk_requests):
                     item_title = req["title"]
@@ -970,7 +913,7 @@ class GeminiSummarizer:
                         jsonl_line["request"]["cachedContent"] = cache_name
 
                     temp_file.write(json.dumps(jsonl_line) + '\n')
-                    request_map[item_id] = req
+                    item_ids.append(item_id)
 
                 temp_file.close()
 
@@ -992,9 +935,8 @@ class GeminiSummarizer:
 
                 logger.info("uploaded file", file_name=uploaded_file.name)
 
-                # Submit batch job
+                # Submit batch job (no wait -- the collector polls it later)
                 logger.info("submitting batch job", chunk_num=chunk_num)
-                batch_start_time = time.time()
 
                 try:
                     batch_job = self.client.batches.create(
@@ -1013,64 +955,17 @@ class GeminiSummarizer:
                 if not batch_job.name:
                     raise ValueError("Batch job created but no name returned")
 
-                logger.info("submitted batch", batch_name=batch_job.name)
-
-                # Wait for batch completion. 1h per chunk: the batch lane's
-                # job ceiling allows it, and slow Gemini days are exactly when
-                # cancel-and-retry churn wastes the most money.
-                await self._wait_for_batch_completion(batch_job.name, max_wait_time=3600)
-
-                # Download and parse results
-                batch_job = self.client.batches.get(name=batch_job.name)
-
-                if not batch_job.dest or not batch_job.dest.file_name:
-                    logger.error("batch job completed but no response file available")
-                    raise RuntimeError("No response file in batch job result")
-
-                response_file_name = batch_job.dest.file_name
-                logger.info("downloading response file", file_name=response_file_name)
-
-                response_content = self.client.files.download(file=response_file_name)
-                response_text = response_content.decode('utf-8')
-
-                # Parse JSONL responses
-                results = []
-                for line_num, line in enumerate(response_text.strip().split('\n')):
-                    result = self._parse_batch_response_line(line, line_num, request_map)
-                    if result:
-                        results.append(result)
-
-                # Cleanup temp file
-                try:
-                    if temp_path and os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                        logger.debug("cleaned up temp file", path=temp_path)
-                except OSError as cleanup_error:
-                    logger.warning("failed to cleanup temp file", path=temp_path, error=str(cleanup_error), error_type=type(cleanup_error).__name__)
-
-                # Record metrics
-                successful = sum(1 for r in results if r.get("success"))
-                failed = len(results) - successful
-                batch_duration = time.time() - batch_start_time
-
-                for result in results:
-                    req = request_map.get(result["item_id"], {})
-                    page_count = req.get("page_count", 0) if req else 0
-                    prompt_type = self._select_prompt_type()
-
-                    self.metrics.record_llm_call(
-                        model="flash",
-                        prompt_type=f"item_{prompt_type}_batch",
-                        duration_seconds=batch_duration / len(results),
-                        input_tokens=0,
-                        output_tokens=0,
-                        cost_dollars=0,
-                        success=result.get("success", False)
-                    )
-
-                logger.info("batch chunk complete", chunk_num=chunk_num, duration_seconds=round(batch_duration, 1), successful=successful, total=len(results), failure_rate=round(failed / len(results) * 100, 1) if results else 0)
-
-                return results
+                logger.info(
+                    "submitted batch",
+                    batch_name=batch_job.name,
+                    chunk_num=chunk_num,
+                    item_count=len(item_ids),
+                )
+                return {
+                    "gemini_job_name": batch_job.name,
+                    "item_ids": item_ids,
+                    "chunk_num": chunk_num,
+                }
 
             except Exception as e:  # Intentionally broad: retry logic with specific error checks
                 error_str = str(e)
@@ -1081,7 +976,7 @@ class GeminiSummarizer:
                 if is_quota_error and attempt < max_retries - 1:
                     backoff_delay = retry_delay * (2**attempt)
                     logger.warning(
-                        "chunk hit quota limit retrying",
+                        "chunk submit hit quota limit retrying",
                         chunk_num=chunk_num,
                         attempt=attempt + 1,
                         max_retries=max_retries,
@@ -1091,36 +986,18 @@ class GeminiSummarizer:
                     continue
 
                 # Final attempt failed or non-quota error
-                logger.error("batch chunk failed", chunk_num=chunk_num, attempts=attempt + 1, error=str(e), error_type=type(e).__name__)
+                logger.error("batch chunk submit failed", chunk_num=chunk_num, attempts=attempt + 1, error=error_str, error_type=type(e).__name__)
+                return None
 
-                # Record failed batch metrics
-                for req in chunk_requests:
-                    page_count = req.get("page_count", 0)
-                    prompt_type = self._select_prompt_type()
-                    self.metrics.record_llm_call(
-                        model="flash",
-                        prompt_type=f"item_{prompt_type}_batch",
-                        duration_seconds=0,
-                        input_tokens=0,
-                        output_tokens=0,
-                        cost_dollars=0,
-                        success=False
-                    )
+            finally:
+                # The uploaded copy lives server-side now; drop the local temp.
+                try:
+                    if temp_path and os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                except OSError as cleanup_error:
+                    logger.warning("failed to cleanup temp file", path=temp_path, error=str(cleanup_error), error_type=type(cleanup_error).__name__)
 
-                return [
-                    {"item_id": req["item_id"], "success": False, "error": error_str}
-                    for req in chunk_requests
-                ]
-
-        # Should never reach here, but safety fallback
-        return [
-            {
-                "item_id": req["item_id"],
-                "success": False,
-                "error": "Max retries exceeded",
-            }
-            for req in chunk_requests
-        ]
+        return None
 
     def _get_prompt(self, category: str, prompt_type: str, **variables) -> str:
         """Get prompt from JSON and format with variables

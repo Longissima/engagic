@@ -11,10 +11,12 @@ from database.repositories_async.meetings import MeetingRepository
 from database.repositories_async.items import ItemRepository
 from database.repositories_async.matters import MatterRepository
 from database.repositories_async.queue import QueueRepository
+from database.repositories_async.batch_jobs import BatchJobRepository
 from database.repositories_async.search import SearchRepository
 
 __all__ = [
     "BaseRepository",
+    "BatchJobRepository",
     "JurisdictionRepository",
     "CommitteeRepository",
     "CouncilMemberRepository",
