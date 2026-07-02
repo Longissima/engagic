@@ -13,12 +13,41 @@ Replaces: vendors/session_manager.py (sync version with requests)
 """
 
 import asyncio
+import os
+import ssl
 import aiohttp
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from config import get_logger
+from config import config, get_logger
 
 logger = get_logger(__name__).bind(component="vendor")
+
+# Vendors whose TLS chain anchors in a root that the system ca-certificates
+# package has dropped. We add those roots (data/ca_supplement.pem) on top of the
+# system defaults for these vendors only -- proper verification, not disabled.
+# eScribe: ca-certificates 20260601 removed AAA Certificate Services, which its
+# Cloudflare/SSL.com chain still anchors to.
+_VENDORS_NEEDING_CA_SUPPLEMENT = frozenset({"escribe"})
+_CA_SUPPLEMENT_PATH = os.path.join(config.DB_DIR, "ca_supplement.pem")
+_supplemented_ssl_context: Optional[ssl.SSLContext] = None
+
+
+def _ca_supplemented_context() -> ssl.SSLContext:
+    """System trust store plus the supplemental roots in data/ca_supplement.pem.
+
+    Cached process-wide. Falls back to the plain default context if the file is
+    missing so a packaging slip degrades to standard trust rather than breaking
+    TLS outright.
+    """
+    global _supplemented_ssl_context
+    if _supplemented_ssl_context is None:
+        ctx = ssl.create_default_context()
+        if os.path.exists(_CA_SUPPLEMENT_PATH):
+            ctx.load_verify_locations(cafile=_CA_SUPPLEMENT_PATH)
+        else:
+            logger.warning("ca supplement file missing", path=_CA_SUPPLEMENT_PATH)
+        _supplemented_ssl_context = ctx
+    return _supplemented_ssl_context
 
 
 class AsyncSessionManager:
@@ -67,12 +96,15 @@ class AsyncSessionManager:
             )
 
             # Connection pooling configuration
-            connector = aiohttp.TCPConnector(
-                limit=20,  # Max 20 total connections per vendor
-                limit_per_host=5,  # Max 5 connections per host
-                ttl_dns_cache=300,  # Cache DNS for 5 minutes
-                enable_cleanup_closed=True  # Clean up closed connections
-            )
+            connector_kwargs: Dict[str, Any] = {
+                "limit": 20,  # Max 20 total connections per vendor
+                "limit_per_host": 5,  # Max 5 connections per host
+                "ttl_dns_cache": 300,  # Cache DNS for 5 minutes
+                "enable_cleanup_closed": True,  # Clean up closed connections
+            }
+            if vendor in _VENDORS_NEEDING_CA_SUPPLEMENT:
+                connector_kwargs["ssl"] = _ca_supplemented_context()
+            connector = aiohttp.TCPConnector(**connector_kwargs)
 
             # Browser-like headers to avoid bot detection
             headers = {
