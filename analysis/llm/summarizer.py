@@ -676,6 +676,7 @@ class GeminiSummarizer:
             return None
 
         response_data = response_obj['response']
+        response_text = None
 
         try:
             # Extract text from nested structure
@@ -729,10 +730,14 @@ class GeminiSummarizer:
                 error=str(e),
                 error_type=type(e).__name__
             )
+            # Batch-collector request maps carry only item_id (see
+            # collect_item_batch), so title/text must not be assumed here:
+            # a raise inside this handler escapes the collector and wedges
+            # the batch in 'submitted' forever.
             logger.error(
                 "input that caused failure",
-                title=original_req['title'][:100],
-                text_length=len(original_req['text'])
+                title=str(original_req.get('title', '<unknown>'))[:100],
+                text_length=len(original_req.get('text') or '')
             )
             logger.error(
                 "raw response that failed",
@@ -1230,8 +1235,12 @@ class GeminiSummarizer:
         topics: list[str] = []
 
         # Extract summary_markdown - usually complete even in truncated responses
+        # Terminator accepts a closing quote, end-of-text, or end-of-text with
+        # a dangling backslash: truncation mid-escape leaves a lone trailing
+        # backslash that neither char class consumes, which used to fail the
+        # whole match and lose an otherwise complete summary.
         summary_match = re.search(
-            r'"summary_markdown"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|$)',
+            r'"summary_markdown"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|\\?$)',
             response_text,
             re.DOTALL
         )
