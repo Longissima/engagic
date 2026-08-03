@@ -1,4 +1,4 @@
-"""Regression tests for the v3.1 primary-source pipeline changes."""
+"""Regression tests for the v3.2 primary-source pipeline changes."""
 
 import asyncio
 import io
@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 from typing import Any, cast
 
+import fitz
 from openpyxl import Workbook
 
 from analysis.llm.input_budget import (
@@ -17,11 +18,13 @@ from analysis.llm.input_budget import (
 )
 from analysis.llm.summarizer import GeminiSummarizer
 from database.models import AttachmentInfo
-from parsing.pdf import XLSX_MAX_TOTAL_CHARS, _extract_xlsx
+from parsing.pdf import XLSX_MAX_TOTAL_CHARS, PdfExtractor, _extract_xlsx
 from pipeline.processor import Processor
-from scripts.backfill_v31_summaries import (
+import scripts.backfill_v32_summaries as backfill
+from scripts.backfill_v32_summaries import (
     CORPUS_TEXT_FOR_IDENTITY,
     LATEST_MATTER_ITEM,
+    STATE_PATH,
     build_item_text,
     refresh_canonical_summaries,
 )
@@ -65,8 +68,99 @@ def test_rendered_prompt_is_status_aware():
     )
 
     assert "transactional document IS the purchase" not in prompt
+    assert "operative documents are the action itself" not in prompt
     assert "a quote or proposal is not automatically the approved purchase" in prompt
     assert "do not say the jurisdiction is purchasing" in prompt
+
+
+def _small_redline_pdf() -> bytes:
+    document = fitz.open()
+    page = document.new_page()
+    x, baseline = 72, 72
+    text = "keep remove add"
+    page.insert_text((x, baseline), text, fontsize=12)
+
+    keep_width = fitz.get_text_length("keep ", fontsize=12)
+    remove_width = fitz.get_text_length("remove", fontsize=12)
+    gap_width = fitz.get_text_length(" ", fontsize=12)
+    add_width = fitz.get_text_length("add", fontsize=12)
+    remove_x = x + keep_width
+    add_x = remove_x + remove_width + gap_width
+
+    # Word commonly emits tracked-change marks in saturated colors. Pure red
+    # was previously rejected by max(rgb) < .85 despite the implementation
+    # claiming to support it.
+    page.draw_line(
+        (remove_x, baseline - 4),
+        (remove_x + remove_width, baseline - 4),
+        color=(1, 0, 0),
+        width=0.7,
+    )
+    page.draw_line(
+        (add_x, baseline + 4),
+        (add_x + add_width, baseline + 4),
+        color=(0, 0, 1),
+        width=0.7,
+    )
+    page.insert_text((x, 100), "second paragraph", fontsize=12)
+    pdf_bytes = document.tobytes()
+    document.close()
+    return pdf_bytes
+
+
+def test_small_colored_redline_activates_and_preserves_paragraphs():
+    extractor = PdfExtractor(ocr_threshold=0)
+    result = extractor.extract_from_bytes(_small_redline_pdf())
+
+    assert "[DELETED: remove]" in result["text"]
+    assert "[ADDED: add]" in result["text"]
+    assert "[ADDED: add]\n\nsecond paragraph" in result["text"]
+
+
+def test_pdf_markup_annotations_are_redline_evidence():
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "keep remove add", fontsize=12)
+    page.add_strikeout_annot(page.search_for("remove")[0])
+    page.add_underline_annot(page.search_for("add")[0])
+    pdf_bytes = document.tobytes()
+    document.close()
+
+    result = PdfExtractor(ocr_threshold=0).extract_from_bytes(pdf_bytes)
+
+    assert "[DELETED: remove]" in result["text"]
+    assert "[ADDED: add]" in result["text"]
+
+
+def test_v32_backfill_does_not_reuse_v31_state():
+    assert STATE_PATH.name == "backfill_v32_state.jsonl"
+
+
+def test_backfill_state_rejects_records_from_other_prompt_versions(
+    tmp_path, monkeypatch
+):
+    state_path = tmp_path / "state.jsonl"
+    records = [
+        {
+            "prompts_version": "v3.1",
+            "kind": "submitted",
+            "item_ids": ["old-item"],
+            "gemini_job_name": "old-job",
+        },
+        {
+            "prompts_version": backfill.PROMPT_VERSION,
+            "kind": "submitted",
+            "item_ids": ["current-item"],
+            "gemini_job_name": "current-job",
+        },
+    ]
+    state_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    monkeypatch.setattr(backfill, "STATE_PATH", state_path)
+
+    submitted, _ingested, jobs, _metadata = backfill.load_state()
+
+    assert submitted == {"current-item"}
+    assert [job["gemini_job_name"] for job in jobs] == ["current-job"]
 
 
 def _xlsx_bytes(rows: int, columns: int = 1, cell_chars: int = 8) -> bytes:
