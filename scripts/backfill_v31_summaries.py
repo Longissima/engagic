@@ -60,7 +60,7 @@ SELECT i.id, i.title, i.sequence, i.matter_id, i.attachments, m.date AS mdate
 FROM items i
 JOIN meetings m ON i.meeting_id = m.id
 WHERE i.summary IS NOT NULL
-  AND i.prompts_version IS DISTINCT FROM 'v3.1'
+  AND i.prompts_version IS DISTINCT FROM 'v3.2'
   AND m.date >= now() - ($1 || ' days')::interval
   AND i.attachments::text ~* $2
 ORDER BY m.date ASC, i.sequence ASC, i.id ASC
@@ -165,7 +165,7 @@ async def ingest_result(db, result: dict, normalizer) -> bool:
         item_id=item_id,
         summary=result["summary"],
         topics=topics,
-        prompts_version="v3.1",
+        prompts_version="v3.2",
     )
     return True
 
@@ -254,7 +254,7 @@ async def main() -> None:
     )
     summarizer = GeminiSummarizer()
     normalizer = get_normalizer()
-    assert summarizer.prompts_version == "v3.1", "backfill requires the v3.1 prompt"
+    assert summarizer.prompts_version == "v3.2", "backfill requires the v3.2 prompt"
 
     # Submit in waves so text buffers stay bounded.
     sem = asyncio.Semaphore(R2_FETCH_CONCURRENCY)

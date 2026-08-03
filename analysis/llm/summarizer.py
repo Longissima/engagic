@@ -86,8 +86,10 @@ class GeminiSummarizer:
 
         # Load prompts from JSON. Version bumps when the template materially
         # changes -- items carry prompts_version so stale summaries are
-        # queryable for backfill (v3 -> v3.1: primary-source override step).
-        self.prompts_version = "v3.1"
+        # queryable for backfill (v3.1: status-aware transactional policy;
+        # v3.2: policy broadened to legislative redlines, fiscal
+        # characterizations, and internal-conflict reconciliation).
+        self.prompts_version = "v3.2"
 
         if prompts_path is None:
             # Load from package resources (works in installed packages)

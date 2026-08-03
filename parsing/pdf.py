@@ -247,90 +247,136 @@ def _detect_horizontal_lines(page: fitz.Page) -> List[Tuple[float, float, float]
     Returns:
         list of (x0, x1, y_position) tuples for horizontal bars
     """
+    # Strikethrough is not one encoding. Known rendering families, each
+    # detected independently and fed into the same mid-span classifier:
+    #   A. Thin FILLED rects -- LibreOffice (black), Word track-changes (red).
+    #   B. STROKED horizontal line/thin-rect paths -- other Word export paths
+    #      and HTML-to-PDF vendors. (The old code nested 'l' handling inside
+    #      the fill branch, so stroke-only paths could never match.)
+    #   C. StrikeOut ANNOTATIONS -- PDF markup layer.
+    # Near-white marks are excluded (masking rectangles). Geometry -- thin,
+    # wide, crossing mid-span -- remains the real discriminator downstream.
     lines = []
-    paths = page.get_drawings()
 
-    for path in paths:
-        # Check if this path is a filled black rectangle (potential line)
+    def _append_thin_rect(rect) -> None:
+        x0, y0, x1, y1 = rect
+        height = abs(y1 - y0)
+        width = abs(x1 - x0)
+        if height < 2 and width > 5:
+            lines.append((x0, x1, (y0 + y1) / 2))
+
+    for path in page.get_drawings():
         fill_color = path.get("fill")
-        if fill_color and fill_color == (0.0, 0.0, 0.0):  # Black fill
-            for item in path["items"]:
-                if item[0] == "re":  # Rectangle
-                    rect = item[1]
-                    x0, y0, x1, y1 = rect
+        stroke_color = path.get("color")
+        dark_fill = bool(fill_color) and max(fill_color) < 0.85
+        dark_stroke = bool(stroke_color) and max(stroke_color) < 0.85
+        if not (dark_fill or dark_stroke):
+            continue
+        for item in path["items"]:
+            if item[0] == "re":
+                _append_thin_rect(item[1])
+            elif item[0] == "l" and dark_stroke:
+                p1, p2 = item[1:3]
+                if abs(p1.y - p2.y) < 0.5 and abs(p2.x - p1.x) > 5:
+                    lines.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
 
-                    height = abs(y1 - y0)
-                    width = abs(x1 - x0)
-
-                    # Thin horizontal rectangle (height < 2 points, width > 5 points)
-                    if height < 2 and width > 5:
-                        y_mid = (y0 + y1) / 2
-                        lines.append((x0, x1, y_mid))
-
-                # Also check for actual line items (just in case)
-                elif item[0] == "l":
-                    p1, p2 = item[1:]
-                    if abs(p1.y - p2.y) < 0.5:
-                        line_x0 = min(p1.x, p2.x)
-                        line_x1 = max(p1.x, p2.x)
-                        lines.append((line_x0, line_x1, p1.y))
+    annot = page.first_annot
+    while annot:
+        if annot.type[0] == fitz.PDF_ANNOT_STRIKE_OUT:
+            r = annot.rect
+            lines.append((r.x0, r.x1, (r.y0 + r.y1) / 2))
+        annot = annot.next
 
     return lines
 
 
-def _match_lines_to_text(page: fitz.Page, lines: List[Tuple[float, float, float]]) -> Dict[str, List[Tuple[str, Tuple]]]:
+def _span_mark_runs(
+    chars: List[Tuple[str, float, float]],
+    span_bbox: Tuple[float, float, float, float],
+    lines: List[Tuple[float, float, float]],
+) -> List[Tuple[str, Optional[str]]]:
+    """Classify a span's characters against mark lines, character by character.
+
+    A single span can carry BOTH a strike over its old words and an underline
+    under its new words (Word emits "old new" as one span with two marks at
+    different x-ranges). Span-granular classification either misses one mark
+    or mislabels the whole span, so marks are applied per character using each
+    line's x-extent, then grouped into runs.
+
+    chars: (character, x0, x1) in reading order.
+    Returns runs of (text, mark) where mark is None, 'del', or 'add'.
     """
-    Match horizontal lines to text spans and classify as strikethrough/underline.
+    y0, y1 = span_bbox[1], span_bbox[3]
+    height = y1 - y0
+    strike_lo, strike_hi = y0 + 0.3 * height, y0 + 0.7 * height
+    under_lo, under_hi = y1 - 1, y1 + 3
 
-    Returns dict with:
-        'strikethrough': list of (text, bbox) tuples
-        'underline': list of (text, bbox) tuples
-    """
-    result = {
-        'strikethrough': [],
-        'underline': []
-    }
-
-    # Get text with detailed positioning
-    text_dict = page.get_text("dict")  # type: ignore[attr-defined]
-
-    for block in text_dict["blocks"]:
-        if block.get("type") != 0:  # Skip non-text blocks
+    marks: List[Optional[str]] = [None] * len(chars)
+    for line_x0, line_x1, line_y in lines:
+        if strike_lo <= line_y <= strike_hi:
+            mark = "del"
+        elif under_lo <= line_y <= under_hi:
+            mark = "add"
+        else:
             continue
+        for i, (_, cx0, cx1) in enumerate(chars):
+            mid = (cx0 + cx1) / 2
+            if line_x0 - 1 <= mid <= line_x1 + 1:
+                # Deletion outranks addition on the rare overlap; never
+                # downgrade an already-marked deletion.
+                if marks[i] is None or (mark == "del" and marks[i] == "add"):
+                    marks[i] = mark
 
+    runs: List[List] = []
+    for (char, _, _), mark in zip(chars, marks):
+        if runs and runs[-1][1] == mark:
+            runs[-1][0] += char
+        else:
+            runs.append([char, mark])
+    # Whitespace-only marked runs are geometric accidents (a mark line
+    # skimming a space between words); render them plain.
+    return [
+        (text, None if (mark and not text.strip()) else mark)
+        for text, mark in runs
+    ]
+
+
+def _page_mark_runs(page: fitz.Page) -> Tuple[List[List[Tuple[str, Optional[str]]]], int, int]:
+    """Compute per-span mark runs for a whole page.
+
+    Returns (per-span run lists in reading order, struck_span_count,
+    underlined_span_count) so extraction and the activation gate share one
+    deterministic classification pass.
+    """
+    lines = _detect_horizontal_lines(page)
+    span_runs: List[List[Tuple[str, Optional[str]]]] = []
+    struck = 0
+    underlined = 0
+    raw = page.get_text("rawdict")  # type: ignore[attr-defined]
+    for block in raw["blocks"]:
+        if block.get("type") != 0:
+            continue
         for line_obj in block.get("lines", []):
             for span in line_obj.get("spans", []):
-                text = span.get("text", "").strip()
-                if not text:
+                chars = [
+                    (ch["c"], ch["bbox"][0], ch["bbox"][2])
+                    for ch in span.get("chars", [])
+                ]
+                if not chars:
                     continue
-
-                bbox = span["bbox"]  # (x0, y0, x1, y1)
-                text_x0, text_y0, text_x1, text_y1 = bbox
-
-                # Text vertical center and bottom
-                text_bottom_y = text_y1
-                text_height = text_y1 - text_y0
-
-                # Check each horizontal line
-                for line_x0, line_x1, line_y in lines:
-                    # Check if line horizontally overlaps with text
-                    # (with small tolerance for slight misalignment)
-                    if not (line_x1 < text_x0 - 2 or line_x0 > text_x1 + 2):
-                        # Line overlaps text horizontally
-
-                        # Strikethrough: line passes through middle of text
-                        # (within 30% to 70% of text height from top)
-                        if text_y0 + 0.3 * text_height <= line_y <= text_y0 + 0.7 * text_height:
-                            result['strikethrough'].append((text, bbox))
-                            break
-
-                        # Underline: line is just below text
-                        # (within 3 points below text bottom, or just touching)
-                        elif text_bottom_y - 1 <= line_y <= text_bottom_y + 3:
-                            result['underline'].append((text, bbox))
-                            break
-
-    return result
+                runs = (
+                    _span_mark_runs(chars, tuple(span["bbox"]), lines)
+                    if lines
+                    else [("".join(c for c, _, _ in chars), None)]
+                )
+                span_runs.append(runs)
+                # A mark must cover at least 2 non-space characters to count
+                # as evidence -- single-character grazes are noise.
+                if any(m == "del" and len(t.strip()) >= 2 for t, m in runs):
+                    struck += 1
+                if any(m == "add" and len(t.strip()) >= 2 for t, m in runs):
+                    underlined += 1
+    return span_runs, struck, underlined
 
 
 def _has_legislative_legend(doc: fitz.Document, proximity_chars: int = 200, max_pages: int = 5) -> bool:
@@ -391,52 +437,72 @@ def _has_legislative_legend(doc: fitz.Document, proximity_chars: int = 200, max_
     return False
 
 
+def count_redline_evidence(doc: fitz.Document, max_pages: int = 30) -> Dict[str, int]:
+    """Count geometric strikethrough/underline evidence across the document.
+
+    Deterministic activation signal for legislative formatting: a thin filled
+    rectangle crossing the vertical MIDDLE of a text span (30-70% of span
+    height, per _match_lines_to_text) is a strikethrough candidate. Table
+    rules and separators sit between spans and underlines sit at the
+    baseline, so mid-span crossings are the discriminator that survives the
+    false positives which motivated the old legend-only gate.
+
+    Scans up to max_pages pages, stopping early once enough strike evidence
+    accumulates to activate. Returns counts for logging/auditing:
+        {'struck_spans': N, 'underlined_spans': M, 'pages_scanned': P}
+    """
+    struck = 0
+    underlined = 0
+    pages_scanned = 0
+    for page_num in range(min(len(doc), max_pages)):
+        pages_scanned += 1
+        if not _detect_horizontal_lines(doc[page_num]):
+            continue
+        _, page_struck, page_underlined = _page_mark_runs(doc[page_num])
+        struck += page_struck
+        underlined += page_underlined
+        if struck >= REDLINE_ACTIVATION_STRUCK_SPANS:
+            break
+    return {
+        "struck_spans": struck,
+        "underlined_spans": underlined,
+        "pages_scanned": pages_scanned,
+    }
+
+
+# Activation threshold for geometry-based redline detection: at least this
+# many text spans crossed mid-height by a strike rect. One or two crossings
+# occur incidentally (e.g., a table rule through a wrapped cell); genuine
+# redlines strike whole clauses. Tune with the audit log, which records the
+# counts behind every activation decision.
+REDLINE_ACTIVATION_STRUCK_SPANS = 3
+
+
 def _extract_text_with_formatting(page: fitz.Page, page_num: int) -> str:
     """
     Extract text from page with legislative formatting tags.
 
-    Returns text with [DELETED: ...] and [ADDED: ...] tags for strikethrough/underline.
+    Returns text with [DELETED: ...] and [ADDED: ...] tags rendered at
+    character-run granularity: a single span holding both struck old text and
+    underlined new text yields separate tagged runs, not one mislabeled span.
     """
-    # Detect horizontal lines (strikethrough/underline indicators)
-    lines = _detect_horizontal_lines(page)
-
-    if not lines:
-        # No formatting detected, return plain text
+    if not _detect_horizontal_lines(page):
+        # No mark lines on this page, return plain text
         return page.get_text(sort=True)  # type: ignore[attr-defined]
 
-    # Match lines to text
-    matched = _match_lines_to_text(page, lines)
-    strikethrough_spans = {bbox: text for text, bbox in matched['strikethrough']}
-    underline_spans = {bbox: text for text, bbox in matched['underline']}
-
-    # Get text with detailed positioning
-    text_dict = page.get_text("dict")  # type: ignore[attr-defined]
-    result_parts = []
-
-    for block in text_dict["blocks"]:
-        if block.get("type") != 0:  # Skip non-text blocks
-            continue
-
-        block_parts = []
-        for line_obj in block.get("lines", []):
-            line_parts = []
-            for span in line_obj.get("spans", []):
-                text = span.get("text", "")
-                bbox = tuple(span["bbox"])
-
-                # Check if this span has formatting
-                if bbox in strikethrough_spans:
-                    line_parts.append(f"[DELETED: {text}]")
-                elif bbox in underline_spans:
-                    line_parts.append(f"[ADDED: {text}]")
-                else:
-                    line_parts.append(text)
-
-            block_parts.append("".join(line_parts))
-
-        result_parts.append("\n".join(block_parts))
-
-    return "\n\n".join(result_parts)
+    span_runs, _, _ = _page_mark_runs(page)
+    parts = []
+    for runs in span_runs:
+        span_out = []
+        for text, mark in runs:
+            if mark == "del":
+                span_out.append(f"[DELETED: {text}]")
+            elif mark == "add":
+                span_out.append(f"[ADDED: {text}]")
+            else:
+                span_out.append(text)
+        parts.append("".join(span_out))
+    return "\n".join(parts)
 
 
 class PdfExtractor:
@@ -724,10 +790,31 @@ class PdfExtractor:
         ocr_tasks = []  # List of (page_num, png_bytes, original_text)
         ocr_pending = 0  # below-threshold pages skipped because ocr_enabled=False
 
-        # Check for legislative legend once (if formatting detection enabled)
-        use_formatting = self.detect_legislative_formatting and _has_legislative_legend(doc)
-        if use_formatting:
-            logger.info("[PyMuPDF] Legislative formatting detected - tagging additions/deletions")
+        # Activation is deterministic and auditable: a textual legend OR
+        # geometric strike evidence (spans crossed mid-height by strike
+        # rects). The legend-only gate missed every real-world redline that
+        # lacked a legend sentence -- deletions then extracted as plain text,
+        # indistinguishable from operative language.
+        use_formatting = False
+        if self.detect_legislative_formatting:
+            legend = _has_legislative_legend(doc)
+            evidence = {"struck_spans": 0, "underlined_spans": 0, "pages_scanned": 0}
+            if not legend:
+                evidence = count_redline_evidence(doc)
+            use_formatting = legend or evidence["struck_spans"] >= REDLINE_ACTIVATION_STRUCK_SPANS
+            if use_formatting:
+                logger.info(
+                    "[PyMuPDF] Legislative formatting detected - tagging additions/deletions",
+                    activated_by="legend" if legend else "geometry",
+                    struck_spans=evidence["struck_spans"],
+                    underlined_spans=evidence["underlined_spans"],
+                )
+            elif evidence["struck_spans"] > 0:
+                logger.info(
+                    "[PyMuPDF] Strike marks below activation threshold, not tagging",
+                    struck_spans=evidence["struck_spans"],
+                    threshold=REDLINE_ACTIVATION_STRUCK_SPANS,
+                )
 
         # Per-page sanity cap. A single PDF page should never yield more than
         # a few KB of real text. When PyMuPDF sees a broken font CMap or a
