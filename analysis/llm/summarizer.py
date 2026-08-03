@@ -451,9 +451,6 @@ class GeminiSummarizer:
         cache -- an expiry mid-flight fails the whole job. Storage at this size
         is pennies, so we size the TTL past the job ceiling rather than gamble.
         """
-        if not shared_context:
-            return None
-
         shared_context = limit_shared_context(shared_context)
         if not shared_context:
             return None
@@ -545,6 +542,7 @@ class GeminiSummarizer:
         # text. Flash Lite 4M TPM; cap a chunk at ~1.2M estimated tokens.
         max_chunk_items = 30
         max_chunk_est_tokens = 1_200_000
+        cached_chars = len(shared_context or "") if cache_name else 0
         chunks: List[List[Dict[str, Any]]] = []
         current: List[Dict[str, Any]] = []
         current_tokens = 0
@@ -554,16 +552,13 @@ class GeminiSummarizer:
                 item_title,
                 req.get("text", ""),
                 shared_context,
-                inline_shared=not bool(cache_name),
+                inline_shared=not cache_name,
             )
             prompt = self._get_prompt(
                 "item",
                 self._select_prompt_type(),
                 title=item_title,
                 text=prepared_text,
-            )
-            cached_chars = (
-                len(limit_shared_context(shared_context) or "") if cache_name else 0
             )
             est_tokens = (len(prompt) + cached_chars) // 4
             if current and (
@@ -904,7 +899,7 @@ class GeminiSummarizer:
                         item_title,
                         req["text"],
                         shared_context,
-                        inline_shared=not bool(cache_name),
+                        inline_shared=not cache_name,
                     )
 
                     # Use actual page count if available, otherwise estimate

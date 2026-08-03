@@ -1661,9 +1661,9 @@ class Processor:
                             logger.info("excerpting public comment document", attachment=att_name or att_url, pages=page_count, chars=len(text))
                             text = (
                                 text[:PUBLIC_COMMENT_EXCERPT_CHARS]
-                                + f"\n\n[PIPELINE NOTE: this attachment appears to be a public-comment"
+                                + "\n\n[PIPELINE NOTE: this attachment appears to be a public-comment"
                                 f" document ({page_count} pages, {len(result['text']):,} characters);"
-                                f" only the excerpt above is included]"
+                                " only the excerpt above is included]"
                             )
                         return att_url, {"text": text, "page_count": page_count, "name": att_name or att_url}
                     return att_url, None
@@ -1712,10 +1712,7 @@ class Processor:
         failed_items = []
         # The shared documents count toward every item's context window whether
         # they are inline or held in Gemini cached content.
-        item_text_budget = max(
-            0,
-            MAX_ITEM_INPUT_CHARS - shared_context_chars - 1_000,
-        )
+        item_text_budget = max(0, MAX_ITEM_INPUT_CHARS - shared_context_chars - 1_000)
 
         for item in need_processing:
             try:
@@ -1726,7 +1723,7 @@ class Processor:
                 url_names = {
                     att.url: (att.name or att.url)
                     for att in (item.attachments or [])
-                    if getattr(att, "url", None)
+                    if att.url
                 }
 
                 for att_url in item_attachments.get(item.id, []):
@@ -1743,35 +1740,31 @@ class Processor:
                         # the summary silently claims more coverage than it has.
                         unreadable.append(url_names.get(att_url, att_url))
 
+                unreadable_note = ""
+                if unreadable:
+                    unreadable_note = (
+                        "[PIPELINE NOTE: the following attachments exist for this"
+                        " item but could not be read: " + "; ".join(unreadable) + "]"
+                    )
+
                 # Items with only shared attachments can still be processed
                 # using shared context + item metadata
                 if doc_parts:
-                    external_notes = []
-                    if unreadable:
-                        external_notes.append(
-                            "[PIPELINE NOTE: the following attachments exist for this item"
-                            " but could not be read: " + "; ".join(unreadable) + "]"
-                        )
-                    note_chars = sum(len(note) + 2 for note in external_notes)
+                    note_chars = len(unreadable_note) + 2 if unreadable_note else 0
                     combined_text, trim_notes = render_document_parts(
                         doc_parts,
                         max(0, item_text_budget - note_chars),
                     )
                     if trim_notes:
                         logger.warning("item input trimmed to budget", title=item.title[:50], notes=trim_notes)
-                    combined_text = "\n\n".join([combined_text, *external_notes])
+                    if unreadable_note:
+                        combined_text += "\n\n" + unreadable_note
                 elif has_shared_attachments:
                     # Item relies on shared context - use description or title as anchor
                     desc = getattr(item, 'description', '') or ''
                     combined_text = f"[Item: {item.title}]\n{desc}".strip() if desc else f"[Item: {item.title}]"
                     logger.debug("item uses shared attachments only", title=item.title[:50])
                 elif item.body_text:
-                    unreadable_note = ""
-                    if unreadable:
-                        unreadable_note = (
-                            "[PIPELINE NOTE: the following attachments exist for this"
-                            " item but could not be read: " + "; ".join(unreadable) + "]"
-                        )
                     combined_text = truncate_text_to_budget(
                         item.body_text,
                         max(0, item_text_budget - len(unreadable_note) - 2),
@@ -1786,10 +1779,7 @@ class Processor:
 
                 # Notes and coversheet fallbacks are assembled after document
                 # fitting, so enforce the absolute item share one final time.
-                combined_text = truncate_text_to_budget(
-                    combined_text,
-                    item_text_budget,
-                )
+                combined_text = truncate_text_to_budget(combined_text, item_text_budget)
 
                 if item.sequence in (first_sequence, last_sequence):
                     item_participation = parse_participation_info(combined_text)

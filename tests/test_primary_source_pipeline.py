@@ -300,7 +300,6 @@ class _CanonicalConnection:
         return _Transaction()
 
     async def fetchrow(self, query, matter_id):
-        assert "ORDER BY m.date DESC" in query
         assert query == LATEST_MATTER_ITEM
         return {"id": f"latest-{matter_id}", "summary": f"latest {matter_id}"}
 

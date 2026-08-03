@@ -14,9 +14,7 @@ from typing import Iterable, Sequence
 MAX_ITEM_INPUT_CHARS = 3_600_000
 TRIM_FLOOR_CHARS = 50_000
 SHARED_CONTEXT_RESERVE_CHARS = 50_000
-MAX_SHARED_CONTEXT_CHARS = (
-    MAX_ITEM_INPUT_CHARS - SHARED_CONTEXT_RESERVE_CHARS - 1_000
-)
+MAX_SHARED_CONTEXT_CHARS = MAX_ITEM_INPUT_CHARS - SHARED_CONTEXT_RESERVE_CHARS - 1_000
 PUBLIC_COMMENT_EXCERPT_CHARS = 15_000
 MAX_ITEM_TITLE_CHARS = 2_000
 
@@ -68,7 +66,7 @@ def fit_parts_to_budget(
         return fitted, []
 
     original_lengths = [len(text) for _, text in fitted]
-    effective_floor = min(max(0, floor), budget // len(fitted)) if fitted else 0
+    effective_floor = min(max(0, floor), budget // len(fitted))
 
     while total > budget:
         candidates = [
@@ -81,16 +79,6 @@ def fit_parts_to_budget(
         keep = max(effective_floor, len(text) - (total - budget))
         fitted[idx] = (name, text[:keep])
         total -= len(text) - keep
-
-    # Defensive final shave for unexpected edge cases (for example a negative
-    # custom floor supplied by a caller). This loop is normally a no-op.
-    for idx in sorted(range(len(fitted)), key=lambda i: len(fitted[i][1]), reverse=True):
-        if total <= budget:
-            break
-        name, text = fitted[idx]
-        cut = min(len(text), total - budget)
-        fitted[idx] = (name, text[: len(text) - cut])
-        total -= cut
 
     notes = [
         f"{fitted[i][0]}: kept {len(fitted[i][1]):,} of {original_lengths[i]:,} characters"

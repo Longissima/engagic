@@ -583,9 +583,9 @@ class AsyncAnalyzer:
                 page_count = item.get("page_count")
 
                 # Mirror the batch lane's shared-context inlining
-                # (_submit_one_chunk). Before this, shared_context was accepted
-                # and silently dropped: items whose only documents are shared
-                # went to the model as "[Item: title]" with no document text.
+                # (_submit_one_chunk); without it, items whose only documents
+                # are shared reach the model as "[Item: title]" with no
+                # document text.
                 text = prepare_item_text(
                     title,
                     text,

@@ -893,10 +893,7 @@ class PdfExtractor:
             if use_formatting:
                 page_text = _extract_text_with_formatting(page, page_num + 1)
             else:
-                page_text = cast(
-                    str,
-                    page.get_text(sort=True),  # type: ignore[attr-defined]
-                )
+                page_text = cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
 
             if len(page_text) > _MAX_PAGE_CHARS:
                 logger.warning(

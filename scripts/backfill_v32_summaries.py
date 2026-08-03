@@ -380,10 +380,7 @@ async def main() -> None:
         for item_id in ingested_ids
         if meta_by_id.get(item_id, {}).get("matter_id")
     }
-    canonicals_refreshed = await refresh_canonical_summaries(
-        db,
-        affected_matter_ids,
-    )
+    canonicals_refreshed = await refresh_canonical_summaries(db, affected_matter_ids)
 
     logger.info(
         "backfill complete",
