@@ -575,6 +575,16 @@ class AsyncAnalyzer:
                 title = item.get("title", "")
                 page_count = item.get("page_count")
 
+                # Mirror the batch lane's shared-context inlining
+                # (_submit_one_chunk). Before this, shared_context was accepted
+                # and silently dropped: items whose only documents are shared
+                # went to the model as "[Item: title]" with no document text.
+                if shared_context:
+                    text = (
+                        f"=== SHARED CONTEXT (Background documents for this meeting) ===\n\n"
+                        f"{shared_context}\n\n=== AGENDA ITEM: {title} ===\n\n{text}"
+                    )
+
                 # Summarize item (Gemini SDK is sync, run in thread pool).
                 # SDK now has its own 300s http timeout matching this wait_for,
                 # so a real stall cancels the socket and frees the thread

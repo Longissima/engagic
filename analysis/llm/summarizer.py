@@ -79,8 +79,10 @@ class GeminiSummarizer:
         self.primary_model = config.PRIMARY_MODEL
         self.small_doc_model = config.SMALL_DOC_MODEL
 
-        # Load prompts from JSON
-        self.prompts_version = "v3"
+        # Load prompts from JSON. Version bumps when the template materially
+        # changes -- items carry prompts_version so stale summaries are
+        # queryable for backfill (v3 -> v3.1: primary-source override step).
+        self.prompts_version = "v3.1"
 
         if prompts_path is None:
             # Load from package resources (works in installed packages)
@@ -523,15 +525,28 @@ class GeminiSummarizer:
         total_items = len(item_requests)
         logger.info("submitting batch", total_items=total_items, batch_enabled=True, cost_savings_percent=50)
 
-        # Chunk to respect TPM. Flash Lite 4M TPM: 30 items x 50K tokens = 1.5M
-        # (37% of limit). Most items are well under 50K, so most meetings fit
-        # one chunk.
-        chunk_size = 30
-        chunks = [
-            item_requests[i : i + chunk_size]
-            for i in range(0, total_items, chunk_size)
-        ]
-        logger.info("split into chunks", num_chunks=len(chunks), chunk_size=chunk_size)
+        # Chunk to respect TPM, sizing by estimated tokens rather than a fixed
+        # item count: the old 30-per-chunk assumed <=50K tokens/item, but items
+        # can legitimately carry hundreds of thousands of tokens of contract
+        # text. Flash Lite 4M TPM; cap a chunk at ~1.2M estimated tokens.
+        max_chunk_items = 30
+        max_chunk_est_tokens = 1_200_000
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_tokens = 0
+        for req in item_requests:
+            est_tokens = len(req.get("text", "")) // 4 + 2_000  # + template overhead
+            if current and (
+                len(current) >= max_chunk_items
+                or current_tokens + est_tokens > max_chunk_est_tokens
+            ):
+                chunks.append(current)
+                current, current_tokens = [], 0
+            current.append(req)
+            current_tokens += est_tokens
+        if current:
+            chunks.append(current)
+        logger.info("split into chunks", num_chunks=len(chunks), max_chunk_items=max_chunk_items)
 
         submitted: List[Dict[str, Any]] = []
         for chunk_idx, chunk in enumerate(chunks):

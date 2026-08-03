@@ -3,7 +3,7 @@
 Moved from: infocore/processing/pdf_extractor.py
 
 Supports: PDF, DOCX (via PyMuPDF), legacy .doc (via antiword), RTF (via striprtf),
-PPTX (via python-pptx).
+PPTX (via python-pptx), XLSX (via openpyxl).
 
 Legislative formatting detection (strikethrough/underline):
 - Detects thin filled rectangles (MS Word/LibreOffice export format)
@@ -70,6 +70,8 @@ def _detect_format(data: bytes) -> str:
                 ct = zf.read("[Content_Types].xml").decode("utf-8", errors="ignore")
                 if "presentationml" in ct:
                     return "pptx"
+                if "spreadsheetml" in ct:
+                    return "xlsx"
         except Exception:
             pass
         return "docx"
@@ -145,6 +147,60 @@ def _extract_pptx(data: bytes) -> Optional[str]:
         return "\n".join(parts) if parts else None
     except Exception as e:
         logger.debug("pptx extraction failed", error=str(e))
+        return None
+
+
+def _extract_xlsx(data: bytes) -> Optional[str]:
+    """Extract XLSX as markdown tables using openpyxl. Returns text or None.
+
+    Fee schedules and budget detail live in spreadsheets; without this, 800+
+    attachments were invisible to summarization. Row cap keeps monster
+    workbooks bounded -- the model needs the shape and leading rows, not every
+    line of a 10,000-row ledger. Confidence: 8/10 on the row cap being enough.
+    """
+    max_rows_per_sheet = 100
+    max_sheets = 20
+    max_cols = 30
+    max_cell_chars = 300
+    max_total_chars = 200_000
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        parts = []
+        total_chars = 0
+        for sheet_index, ws in enumerate(wb.worksheets):
+            if sheet_index >= max_sheets:
+                parts.append(f"[{len(wb.worksheets) - max_sheets} more sheets omitted]")
+                break
+            if total_chars >= max_total_chars:
+                parts.append("[remaining sheets omitted: extraction size limit]")
+                break
+            rows_out = []
+            total_rows = 0
+            for row in ws.iter_rows(values_only=True):
+                total_rows += 1
+                if total_rows > max_rows_per_sheet:
+                    continue
+                cells = [
+                    "" if v is None else str(v).strip()[:max_cell_chars]
+                    for v in row[:max_cols]
+                ]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if any(cells):
+                    line = "| " + " | ".join(cells) + " |"
+                    rows_out.append(line)
+                    total_chars += len(line)
+            if rows_out:
+                parts.append(f"## Sheet: {ws.title}")
+                parts.extend(rows_out)
+                if total_rows > max_rows_per_sheet:
+                    parts.append(f"[{total_rows - max_rows_per_sheet} more rows omitted]")
+        wb.close()
+        text = "\n".join(parts)
+        return text if text.strip() else None
+    except Exception as e:
+        logger.debug("xlsx extraction failed", error=str(e))
         return None
 
 
@@ -870,6 +926,21 @@ class PdfExtractor:
                     "extraction_time": extraction_time,
                 }
             raise ExtractionError("PPTX extraction failed", document_type="pptx")
+
+        # XLSX
+        if fmt == "xlsx":
+            text = _extract_xlsx(pdf_bytes)
+            if text:
+                extraction_time = time.time() - start_time
+                logger.info("extracted xlsx via openpyxl", chars=len(text), extraction_time=round(extraction_time, 2))
+                return {
+                    "success": True,
+                    "text": text,
+                    "method": "openpyxl",
+                    "page_count": 0,
+                    "extraction_time": extraction_time,
+                }
+            raise ExtractionError("XLSX extraction failed", document_type="xlsx")
 
         # PDF, DOCX, and unknown formats -- PyMuPDF handles all of these
         try:

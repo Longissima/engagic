@@ -48,11 +48,56 @@ STALE_SWEEP_MINUTES = 15
 
 PUBLIC_COMMENT_SIGNATURE_THRESHOLD = 20
 
-# Per-attachment extracted text cap. Monster OCR packets can produce 3MB+ of text
-# per document, and a single meeting may cache 50+ documents. Truncating keeps the
-# document_cache bounded regardless of packet size -- summaries rarely need >500KB
-# of raw text from any single source, and Gemini has its own input token limit.
-MAX_EXTRACTED_TEXT_CHARS = 500_000
+# Combined per-item input budget, enforced in _build_batch_requests. Gemini
+# Flash Lite accepts ~1M input tokens (~4M chars); leave headroom for the
+# prompt template, response schema, and shared context. Items over budget are
+# trimmed largest-document-first with an explicit [PIPELINE NOTE] so the model
+# and the reader both know the input was cut. Without this, an oversized
+# request 400s as non-retryable and the item stays unsummarized forever.
+# (Replaces MAX_EXTRACTED_TEXT_CHARS, which was defined but never enforced.)
+MAX_ITEM_INPUT_CHARS = 3_600_000
+
+# Floor below which budget trimming never cuts an individual document -- every
+# document keeps at least a real excerpt so no source vanishes entirely.
+TRIM_FLOOR_CHARS = 50_000
+
+# Public-comment attachments (matched by name) and comment compilations
+# (detected by content) are excerpted, not dropped: the public's position is
+# part of the record, but 300 form letters must not drown the substantive
+# documents in the same packet.
+PUBLIC_COMMENT_EXCERPT_CHARS = 15_000
+
+
+def fit_parts_to_budget(
+    parts: List[tuple], budget: int, floor: int = TRIM_FLOOR_CHARS
+) -> tuple[List[tuple], List[str]]:
+    """Trim (name, text) parts largest-first until combined size fits budget.
+
+    No document is cut below `floor`, so every source survives as an excerpt.
+    Returns the fitted parts plus human-readable notes describing what was cut.
+    """
+    total = sum(len(text) for _, text in parts)
+    if total <= budget:
+        return parts, []
+
+    fitted = list(parts)
+    original_lengths = {i: len(text) for i, (_, text) in enumerate(fitted)}
+    while total > budget:
+        candidates = [i for i in range(len(fitted)) if len(fitted[i][1]) > floor]
+        if not candidates:
+            break
+        idx = max(candidates, key=lambda i: len(fitted[i][1]))
+        name, text = fitted[idx]
+        keep = max(floor, len(text) - (total - budget))
+        fitted[idx] = (name, text[:keep])
+        total = sum(len(t) for _, t in fitted)
+
+    notes = [
+        f"{fitted[i][0]}: kept {len(fitted[i][1]):,} of {original_lengths[i]:,} characters"
+        for i in range(len(fitted))
+        if len(fitted[i][1]) < original_lengths[i]
+    ]
+    return fitted, notes
 
 # Cache libc handle for malloc_trim. glibc retains freed heap arenas by default;
 # malloc_trim(0) forces release back to the kernel after large transient allocations.
@@ -1648,13 +1693,14 @@ class Processor:
             logger.error("analyzer not initialized, cannot extract attachments")
             return {}, item_attachments, all_urls
 
-        # Filter out low-value attachments before extraction
+        # Public-comment attachments are extracted but excerpted below, never
+        # silently dropped: the public's position is part of the record.
         urls_to_extract = []
+        comment_urls = set()
         for att_url in all_urls:
             att_name = url_to_name.get(att_url, "")
             if att_name and is_public_comment_attachment(att_name):
-                logger.info("skipping low-value attachment", attachment_name=att_name)
-                continue
+                comment_urls.add(att_url)
             urls_to_extract.append((att_url, att_name))
 
         # Concurrent PDF extraction (global semaphore caps total across all meetings)
@@ -1665,10 +1711,20 @@ class Processor:
                 try:
                     result = await self.analyzer.extract_pdf_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
-                        if is_likely_public_comment_compilation(result, att_name or att_url):
-                            logger.info("skipping public comment compilation", attachment=att_name or att_url)
-                            return att_url, None
-                        return att_url, {"text": result["text"], "page_count": result.get("page_count", 0), "name": att_name or att_url}
+                        text = result["text"]
+                        page_count = result.get("page_count", 0)
+                        is_comment = att_url in comment_urls or is_likely_public_comment_compilation(
+                            result, att_name or att_url
+                        )
+                        if is_comment and len(text) > PUBLIC_COMMENT_EXCERPT_CHARS:
+                            logger.info("excerpting public comment document", attachment=att_name or att_url, pages=page_count, chars=len(text))
+                            text = (
+                                text[:PUBLIC_COMMENT_EXCERPT_CHARS]
+                                + f"\n\n[PIPELINE NOTE: this attachment appears to be a public-comment"
+                                f" document ({page_count} pages, {len(result['text']):,} characters);"
+                                f" only the excerpt above is included]"
+                            )
+                        return att_url, {"text": text, "page_count": page_count, "name": att_name or att_url}
                     return att_url, None
                 except (ExtractionError, OSError, IOError) as e:
                     logger.warning("failed to extract document", attachment=att_name or att_url, error=str(e))
@@ -1715,9 +1771,15 @@ class Processor:
 
         for item in need_processing:
             try:
-                item_specific_parts = []
+                doc_parts = []
+                unreadable = []
                 total_page_count = 0
                 has_shared_attachments = False
+                url_names = {
+                    att.url: (att.name or att.url)
+                    for att in (item.attachments or [])
+                    if getattr(att, "url", None)
+                }
 
                 for att_url in item_attachments.get(item.id, []):
                     if att_url in shared_urls:
@@ -1725,13 +1787,31 @@ class Processor:
                         continue
                     if att_url in document_cache:
                         doc = document_cache[att_url]
-                        item_specific_parts.append(f"=== {doc['name']} ===\n{doc['text']}")
+                        doc_parts.append((doc['name'], doc['text']))
                         total_page_count += doc['page_count']
+                    else:
+                        # Extraction failed or was filtered upstream: the model
+                        # must know a document exists that it cannot see, or
+                        # the summary silently claims more coverage than it has.
+                        unreadable.append(url_names.get(att_url, att_url))
 
                 # Items with only shared attachments can still be processed
                 # using shared context + item metadata
-                if item_specific_parts:
-                    combined_text = "\n\n".join(item_specific_parts)
+                if doc_parts:
+                    doc_parts, trim_notes = fit_parts_to_budget(doc_parts, MAX_ITEM_INPUT_CHARS)
+                    sections = [f"=== {name} ===\n{text}" for name, text in doc_parts]
+                    if unreadable:
+                        sections.append(
+                            "[PIPELINE NOTE: the following attachments exist for this item"
+                            " but could not be read: " + "; ".join(unreadable) + "]"
+                        )
+                    if trim_notes:
+                        logger.warning("item input trimmed to budget", title=item.title[:50], notes=trim_notes)
+                        sections.append(
+                            "[PIPELINE NOTE: input trimmed to fit the model context window"
+                            " -- " + "; ".join(trim_notes) + "]"
+                        )
+                    combined_text = "\n\n".join(sections)
                 elif has_shared_attachments:
                     # Item relies on shared context - use description or title as anchor
                     desc = getattr(item, 'description', '') or ''
@@ -1739,6 +1819,11 @@ class Processor:
                     logger.debug("item uses shared attachments only", title=item.title[:50])
                 elif item.body_text:
                     combined_text = item.body_text
+                    if unreadable:
+                        combined_text += (
+                            "\n\n[PIPELINE NOTE: the following attachments exist for this"
+                            " item but could not be read: " + "; ".join(unreadable) + "]"
+                        )
                     logger.debug("using coversheet body text", title=item.title[:50], chars=len(combined_text))
                 else:
                     logger.warning("no text extracted for item", title=item.title[:50])
