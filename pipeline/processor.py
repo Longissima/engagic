@@ -13,10 +13,22 @@ from database.id_generation import validate_matter_id, extract_banana_from_matte
 from corpus.store import get_corpus
 from pipeline.ground_truth import produce_ground_truth
 from pipeline.orchestrators.meeting_sync import MeetingSyncOrchestrator
-from pipeline.utils import hash_substantive_attachments, hash_substantive_attachments_legacy
+from pipeline.utils import (
+    filter_document_version_urls,
+    hash_substantive_attachments,
+    hash_substantive_attachments_legacy,
+)
 from pipeline.url_refresh import refresh_attachment_urls
 from exceptions import ProcessingError, ExtractionError, LLMError
 from analysis.analyzer_async import AsyncAnalyzer
+from analysis.llm.input_budget import (
+    DOCUMENT_ATTACHMENT_TYPES,
+    MAX_ITEM_INPUT_CHARS,
+    MAX_SHARED_CONTEXT_CHARS,
+    PUBLIC_COMMENT_EXCERPT_CHARS,
+    render_document_parts,
+    truncate_text_to_budget,
+)
 from analysis.topics.normalizer import get_normalizer
 from parsing.participation import parse_participation_info
 from config import config, get_logger
@@ -47,57 +59,6 @@ STALE_SWEEP_INTERVAL = 300
 STALE_SWEEP_MINUTES = 15
 
 PUBLIC_COMMENT_SIGNATURE_THRESHOLD = 20
-
-# Combined per-item input budget, enforced in _build_batch_requests. Gemini
-# Flash Lite accepts ~1M input tokens (~4M chars); leave headroom for the
-# prompt template, response schema, and shared context. Items over budget are
-# trimmed largest-document-first with an explicit [PIPELINE NOTE] so the model
-# and the reader both know the input was cut. Without this, an oversized
-# request 400s as non-retryable and the item stays unsummarized forever.
-# (Replaces MAX_EXTRACTED_TEXT_CHARS, which was defined but never enforced.)
-MAX_ITEM_INPUT_CHARS = 3_600_000
-
-# Floor below which budget trimming never cuts an individual document -- every
-# document keeps at least a real excerpt so no source vanishes entirely.
-TRIM_FLOOR_CHARS = 50_000
-
-# Public-comment attachments (matched by name) and comment compilations
-# (detected by content) are excerpted, not dropped: the public's position is
-# part of the record, but 300 form letters must not drown the substantive
-# documents in the same packet.
-PUBLIC_COMMENT_EXCERPT_CHARS = 15_000
-
-
-def fit_parts_to_budget(
-    parts: List[tuple], budget: int, floor: int = TRIM_FLOOR_CHARS
-) -> tuple[List[tuple], List[str]]:
-    """Trim (name, text) parts largest-first until combined size fits budget.
-
-    No document is cut below `floor`, so every source survives as an excerpt.
-    Returns the fitted parts plus human-readable notes describing what was cut.
-    """
-    total = sum(len(text) for _, text in parts)
-    if total <= budget:
-        return parts, []
-
-    fitted = list(parts)
-    original_lengths = {i: len(text) for i, (_, text) in enumerate(fitted)}
-    while total > budget:
-        candidates = [i for i in range(len(fitted)) if len(fitted[i][1]) > floor]
-        if not candidates:
-            break
-        idx = max(candidates, key=lambda i: len(fitted[i][1]))
-        name, text = fitted[idx]
-        keep = max(floor, len(text) - (total - budget))
-        fitted[idx] = (name, text[:keep])
-        total = sum(len(t) for _, t in fitted)
-
-    notes = [
-        f"{fitted[i][0]}: kept {len(fitted[i][1]):,} of {original_lengths[i]:,} characters"
-        for i in range(len(fitted))
-        if len(fitted[i][1]) < original_lengths[i]
-    ]
-    return fitted, notes
 
 # Cache libc handle for malloc_trim. glibc retains freed heap arenas by default;
 # malloc_trim(0) forces release back to the kernel after large transient allocations.
@@ -812,27 +773,7 @@ class Processor:
 
     def _filter_document_versions(self, urls: List[str]) -> List[str]:
         """Keep only latest versions (Ver2 > Ver1, etc.)."""
-        import re
-
-        url_groups = {}
-        non_versioned = []
-        version_pattern = re.compile(r'(.+?)\s+Ver(\d+)', re.IGNORECASE)
-
-        for url in urls:
-            filename = url.split('/')[-1] if url else ""
-            match = version_pattern.search(filename)
-            if match:
-                base_name = match.group(1).strip()
-                version_num = int(match.group(2))
-                url_groups.setdefault(base_name, {})[version_num] = url
-            else:
-                non_versioned.append(url)
-
-        filtered = non_versioned.copy()
-        for versions in url_groups.values():
-            filtered.append(versions[max(versions.keys())])
-
-        return filtered
+        return filter_document_version_urls(urls)
 
     async def _dispatch_and_process_job(self, job, queue_id: int) -> bool:
         """Dispatch and process a single queue job. Returns True if processed."""
@@ -1675,7 +1616,7 @@ class Processor:
         for item in need_processing:
             item_urls = []
             for att in (item.attachments or []):
-                if att.type in ("pdf", "doc", "document", "unknown") and att.url:
+                if att.type in DOCUMENT_ATTACHMENT_TYPES and att.url:
                     item_urls.append(att.url)
                     if att.name and att.url not in url_to_name:
                         url_to_name[att.url] = att.name
@@ -1762,12 +1703,19 @@ class Processor:
         participation_data: Dict[str, Any],
         first_sequence: Optional[int],
         last_sequence: Optional[int],
-        city_has_participation: bool = False
+        city_has_participation: bool = False,
+        shared_context_chars: int = 0,
     ) -> tuple[List[Dict], Dict, List[str]]:
         """Build batch requests from cached documents."""
         batch_requests = []
         item_map = {}
         failed_items = []
+        # The shared documents count toward every item's context window whether
+        # they are inline or held in Gemini cached content.
+        item_text_budget = max(
+            0,
+            MAX_ITEM_INPUT_CHARS - shared_context_chars - 1_000,
+        )
 
         for item in need_processing:
             try:
@@ -1798,37 +1746,50 @@ class Processor:
                 # Items with only shared attachments can still be processed
                 # using shared context + item metadata
                 if doc_parts:
-                    doc_parts, trim_notes = fit_parts_to_budget(doc_parts, MAX_ITEM_INPUT_CHARS)
-                    sections = [f"=== {name} ===\n{text}" for name, text in doc_parts]
+                    external_notes = []
                     if unreadable:
-                        sections.append(
+                        external_notes.append(
                             "[PIPELINE NOTE: the following attachments exist for this item"
                             " but could not be read: " + "; ".join(unreadable) + "]"
                         )
+                    note_chars = sum(len(note) + 2 for note in external_notes)
+                    combined_text, trim_notes = render_document_parts(
+                        doc_parts,
+                        max(0, item_text_budget - note_chars),
+                    )
                     if trim_notes:
                         logger.warning("item input trimmed to budget", title=item.title[:50], notes=trim_notes)
-                        sections.append(
-                            "[PIPELINE NOTE: input trimmed to fit the model context window"
-                            " -- " + "; ".join(trim_notes) + "]"
-                        )
-                    combined_text = "\n\n".join(sections)
+                    combined_text = "\n\n".join([combined_text, *external_notes])
                 elif has_shared_attachments:
                     # Item relies on shared context - use description or title as anchor
                     desc = getattr(item, 'description', '') or ''
                     combined_text = f"[Item: {item.title}]\n{desc}".strip() if desc else f"[Item: {item.title}]"
                     logger.debug("item uses shared attachments only", title=item.title[:50])
                 elif item.body_text:
-                    combined_text = item.body_text
+                    unreadable_note = ""
                     if unreadable:
-                        combined_text += (
-                            "\n\n[PIPELINE NOTE: the following attachments exist for this"
+                        unreadable_note = (
+                            "[PIPELINE NOTE: the following attachments exist for this"
                             " item but could not be read: " + "; ".join(unreadable) + "]"
                         )
+                    combined_text = truncate_text_to_budget(
+                        item.body_text,
+                        max(0, item_text_budget - len(unreadable_note) - 2),
+                    )
+                    if unreadable_note:
+                        combined_text += "\n\n" + unreadable_note
                     logger.debug("using coversheet body text", title=item.title[:50], chars=len(combined_text))
                 else:
                     logger.warning("no text extracted for item", title=item.title[:50])
                     failed_items.append(item.title)
                     continue
+
+                # Notes and coversheet fallbacks are assembled after document
+                # fitting, so enforce the absolute item share one final time.
+                combined_text = truncate_text_to_budget(
+                    combined_text,
+                    item_text_budget,
+                )
 
                 if item.sequence in (first_sequence, last_sequence):
                     item_participation = parse_participation_info(combined_text)
@@ -2043,13 +2004,25 @@ class Processor:
 
             shared_context = None
             if shared_urls:
-                shared_parts = [f"=== {document_cache[url]['name']} ===\n{document_cache[url]['text']}" for url in sorted(shared_urls)]
-                shared_context = "\n\n".join(shared_parts)
+                shared_parts = [
+                    (document_cache[url]["name"], document_cache[url]["text"])
+                    for url in sorted(shared_urls)
+                ]
+                shared_context, shared_trim_notes = render_document_parts(
+                    shared_parts,
+                    MAX_SHARED_CONTEXT_CHARS,
+                )
+                if shared_trim_notes:
+                    logger.warning(
+                        "shared context trimmed to budget",
+                        notes=shared_trim_notes,
+                    )
                 logger.info("built meeting-level shared context", chars=len(shared_context), shared_document_count=len(shared_urls))
 
             batch_requests, item_map, failed_items = self._build_batch_requests(
                 need_processing, document_cache, item_attachments, shared_urls,
-                participation_data, first_sequence, last_sequence, city_has_participation
+                participation_data, first_sequence, last_sequence,
+                city_has_participation, len(shared_context or ""),
             )
 
             if batch_requests and use_batch:

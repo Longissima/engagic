@@ -1,12 +1,13 @@
 """Re-summarize corpus-covered transactional items under the v3.1 prompt.
 
 Targets items whose attachments carry transactional documents (quote,
-contract, agreement, proposal, exhibit) summarized under pre-v3.1 prompts,
-where every attachment's extracted text is present in the ground-truth corpus.
-Input text is rebuilt from the corpus exactly as the pipeline would build it
-(=== name === sections, budget-fitted), submitted through the production
-Gemini Batch API path (v3.1 prompt, token-aware chunking), then ingested via
-the production repositories (items + normalized topics + matter canonical).
+contract, agreement, proposal, exhibit, purchase order, pricing, or SOW)
+summarized under pre-v3.1 prompts, where every production-eligible attachment's
+extracted text is present in the ground-truth corpus.
+Input text is rebuilt from the corpus using the pipeline's document selection,
+section, and budget conventions, submitted through the production Gemini Batch
+API path (v3.1 prompt, token-aware chunking), then ingested via the production
+repositories (items + normalized topics + matter canonical).
 
 Scope is deliberately corpus-only: items whose documents predate the corpus
 cannot be faithfully reconstructed (expired vendor URLs) and are left alone.
@@ -14,10 +15,10 @@ cannot be faithfully reconstructed (expired vendor URLs) and are left alone.
 Usage:
     uv run scripts/backfill_v31_summaries.py --since-days 30 [--limit N] [--dry-run]
 
-State persists to data/backfill_v31_state.jsonl; re-running resumes: already
-submitted items are not resubmitted, already ingested items are not rewritten.
-Confidence: 8/10 on canonical-update ordering (items processed in meeting-date
-order so the latest appearance writes canonical last).
+State persists to data/backfill_v31_state.jsonl; re-running resumes open jobs,
+does not rewrite ingested items, and makes terminal failures eligible for a
+later retry. Canonical matters are refreshed after collection from their newest
+summarized appearance, independent of Gemini job completion order.
 """
 
 import argparse
@@ -34,7 +35,14 @@ from config import config, get_logger
 from corpus.r2 import R2Client
 from database.db_postgres import Database
 from database.repositories_async.helpers import replace_entity_topics
-from pipeline.processor import MAX_ITEM_INPUT_CHARS, fit_parts_to_budget
+from analysis.llm.input_budget import (
+    DOCUMENT_ATTACHMENT_TYPES,
+    MAX_ITEM_INPUT_CHARS,
+    PUBLIC_COMMENT_EXCERPT_CHARS,
+    render_document_parts,
+)
+from pipeline.filters import is_public_comment_attachment
+from pipeline.utils import attachment_identity, filter_document_version_urls
 
 logger = get_logger(__name__).bind(component="backfill_v31")
 
@@ -42,55 +50,60 @@ STATE_PATH = Path("/opt/engagic/data/backfill_v31_state.jsonl")
 WAVE_SIZE = 200
 R2_FETCH_CONCURRENCY = 12
 POLL_INTERVAL_SECONDS = 120
-TRANSACTIONAL_NAME_RE = '"name": *"[^"]*(quote|contract|agreement|proposal|exhibit)[^"]*"'
-ALLOWED_TYPES = ("pdf", "doc", "document", "unknown")
-
-SELECT_TARGETS = f"""
-WITH cand AS (
-    SELECT i.id, i.title, i.sequence, i.matter_id, i.attachments, m.date AS mdate
-    FROM items i JOIN meetings m ON i.meeting_id = m.id
-    WHERE i.summary IS NOT NULL
-      AND i.prompts_version IS DISTINCT FROM 'v3.1'
-      AND m.date >= now() - ($1 || ' days')::interval
-      AND i.attachments::text ~* $2
+TRANSACTIONAL_NAME_RE = (
+    '"name": *"[^"]*(quote|contract|agreement|proposal|exhibit|purchase order|'
+    'order form|pricing|bid tab|statement of work|sow)[^"]*"'
 )
-SELECT c.id, c.title, c.sequence, c.matter_id, c.attachments, c.mdate
-FROM cand c
-JOIN LATERAL jsonb_array_elements(c.attachments::jsonb) att ON att->>'url' IS NOT NULL
-LEFT JOIN document_source ds
-       ON split_part(ds.source_identity, '?', 1) = split_part(att->>'url', '?', 1)
-GROUP BY c.id, c.title, c.sequence, c.matter_id, c.attachments, c.mdate
-HAVING count(*) = count(ds.content_sha256)
-ORDER BY c.mdate ASC
+
+SELECT_TARGETS = """
+SELECT i.id, i.title, i.sequence, i.matter_id, i.attachments, m.date AS mdate
+FROM items i
+JOIN meetings m ON i.meeting_id = m.id
+WHERE i.summary IS NOT NULL
+  AND i.prompts_version IS DISTINCT FROM 'v3.1'
+  AND m.date >= now() - ($1 || ' days')::interval
+  AND i.attachments::text ~* $2
+ORDER BY m.date ASC, i.sequence ASC, i.id ASC
 """
 
-CORPUS_TEXT_FOR_URL = """
+CORPUS_TEXT_FOR_IDENTITY = """
 SELECT b.text_key, b.page_count
 FROM document_source s
 JOIN document_blob b ON s.content_sha256 = b.content_sha256
-WHERE split_part(s.source_identity, '?', 1) = split_part($1, '?', 1)
+WHERE s.source_identity = $1
   AND b.text_key IS NOT NULL
 ORDER BY s.first_seen DESC
 LIMIT 1
 """
 
+LATEST_MATTER_ITEM = """
+SELECT i.id, i.summary
+FROM items i
+JOIN meetings m ON i.meeting_id = m.id
+WHERE i.matter_id = $1
+  AND i.summary IS NOT NULL
+ORDER BY m.date DESC NULLS LAST, i.sequence DESC, i.id DESC
+LIMIT 1
+"""
 
-def load_state() -> tuple[set, set, list]:
-    """Return (submitted_item_ids, ingested_item_ids, open_jobs)."""
-    submitted, ingested, jobs = set(), set(), []
+
+def load_state() -> tuple[set, set, list, dict]:
+    """Return submitted IDs, ingested IDs, open jobs, and all item metadata."""
+    submitted, ingested, jobs, meta_by_id = set(), set(), [], {}
     if not STATE_PATH.exists():
-        return submitted, ingested, jobs
+        return submitted, ingested, jobs, meta_by_id
     with open(STATE_PATH) as f:
         for line in f:
             rec = json.loads(line)
             if rec["kind"] == "submitted":
                 submitted.update(rec["item_ids"])
+                meta_by_id.update(rec.get("meta", {}))
                 jobs.append(rec)
             elif rec["kind"] == "ingested":
                 ingested.add(rec["item_id"])
             elif rec["kind"] == "job_done":
                 jobs = [j for j in jobs if j["gemini_job_name"] != rec["gemini_job_name"]]
-    return submitted, ingested, jobs
+    return submitted, ingested, jobs, meta_by_id
 
 
 def append_state(rec: dict) -> None:
@@ -103,33 +116,47 @@ async def build_item_text(pool, r2, attachments: list) -> tuple:
     """Rebuild combined_text from corpus. Returns (text, page_count) or (None, 0)."""
     parts = []
     pages = 0
+    eligible = [
+        att
+        for att in attachments
+        if att.get("type") in DOCUMENT_ATTACHMENT_TYPES and att.get("url")
+    ]
+    selected_urls = set(
+        filter_document_version_urls([att["url"] for att in eligible])
+    )
+    eligible = [att for att in eligible if att["url"] in selected_urls]
+
     async with pool.acquire() as conn:
-        for att in attachments:
-            if att.get("type") not in ALLOWED_TYPES or not att.get("url"):
-                continue
-            row = await conn.fetchrow(CORPUS_TEXT_FOR_URL, att["url"])
+        for att in eligible:
+            identity = attachment_identity(att["url"])
+            row = await conn.fetchrow(CORPUS_TEXT_FOR_IDENTITY, identity)
             if not row:
                 return None, 0
             blob = await r2.get(row["text_key"])
             if not blob:
                 return None, 0
-            parts.append((att.get("name") or att["url"], blob.decode("utf-8", errors="replace")))
+            name = att.get("name") or att["url"]
+            text = blob.decode("utf-8", errors="replace")
+            if is_public_comment_attachment(name) and len(text) > PUBLIC_COMMENT_EXCERPT_CHARS:
+                text = (
+                    text[:PUBLIC_COMMENT_EXCERPT_CHARS]
+                    + "\n\n[PIPELINE NOTE: this attachment appears to be a public-comment"
+                    + f" document ({row['page_count'] or 0} pages, {len(text):,} characters);"
+                    + " only the excerpt above is included]"
+                )
+            parts.append((name, text))
             pages += row["page_count"] or 0
 
     if not parts:
         return None, 0
-    parts, trim_notes = fit_parts_to_budget(parts, MAX_ITEM_INPUT_CHARS)
-    sections = [f"=== {name} ===\n{text}" for name, text in parts]
+    text, trim_notes = render_document_parts(parts, MAX_ITEM_INPUT_CHARS)
     if trim_notes:
-        sections.append(
-            "[PIPELINE NOTE: input trimmed to fit the model context window -- "
-            + "; ".join(trim_notes) + "]"
-        )
-    return "\n\n".join(sections), pages
+        logger.warning("backfill item input trimmed", notes=trim_notes)
+    return text, pages
 
 
-async def ingest_result(db, meta: dict, result: dict, normalizer) -> bool:
-    """Write one successful batch result through production semantics."""
+async def ingest_result(db, result: dict, normalizer) -> bool:
+    """Write one successful item result; canonical matters refresh afterward."""
     if not result.get("success") or not result.get("summary"):
         return False
     item_id = result["item_id"]
@@ -140,26 +167,41 @@ async def ingest_result(db, meta: dict, result: dict, normalizer) -> bool:
         topics=topics,
         prompts_version="v3.1",
     )
-    matter_id = meta.get("matter_id")
-    if matter_id:
-        # Mirror MattersRepository.update_matter_summary minus the attachment
-        # hash: backfill must not perturb change-detection state.
+    return True
+
+
+async def refresh_canonical_summaries(db, matter_ids: set[str]) -> int:
+    """Refresh affected matters from their newest summarized appearance."""
+    refreshed = 0
+    for matter_id in sorted(matter_ids):
         async with db.pool.acquire() as conn:
             async with conn.transaction():
+                latest = await conn.fetchrow(LATEST_MATTER_ITEM, matter_id)
+                if not latest:
+                    continue
+                topic_rows = await conn.fetch(
+                    "SELECT topic FROM item_topics WHERE item_id = $1 ORDER BY topic",
+                    latest["id"],
+                )
+                topics = [row["topic"] for row in topic_rows]
                 updated = await conn.execute(
                     """
                     UPDATE city_matters
-                    SET canonical_summary = $2, updated_at = CURRENT_TIMESTAMP
+                    SET canonical_summary = $2,
+                        canonical_topics = $3,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1
                     """,
                     matter_id,
-                    result["summary"],
+                    latest["summary"],
+                    topics,
                 )
-                if updated != "UPDATE 0" and topics:
+                if updated != "UPDATE 0":
                     await replace_entity_topics(
                         conn, "matter_topics", "matter_id", matter_id, topics
                     )
-    return True
+                    refreshed += 1
+    return refreshed
 
 
 async def main() -> None:
@@ -170,17 +212,10 @@ async def main() -> None:
     args = parser.parse_args()
 
     db = await Database.create()
-    r2 = R2Client(
-        account_id=config.CLOUDFLARE_ACCOUNT_ID,
-        access_key_id=config.R2_ACCESS_KEY_ID,
-        secret_access_key=config.R2_SECRET_ACCESS_KEY,
-        bucket=config.CORPUS_BUCKET,
-    )
-    summarizer = GeminiSummarizer()
-    normalizer = get_normalizer()
-    assert summarizer.prompts_version == "v3.1", "backfill requires the v3.1 prompt"
-
-    submitted_ids, ingested_ids, open_jobs = load_state()
+    submitted_ids, ingested_ids, open_jobs, meta_by_id = load_state()
+    open_item_ids = {
+        item_id for job in open_jobs for item_id in job.get("item_ids", [])
+    }
     logger.info(
         "backfill starting",
         since_days=args.since_days,
@@ -191,28 +226,40 @@ async def main() -> None:
 
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(SELECT_TARGETS, str(args.since_days), TRANSACTIONAL_NAME_RE)
-    targets = [r for r in rows if r["id"] not in submitted_ids]
-    if args.limit:
-        targets = targets[: args.limit]
+    # Completed failures are eligible on the next run. Only an already ingested
+    # item or one with a currently open Gemini job is excluded.
+    targets = [
+        r
+        for r in rows
+        if r["id"] not in ingested_ids and r["id"] not in open_item_ids
+    ]
     logger.info("targets selected", total_candidates=len(rows), to_submit=len(targets))
 
     if args.dry_run:
-        for r in targets[:20]:
+        dry_count = min(len(targets), args.limit) if args.limit else len(targets)
+        for r in targets[: min(20, dry_count)]:
             print(r["mdate"], r["id"], "|", r["title"][:80])
-        print(f"dry run: {len(targets)} items would be submitted")
-        await r2.close()
+        print(
+            f"dry run: {dry_count} candidate items; exact corpus coverage "
+            "is checked before submission"
+        )
         await db.close()
         return
 
-    # Item metadata needed at ingest time, keyed by item_id. Persisted in the
-    # submitted state records so a resumed run can still ingest.
-    meta_by_id = {}
-    for job in open_jobs:
-        meta_by_id.update(job.get("meta", {}))
+    r2 = R2Client(
+        account_id=config.CLOUDFLARE_ACCOUNT_ID,
+        access_key_id=config.R2_ACCESS_KEY_ID,
+        secret_access_key=config.R2_SECRET_ACCESS_KEY,
+        bucket=config.CORPUS_BUCKET,
+    )
+    summarizer = GeminiSummarizer()
+    normalizer = get_normalizer()
+    assert summarizer.prompts_version == "v3.1", "backfill requires the v3.1 prompt"
 
     # Submit in waves so text buffers stay bounded.
     sem = asyncio.Semaphore(R2_FETCH_CONCURRENCY)
     skipped_no_text = 0
+    submitted_this_run = 0
     for wave_start in range(0, len(targets), WAVE_SIZE):
         wave = targets[wave_start : wave_start + WAVE_SIZE]
 
@@ -242,6 +289,11 @@ async def main() -> None:
 
         if not requests:
             continue
+        if args.limit:
+            remaining = args.limit - submitted_this_run
+            if remaining <= 0:
+                break
+            requests = requests[:remaining]
         descriptors = await summarizer.submit_item_batches(requests)
         for d in descriptors:
             rec = {
@@ -253,6 +305,7 @@ async def main() -> None:
             append_state(rec)
             open_jobs.append(rec)
             meta_by_id.update(rec["meta"])
+        submitted_this_run += sum(len(d["item_ids"]) for d in descriptors)
         logger.info(
             "wave submitted",
             wave=wave_start // WAVE_SIZE + 1,
@@ -260,6 +313,8 @@ async def main() -> None:
             jobs=len(descriptors),
             skipped_no_text=skipped_no_text,
         )
+        if args.limit and submitted_this_run >= args.limit:
+            break
 
     # Collect until every job is terminal.
     ingested = failed = 0
@@ -273,19 +328,27 @@ async def main() -> None:
                 still_open.append(job)
                 continue
             if state == "succeeded" and results:
+                returned_ids = set()
                 for result in results:
                     item_id = result.get("item_id")
                     if not item_id or item_id in ingested_ids:
                         continue
-                    ok = await ingest_result(
-                        db, meta_by_id.get(item_id, {}), result, normalizer
-                    )
+                    returned_ids.add(item_id)
+                    ok = await ingest_result(db, result, normalizer)
                     if ok:
                         ingested += 1
                         ingested_ids.add(item_id)
                         append_state({"kind": "ingested", "item_id": item_id})
                     else:
                         failed += 1
+                missing_ids = set(job["item_ids"]) - returned_ids - ingested_ids
+                if missing_ids:
+                    failed += len(missing_ids)
+                    logger.warning(
+                        "batch response omitted items",
+                        job=job["gemini_job_name"],
+                        item_ids=sorted(missing_ids),
+                    )
             else:
                 failed += len(job["item_ids"])
                 logger.warning("job terminal without results", job=job["gemini_job_name"])
@@ -295,11 +358,22 @@ async def main() -> None:
         if open_jobs:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
+    affected_matter_ids = {
+        meta_by_id[item_id]["matter_id"]
+        for item_id in ingested_ids
+        if meta_by_id.get(item_id, {}).get("matter_id")
+    }
+    canonicals_refreshed = await refresh_canonical_summaries(
+        db,
+        affected_matter_ids,
+    )
+
     logger.info(
         "backfill complete",
         ingested=ingested,
         failed=failed,
         skipped_no_text=skipped_no_text,
+        canonicals_refreshed=canonicals_refreshed,
     )
     await r2.close()
     await db.close()

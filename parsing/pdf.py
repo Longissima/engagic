@@ -54,11 +54,17 @@ _ZIP_MAGIC = b'PK\x03\x04'           # .docx, .xlsx, .pptx (OOXML/ZIP)
 _PDF_MAGIC = b'%PDF-'
 _RTF_MAGIC = b'{\\rtf'
 
+XLSX_MAX_ROWS_PER_SHEET = 100
+XLSX_MAX_SHEETS = 20
+XLSX_MAX_COLS = 30
+XLSX_MAX_CELL_CHARS = 300
+XLSX_MAX_TOTAL_CHARS = 200_000
+
 
 def _detect_format(data: bytes) -> str:
     """Detect document format from magic bytes.
 
-    Returns 'pdf', 'docx', 'pptx', 'doc', 'rtf', or 'unknown'.
+    Returns 'pdf', 'docx', 'pptx', 'xlsx', 'doc', 'rtf', or 'unknown'.
     For ZIP-based OOXML, peeks at [Content_Types].xml to distinguish
     PPTX (presentationml) from DOCX (wordprocessingml).
     """
@@ -158,50 +164,78 @@ def _extract_xlsx(data: bytes) -> Optional[str]:
     workbooks bounded -- the model needs the shape and leading rows, not every
     line of a 10,000-row ledger. Confidence: 8/10 on the row cap being enough.
     """
-    max_rows_per_sheet = 100
-    max_sheets = 20
-    max_cols = 30
-    max_cell_chars = 300
-    max_total_chars = 200_000
+    wb = None
     try:
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         parts = []
         total_chars = 0
+        size_limit_reached = False
+
+        def append_part(value: str) -> bool:
+            """Append within the workbook-wide output cap; return False if full."""
+            nonlocal total_chars
+            separator_chars = 1 if parts else 0
+            remaining = XLSX_MAX_TOTAL_CHARS - total_chars - separator_chars
+            if remaining <= 0:
+                return False
+            clipped = value[:remaining]
+            parts.append(clipped)
+            total_chars += separator_chars + len(clipped)
+            return len(clipped) == len(value)
+
         for sheet_index, ws in enumerate(wb.worksheets):
-            if sheet_index >= max_sheets:
-                parts.append(f"[{len(wb.worksheets) - max_sheets} more sheets omitted]")
+            if sheet_index >= XLSX_MAX_SHEETS:
+                append_part(
+                    f"[{len(wb.worksheets) - XLSX_MAX_SHEETS} more sheets omitted]"
+                )
                 break
-            if total_chars >= max_total_chars:
-                parts.append("[remaining sheets omitted: extraction size limit]")
+            if total_chars >= XLSX_MAX_TOTAL_CHARS:
                 break
             rows_out = []
-            total_rows = 0
-            for row in ws.iter_rows(values_only=True):
-                total_rows += 1
-                if total_rows > max_rows_per_sheet:
-                    continue
+            total_rows = ws.max_row or 0
+            rows_to_read = min(total_rows, XLSX_MAX_ROWS_PER_SHEET)
+            for row in ws.iter_rows(
+                min_row=1,
+                max_row=rows_to_read,
+                max_col=min(ws.max_column or 1, XLSX_MAX_COLS),
+                values_only=True,
+            ):
                 cells = [
-                    "" if v is None else str(v).strip()[:max_cell_chars]
-                    for v in row[:max_cols]
+                    "" if v is None else str(v).strip()[:XLSX_MAX_CELL_CHARS]
+                    for v in row[:XLSX_MAX_COLS]
                 ]
                 while cells and not cells[-1]:
                     cells.pop()
                 if any(cells):
-                    line = "| " + " | ".join(cells) + " |"
-                    rows_out.append(line)
-                    total_chars += len(line)
+                    rows_out.append("| " + " | ".join(cells) + " |")
             if rows_out:
-                parts.append(f"## Sheet: {ws.title}")
-                parts.extend(rows_out)
-                if total_rows > max_rows_per_sheet:
-                    parts.append(f"[{total_rows - max_rows_per_sheet} more rows omitted]")
-        wb.close()
+                if not append_part(f"## Sheet: {ws.title}"):
+                    size_limit_reached = True
+                    break
+                for line in rows_out:
+                    if not append_part(line):
+                        size_limit_reached = True
+                        break
+                if size_limit_reached:
+                    break
+                if total_rows > XLSX_MAX_ROWS_PER_SHEET:
+                    if not append_part(
+                        f"[{total_rows - XLSX_MAX_ROWS_PER_SHEET} more rows omitted]"
+                    ):
+                        size_limit_reached = True
+                        break
         text = "\n".join(parts)
+        if size_limit_reached:
+            suffix = "\n\n[remaining workbook content omitted: extraction size limit]"
+            text = text[: XLSX_MAX_TOTAL_CHARS - len(suffix)] + suffix
         return text if text.strip() else None
     except Exception as e:
         logger.debug("xlsx extraction failed", error=str(e))
         return None
+    finally:
+        if wb is not None:
+            wb.close()
 
 
 def _detect_horizontal_lines(page: fitz.Page) -> List[Tuple[float, float, float]]:
@@ -868,10 +902,11 @@ class PdfExtractor:
             ) from e
 
     def extract_from_bytes(self, pdf_bytes: bytes, extract_links: bool = False) -> Dict[str, Any]:
-        """Extract text from document bytes (PDF, DOCX, legacy .doc, RTF).
+        """Extract text from document bytes (PDF, Office documents, or RTF).
 
         Detects format from magic bytes and routes to the appropriate extractor.
-        PDF and DOCX go through PyMuPDF; legacy .doc uses antiword; RTF uses striprtf.
+        PDF and DOCX go through PyMuPDF; legacy .doc uses antiword; RTF uses
+        striprtf; PPTX and XLSX use their corresponding Office libraries.
 
         Args:
             pdf_bytes: Document content as bytes
@@ -978,7 +1013,7 @@ def extract_document_file(pdf_path: str, ocr_threshold: int, ocr_dpi: int,
     and this one costs a parsing-stack import instead of the analyzer's
     HTTP/LLM stack. Reads the document from disk (parent wrote a temp file
     and released the bytes) and routes through extract_from_bytes for
-    format sniffing -- process attachments arrive as PDF/DOCX/RTF/PPTX.
+    format sniffing -- process attachments arrive as PDF/DOCX/RTF/PPTX/XLSX.
     """
     with open(pdf_path, "rb") as f:
         data = f.read()

@@ -6,6 +6,7 @@ Contains utilities used across pipeline modules for matters-first processing.
 
 import hashlib
 import json
+import re
 
 import requests
 from datetime import datetime
@@ -51,6 +52,28 @@ def attachment_identity(url: str) -> str:
     if keys & _SIGNED_URL_MARKERS:
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
     return url
+
+
+def filter_document_version_urls(urls: List[str]) -> List[str]:
+    """Keep only the newest ``... VerN`` URL for each versioned document."""
+    url_groups: Dict[str, Dict[int, str]] = {}
+    non_versioned = []
+    version_pattern = re.compile(r"(.+?)\s+Ver(\d+)", re.IGNORECASE)
+
+    for url in urls:
+        filename = url.split("/")[-1] if url else ""
+        match = version_pattern.search(filename)
+        if match:
+            base_name = match.group(1).strip()
+            version_num = int(match.group(2))
+            url_groups.setdefault(base_name, {})[version_num] = url
+        else:
+            non_versioned.append(url)
+
+    filtered = non_versioned.copy()
+    for versions in url_groups.values():
+        filtered.append(versions[max(versions)])
+    return filtered
 
 
 def hash_attachments_fast(attachments: List[Any]) -> str:

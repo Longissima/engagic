@@ -24,6 +24,11 @@ from google import genai
 from google.genai import types
 
 from config import config, get_logger
+from analysis.llm.input_budget import (
+    limit_item_title,
+    limit_shared_context,
+    prepare_item_text,
+)
 from pipeline.protocols import MetricsCollector, NullMetrics
 from exceptions import LLMError
 
@@ -323,6 +328,7 @@ class GeminiSummarizer:
             summary = Combined markdown with thinking trace, summary, and citizen impact
             topics = List of canonical topic strings
         """
+        item_title = limit_item_title(item_title)
         text_size = len(text)
 
         # Use actual page count from PDF if available, otherwise estimate
@@ -446,6 +452,10 @@ class GeminiSummarizer:
         if not shared_context:
             return None
 
+        shared_context = limit_shared_context(shared_context)
+        if not shared_context:
+            return None
+
         # Rough estimate: 1 token ~ 4 chars
         token_count = len(shared_context) // 4
         min_tokens = 1024  # Minimum for Flash caching
@@ -522,6 +532,8 @@ class GeminiSummarizer:
         if not item_requests:
             return []
 
+        shared_context = limit_shared_context(shared_context)
+
         total_items = len(item_requests)
         logger.info("submitting batch", total_items=total_items, batch_enabled=True, cost_savings_percent=50)
 
@@ -535,7 +547,23 @@ class GeminiSummarizer:
         current: List[Dict[str, Any]] = []
         current_tokens = 0
         for req in item_requests:
-            est_tokens = len(req.get("text", "")) // 4 + 2_000  # + template overhead
+            item_title = limit_item_title(req.get("title", ""))
+            prepared_text = prepare_item_text(
+                item_title,
+                req.get("text", ""),
+                shared_context,
+                inline_shared=not bool(cache_name),
+            )
+            prompt = self._get_prompt(
+                "item",
+                self._select_prompt_type(),
+                title=item_title,
+                text=prepared_text,
+            )
+            cached_chars = (
+                len(limit_shared_context(shared_context) or "") if cache_name else 0
+            )
+            est_tokens = (len(prompt) + cached_chars) // 4
             if current and (
                 len(current) >= max_chunk_items
                 or current_tokens + est_tokens > max_chunk_est_tokens
@@ -868,13 +896,14 @@ class GeminiSummarizer:
                 item_ids: List[str] = []
 
                 for i, req in enumerate(chunk_requests):
-                    item_title = req["title"]
+                    item_title = limit_item_title(req["title"])
                     item_id = req["item_id"]
-                    text = req["text"]
-
-                    # If shared context exists but not cached, prepend it inline
-                    if shared_context and not cache_name:
-                        text = f"=== SHARED CONTEXT (Background documents for this meeting) ===\n\n{shared_context}\n\n=== AGENDA ITEM: {item_title} ===\n\n{text}"
+                    text = prepare_item_text(
+                        item_title,
+                        req["text"],
+                        shared_context,
+                        inline_shared=not bool(cache_name),
+                    )
 
                     # Use actual page count if available, otherwise estimate
                     page_count = req.get("page_count")
@@ -1035,6 +1064,24 @@ class GeminiSummarizer:
             template = prompt_data["template"]
         except KeyError as e:
             raise ValueError(f"Prompt not found: {category}.{prompt_type}") from e
+
+        # Keep the status-aware source policy in its own readable JSON field.
+        # It replaces the original v3.1 draft section at render time so batch
+        # and streaming requests receive exactly the same controlling language.
+        primary_source_policy = prompt_data.get("primary_source_policy")
+        if primary_source_policy:
+            section_start = template.find("# Step 2.5:")
+            section_end = template.find("# Step 3:", section_start)
+            if section_start < 0 or section_end < 0:
+                raise ValueError(
+                    f"Primary-source section markers missing: {category}.{prompt_type}"
+                )
+            template = (
+                template[:section_start]
+                + primary_source_policy
+                + "\n\n"
+                + template[section_end:]
+            )
 
         # Validate the TEMPLATE for missing variables before substitution.
         # Substituted values often include user content (PDF text, agenda items)
