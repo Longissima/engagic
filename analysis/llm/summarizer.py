@@ -1067,24 +1067,6 @@ class GeminiSummarizer:
         except KeyError as e:
             raise ValueError(f"Prompt not found: {category}.{prompt_type}") from e
 
-        # Keep the status-aware source policy in its own readable JSON field.
-        # It replaces the original v3.1 draft section at render time so batch
-        # and streaming requests receive exactly the same controlling language.
-        primary_source_policy = prompt_data.get("primary_source_policy")
-        if primary_source_policy:
-            section_start = template.find("# Step 2.5:")
-            section_end = template.find("# Step 3:", section_start)
-            if section_start < 0 or section_end < 0:
-                raise ValueError(
-                    f"Primary-source section markers missing: {category}.{prompt_type}"
-                )
-            template = (
-                template[:section_start]
-                + primary_source_policy
-                + "\n\n"
-                + template[section_end:]
-            )
-
         # Validate the TEMPLATE for missing variables before substitution.
         # Substituted values often include user content (PDF text, agenda items)
         # that legitimately contains literal {word} tokens -- e.g. CAD notation,
