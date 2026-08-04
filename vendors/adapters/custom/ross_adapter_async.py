@@ -53,6 +53,8 @@ _NODE_ID_RE = re.compile(r'/meeting/(\d+)/')
 class AsyncRossAdapter(AsyncBaseAdapter):
     """Custom adapter for Town of Ross CA (Drupal/AHA FastTrack)."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="ross", metrics=metrics)
         self.base_url = "https://www.townofrossca.gov"
@@ -78,6 +80,11 @@ class AsyncRossAdapter(AsyncBaseAdapter):
             start_date=str(start_date.date()),
             end_date=str(end_date.date()),
         )
+
+        if self._minutes_discovery_only:
+            for meeting in meetings:
+                meeting.pop("_detail_url", None)
+            return meetings
 
         # Enrich with structured items from detail pages
         tasks = [self._enrich_meeting(m) for m in meetings]
@@ -399,4 +406,3 @@ class AsyncRossAdapter(AsyncBaseAdapter):
 
         # All are closed session, return the last one
         return agenda_urls[-1]
-

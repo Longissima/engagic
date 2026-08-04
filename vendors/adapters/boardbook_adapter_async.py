@@ -57,6 +57,8 @@ _DATE_FORMATS = (
 class AsyncBoardBookAdapter(AsyncBaseAdapter):
     """Async BoardBook adapter - school district / special district board agendas."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="boardbook", metrics=metrics)
         self.base_url = "https://meetings.boardbook.org"
@@ -93,6 +95,18 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
                 start=str(start_date.date()), end=str(end_date.date()),
             )
             return []
+
+        if self._minutes_discovery_only:
+            return [
+                {
+                    "vendor_id": ref["meeting_id"],
+                    "title": ref["title"],
+                    "start": ref["start"],
+                    "minutes_url": ref["minutes_url"],
+                }
+                for ref in meeting_refs
+                if ref.get("minutes_url")
+            ]
 
         coros = [self._fetch_meeting_detail(ref) for ref in meeting_refs]
         results = await self._bounded_gather(coros, max_concurrent=5)

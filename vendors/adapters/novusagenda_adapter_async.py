@@ -23,6 +23,8 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
     cell by content rather than assuming a fixed position.
     """
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     _DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
     _TIME_RE = re.compile(r"^\d{1,2}:\d{2}")
 
@@ -177,6 +179,19 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                     title=meeting_type,
                     date=meeting_date
                 )
+
+            if self._minutes_discovery_only:
+                if minutes_url:
+                    result = {
+                        "vendor_id": meeting_id,
+                        "title": meeting_type,
+                        "start": date_str,
+                        "minutes_url": minutes_url,
+                    }
+                    if meeting_status:
+                        result["meeting_status"] = meeting_status
+                    meetings.append(result)
+                continue
 
             if not packet_url and not agenda_url:
                 logger.debug(

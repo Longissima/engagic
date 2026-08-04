@@ -73,6 +73,8 @@ class _CurlCffiResponse:
 class AsyncMunicodeAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Municode platform."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, city_code: Optional[str] = None, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="municode", metrics=metrics)
 
@@ -356,6 +358,12 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             in_range=len(filtered),
             pages_scraped=page + 1,
         )
+
+        if self._minutes_discovery_only:
+            for meeting in filtered:
+                meeting.pop("_parsed_date", None)
+                meeting.pop("_meeting_guid", None)
+            return filtered
 
         # Enrich meetings with HTML agenda items (same path as PublishPage)
         semaphore = asyncio.Semaphore(5)
@@ -733,6 +741,12 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                 in_range=len(filtered)
             )
 
+            if self._minutes_discovery_only:
+                for meeting in filtered:
+                    meeting.pop("_parsed_date", None)
+                    meeting.pop("_meeting_guid", None)
+                return filtered
+
             # Enrich meetings with HTML agenda items using extracted GUIDs
             semaphore = asyncio.Semaphore(5)
 
@@ -996,6 +1010,9 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         minutes_url = meeting.get("MinutesLinksURL") or meeting.get("MinutesLinksHtmlURL")
         if minutes_url:
             result["minutes_url"] = minutes_url
+
+        if self._minutes_discovery_only:
+            return result
 
         # Get meeting GUID for HTML agenda construction
         meeting_guid = self._extract_meeting_guid(meeting)

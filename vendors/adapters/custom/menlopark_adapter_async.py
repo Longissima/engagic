@@ -48,6 +48,8 @@ _BODIES: List[Tuple[str, str, str]] = [
 class AsyncMenloParkAdapter(AsyncBaseAdapter):
     """Async Menlo Park - all commissions with PDF agenda/packet extraction"""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="menlopark", metrics=metrics)
         self.base_url = "https://menlopark.gov"
@@ -173,6 +175,9 @@ class AsyncMenloParkAdapter(AsyncBaseAdapter):
 
         if minutes_url:
             meeting_data['minutes_url'] = minutes_url
+
+        if self._minutes_discovery_only:
+            return meeting_data
 
         # Extract items using the appropriate chunking strategy
         try:

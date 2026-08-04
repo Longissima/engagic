@@ -259,10 +259,11 @@ CREATE TABLE IF NOT EXISTS document_source (
     source_identity TEXT NOT NULL,
     banana TEXT,
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (content_sha256, source_identity)
 );
 CREATE INDEX IF NOT EXISTS idx_document_source_identity
-    ON document_source (source_identity, first_seen DESC);
+    ON document_source (source_identity, last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_document_blob_untexted
     ON document_blob (created_at)
     WHERE text_key IS NULL;

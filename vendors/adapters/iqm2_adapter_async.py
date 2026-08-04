@@ -19,6 +19,8 @@ from bs4 import BeautifulSoup
 class AsyncIQM2Adapter(AsyncBaseAdapter):
     """Async adapter for IQM2 platform with item-level extraction."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="iqm2", metrics=metrics)
         self.base_url = f"https://{self.slug}.iqm2.com"
@@ -171,6 +173,16 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
             title = title_elem.get_text(strip=True) if title_elem else "Meeting"
 
             minutes_url = self._extract_row_minutes_url(row)
+
+            if self._minutes_discovery_only:
+                if minutes_url:
+                    meetings.append({
+                        "vendor_id": meeting_id,
+                        "title": title,
+                        "start": meeting_dt.isoformat(),
+                        "minutes_url": minutes_url,
+                    })
+                continue
 
             # Fetch Detail_Meeting page to extract items
             logger.info(

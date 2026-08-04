@@ -96,15 +96,17 @@ class DocumentBlobRepository(BaseRepository):
     ) -> None:
         """Remember that these bytes were seen at this (stable) URL identity.
 
-        Re-sightings backfill provenance: a row first written without a
-        banana (early tee sites didn't know it) gains one the next time the
-        same bytes surface from a caller that does. Never overwrites."""
+        Re-sightings backfill provenance and advance last_seen. The latter is
+        intentionally mutable: stable vendor URLs can serve revised bytes, so
+        ingestion uses it to schedule bounded revalidation without downloading
+        every document on every run."""
         await self._execute(
             """
             INSERT INTO document_source (content_sha256, source_identity, banana)
             VALUES ($1, $2, $3)
             ON CONFLICT (content_sha256, source_identity) DO UPDATE
-                SET banana = COALESCE(document_source.banana, EXCLUDED.banana)
+                SET banana = COALESCE(document_source.banana, EXCLUDED.banana),
+                    last_seen = CURRENT_TIMESTAMP
             """,
             content_sha256,
             source_identity,
@@ -121,7 +123,7 @@ class DocumentBlobRepository(BaseRepository):
             FROM document_source s
             JOIN document_blob b USING (content_sha256)
             WHERE s.source_identity = $1
-            ORDER BY s.first_seen DESC
+            ORDER BY s.last_seen DESC
             LIMIT 1
             """,
             source_identity,

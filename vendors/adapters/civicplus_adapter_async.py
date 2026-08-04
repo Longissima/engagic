@@ -35,6 +35,8 @@ from config import config
 class AsyncCivicPlusAdapter(AsyncBaseAdapter):
     """Async adapter for cities using CivicPlus CMS (often with external agenda systems)"""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="civicplus", metrics=metrics)
         self._site_config = self._load_site_config()
@@ -125,6 +127,8 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
             results = []
             for link_data in meeting_links:
+                if self._minutes_discovery_only and not link_data.get("minutes_url"):
+                    continue
                 if '/ViewFile/Agenda/' in link_data['url']:
                     meeting = self._create_meeting_from_viewfile_link(link_data)
                     if meeting and self._is_meeting_in_range(meeting, start_date, end_date):
@@ -142,13 +146,14 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             deduped = self._dedupe_by_date(results)
 
             # Try to parse packet PDFs for structured items
-            pdf_tasks = [
-                self._try_parse_packet_items(meeting)
-                for meeting in deduped
-                if meeting.get("packet_url") and not meeting.get("items")
-            ]
-            if pdf_tasks:
-                await asyncio.gather(*pdf_tasks, return_exceptions=True)
+            if not self._minutes_discovery_only:
+                pdf_tasks = [
+                    self._try_parse_packet_items(meeting)
+                    for meeting in deduped
+                    if meeting.get("packet_url") and not meeting.get("items")
+                ]
+                if pdf_tasks:
+                    await asyncio.gather(*pdf_tasks, return_exceptions=True)
 
             logger.info(
                 "filtered meetings in date range",
@@ -419,9 +424,12 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 date_text = self._extract_date_from_title(title)
             parsed_date = self._parse_date(date_text) if date_text else None
 
-            pdfs = await self._discover_pdfs_async(url, soup)
             meeting_id = self._extract_meeting_id(url)
             meeting_status = self._parse_meeting_status(title, date_text)
+
+            pdfs = []
+            if not self._minutes_discovery_only:
+                pdfs = await self._discover_pdfs_async(url, soup)
 
             if not pdfs:
                 logger.debug("no PDFs found for meeting", vendor="civicplus", slug=self.slug, title=title)

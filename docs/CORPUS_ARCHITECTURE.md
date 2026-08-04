@@ -2,7 +2,8 @@
 
 **Status:** Proposal (2026-06-29); slices 1-3 SHIPPED (2026-07-02, see
 CHANGELOG "The Corpus Exists", "The Collapse", "One Write Path"). Live now:
-the sha256(bytes) primitive, document_blob/document_source (migration 025),
+the sha256(bytes) primitive, document_blob/document_source (migration 025;
+source revalidation timestamps in migration 027),
 the engagic-corpus R2 bucket over the S3 data plane, the `corpus/` package,
 the shared subprocess guard (parsing/subprocess_guard.py), and ONE producer
 function (pipeline/ground_truth.py: archive -> guarded chunk -> text persist)

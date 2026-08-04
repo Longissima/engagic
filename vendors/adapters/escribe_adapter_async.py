@@ -65,6 +65,8 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
     Item-level extraction from Agenda=Merged view with matter tracking.
     """
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         """city_slug is the Escribe subdomain (e.g., "pub-raleighnc")"""
         super().__init__(city_slug, vendor="escribe", metrics=metrics)
@@ -108,6 +110,13 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         for meeting_json in meetings_data:
             meeting_basic = self._parse_calendar_meeting(meeting_json)
             if not meeting_basic:
+                continue
+
+            if self._minutes_discovery_only:
+                meeting_basic.pop("_uuid", None)
+                meeting_basic.pop("has_agenda", None)
+                if meeting_basic.get("minutes_url"):
+                    results.append(meeting_basic)
                 continue
 
             meeting_uuid = meeting_basic.get("_uuid")

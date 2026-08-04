@@ -8,8 +8,8 @@ run the full sync_meeting path: re-storing old meetings and re-tracking matters 
 the daemon's job inside its own window; the sweep is surgical by design and can
 never overwrite anything (UPDATE ... WHERE minutes_url IS NULL).
 
-Zero LLM calls. Listing fetches only -- one adapter fetch per city, rate-limited
-by the adapters' own limiters.
+Zero LLM calls. Metadata discovery only -- each primary and extra-vendor stream
+must explicitly support a no-detail minutes path, rate-limited by the adapters.
 
 Usage:
     uv run python scripts/sweep_minutes.py --dry-run
@@ -34,7 +34,7 @@ logger = get_logger(__name__).bind(component="sweep_minutes")
 
 
 CITIES_SQL = """
-    SELECT j.banana, j.vendor, j.slug,
+    SELECT j.banana, j.vendor, j.slug, j.extra_vendors,
            count(*) FILTER (WHERE m.minutes_url IS NULL) AS missing
     FROM jurisdictions j
     JOIN meetings m ON m.banana = j.banana
@@ -42,7 +42,7 @@ CITIES_SQL = """
       AND m.date >= CURRENT_TIMESTAMP - make_interval(days => $1)
       AND m.date < CURRENT_TIMESTAMP
       AND ($2::text IS NULL OR j.banana = $2)
-    GROUP BY 1, 2, 3
+    GROUP BY 1, 2, 3, 4
     HAVING count(*) FILTER (WHERE m.minutes_url IS NULL) > 0
     ORDER BY missing DESC
 """
@@ -54,68 +54,101 @@ FILL_SQL = """
 """
 
 
+def vendor_streams(city_row) -> list[tuple[str, str]]:
+    """Primary plus valid, deduplicated extra-vendor streams."""
+    streams = [(city_row["vendor"], city_row["slug"])]
+    for extra in city_row.get("extra_vendors") or []:
+        if isinstance(extra, dict) and extra.get("vendor") and extra.get("slug"):
+            streams.append((extra["vendor"], extra["slug"]))
+    return list(dict.fromkeys(streams))
+
+
 async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) -> dict:
-    banana, vendor, slug = city_row["banana"], city_row["vendor"], city_row["slug"]
+    banana = city_row["banana"]
     counts = {"fetched": 0, "with_minutes": 0, "filled": 0, "already_set": 0,
-              "id_miss": 0, "undated_skipped": 0, "fetch_failed": 0}
+              "id_miss": 0, "undated_skipped": 0, "fetch_failed": 0,
+              "unsupported": 0}
 
-    kwargs = {}
-    if vendor == "legistar" and slug == "nyc":
-        kwargs["api_token"] = config.NYC_LEGISTAR_TOKEN
+    for vendor, slug in vendor_streams(city_row):
+        kwargs = {}
+        if vendor == "legistar" and slug == "nyc":
+            kwargs["api_token"] = config.NYC_LEGISTAR_TOKEN
 
-    try:
-        adapter = get_async_adapter(vendor, slug, **kwargs)
-        adapter.banana = banana
-        fetch_result = await adapter.fetch_meetings(days_back=days_back, days_forward=0)
-    except Exception as e:
-        logger.warning("sweep fetch failed", banana=banana, vendor=vendor, error=str(e))
-        counts["fetch_failed"] = 1
-        return counts
-
-    if not fetch_result.success:
-        logger.warning("adapter fetch unsuccessful", banana=banana, error=fetch_result.error)
-        counts["fetch_failed"] = 1
-        return counts
-
-    counts["fetched"] = len(fetch_result.meetings)
-    for md in fetch_result.meetings:
-        minutes_url = md.get("minutes_url")
-        if not minutes_url:
-            continue
-        counts["with_minutes"] += 1
-
-        vendor_id = md.get("vendor_id")
-        title = md.get("title") or "Meeting"
-        meeting_date = parse_date(md)
-        if not vendor_id:
-            continue
-        if meeting_date is None:
-            # sync_meeting ids undated meetings with datetime.now() at store
-            # time -- underivable here, so the sweep cannot re-match them.
-            counts["undated_skipped"] += 1
-            continue
-
-        meeting_id = generate_meeting_id(
-            banana=banana, vendor_id=str(vendor_id), date=meeting_date, title=title
-        )
-
-        if dry_run:
-            counts["filled"] += 1
-            logger.info("would fill", banana=banana, meeting_id=meeting_id, url=minutes_url[:120])
-            continue
-
-        async with db.pool.acquire() as conn:
-            status = await conn.execute(FILL_SQL, meeting_id, minutes_url)
-            if status == "UPDATE 1":
-                counts["filled"] += 1
-            else:
-                already = await conn.fetchval(
-                    "SELECT minutes_url IS NOT NULL FROM meetings WHERE id = $1", meeting_id
+        try:
+            adapter = get_async_adapter(vendor, slug, **kwargs)
+            adapter.banana = banana
+            if not adapter.MINUTES_DISCOVERY_SUPPORTED:
+                counts["unsupported"] += 1
+                logger.info(
+                    "minutes discovery unsupported",
+                    banana=banana,
+                    vendor=vendor,
+                    slug=slug,
                 )
-                if already is None:
-                    counts["id_miss"] += 1
-                elif already:
-                    counts["already_set"] += 1
+                continue
+            fetch_result = await adapter.fetch_minutes(
+                days_back=days_back, days_forward=0
+            )
+        except Exception as e:
+            logger.warning(
+                "sweep fetch failed", banana=banana, vendor=vendor, slug=slug, error=str(e)
+            )
+            counts["fetch_failed"] += 1
+            continue
+
+        if not fetch_result.success:
+            logger.warning(
+                "adapter fetch unsuccessful",
+                banana=banana,
+                vendor=vendor,
+                slug=slug,
+                error=fetch_result.error,
+            )
+            counts["fetch_failed"] += 1
+            continue
+
+        counts["fetched"] += len(fetch_result.meetings)
+        for md in fetch_result.meetings:
+            minutes_url = md.get("minutes_url")
+            if not minutes_url:
+                continue
+            counts["with_minutes"] += 1
+
+            vendor_id = md.get("vendor_id")
+            title = md.get("title") or "Meeting"
+            meeting_date = parse_date(md)
+            if not vendor_id:
+                continue
+            if meeting_date is None:
+                # sync_meeting ids undated meetings with datetime.now() at store
+                # time -- underivable here, so the sweep cannot re-match them.
+                counts["undated_skipped"] += 1
+                continue
+
+            meeting_id = generate_meeting_id(
+                banana=banana, vendor_id=str(vendor_id), date=meeting_date, title=title
+            )
+
+            if dry_run:
+                counts["filled"] += 1
+                logger.info(
+                    "would fill", banana=banana, meeting_id=meeting_id, url=minutes_url[:120]
+                )
+                continue
+
+            async with db.pool.acquire() as conn:
+                status = await conn.execute(FILL_SQL, meeting_id, minutes_url)
+                if status == "UPDATE 1":
+                    counts["filled"] += 1
+                else:
+                    already = await conn.fetchval(
+                        "SELECT minutes_url IS NOT NULL FROM meetings WHERE id = $1",
+                        meeting_id,
+                    )
+                    if already is None:
+                        counts["id_miss"] += 1
+                    elif already:
+                        counts["already_set"] += 1
 
     return counts
 

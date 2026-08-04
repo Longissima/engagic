@@ -17,7 +17,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urljoin, urlparse, parse_qs, unquote
 
 from bs4 import BeautifulSoup
 
@@ -62,6 +62,8 @@ def _load_onbase_config() -> Dict[str, List[str]]:
 
 class AsyncOnBaseAdapter(AsyncBaseAdapter):
     """Async adapter for direct OnBase Agenda Online instances."""
+
+    MINUTES_DISCOVERY_SUPPORTED = True
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="onbase", metrics=metrics)
@@ -146,6 +148,23 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
 
         if not meetings_in_range:
             return []
+
+        if self._minutes_discovery_only:
+            meetings = []
+            for meeting in meetings_in_range:
+                minutes_href = meeting.get("minutes_url")
+                if not minutes_href:
+                    continue
+                minutes_url = urljoin(base_url, minutes_href)
+                meetings.append({
+                    "vendor_id": meeting["id"],
+                    "title": meeting.get("title", "Meeting"),
+                    "start": (
+                        meeting["date"].isoformat() if meeting.get("date") else ""
+                    ),
+                    "minutes_url": minutes_url,
+                })
+            return meetings
 
         # Fetch meeting details concurrently
         detail_tasks = [

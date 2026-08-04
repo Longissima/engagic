@@ -78,6 +78,8 @@ def _translate_downloadfile_to_viewdocument(url: str) -> str:
 class AsyncGranicusAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Granicus platform."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         """city_slug is the Granicus subdomain (e.g., "redwoodcity-ca"). Raises ValueError if view_id not configured."""
         super().__init__(city_slug, vendor="granicus", metrics=metrics)
@@ -189,6 +191,18 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
 
         if not meetings_in_range:
             return []
+
+        if self._minutes_discovery_only:
+            return [
+                {
+                    "vendor_id": meeting["event_id"],
+                    "title": meeting.get("title", "Meeting"),
+                    "start": meeting["start"],
+                    "minutes_url": meeting["minutes_url"],
+                }
+                for meeting in meetings_in_range
+                if meeting.get("event_id") and meeting.get("minutes_url")
+            ]
 
         detail_tasks = [
             self._fetch_meeting_detail(meeting_data)

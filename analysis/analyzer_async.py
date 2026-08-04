@@ -21,7 +21,7 @@ import os
 import re
 import tempfile
 import time
-from typing import AsyncIterator, List, Dict, Any, Optional, Tuple
+from typing import AsyncIterator, List, Dict, Any, Optional, Tuple, cast
 from urllib.parse import urljoin
 
 import aiohttp
@@ -144,17 +144,25 @@ class AsyncAnalyzer:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        metrics: Optional[MetricsCollector] = None
+        metrics: Optional[MetricsCollector] = None,
+        *,
+        enable_llm: bool = True,
     ):
         """Initialize the async analyzer
 
         Args:
             api_key: Gemini API key (or uses environment variables)
             metrics: Metrics collector for LLM call tracking (uses NullMetrics if not provided)
+            enable_llm: Construct the Gemini client. Extraction-only jobs set
+                this false so they do not require an API key.
         """
-        self.metrics = metrics or NullMetrics()
+        self.metrics = cast(MetricsCollector, metrics or NullMetrics())
         self.pdf_extractor = PdfExtractor(ocr_dpi=150)  # 150 DPI sufficient for meeting agendas
-        self.summarizer = GeminiSummarizer(api_key=api_key, metrics=self.metrics)
+        self.summarizer = (
+            GeminiSummarizer(api_key=api_key, metrics=self.metrics)
+            if enable_llm
+            else None
+        )
         self.http_session: Optional[aiohttp.ClientSession] = None
         self._request_count = 0
         self._recycle_after = 100  # Recycle session after N requests to prevent memory accumulation
@@ -164,7 +172,7 @@ class AsyncAnalyzer:
         logger.info(
             "async analyzer initialized",
             pdf_extractor="pymupdf",
-            summarizer="gemini"
+            summarizer="gemini" if enable_llm else "disabled"
         )
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -355,6 +363,8 @@ class AsyncAnalyzer:
                     sha=content_sha256[:16],
                     chars=len(cached.get("text") or ""),
                 )
+                cached["content_sha256"] = content_sha256
+                cached["corpus_persisted"] = True
                 return cached
 
         # Write to temp file and release bytes before subprocess starts.
@@ -407,8 +417,15 @@ class AsyncAnalyzer:
 
         # Write-once: the freshly manufactured ground truth enters the corpus.
         # Every future encounter with these bytes is a lookup, not an extraction.
+        corpus_persisted = False
         if corpus_store and content_sha256:
-            await corpus_store.persist_extraction(content_sha256, result)
+            corpus_persisted = await corpus_store.persist_extraction(content_sha256, result)
+
+        # Operational ingestion callers need to distinguish "text extracted"
+        # from "text durably entered the corpus". Normal analysis callers can
+        # continue to treat corpus persistence as best-effort.
+        result["content_sha256"] = content_sha256
+        result["corpus_persisted"] = corpus_persisted
 
         logger.debug("pdf extracted", url=url, pages=result.get("page_count", 0))
         return result
@@ -484,6 +501,10 @@ class AsyncAnalyzer:
         Raises:
             AnalysisError: If processing fails
         """
+        summarizer = self.summarizer
+        if summarizer is None:
+            raise AnalysisError("LLM processing is disabled for this analyzer")
+
         try:
             # Extract PDF text (async download + thread pool extraction)
             result = await self.extract_pdf_async(url, banana=banana)
@@ -502,7 +523,7 @@ class AsyncAnalyzer:
                 try:
                     summary = await asyncio.wait_for(
                         asyncio.to_thread(
-                            self.summarizer.summarize_meeting,
+                            summarizer.summarize_meeting,
                             extracted_text
                         ),
                         timeout=300
@@ -567,6 +588,10 @@ class AsyncAnalyzer:
         if not item_requests:
             return
 
+        summarizer = self.summarizer
+        if summarizer is None:
+            raise AnalysisError("LLM processing is disabled for this analyzer")
+
         shared_context = limit_shared_context(shared_context)
 
         logger.info(
@@ -599,7 +624,7 @@ class AsyncAnalyzer:
                 # instead of leaking it past the async-layer cancellation.
                 summary, topics = await asyncio.wait_for(
                     asyncio.to_thread(
-                        self.summarizer.summarize_item,
+                        summarizer.summarize_item,
                         title,
                         text,
                         page_count,

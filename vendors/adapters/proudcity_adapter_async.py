@@ -97,6 +97,8 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
     or overridden via data/proudcity_sites.json for edge cases.
     """
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="proudcity", metrics=metrics)
 
@@ -476,6 +478,9 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
         3. If no agenda PDF: set packet_url = packet PDF from
            #tab-agenda-packet for TOC/monolithic chunking.
         """
+        if self._minutes_discovery_only and meeting.get("minutes_url"):
+            return meeting
+
         metadata = meeting.get("metadata", {}) or {}
         meeting_url = metadata.get("meeting_url", "")
 
@@ -510,6 +515,9 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
             meeting.setdefault("metadata", {})["minutes_url"] = docs["minutes"]
         if docs.get("video"):
             meeting.setdefault("metadata", {})["video_url"] = docs["video"]
+
+        if self._minutes_discovery_only:
+            return meeting
 
         # --- Fallback chain ---
 
@@ -873,4 +881,3 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
                 continue
             return body.replace("-", " ").title()
         return None
-

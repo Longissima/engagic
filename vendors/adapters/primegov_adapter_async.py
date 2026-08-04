@@ -38,6 +38,8 @@ _AGENDA_KEYWORD_PRIORITY = [
 class AsyncPrimeGovAdapter(AsyncBaseAdapter):
     """Async adapter for cities using PrimeGov platform."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="primegov", metrics=metrics)
         self.base_url = f"https://{self.slug}.primegov.com"
@@ -240,6 +242,9 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         minutes_doc = self._find_minutes_doc(meeting.get("documentList", []))
         if minutes_doc:
             result["minutes_url"] = self._build_packet_url(minutes_doc)
+
+        if self._minutes_discovery_only:
+            return result
 
         agenda_docs = self._find_agenda_docs(meeting.get("documentList", []))
 

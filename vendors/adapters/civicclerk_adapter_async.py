@@ -21,6 +21,8 @@ from pipeline.protocols import MetricsCollector
 class AsyncCivicClerkAdapter(AsyncBaseAdapter):
     """Async adapter for cities using CivicClerk platform"""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         """city_slug is the CivicClerk subdomain (e.g., 'stlouismo', 'montpelliervt')"""
         super().__init__(city_slug, vendor="civicclerk", metrics=metrics)
@@ -159,6 +161,9 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
         )
         if minutes_doc:
             result["minutes_url"] = self._build_packet_url(minutes_doc)
+
+        if self._minutes_discovery_only:
+            return result
 
         # Try to fetch structured items if agenda exists
         items = []
@@ -508,4 +513,3 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             if any(frag in title for frag in PLACEHOLDER_FRAGMENTS):
                 return True
         return False
-

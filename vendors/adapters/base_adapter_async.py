@@ -76,6 +76,11 @@ class AsyncBaseAdapter:
     - Callers can distinguish "0 meetings" from "adapter failed"
     """
 
+    # Adapters opt in only after their implementation has a metadata-only
+    # branch. This keeps the minutes sweep from accidentally running detail,
+    # attachment, or corpus-enrichment work on an unsupported vendor.
+    MINUTES_DISCOVERY_SUPPORTED = False
+
     def __init__(
         self,
         city_slug: str,
@@ -98,6 +103,7 @@ class AsyncBaseAdapter:
         self._chunk_audits: Dict[str, List[Dict[str, Any]]] = {}
         # html parse audits (which dialect pattern matched), same lifecycle
         self._html_audits: Dict[str, Dict[str, Any]] = {}
+        self._minutes_discovery_only = False
 
         logger.info("initialized async adapter", vendor=vendor, city_slug=city_slug)
 
@@ -566,6 +572,12 @@ class AsyncBaseAdapter:
         Routing policy lives in router.LADDERS; every rung attempt and any
         terminal failure reason ends up in the result's audit trail.
         """
+        if self._minutes_discovery_only:
+            # Defense in depth for sweep dry-runs: even if an adapter's
+            # metadata-only branch regresses, discovery can never tee bytes to
+            # the corpus or invoke a parser.
+            return ChunkResult(failure_reason=DEFERRED, ladder=ladder)
+
         # Shape deferral: with SYNC_CHUNKING off, sync does stage-1 only --
         # archive the bytes to the corpus and store the meeting's URLs; the
         # processor manufactures items at claim time from the archived bytes
@@ -660,6 +672,9 @@ class AsyncBaseAdapter:
         ladder: str = "auto",
     ) -> ChunkResult:
         """Download a PDF and run the chunker cascade. Returns full ChunkResult."""
+        if self._minutes_discovery_only:
+            return ChunkResult(failure_reason=DEFERRED, ladder=ladder)
+
         try:
             response = await self._get(pdf_url)
             pdf_bytes = await response.read()
@@ -932,6 +947,31 @@ class AsyncBaseAdapter:
         except Exception as e:
             logger.error("fetch_meetings failed", vendor=self.vendor, slug=self.slug, error=str(e), error_type=type(e).__name__)
             return FetchResult(meetings=[], success=False, error=str(e), error_type=type(e).__name__)
+
+    async def fetch_minutes(self, days_back: int = 60, days_forward: int = 0) -> FetchResult:
+        """Discover minutes URLs without agenda/item/document enrichment.
+
+        Subclasses must explicitly opt in and honor
+        ``self._minutes_discovery_only`` before this method will call them.
+        Unsupported adapters safely report no discoveries.
+        """
+        if not self.MINUTES_DISCOVERY_SUPPORTED:
+            logger.info(
+                "minutes discovery unsupported",
+                vendor=self.vendor,
+                slug=self.slug,
+            )
+            return FetchResult(meetings=[], success=True)
+
+        self._minutes_discovery_only = True
+        try:
+            result = await self.fetch_meetings(days_back, days_forward)
+        finally:
+            self._minutes_discovery_only = False
+
+        if result.success:
+            result.meetings = [m for m in result.meetings if m.get("minutes_url")]
+        return result
 
     def _date_range(self, days_back: int, days_forward: int) -> Tuple[datetime, datetime]:
         """Compute inclusive date range for meeting filtering.

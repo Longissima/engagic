@@ -39,6 +39,8 @@ from pipeline.protocols import MetricsCollector
 class AsyncBerkeleyAdapter(AsyncBaseAdapter):
     """Async Berkeley City Council - Custom Drupal CMS adapter"""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="berkeley", metrics=metrics)
         self.base_url = "https://berkeleyca.gov"
@@ -135,6 +137,11 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
                 record_a = record_cell.find('a', href=True)
                 if record_a:
                     meeting_data['minutes_url'] = urljoin(self.base_url, record_a.get('href', ''))
+
+            if self._minutes_discovery_only:
+                if meeting_data.get("minutes_url"):
+                    results.append(meeting_data)
+                continue
 
             # Fetch HTML agenda detail to extract items
             try:

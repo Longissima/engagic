@@ -83,6 +83,8 @@ class AsyncWPEventsAdapter(AsyncBaseAdapter):
     auto-discovered or overridden via data/wp_events_sites.json.
     """
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="wp_events", metrics=metrics)
 
@@ -294,6 +296,16 @@ class AsyncWPEventsAdapter(AsyncBaseAdapter):
         if media:
             classified = self._classify_media(media)
 
+            # Approved/draft minutes PDF. Discovery stops here: the media API
+            # is the listing for this adapter, and no agenda chunking follows.
+            if classified.get("minutes"):
+                result["minutes_url"] = classified["minutes"][0]["url"]
+
+            if self._minutes_discovery_only:
+                if meta:
+                    result["metadata"] = meta
+                return result
+
             # Agenda item PDFs -> structured items with attachments
             if classified.get("agenda_item"):
                 result["items"] = classified["agenda_item"]
@@ -301,10 +313,6 @@ class AsyncWPEventsAdapter(AsyncBaseAdapter):
             # Main agenda PDF
             if classified.get("agenda"):
                 result["agenda_url"] = classified["agenda"][0]["url"]
-
-            # Approved/draft minutes PDF
-            if classified.get("minutes"):
-                result["minutes_url"] = classified["minutes"][0]["url"]
 
             # No structured items from media -- try agenda (url) then packet (toc)
             if not classified.get("agenda_item") and classified.get("agenda"):
@@ -534,4 +542,3 @@ class AsyncWPEventsAdapter(AsyncBaseAdapter):
         if "video" in mime_type:
             return "video"
         return "unknown"
-

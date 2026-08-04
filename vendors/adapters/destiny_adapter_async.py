@@ -45,6 +45,8 @@ DESTINY_CONFIG_FILE = "data/destiny_sites.json"
 class AsyncDestinyAdapter(AsyncBaseAdapter):
     """Async Destiny/AgendaQuick - structured HTML agendas with staff report memos"""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="destiny", metrics=metrics)
         cfg = self._load_vendor_config(DESTINY_CONFIG_FILE).get(self.slug, {})
@@ -129,9 +131,6 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
             title = cells[1].get_text(strip=True)
             body_name = self._extract_body_name(title)
 
-            # Fetch the agenda detail page for items + PDF packet
-            agenda_data = await self._fetch_agenda_detail(year, month, seq)
-
             meeting_data: Dict[str, Any] = {
                 'vendor_id': seq,
                 'start': meeting_date.isoformat(),
@@ -140,12 +139,21 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
                 'agenda_url': urljoin(self.base_url, href),
             }
 
-            if agenda_data.get('packet_url'):
-                meeting_data['packet_url'] = agenda_data['packet_url']
-
             minutes_url = self._find_minutes_link(row)
             if minutes_url:
                 meeting_data['minutes_url'] = minutes_url
+
+            if self._minutes_discovery_only:
+                if minutes_url:
+                    meetings.append(meeting_data)
+                continue
+
+            # Fetch the agenda detail page for items + PDF packet only during
+            # a full sync; the listing already contains minutes metadata.
+            agenda_data = await self._fetch_agenda_detail(year, month, seq)
+
+            if agenda_data.get('packet_url'):
+                meeting_data['packet_url'] = agenda_data['packet_url']
 
             if agenda_data.get('items'):
                 meeting_data['items'] = agenda_data['items']

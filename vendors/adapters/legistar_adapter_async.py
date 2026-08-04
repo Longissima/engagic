@@ -50,6 +50,8 @@ _PREFER_AADA_SLUGS = _load_prefer_aada_slugs()
 class AsyncLegistarAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Legistar platform."""
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(
         self,
         city_slug: str,
@@ -305,13 +307,20 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             if meeting_status:
                 meeting["meeting_status"] = meeting_status
 
-            # Fetch agenda items for this event (concurrent)
-            items_task = asyncio.create_task(self._fetch_event_items_api(event_id))
-
             # Try to get agenda PDF URL from API
             agenda_url = event.get("EventAgendaFile")
             packet_url = event.get("EventMinutesFile")  # Sometimes agenda is in minutes field
             minutes_url = event.get("EventMinutesFile")
+
+            if minutes_url:
+                meeting["minutes_url"] = minutes_url
+
+            if self._minutes_discovery_only:
+                return meeting
+
+            # Fetch agenda items for this event (concurrent with any HTML
+            # agenda URL fallback below) only during a full sync.
+            items_task = asyncio.create_task(self._fetch_event_items_api(event_id))
 
             # If API didn't provide agenda URL, discover from HTML detail page.
             # Try two URL formats: GUID-based (common) then InSiteURL/LEGID (San Jose).
@@ -364,9 +373,6 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 meeting["agenda_url"] = agenda_url
             if packet_url and "agenda_url" not in meeting:
                 meeting["packet_url"] = packet_url
-            if minutes_url:
-                meeting["minutes_url"] = minutes_url
-
             return meeting
 
         except (AttributeError, ValueError, TypeError) as e:
@@ -1012,6 +1018,20 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             minutes_link = row.find("a", href=lambda x: x and "View.ashx" in x and re.search(r'M=M(&|$)', x))
             if minutes_link:
                 minutes_url = urljoin(html_base_url, minutes_link["href"])
+
+            if self._minutes_discovery_only:
+                if not minutes_url:
+                    return None
+                meeting_data = {
+                    "vendor_id": meeting_id,
+                    "title": title,
+                    "start": meeting_dt.isoformat(),
+                    "minutes_url": minutes_url,
+                }
+                meeting_status = self._parse_meeting_status(title)
+                if meeting_status:
+                    meeting_data["meeting_status"] = meeting_status
+                return meeting_data
 
             # Config-driven short-circuit: some Legistar instances (e.g. LA
             # County) expose a MeetingDetail link that technically resolves

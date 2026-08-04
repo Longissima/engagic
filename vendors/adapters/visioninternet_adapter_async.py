@@ -82,6 +82,8 @@ class AsyncVisionInternetAdapter(AsyncBaseAdapter):
     base_url and calendar_paths for each body.
     """
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="visioninternet", metrics=metrics)
 
@@ -223,6 +225,9 @@ class AsyncVisionInternetAdapter(AsyncBaseAdapter):
                 )
             elif isinstance(result, list):
                 all_meetings.extend(result)
+
+        if self._minutes_discovery_only:
+            return all_meetings
 
         # Enrich meetings that have packet PDFs (concurrent, bounded)
         enrich_results = await self._bounded_gather(
@@ -482,4 +487,3 @@ class AsyncVisionInternetAdapter(AsyncBaseAdapter):
             if text == "recording" and href:
                 return href
         return None
-
