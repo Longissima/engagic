@@ -211,11 +211,17 @@ Root crontab (`sudo crontab -l`) has 11 active jobs:
 **Not yet scheduled** (added 2026-08-04, run manually until cadence is proven):
 `scripts/sweep_minutes.py` fills `meetings.minutes_url` for meetings the 14-day
 resync window left behind (minutes often publish 2-4 weeks post-meeting; listing
-metadata only, including extra-vendor streams) — suggested weekly.
+or API metadata for most adapters, including extra-vendor streams) — suggested
+weekly. ProudCity and CivicPlus may make one lightweight meeting-page request per
+candidate; WP Events queries its media API per event. No discovery path downloads
+documents, parses PDFs, or writes to the corpus.
 `scripts/ingest_minutes.py` pulls minutes bytes into the R2 corpus via the
 analyzer's extraction-only path (no LLM client or key); incomplete writes retry
 and completed stable URLs are revalidated every seven days by default so revised
-minutes are captured — suggested daily after sync. Sweep before ingest.
+minutes are captured. Repeated download/extraction failures retry weekly and are
+suppressed after three attempts for the current extractor version; known
+HTML-only viewer URLs are excluded — suggested daily after sync. Sweep before
+ingest.
 
 ---
 

@@ -81,6 +81,12 @@ def test_select_candidates_retries_incomplete_and_rechecks_old_sources():
         {"id": "broken", "minutes_url": "https://example.test/broken.pdf"},
         {"id": "old", "minutes_url": "https://example.test/old.pdf"},
         {"id": "current", "minutes_url": "https://example.test/current.pdf"},
+        {"id": "backoff", "minutes_url": "https://example.test/backoff.pdf"},
+        {"id": "permanent", "minutes_url": "https://example.test/permanent.pdf"},
+        {
+            "id": "viewer",
+            "minutes_url": "https://meetings.boardbook.org/Public/Minutes/123?org=1",
+        },
     ]
     states = {
         "https://example.test/broken.pdf": {
@@ -96,8 +102,20 @@ def test_select_candidates_retries_incomplete_and_rechecks_old_sources():
             "recheck_due": False,
         },
     }
+    failure_states = {
+        "https://example.test/backoff.pdf": {
+            "permanent": False,
+            "retry_due": False,
+        },
+        "https://example.test/permanent.pdf": {
+            "permanent": True,
+            "retry_due": True,
+        },
+    }
 
-    selected, counts = select_candidates(rows, states, limit=10)
+    selected, counts = select_candidates(
+        rows, states, limit=10, failure_states=failure_states
+    )
 
     assert [(row["id"], reason) for row, _, reason in selected] == [
         ("new", "new"),
@@ -109,6 +127,9 @@ def test_select_candidates_retries_incomplete_and_rechecks_old_sources():
         "incomplete": 1,
         "revision_recheck": 1,
         "current": 1,
+        "failure_backoff": 1,
+        "permanent_failure": 1,
+        "unsupported_url": 1,
     }
 
 
@@ -221,6 +242,7 @@ def test_vendor_streams_includes_valid_extras_once():
 
 def test_sweep_city_uses_minutes_discovery_for_primary_and_extra(monkeypatch):
     calls = []
+    id_lookups = []
 
     class Adapter:
         MINUTES_DISCOVERY_SUPPORTED = True
@@ -244,6 +266,29 @@ def test_sweep_city_uses_minutes_discovery_for_primary_and_extra(monkeypatch):
         "get_async_adapter",
         lambda vendor, slug, **kwargs: Adapter(vendor, slug),
     )
+
+    class Connection:
+        async def fetchrow(self, query, meeting_id):
+            assert query == sweep_minutes.MEETING_STATE_SQL
+            id_lookups.append(meeting_id)
+            # First stream proves a fillable ID; second deliberately proves
+            # that dry-run reports parity drift instead of claiming a fill.
+            return {"minutes_url": None} if len(id_lookups) == 1 else None
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    class Database:
+        pool = Pool()
+
     city = {
         "banana": "exampleCA",
         "vendor": "onbase",
@@ -253,7 +298,7 @@ def test_sweep_city_uses_minutes_discovery_for_primary_and_extra(monkeypatch):
 
     counts = asyncio.run(
         sweep_minutes.sweep_city(
-            object(),
+            Database(),
             lambda meeting: datetime.fromisoformat(meeting["start"]),
             city,
             days_back=60,
@@ -266,4 +311,7 @@ def test_sweep_city_uses_minutes_discovery_for_primary_and_extra(monkeypatch):
         ("civicplus", "commissions", "exampleCA", 60, 0),
     ]
     assert counts["fetched"] == 2
-    assert counts["filled"] == 2
+    assert len(id_lookups) == 2
+    assert counts["would_fill"] == 1
+    assert counts["id_miss"] == 1
+    assert counts["filled"] == 0

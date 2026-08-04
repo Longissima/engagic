@@ -272,6 +272,16 @@ class ExtractionError(ProcessingError):
         super().__init__(message, context)
 
 
+class DocumentDownloadError(ExtractionError):
+    """Document bytes could not be acquired or resolved to a supported file."""
+
+    _retryable = True
+
+    def __init__(self, message: str, *, retryable: bool = True, **kwargs):
+        self._retryable = retryable
+        super().__init__(message, **kwargs)
+
+
 class LLMError(ProcessingError):
     """LLM API failures
 

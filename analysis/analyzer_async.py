@@ -27,7 +27,7 @@ from urllib.parse import urljoin
 import aiohttp
 
 from corpus.store import get_corpus, sha256_hex
-from exceptions import ExtractionError, LLMError
+from exceptions import DocumentDownloadError, ExtractionError, LLMError
 from parsing.pdf import PdfExtractor, extract_document_file
 from parsing.subprocess_guard import GuardCrashed, GuardTaskError, GuardTimeout, run_guarded
 from parsing.participation import parse_participation_info
@@ -263,7 +263,10 @@ class AsyncAnalyzer:
         try:
             async with session.get(url, ssl=False) as resp:  # Disable SSL for Granicus S3
                 if resp.status != 200:
-                    raise ExtractionError(f"HTTP {resp.status} downloading PDF from {url}")
+                    raise DocumentDownloadError(
+                        f"HTTP {resp.status} downloading PDF from {url}",
+                        document_url=url,
+                    )
 
                 content_type = resp.headers.get("Content-Type", "")
                 raw_bytes = await resp.read()
@@ -277,7 +280,11 @@ class AsyncAnalyzer:
                 if _depth >= 1:
                     # Already followed one redirect; don't chase further.
                     logger.debug("html attachment page returned non-pdf after resolve, giving up", url=url[:120])
-                    raise ExtractionError(f"Resolved URL still not a PDF: {url[:120]}")
+                    raise DocumentDownloadError(
+                        f"Resolved URL still not a PDF: {url[:120]}",
+                        document_url=url,
+                        retryable=False,
+                    )
 
                 if "text/html" in content_type or raw_bytes[:15].lstrip().lower().startswith((b"<!doctype", b"<html")):
                     pdf_url = _extract_best_pdf_link(raw_bytes, url)
@@ -310,15 +317,23 @@ class AsyncAnalyzer:
                         return await self.download_pdf_async(onbase_alt, _depth=_depth + 1)
 
                     logger.debug("html attachment page had no pdf links", url=url[:120])
-                    raise ExtractionError(f"Attachment page contained no PDF links: {url[:120]}")
+                    raise DocumentDownloadError(
+                        f"Attachment page contained no PDF links: {url[:120]}",
+                        document_url=url,
+                        retryable=False,
+                    )
 
                 # Unknown content type -- try using it as-is (could be octet-stream)
                 logger.debug("pdf downloaded", url=url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
                 return raw_bytes
 
-        except aiohttp.ClientError as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.error("pdf download failed", url=url, error=str(e))
-            raise ExtractionError(f"Failed to download PDF: {e}") from e
+            raise DocumentDownloadError(
+                f"Failed to download PDF: {e}",
+                document_url=url,
+                original_error=e,
+            ) from e
         finally:
             self._in_flight -= 1
 

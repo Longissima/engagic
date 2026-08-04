@@ -268,6 +268,26 @@ CREATE INDEX IF NOT EXISTS idx_document_blob_untexted
     ON document_blob (created_at)
     WHERE text_key IS NULL;
 
+-- Retry ledger for minutes/document ingestion. Scoped to extractor version so
+-- a future extractor upgrade reconsiders identities that the current version
+-- cannot handle.
+CREATE TABLE IF NOT EXISTS document_ingest_failure (
+    source_identity TEXT NOT NULL,
+    extract_version TEXT NOT NULL,
+    banana TEXT,
+    failure_stage TEXT NOT NULL CHECK (failure_stage IN ('download', 'extract')),
+    attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count > 0),
+    permanent BOOLEAN NOT NULL DEFAULT FALSE,
+    last_error TEXT,
+    first_failed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_failed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    retry_after TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_identity, extract_version)
+);
+CREATE INDEX IF NOT EXISTS idx_document_ingest_failure_retry
+    ON document_ingest_failure (retry_after)
+    WHERE permanent = FALSE;
+
 -- Tenants table: B2B customers (Phase 5)
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,

@@ -8,8 +8,10 @@ run the full sync_meeting path: re-storing old meetings and re-tracking matters 
 the daemon's job inside its own window; the sweep is surgical by design and can
 never overwrite anything (UPDATE ... WHERE minutes_url IS NULL).
 
-Zero LLM calls. Metadata discovery only -- each primary and extra-vendor stream
-must explicitly support a no-detail minutes path, rate-limited by the adapters.
+Zero LLM calls and no document downloads/parsing/corpus writes. Most adapters
+discover minutes on listing/API responses; ProudCity and CivicPlus may fetch
+lightweight meeting pages, and WP Events queries its media API per event.
+Primary and extra-vendor streams are both rate-limited by their adapters.
 
 Usage:
     uv run python scripts/sweep_minutes.py --dry-run
@@ -53,6 +55,12 @@ FILL_SQL = """
     WHERE id = $1 AND minutes_url IS NULL
 """
 
+MEETING_STATE_SQL = """
+    SELECT minutes_url
+    FROM meetings
+    WHERE id = $1
+"""
+
 
 def vendor_streams(city_row) -> list[tuple[str, str]]:
     """Primary plus valid, deduplicated extra-vendor streams."""
@@ -65,7 +73,8 @@ def vendor_streams(city_row) -> list[tuple[str, str]]:
 
 async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) -> dict:
     banana = city_row["banana"]
-    counts = {"fetched": 0, "with_minutes": 0, "filled": 0, "already_set": 0,
+    counts = {"fetched": 0, "with_minutes": 0, "would_fill": 0, "filled": 0,
+              "already_set": 0,
               "id_miss": 0, "undated_skipped": 0, "fetch_failed": 0,
               "unsupported": 0}
 
@@ -130,10 +139,34 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
             )
 
             if dry_run:
-                counts["filled"] += 1
-                logger.info(
-                    "would fill", banana=banana, meeting_id=meeting_id, url=minutes_url[:120]
-                )
+                # ID parity is the sweep's critical invariant. Discovery must
+                # reproduce the exact vendor_id/title/start tuple used by the
+                # original sync, so dry-run resolves every generated ID rather
+                # than optimistically counting candidates as fills.
+                async with db.pool.acquire() as conn:
+                    existing = await conn.fetchrow(MEETING_STATE_SQL, meeting_id)
+                if existing is None:
+                    counts["id_miss"] += 1
+                    logger.warning(
+                        "dry-run id parity miss",
+                        banana=banana,
+                        vendor=vendor,
+                        slug=slug,
+                        meeting_id=meeting_id,
+                        vendor_id=str(vendor_id),
+                        title=title,
+                        start=str(md.get("start")),
+                    )
+                elif existing["minutes_url"] is not None:
+                    counts["already_set"] += 1
+                else:
+                    counts["would_fill"] += 1
+                    logger.info(
+                        "would fill",
+                        banana=banana,
+                        meeting_id=meeting_id,
+                        url=minutes_url[:120],
+                    )
                 continue
 
             async with db.pool.acquire() as conn:
@@ -141,13 +174,10 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                 if status == "UPDATE 1":
                     counts["filled"] += 1
                 else:
-                    already = await conn.fetchval(
-                        "SELECT minutes_url IS NOT NULL FROM meetings WHERE id = $1",
-                        meeting_id,
-                    )
-                    if already is None:
+                    existing = await conn.fetchrow(MEETING_STATE_SQL, meeting_id)
+                    if existing is None:
                         counts["id_miss"] += 1
-                    elif already:
+                    elif existing["minutes_url"] is not None:
                         counts["already_set"] += 1
 
     return counts
