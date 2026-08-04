@@ -18,7 +18,8 @@ from analysis.llm.input_budget import (
 )
 from analysis.llm.summarizer import GeminiSummarizer
 from database.models import AttachmentInfo
-from parsing.pdf import XLSX_MAX_TOTAL_CHARS, PdfExtractor, _extract_xlsx
+import parsing.pdf
+from parsing.pdf import PdfExtractor, _extract_xlsx
 from pipeline.processor import Processor
 import scripts.backfill_v32_summaries as backfill
 from scripts.backfill_v32_summaries import (
@@ -177,17 +178,22 @@ def _xlsx_bytes(rows: int, columns: int = 1, cell_chars: int = 8) -> bytes:
     return buffer.getvalue()
 
 
-def test_xlsx_row_and_total_size_caps_are_enforced():
-    row_limited = _extract_xlsx(_xlsx_bytes(150))
-    size_limited = _extract_xlsx(_xlsx_bytes(100, columns=30, cell_chars=500))
+def test_xlsx_extraction_is_lossless():
+    text = _extract_xlsx(_xlsx_bytes(150, columns=40, cell_chars=500))
 
-    assert row_limited is not None
-    assert "row-100" in row_limited
-    assert "row-101" not in row_limited
-    assert "[50 more rows omitted]" in row_limited
-    assert size_limited is not None
-    assert len(size_limited) <= XLSX_MAX_TOTAL_CHARS
-    assert "remaining workbook content omitted" in size_limited
+    assert text is not None
+    assert "row-1-" in text and "row-150-" in text
+    assert text.count("row-150-") == 40
+    assert "omitted" not in text
+
+
+def test_xlsx_sanity_cap_guards_pathological_workbooks(monkeypatch):
+    monkeypatch.setattr(parsing.pdf, "XLSX_SANITY_MAX_CHARS", 200)
+    text = _extract_xlsx(_xlsx_bytes(150))
+
+    assert text is not None
+    assert "extraction sanity cap" in text
+    assert "row-150-" not in text
 
 
 class _Acquire:

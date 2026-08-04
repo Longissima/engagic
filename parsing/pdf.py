@@ -58,11 +58,11 @@ _RTF_MAGIC = b'{\\rtf'
 _PDF_ANNOT_UNDERLINE = cast(int, getattr(fitz, "PDF_ANNOT_UNDERLINE", 9))
 _PDF_ANNOT_STRIKE_OUT = cast(int, getattr(fitz, "PDF_ANNOT_STRIKE_OUT", 11))
 
-XLSX_MAX_ROWS_PER_SHEET = 100
-XLSX_MAX_SHEETS = 20
-XLSX_MAX_COLS = 30
-XLSX_MAX_CELL_CHARS = 300
-XLSX_MAX_TOTAL_CHARS = 200_000
+# Sanity bound against pathological workbooks (dimension bombs, formula
+# spew), not an editorial cap: extraction is otherwise lossless and any
+# fitting to the model budget happens at prompt assembly, where it is
+# logged and disclosed to the model.
+XLSX_SANITY_MAX_CHARS = 20_000_000
 
 
 def _detect_format(data: bytes) -> str:
@@ -165,9 +165,11 @@ def _extract_xlsx(data: bytes) -> Optional[str]:
     """Extract XLSX as markdown tables using openpyxl. Returns text or None.
 
     Fee schedules and budget detail live in spreadsheets; without this, 800+
-    attachments were invisible to summarization. Row cap keeps monster
-    workbooks bounded -- the model needs the shape and leading rows, not every
-    line of a 10,000-row ledger. Confidence: 8/10 on the row cap being enough.
+    attachments were invisible to summarization. Extraction is lossless --
+    every sheet, row, and cell -- so the corpus archives the full text and
+    any trimming happens once, at prompt assembly, where it is logged and
+    disclosed to the model. Empty rows and trailing empty cells carry no
+    text and are skipped.
     """
     wb = None
     try:
@@ -175,65 +177,30 @@ def _extract_xlsx(data: bytes) -> Optional[str]:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         parts = []
         total_chars = 0
-        size_limit_reached = False
-
-        def append_part(value: str) -> bool:
-            """Append within the workbook-wide output cap; return False if full."""
-            nonlocal total_chars
-            separator_chars = 1 if parts else 0
-            remaining = XLSX_MAX_TOTAL_CHARS - total_chars - separator_chars
-            if remaining <= 0:
-                return False
-            clipped = value[:remaining]
-            parts.append(clipped)
-            total_chars += separator_chars + len(clipped)
-            return len(clipped) == len(value)
-
-        for sheet_index, ws in enumerate(wb.worksheets):
-            if sheet_index >= XLSX_MAX_SHEETS:
-                append_part(
-                    f"[{len(wb.worksheets) - XLSX_MAX_SHEETS} more sheets omitted]"
-                )
-                break
-            if total_chars >= XLSX_MAX_TOTAL_CHARS:
-                break
-            rows_out = []
-            total_rows = ws.max_row or 0
-            rows_to_read = min(total_rows, XLSX_MAX_ROWS_PER_SHEET)
-            for row in ws.iter_rows(
-                min_row=1,
-                max_row=rows_to_read,
-                max_col=min(ws.max_column or 1, XLSX_MAX_COLS),
-                values_only=True,
-            ):
-                cells = [
-                    "" if v is None else str(v).strip()[:XLSX_MAX_CELL_CHARS]
-                    for v in row[:XLSX_MAX_COLS]
-                ]
+        for ws in wb.worksheets:
+            wrote_header = False
+            for row in ws.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v).strip() for v in row]
                 while cells and not cells[-1]:
                     cells.pop()
-                if any(cells):
-                    rows_out.append("| " + " | ".join(cells) + " |")
-            if rows_out:
-                if not append_part(f"## Sheet: {ws.title}"):
-                    size_limit_reached = True
-                    break
-                for line in rows_out:
-                    if not append_part(line):
-                        size_limit_reached = True
-                        break
-                if size_limit_reached:
-                    break
-                if total_rows > XLSX_MAX_ROWS_PER_SHEET:
-                    if not append_part(
-                        f"[{total_rows - XLSX_MAX_ROWS_PER_SHEET} more rows omitted]"
-                    ):
-                        size_limit_reached = True
-                        break
+                if not any(cells):
+                    continue
+                if not wrote_header:
+                    parts.append(f"## Sheet: {ws.title}")
+                    total_chars += len(parts[-1]) + 1
+                    wrote_header = True
+                line = "| " + " | ".join(cells) + " |"
+                parts.append(line)
+                total_chars += len(line) + 1
+                if total_chars > XLSX_SANITY_MAX_CHARS:
+                    logger.warning(
+                        "xlsx sanity cap hit", sheet=ws.title, chars=total_chars
+                    )
+                    parts.append(
+                        "[remaining workbook content omitted: extraction sanity cap]"
+                    )
+                    return "\n".join(parts)
         text = "\n".join(parts)
-        if size_limit_reached:
-            suffix = "\n\n[remaining workbook content omitted: extraction size limit]"
-            text = text[: XLSX_MAX_TOTAL_CHARS - len(suffix)] + suffix
         return text if text.strip() else None
     except Exception as e:
         logger.debug("xlsx extraction failed", error=str(e))
