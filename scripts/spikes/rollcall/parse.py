@@ -11,8 +11,9 @@ Zero LLM calls: regex + gazetteer + arithmetic. Two template drivers:
               by "Aye:" names "(12)" / "Nay:" "(None) (0)" / "Absent:" ...
 
 The publish gate: a passage is publishable only if every category's extracted
-name count equals its stated count. Anything else is ABSTAIN (from publishing),
-never a guess.
+name count equals its stated count, every name resolves against the roster, and
+each canonical member appears exactly once across all categories. Anything else
+is ABSTAIN (from publishing), never a guess.
 """
 
 from __future__ import annotations
@@ -104,6 +105,22 @@ class Gazetteer:
 # -------------------------------------------------------------------- results
 
 @dataclass
+class PublishGateResult:
+    """Decision from the deterministic safety gate.
+
+    A member must resolve exactly once across the entire roll call. Checking
+    category tallies independently is insufficient: the same person could
+    otherwise appear in both AYE and NO while both printed counts still match.
+    """
+
+    publishable: bool
+    votes: list[tuple[str, str]]
+    unresolved: list[tuple[str, str]]
+    duplicate_members: list[tuple[str, list[str]]]
+    reasons: list[str]
+
+
+@dataclass
 class Passage:
     matter_file: str | None
     motion_text: str
@@ -133,6 +150,40 @@ class Passage:
                     f"{value}: extracted {len(names)} names, stated {stated}"
                 )
         self.tally_ok = not self.tally_notes
+
+    def evaluate_publish_gate(self, gz: Gazetteer) -> PublishGateResult:
+        """Require sound tallies, complete resolution, and one vote per member."""
+        self.validate()
+        votes, unresolved = self.votes(gz)
+
+        values_by_member: dict[str, list[str]] = {}
+        for member, value in votes:
+            values_by_member.setdefault(member, []).append(value)
+        duplicate_members = sorted(
+            (member, values)
+            for member, values in values_by_member.items()
+            if len(values) > 1
+        )
+
+        reasons = []
+        if not self.sections:
+            reasons.append("no vote sections extracted")
+        if self.tally_notes:
+            reasons.extend(f"tally: {note}" for note in self.tally_notes)
+        if unresolved:
+            reasons.append(f"unresolved names: {unresolved[:4]}")
+        if duplicate_members:
+            reasons.append(f"members appear more than once: {duplicate_members[:4]}")
+        if self.sections and not votes and not unresolved:
+            reasons.append("no member votes extracted")
+
+        return PublishGateResult(
+            publishable=not reasons,
+            votes=votes,
+            unresolved=unresolved,
+            duplicate_members=duplicate_members,
+            reasons=reasons,
+        )
 
 
 # ---------------------------------------------------------------- page strip

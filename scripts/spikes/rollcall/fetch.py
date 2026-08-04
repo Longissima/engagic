@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 CACHE = ROOT / "cache"
 PDFS = ROOT / "pdfs"
+OUT = ROOT / "out"
 BASE = "https://webapi.legistar.com/v1"
 UA = {"User-Agent": "rollcall-feasibility-spike/0.1 (research; contact ibansadowski@icloud.com)"}
 
@@ -21,6 +22,12 @@ CLIENTS = ["milwaukee", "denver"]
 # Prefer full-council bodies; committees are usable but council is vote-richest.
 COUNCIL_PAT = re.compile(r"(common council|city council)", re.I)
 EVENTS_PER_CLIENT = 4
+
+
+def prepare_output_dirs() -> None:
+    """Create the generated-data directories used by a clean checkout."""
+    for directory in (CACHE, PDFS, OUT):
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 def slug(url: str) -> str:
@@ -36,6 +43,7 @@ def get_json(url: str):
         data = r.read()
     time.sleep(0.5)
     obj = json.loads(data)
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(obj, indent=1))
     return obj
 
@@ -54,11 +62,13 @@ def get_pdf(url: str, dest: Path) -> bool:
     if not data[:5].startswith(b"%PDF"):
         print(f"    NOT A PDF ({len(data)} bytes) {url}", file=sys.stderr)
         return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     return True
 
 
 def main():
+    prepare_output_dirs()
     manifest = {}
     for client in CLIENTS:
         print(f"== {client}")
@@ -133,7 +143,7 @@ def main():
                 }
             )
         manifest[client] = chosen
-    (ROOT / "out" / "ground_truth.json").write_text(json.dumps(manifest, indent=1))
+    (OUT / "ground_truth.json").write_text(json.dumps(manifest, indent=1))
     total = sum(len(v) for v in manifest.values())
     print(f"manifest written: {total} events")
 

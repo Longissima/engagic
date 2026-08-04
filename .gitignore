@@ -218,6 +218,11 @@ __pycache__/
 .mcp.json
 prometheus/
 
+# Roll-call feasibility spike generated data (scores.json remains tracked)
+scripts/spikes/rollcall/cache/
+scripts/spikes/rollcall/pdfs/
+scripts/spikes/rollcall/out/
+
 # Home directory dotfiles (repo root = engagic user $HOME)
 .bash_history
 .bashrc

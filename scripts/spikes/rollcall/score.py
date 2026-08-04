@@ -2,7 +2,8 @@
 
 Publish gate (the design under test): a passage is published only if
 (1) every category's name count equals the stated count, and
-(2) every name resolves uniquely against the roster gazetteer.
+(2) every name resolves uniquely against the roster gazetteer, and
+(3) each canonical member appears exactly once across all categories.
 Everything else is an abstention, never a guess.
 
 Matching: GT voted items and parser passages are grouped by matter file and
@@ -11,7 +12,6 @@ aligned in order of appearance (n-th passage for file F <-> n-th GT item for F).
 
 import json
 import subprocess
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -25,6 +25,7 @@ def pdf_text(pdf_path: str) -> str:
     p = Path(pdf_path)
     txt = ROOT / "out" / (p.stem + ".txt")
     if not txt.exists():
+        txt.parent.mkdir(parents=True, exist_ok=True)
         code = (
             "import fitz,sys;"
             "doc=fitz.open(sys.argv[1]);"
@@ -111,25 +112,30 @@ for client, events in GT.items():
             matched_sigs.add((f, it["ActionName"], frozenset(gt_tuples)))
             p = cands[idx]
 
-            votes, unresolved = p.votes(gz)
-            publishable = p.tally_ok and not unresolved
-            if not publishable:
+            decision = p.evaluate_publish_gate(gz)
+            votes = decision.votes
+            unresolved = decision.unresolved
+            if not decision.publishable:
                 C["gate_abstained"] += 1
-                why = []
                 if not p.tally_ok:
-                    why.append(f"tally:{p.tally_notes}")
                     taxonomy[f"{client}:gate_tally_mismatch"] += 1
                 if unresolved:
-                    why.append(f"unresolved:{unresolved[:4]}")
                     taxonomy[f"{client}:gate_unresolved_name"] += 1
+                if decision.duplicate_members:
+                    taxonomy[f"{client}:gate_duplicate_member"] += 1
+                if not p.sections or (not votes and not unresolved):
+                    taxonomy[f"{client}:gate_empty_vote"] += 1
                 # would publishing have been wrong?
-                ext = set(votes) | {(f"?{r}", v) for r, v in unresolved}
-                if set(votes) == gt_tuples and not unresolved:
+                if (
+                    set(votes) == gt_tuples
+                    and not unresolved
+                    and not decision.duplicate_members
+                ):
                     gate["false_abstention"] += 1
                 else:
                     gate["caught_bad"] += 1
                 gate["details"].append(
-                    f"{client} ev{ev['EventId']} {f}: {'; '.join(why)}"
+                    f"{client} ev{ev['EventId']} {f}: {'; '.join(decision.reasons)}"
                 )
                 continue
 
@@ -217,18 +223,15 @@ for k, exs in tax_examples.items():
     for e in exs[:8]:
         print(f"     {e}")
 
-json.dump(
-    {
-        "rows": [
-            {"client": c, "counts": dict(C), "precision": p, "recall": r,
-             "coverage": cv, "outcome_acc": o}
-            for c, C, p, r, cv, o in report_rows
-        ],
-        "taxonomy": dict(taxonomy),
-        "gate": {k: v for k, v in gate.items() if k != "details"},
-        "gate_details": gate["details"],
-        "examples": {k: v[:20] for k, v in tax_examples.items()},
-    },
-    open(ROOT / "out" / "scores.json", "w"),
-    indent=1,
-)
+score_report = {
+    "rows": [
+        {"client": c, "counts": dict(C), "precision": p, "recall": r,
+         "coverage": cv, "outcome_acc": o}
+        for c, C, p, r, cv, o in report_rows
+    ],
+    "taxonomy": dict(taxonomy),
+    "gate": {k: v for k, v in gate.items() if k != "details"},
+    "gate_details": gate["details"],
+    "examples": {k: v[:20] for k, v in tax_examples.items()},
+}
+(ROOT / "scores.json").write_text(json.dumps(score_report, indent=1) + "\n")

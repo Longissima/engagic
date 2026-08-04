@@ -16,8 +16,9 @@ Design being validated, in order of load-bearing-ness:
 1. Roster gazetteer (production: `council_members`) — names are a closed per-city set.
 2. Template drivers per vendor dialect (Denver needed 2 patterns, Milwaukee 3; each
    new client converges in hours, not weeks).
-3. Publish gate: per-category name-count must equal stated count AND every name must
-   resolve uniquely against the roster; mismatch = abstain, never guess.
+3. Publish gate: per-category name-count must equal stated count, every name must
+   resolve uniquely against the roster, and every canonical member must appear
+   exactly once across all categories; mismatch = abstain, never guess.
 
 Non-Legistar probe (CivicClerk/Wheatland, Revize/Craig, self-hosted/Hugo): the pattern
 family transfers; what varies is *attribution power* — named-list minutes give full
@@ -33,4 +34,12 @@ repeated same-file motions.
 Files: `parse.py` (gazetteer + two template drivers + publish gate), `fetch.py`
 (cache-first Legistar API fetcher), `score.py` (GT scoring harness), `scores.json`
 (machine-readable results). Full cache/PDFs/ground-truth stayed in the originating
-session scratchpad; regenerate with fetch.py.
+session scratchpad; regenerate from a clean checkout with:
+
+```bash
+python scripts/spikes/rollcall/fetch.py
+python scripts/spikes/rollcall/score.py
+```
+
+The fetcher creates the ignored `cache/`, `pdfs/`, and `out/` directories. The
+scorer updates the tracked `scores.json` beside these scripts.
