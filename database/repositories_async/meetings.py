@@ -22,16 +22,17 @@ class MeetingRepository(BaseRepository):
                 """
                 INSERT INTO meetings (
                     id, banana, title, date, agenda_url, agenda_sources, packet_url,
-                    summary, participation, status, processing_status,
+                    minutes_url, summary, participation, status, processing_status,
                     processing_method, processing_time, committee_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 ON CONFLICT (id) DO UPDATE SET
                     title = EXCLUDED.title,
                     date = EXCLUDED.date,
                     agenda_url = EXCLUDED.agenda_url,
                     agenda_sources = COALESCE(EXCLUDED.agenda_sources, meetings.agenda_sources),
                     packet_url = EXCLUDED.packet_url,
+                    minutes_url = COALESCE(EXCLUDED.minutes_url, meetings.minutes_url),
                     summary = COALESCE(EXCLUDED.summary, meetings.summary),
                     participation = COALESCE(EXCLUDED.participation, meetings.participation),
                     status = EXCLUDED.status,
@@ -48,6 +49,7 @@ class MeetingRepository(BaseRepository):
                 meeting.agenda_url,
                 meeting.agenda_sources,
                 meeting.packet_url,
+                meeting.minutes_url,
                 meeting.summary,
                 meeting.participation,
                 meeting.status,
@@ -71,7 +73,7 @@ class MeetingRepository(BaseRepository):
                 """
                 SELECT
                     id, banana, title, date, agenda_url, agenda_sources, packet_url,
-                    summary, participation, status, processing_status,
+                    minutes_url, summary, participation, status, processing_status,
                     processing_method, processing_time, committee_id,
                     created_at, updated_at
                 FROM meetings
@@ -105,7 +107,7 @@ class MeetingRepository(BaseRepository):
                 """
                 SELECT
                     id, banana, title, date, agenda_url, agenda_sources, packet_url,
-                    summary, participation, status, processing_status,
+                    minutes_url, summary, participation, status, processing_status,
                     processing_method, processing_time, committee_id
                 FROM meetings
                 WHERE banana = $1
@@ -137,7 +139,7 @@ class MeetingRepository(BaseRepository):
                 """
                 SELECT
                     id, banana, title, date, agenda_url, agenda_sources, packet_url,
-                    summary, participation, status, processing_status,
+                    minutes_url, summary, participation, status, processing_status,
                     processing_method, processing_time, committee_id,
                     created_at, updated_at
                 FROM meetings
@@ -264,7 +266,7 @@ class MeetingRepository(BaseRepository):
                 """
                 SELECT
                     id, banana, title, date, agenda_url, agenda_sources, packet_url,
-                    summary, participation, status, processing_status,
+                    minutes_url, summary, participation, status, processing_status,
                     processing_method, processing_time, committee_id
                 FROM meetings
                 WHERE banana = $1

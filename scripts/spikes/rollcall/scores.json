@@ -1,0 +1,60 @@
+{
+ "rows": [
+  {
+   "client": "milwaukee",
+   "counts": {
+    "gt_voted_items": 336,
+    "gt_procedural_nofile": 0,
+    "gt_items": 335,
+    "gt_tuples": 5025,
+    "published": 334,
+    "ext_tuples": 5010,
+    "tuples_matched": 5010,
+    "outcome_compared": 333,
+    "outcome_correct": 333,
+    "item_not_found": 1,
+    "gt_duplicate_eventitem": 1
+   },
+   "precision": 1.0,
+   "recall": 0.9970149253731343,
+   "coverage": 0.9970149253731343,
+   "outcome_acc": 1.0
+  },
+  {
+   "client": "denver",
+   "counts": {
+    "gt_voted_items": 209,
+    "gt_procedural_nofile": 4,
+    "gt_items": 205,
+    "gt_tuples": 2665,
+    "published": 205,
+    "ext_tuples": 2665,
+    "tuples_matched": 2665,
+    "outcome_compared": 205,
+    "outcome_correct": 205,
+    "passages_without_gt": 4
+   },
+   "precision": 1.0,
+   "recall": 1.0,
+   "coverage": 1.0,
+   "outcome_acc": 1.0
+  }
+ ],
+ "taxonomy": {
+  "milwaukee:item_not_found_in_pdf": 1,
+  "milwaukee:gt_duplicate_eventitem_api_artifact": 1
+ },
+ "gate": {
+  "caught_bad": 0,
+  "false_abstention": 0
+ },
+ "gate_details": [],
+ "examples": {
+  "milwaukee:item_not_found_in_pdf": [
+   "ev13424 260205 'Substitute resolution relating to the use and allocation of ' action=ADOPTED"
+  ],
+  "milwaukee:gt_duplicate_eventitem_api_artifact": [
+   "ev13423 260208 action=APPROVED agenda=89."
+  ]
+ }
+}

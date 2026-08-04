@@ -85,10 +85,36 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
             if option:
                 agenda_href = option['value']
 
-        # Also grab direct packet PDF links (CloudFront-hosted packets)
-        packet_link = row.find('a', href=lambda x: x and '.pdf' in x.lower() if x else False)
-        if packet_link:
-            packet_href = packet_link['href']
+        # Also grab direct packet PDF links (CloudFront-hosted packets).
+        # Prefer a non-minutes PDF; fall back to the first PDF so rows whose
+        # only document is a minutes PDF keep their pre-existing behavior.
+        pdf_links = row.find_all('a', href=lambda x: x and '.pdf' in x.lower() if x else False)
+        if pdf_links:
+            non_minutes_pdfs = [
+                link for link in pdf_links
+                if 'minutes' not in link.get_text(strip=True).lower()
+                and 'minutes' not in link['href'].lower()
+            ]
+            packet_href = (non_minutes_pdfs[0] if non_minutes_pdfs else pdf_links[0])['href']
+
+        # Minutes column: direct document links (services/minutes attachment,
+        # minutes PDF) preferred over MinutesViewer.php viewer pages.
+        minutes_doc_href = None
+        minutes_viewer_href = None
+        for link in row.find_all('a', href=True):
+            link_href = link['href']
+            if not link_href or link_href.startswith(('#', 'javascript:')):
+                continue
+            if 'MinutesViewer' in link_href:
+                minutes_viewer_href = minutes_viewer_href or link_href
+                continue
+            link_text = link.get_text(strip=True).lower()
+            if 'minutes' in link_text or '/minutes/' in link_href.lower():
+                minutes_doc_href = minutes_doc_href or link_href
+        if not minutes_doc_href and not minutes_viewer_href:
+            option = row.find('option', value=lambda x: x and 'MinutesViewer' in x if x else False)
+            if option:
+                minutes_viewer_href = option['value']
 
         if not agenda_href and not packet_href:
             continue
@@ -123,17 +149,30 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
         if packet_href:
             meeting['packet_url'] = packet_href
 
+        minutes_href = minutes_doc_href or minutes_viewer_href
+        if minutes_href:
+            if minutes_href.startswith('//'):
+                minutes_href = 'https:' + minutes_href
+            elif not minutes_href.startswith('http'):
+                minutes_href = urljoin(base_url, minutes_href)
+            meeting['minutes_url'] = minutes_href
+
         meetings.append(meeting)
 
-    # Dedup: same event appears in both "Recent" and "Archived" sections
-    seen_ids = set()
+    # Dedup: same event appears in both "Recent" and "Archived" sections.
+    # The archived copy may carry the minutes link the recent copy lacks --
+    # backfill minutes_url onto the kept row instead of dropping it.
+    kept_by_id: Dict[str, Dict[str, Any]] = {}
     deduped = []
     for m in meetings:
         eid = m.get("event_id")
-        if eid and eid in seen_ids:
+        if eid and eid in kept_by_id:
+            kept = kept_by_id[eid]
+            if m.get("minutes_url") and not kept.get("minutes_url"):
+                kept["minutes_url"] = m["minutes_url"]
             continue
         if eid:
-            seen_ids.add(eid)
+            kept_by_id[eid] = m
         deduped.append(m)
 
     logger.debug(

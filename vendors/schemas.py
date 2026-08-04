@@ -86,6 +86,7 @@ class MeetingSchema(BaseModel):
     location: Optional[str] = None
     agenda_url: Optional[str] = None
     packet_url: Optional[str] = None
+    minutes_url: Optional[str] = None  # Minutes doc/page; publishes post-meeting, fills on resync
     items: Optional[List[AgendaItemSchema]] = None
     participation: Optional[Dict[str, Any]] = None
     meeting_status: Optional[str] = None

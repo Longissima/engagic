@@ -36,6 +36,8 @@ AGENDAONLINE_CONFIG_FILE = "data/agendaonline_sites.json"
 
 _MEETING_ID_RE = re.compile(r'ViewMeeting\?id=(\d+)')
 _DATE_RE = re.compile(r'(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M)')
+# documentType=2 is the product's minutes doctype (mirrors ViewMeeting doctype=2)
+_MINUTES_DOC_RE = re.compile(r'/Documents/DownloadFile/.*[?&]documentType=2(?!\d)')
 
 
 def _load_config() -> Dict[str, Any]:
@@ -180,11 +182,34 @@ class AsyncAgendaOnlineAdapter(AsyncBaseAdapter):
             # Title from first cell or body name
             title = cells[0].get_text(strip=True) or self.body_name
 
-            meetings.append({
+            meeting_ref = {
                 "meeting_id": meeting_id,
                 "title": title,
                 "start": meeting_dt.isoformat(),
-            })
+            }
+
+            # Minutes appear in the same row once published: a direct
+            # DownloadFile PDF link, else the doctype=2 viewer. Keep the
+            # DownloadFile form -- the ViewDocument translation 404s for
+            # meeting-level docs on this product family (verified on the
+            # OnBase sibling, Aug 2026).
+            minutes_link = row.find("a", href=_MINUTES_DOC_RE)
+            if minutes_link:
+                href = minutes_link.get("href", "")
+                meeting_ref["minutes_url"] = (
+                    self.base_url + href if href.startswith("/") else href
+                )
+            else:
+                viewer_link = row.find(
+                    "a",
+                    href=lambda x: bool(x and "ViewMeeting" in x and "doctype=2" in x),
+                )
+                if viewer_link:
+                    meeting_ref["minutes_url"] = self._site_url(
+                        f"/Meetings/ViewMeeting?id={meeting_id}&doctype=2"
+                    )
+
+            meetings.append(meeting_ref)
 
         return meetings
 
@@ -212,6 +237,9 @@ class AsyncAgendaOnlineAdapter(AsyncBaseAdapter):
             "title": ref.get("title", ""),
             "start": ref.get("start", ""),
         }
+
+        if ref.get("minutes_url"):
+            meeting["minutes_url"] = ref["minutes_url"]
 
         if self.body_name:
             meeting.setdefault("metadata", {})["body"] = self.body_name

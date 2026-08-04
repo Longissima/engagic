@@ -151,6 +151,13 @@ class AsyncMenloParkAdapter(AsyncBaseAdapter):
         if not pdf_link:
             return None
 
+        # Cell 2: Minutes PDF link (populated once minutes are approved)
+        minutes_url = None
+        if len(cells) > 2:
+            minutes_link = cells[2].find('a', href=True, class_='document')
+            if minutes_link:
+                minutes_url = urljoin(self.base_url, minutes_link.get('href', ''))
+
         url_path = pdf_link.replace(self.base_url, '').strip('/')
         vendor_id = self._generate_fallback_vendor_id(title=url_path, date=meeting_date)
 
@@ -163,6 +170,9 @@ class AsyncMenloParkAdapter(AsyncBaseAdapter):
             'body_name': body_name,
             'agenda_url': pdf_link,
         }
+
+        if minutes_url:
+            meeting_data['minutes_url'] = minutes_url
 
         # Extract items using the appropriate chunking strategy
         try:

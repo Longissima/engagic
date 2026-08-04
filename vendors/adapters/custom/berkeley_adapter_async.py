@@ -126,6 +126,16 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
             if meeting_time:
                 meeting_data['time'] = meeting_time
 
+            # Post-meeting record column (Drupal field-annotated-agenda):
+            # "Annotated Agenda" PDFs for open sessions -- Berkeley's action
+            # record in lieu of separate council minutes -- and "Closed
+            # Minutes" PDFs for closed sessions. Empty until after the meeting.
+            record_cell = row.find('td', class_='views-field-field-annotated-agenda')
+            if record_cell:
+                record_a = record_cell.find('a', href=True)
+                if record_a:
+                    meeting_data['minutes_url'] = urljoin(self.base_url, record_a.get('href', ''))
+
             # Fetch HTML agenda detail to extract items
             try:
                 logger.info("fetching HTML agenda detail", vendor="berkeley", slug=self.slug, url=html_link)

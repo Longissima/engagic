@@ -103,7 +103,7 @@ Engagic fetches meeting agendas from civic tech platforms (Legistar, PrimeGov, G
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| [vendors/](vendors/README.md) | ~15,300 | 19 async adapters for Legistar, Granicus, PrimeGov, IQM2, NovusAgenda, CivicClerk, CivicPlus, CivicEngage, CivicWeb, eScribe, Municode, OnBase, ProudCity, Vision Internet, WP Events, Berkeley, Chicago, Menlo Park, Ross. HTML parsers, PDF chunker (1749 lines), rate limiting, vendor-agnostic ID contract. |
+| [vendors/](vendors/README.md) | ~15,300 | 22 async adapters for Legistar, Granicus, PrimeGov, IQM2, NovusAgenda, CivicClerk, CivicPlus, CivicEngage, CivicWeb, eScribe, Municode, OnBase, ProudCity, Vision Internet, WP Events, AgendaOnline, BoardBook, Destiny, Berkeley, Chicago, Menlo Park, Ross. HTML parsers, PDF chunker (1749 lines), rate limiting, vendor-agnostic ID contract. |
 | [database/](database/README.md) | ~8,300 | PostgreSQL with 14 async repositories (jurisdictions, meetings, items, matters, queue, search, userland, council_members, committees, engagement, feedback, deliberation, happening, helpers). asyncpg connection pooling, UPSERT preservation, normalized topics. |
 | [pipeline/](pipeline/README.md) | ~3,900 | Conductor orchestration with dual loops: Fetcher (24h sync) and Processor (continuous queue). Orchestrators for business logic (MeetingSyncOrchestrator, EnqueueDecider, MatterFilter, VoteProcessor). |
 | [analysis/](analysis/README.md) | ~2,300 | Gemini API integration with reactive rate limiting, unified adaptive prompting, 16-topic taxonomy, batch processing (50% cost savings), context caching. |
@@ -128,7 +128,7 @@ Engagic fetches meeting agendas from civic tech platforms (Legistar, PrimeGov, G
 
 **Repository Pattern:** 14 async repositories with shared connection pool. Each repository handles one domain (jurisdictions, meetings, items, matters, queue, search, userland, council_members, committees, engagement, feedback, deliberation, happening, helpers).
 
-**AsyncBaseAdapter:** All 19 vendor adapters implement unified interface. Async HTTP with retry, rate limiting, date parsing. Adapters return `vendor_id`, database generates canonical IDs.
+**AsyncBaseAdapter:** All 22 vendor adapters implement unified interface. Async HTTP with retry, rate limiting, date parsing. Adapters return `vendor_id`, database generates canonical IDs.
 
 **Orchestrator Delegation:** Pipeline delegates business logic to orchestrators (MeetingSyncOrchestrator, EnqueueDecider, MatterFilter, VoteProcessor). Enables testing and separation of concerns.
 
@@ -140,7 +140,7 @@ Engagic fetches meeting agendas from civic tech platforms (Legistar, PrimeGov, G
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  SYNC LOOP (every 24h)                                                      │
 │                                                                             │
-│    Conductor ──► Fetcher ──► Vendors (19 adapters)                          │
+│    Conductor ──► Fetcher ──► Vendors (22 adapters)                          │
 │                     │              │                                        │
 │                     │              ▼                                        │
 │                     │        External APIs (Legistar, Granicus, etc.)       │

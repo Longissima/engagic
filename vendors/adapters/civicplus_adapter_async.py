@@ -132,7 +132,8 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 else:
                     meeting = await self._scrape_meeting_page(
                         link_data["url"], link_data["title"],
-                        body_name=link_data.get("body_name")
+                        body_name=link_data.get("body_name"),
+                        minutes_url=link_data.get("minutes_url"),
                     )
                     if meeting and self._is_meeting_in_range(meeting, start_date, end_date):
                         results.append(meeting)
@@ -229,6 +230,11 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                     pass  # keep existing master
                 elif len(meeting.get("title", "")) > len(existing.get("title", "")):
                     by_key[key] = meeting
+                # Whichever copy wins, don't lose the minutes link the other carried
+                chosen = by_key[key]
+                other = meeting if chosen is existing else existing
+                if other.get("minutes_url") and not chosen.get("minutes_url"):
+                    chosen["minutes_url"] = other["minutes_url"]
             else:
                 by_key[key] = meeting
         return list(by_key.values())
@@ -298,6 +304,13 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                     entry = {"url": absolute_url, "title": text}
                     if body_name:
                         entry["body_name"] = body_name
+                    # The same row pairs the agenda with its minutes document
+                    # (posted after the meeting); ViewFile/Minutes serves the PDF
+                    minutes_link = row.find(
+                        "a", href=re.compile(r"/AgendaCenter/ViewFile/Minutes/")
+                    )
+                    if minutes_link:
+                        entry["minutes_url"] = urljoin(base_url, minutes_link["href"])
                     links.append(entry)
 
             if links:
@@ -382,9 +395,19 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         if body_name:
             result["body_name"] = body_name
 
+        minutes_url = link_data.get("minutes_url")
+        if minutes_url:
+            result["minutes_url"] = minutes_url
+
         return result
 
-    async def _scrape_meeting_page(self, url: str, title: str, body_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    async def _scrape_meeting_page(
+        self,
+        url: str,
+        title: str,
+        body_name: Optional[str] = None,
+        minutes_url: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Scrape individual meeting page for metadata and PDF links."""
         try:
             response = await self._get(url)
@@ -415,6 +438,9 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
             if body_name:
                 result["body_name"] = body_name
+
+            if minutes_url:
+                result["minutes_url"] = minutes_url
 
             return result
 

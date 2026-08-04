@@ -422,6 +422,7 @@ class AsyncVisionInternetAdapter(AsyncBaseAdapter):
         # -- Minutes PDF --
         minutes_urls = self._extract_doc_urls(row, "event_minutes")
         if minutes_urls:
+            result["minutes_url"] = minutes_urls[0]
             meta["minutes_url"] = minutes_urls[0]
 
         # -- Recording URL (YouTube etc.) --

@@ -143,6 +143,10 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
             if agenda_data.get('packet_url'):
                 meeting_data['packet_url'] = agenda_data['packet_url']
 
+            minutes_url = self._find_minutes_link(row)
+            if minutes_url:
+                meeting_data['minutes_url'] = minutes_url
+
             if agenda_data.get('items'):
                 meeting_data['items'] = agenda_data['items']
                 logger.info(
@@ -495,6 +499,24 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
 
         if attachments:
             item['attachments'] = attachments
+
+    def _find_minutes_link(self, row: Tag) -> Optional[str]:
+        """Find a minutes link in a listing-table row, once published.
+
+        Two forms coexist per row: a direct PDF under /{prefix}mindocs/
+        ('Minutes Packet', some bodies) and the dsp=min minutes view. Prefer
+        the direct document. Note the dsp=min seq is the minutes record's own
+        seq, distinct from the meeting's dsp=ag seq.
+        """
+        viewer_url = None
+        for link in row.find_all('a', href=True):
+            href = link.get('href', '')
+            label = f"{link.get('title', '')} {link.get_text(strip=True)}".lower()
+            if 'mindocs/' in href.lower() and 'minute' in label:
+                return urljoin(self.base_url, href)
+            if viewer_url is None and re.search(r'[?&]dsp=min(?![a-z])', href):
+                viewer_url = urljoin(self.base_url, href)
+        return viewer_url
 
     @staticmethod
     def _extract_body_name(title: str) -> str:

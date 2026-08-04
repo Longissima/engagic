@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     agenda_url TEXT,
     agenda_sources JSONB,  -- [{type, url, label}] for multi-agenda provenance (PrimeGov)
     packet_url TEXT,
+    minutes_url TEXT,  -- Minutes doc/page; published post-meeting, fills in on resync (migration 026)
     summary TEXT,
     participation JSONB,  -- Complex structure: {email, phone, zoom}, keep as JSONB
     status TEXT,

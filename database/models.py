@@ -169,6 +169,7 @@ class Meeting:
     packet_url: Optional[
         str | List[str]
     ] = None  # PDF packet (monolithic, fallback)
+    minutes_url: Optional[str] = None  # Minutes doc/page; appears post-meeting via resync
     summary: Optional[str] = None
     participation: Optional[ParticipationInfo] = None  # Contact info: email, phone, virtual_url, etc.
     status: Optional[str] = (

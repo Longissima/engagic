@@ -472,9 +472,18 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                 "views-field-nothing-1"
             )
 
+            minutes_cell = find_by_prefix(cell_map, "views-field-field-minutes")
+
             meeting_guid = None
             agenda_url = None
             packet_url = None
+            minutes_url = None
+
+            if minutes_cell:
+                minutes_link = minutes_cell.find("a", href=True)
+                if minutes_link:
+                    m_href = minutes_link["href"]
+                    minutes_url = f"{self._drupal_url}{m_href}" if m_href.startswith("/") else m_href
 
             for cell in [agenda_cell, packet_cell]:
                 if not cell:
@@ -520,6 +529,8 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                 meeting["agenda_url"] = agenda_url
             if packet_url:
                 meeting["packet_url"] = packet_url
+            if minutes_url:
+                meeting["minutes_url"] = minutes_url
 
             meeting_status = self._parse_meeting_status(title)
             if meeting_status:
@@ -857,6 +868,8 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                     meeting["agenda_url"] = agenda_url
                 if packet_url:
                     meeting["packet_url"] = packet_url
+                if minutes_url:
+                    meeting["minutes_url"] = minutes_url
                 if venue:
                     meeting["location"] = venue
 
@@ -978,6 +991,11 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         # Use URLs from API response — these are the real URLs from the site
         packet_url = meeting.get("PacketLinksURL") or meeting.get("PacketLinksHtmlURL")
         agenda_api_url = meeting.get("AgendaLinksHtmlURL") or meeting.get("AgendaLinksURL")
+
+        # Minutes when the API exposes them (PDF first, HTML viewer fallback)
+        minutes_url = meeting.get("MinutesLinksURL") or meeting.get("MinutesLinksHtmlURL")
+        if minutes_url:
+            result["minutes_url"] = minutes_url
 
         # Get meeting GUID for HTML agenda construction
         meeting_guid = self._extract_meeting_guid(meeting)

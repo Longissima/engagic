@@ -179,6 +179,15 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
 
             location = self._parse_location_cell(cells[1])
 
+            # Minutes viewer link lives alongside the Agenda link in cell 2
+            minutes_link = cells[2].find(
+                "a", href=lambda h: bool(h) and "/Public/Minutes/" in h
+            )
+            minutes_url = (
+                urljoin(self.base_url, minutes_link.get("href", ""))
+                if minutes_link else None
+            )
+
             title = body_name or "Board Meeting"
             if meeting_type:
                 title = f"{title} - {meeting_type}"
@@ -191,6 +200,7 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
                 "meeting_type": meeting_type,
                 "body_name": body_name,
                 "agenda_url": urljoin(self.base_url, href),
+                "minutes_url": minutes_url,
             })
 
         return meetings
@@ -249,6 +259,8 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
         }
         if ref.get("location"):
             meeting["location"] = ref["location"]
+        if ref.get("minutes_url"):
+            meeting["minutes_url"] = ref["minutes_url"]
         if items:
             meeting["items"] = items
         elif packet_url:

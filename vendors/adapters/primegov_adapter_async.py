@@ -101,6 +101,18 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
                 return doc
         return None
 
+    def _find_minutes_doc(self, document_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Find a compiled Minutes document by template name.
+
+        Separate from _find_packet_doc on purpose -- packet selection
+        (first doc with compileOutputType) must stay untouched.
+        """
+        for doc in document_list:
+            name = (doc.get("templateName") or "").lower()
+            if "minute" in name and doc.get("compileOutputType"):
+                return doc
+        return None
+
     async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
         """Fetch meetings from PrimeGov API (upcoming + archived concurrently)."""
         start_date, end_date = self._date_range(days_back, days_forward)
@@ -224,6 +236,10 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
             "title": title,
             "start": date_time,
         }
+
+        minutes_doc = self._find_minutes_doc(meeting.get("documentList", []))
+        if minutes_doc:
+            result["minutes_url"] = self._build_packet_url(minutes_doc)
 
         agenda_docs = self._find_agenda_docs(meeting.get("documentList", []))
 

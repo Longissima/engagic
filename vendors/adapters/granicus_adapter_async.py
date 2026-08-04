@@ -212,6 +212,10 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 listing_meta = meetings_in_range[i].get("metadata", {})
                 if listing_meta:
                     result.setdefault("metadata", {}).update(listing_meta)
+                # Minutes link discovered on the ViewPublisher row (post-meeting)
+                minutes_url = meetings_in_range[i].get("minutes_url")
+                if minutes_url:
+                    result.setdefault("minutes_url", minutes_url)
                 meetings.append(result)
 
         logger.info(

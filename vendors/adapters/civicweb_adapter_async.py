@@ -16,6 +16,13 @@ Architecture:
 The packet PDF is typically a compiled agenda+staff reports document with
 a PDF TOC (bookmarks). The chunker handles item extraction via TOC entries.
 
+Minutes: not exposed in the surfaces this adapter fetches. MeetingTypeList
+carries no minutes links, and MeetingInformation static HTML embeds only the
+primary agenda/packet document URL -- minutes load via the page's XHR layer
+(the SPA config exposes meetingOutputTypes {agenda:1, minutes:2} and a
+MinutesDocument button, but no document href). Verified hemetca Id=6986 and
+hudson Id=2843, Aug 2026.
+
 Slug is the civicweb subdomain (e.g. 'sonomacity' for sonomacity.civicweb.net).
 """
 

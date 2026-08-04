@@ -1,5 +1,13 @@
 # Closed Loop Architecture
 
+> **STATUS (2026-08-04): Gap 1's core wiring has since shipped.** Votes persist via
+> `pipeline/orchestrators/meeting_sync.py:611-619` → `council_members.record_votes_for_matter`;
+> the live DB holds ~298K per-member vote rows across ~2,900 members. `vote_tally` /
+> `vote_outcome` populate wherever vendors expose votes (Legistar + Chicago, ~13% of
+> jurisdictions). The rest of this doc's Gap 1 framing describes the pre-wiring state;
+> Gaps 2-3 remain open. The remaining outcome gap is *coverage*, not wiring — minutes
+> parsing for the other ~87% is tracked in spygov's `docs/DATA_SPINE.md` (Known gaps).
+
 > The system answers "what's being discussed" but never "what happened."
 
 ---

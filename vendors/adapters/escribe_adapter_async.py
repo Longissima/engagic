@@ -204,11 +204,29 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             if packet_url and not packet_url.startswith("http"):
                 packet_url = urljoin(self.base_url, packet_url)
 
+        # Minutes ride the same payload; Type is "PostMinutes" on some sites,
+        # "Minutes" on others. Never eligible for packet/agenda selection above.
+        minutes_url = None
+        if isinstance(doc_links, list):
+            for doc in doc_links:
+                if not isinstance(doc, dict) or doc.get("Type") not in ("Minutes", "PostMinutes"):
+                    continue
+                if not doc.get("Url"):
+                    continue
+                if doc.get("Format") == ".pdf":
+                    minutes_url = doc["Url"]
+                    break
+                if not minutes_url:
+                    minutes_url = doc["Url"]
+            if minutes_url and not minutes_url.startswith("http"):
+                minutes_url = urljoin(self.base_url, minutes_url)
+
         result = {
             "vendor_id": vendor_id,
             "title": title,
             "start": parsed_date.isoformat() if parsed_date else "",
             "packet_url": packet_url,
+            "minutes_url": minutes_url,
             "_uuid": meeting_uuid,
             "has_agenda": meeting_json.get("HasAgenda", False),
         }
@@ -240,6 +258,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             "start": basic_meeting["start"],
             "agenda_url": merged_url,
             "packet_url": basic_meeting.get("packet_url"),
+            "minutes_url": basic_meeting.get("minutes_url"),
             "items": items,
         }
 

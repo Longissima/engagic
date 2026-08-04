@@ -232,6 +232,26 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
                 })
                 seen_ids.add(meeting_id)
 
+        # Minutes ship in the same listing HTML as direct DownloadFile links;
+        # documentType=2 is the product's minutes doctype (mirrors the
+        # ViewMeeting doctype=2 viewer). Keep the DownloadFile form: the
+        # ViewDocument translation 404s for meeting-level docs (verified
+        # Concord, Aug 2026), unlike item attachments.
+        if meetings:
+            minutes_by_id: Dict[str, str] = {}
+            for href_match in re.finditer(r'href="([^"]*/Documents/DownloadFile/[^"]*)"', html):
+                href = href_match.group(1).replace("&amp;", "&")
+                params = parse_qs(urlparse(href).query)
+                if params.get("documentType", [""])[0] != "2":
+                    continue
+                mid = params.get("meetingId", [""])[0]
+                if mid:
+                    minutes_by_id.setdefault(mid, href)
+            for meeting in meetings:
+                minutes_href = minutes_by_id.get(meeting["id"])
+                if minutes_href:
+                    meeting["minutes_url"] = minutes_href
+
         return meetings
 
     def _extract_date_from_context(self, element) -> Optional[datetime]:
@@ -341,6 +361,15 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
                 "title": meeting_data.get("title", ""),
                 "start": meeting_data.get("date").isoformat() if meeting_data.get("date") else "",
             }
+
+            minutes_href = meeting_data.get("minutes_url")
+            if minutes_href:
+                site = urlparse(base_url)
+                meeting["minutes_url"] = (
+                    f"{site.scheme}://{site.netloc}{minutes_href}"
+                    if minutes_href.startswith("/")
+                    else minutes_href
+                )
 
             if items:
                 meeting["items"] = items

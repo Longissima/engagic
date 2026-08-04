@@ -150,6 +150,16 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             if addr_parts:
                 result["location"] = ", ".join(addr_parts)
 
+        # Post-meeting minutes are published alongside agenda files;
+        # GetMeetingFileStream serves the document directly.
+        minutes_doc = next(
+            (doc for doc in event.get("publishedFiles", [])
+             if doc.get("type") == "Minutes" and doc.get("fileId")),
+            None,
+        )
+        if minutes_doc:
+            result["minutes_url"] = self._build_packet_url(minutes_doc)
+
         # Try to fetch structured items if agenda exists
         items = []
         if has_agenda and agenda_id:

@@ -18,6 +18,11 @@ API structure (verified Dec 2025):
 - Meeting agenda has nested structure: agenda.groups[].items[]
 - NOTE: Chicago API returns empty agenda.groups[] for most meetings
 - Fallback: Extract record numbers from agenda PDF, fetch via /matter/recordNumber/
+- Minutes: NOT in the meeting-agenda payload. files[] attachmentTypes observed
+  across 81 meetings (Jan-Jun 2026): Agenda, Notice, Summary, Other,
+  Miscellaneous Business, Monthly Rule 45. Committee "Summary" files are
+  summaries of reports, not minutes; the Journal of Proceedings lives behind
+  a separate chicityclerk surface -- deferred until a new endpoint is agreed.
 
 Item extraction hierarchy:
 1. API agenda.groups[].items[] (primary - rarely populated)

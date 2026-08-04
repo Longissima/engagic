@@ -250,6 +250,7 @@ class AsyncRossAdapter(AsyncBaseAdapter):
             result["agenda_url"] = main_agenda
 
         if minutes_urls:
+            result["minutes_url"] = minutes_urls[0]
             result["metadata"] = result.get("metadata", {})
             result["metadata"]["minutes_urls"] = minutes_urls
 

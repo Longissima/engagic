@@ -56,6 +56,21 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
 
         return unique_attachments
 
+    def _extract_row_minutes_url(self, row) -> Optional[str]:
+        """Extract the minutes document URL from a calendar listing row.
+
+        Only FileOpen.aspx/FileView.ashx hrefs are documents; "Minutes" links
+        that point at Detail_Meeting.aspx are viewer pages and are skipped.
+        """
+        for link in row.find_all("a", href=True):
+            if "minutes" not in link.get_text(strip=True).lower():
+                continue
+            href = link["href"]
+            if href and re.search(r"File(?:Open\.aspx|View\.ashx)", href, re.IGNORECASE):
+                # Row hrefs are relative to the /Citizens/ calendar pages
+                return urljoin(f"{self.base_url}/Citizens/", href)
+        return None
+
     async def _fetch_meetings_impl(
         self, days_back: int = 14, days_forward: int = 14
     ) -> List[Dict[str, Any]]:
@@ -155,6 +170,8 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
             title_elem = row.find("div", class_="RowDetails")
             title = title_elem.get_text(strip=True) if title_elem else "Meeting"
 
+            minutes_url = self._extract_row_minutes_url(row)
+
             # Fetch Detail_Meeting page to extract items
             logger.info(
                 "fetching meeting details",
@@ -162,7 +179,9 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
                 slug=self.slug,
                 meeting_id=meeting_id
             )
-            meeting_data = await self._fetch_meeting_details(meeting_id, meeting_dt, title)
+            meeting_data = await self._fetch_meeting_details(
+                meeting_id, meeting_dt, title, minutes_url=minutes_url
+            )
 
             if meeting_data:
                 meetings.append(meeting_data)
@@ -177,7 +196,11 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
         return meetings
 
     async def _fetch_meeting_details(
-        self, meeting_id: str, meeting_dt: datetime, title: str
+        self,
+        meeting_id: str,
+        meeting_dt: datetime,
+        title: str,
+        minutes_url: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Fetch Detail_Meeting page and extract agenda items."""
         detail_url = f"{self.base_url}/Citizens/Detail_Meeting.aspx?ID={meeting_id}"
@@ -200,6 +223,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
             "start": meeting_dt.isoformat(),
             "agenda_url": detail_url,  # HTML agenda source (Detail_Meeting.aspx)
             "packet_url": packet_url,  # Full PDF packet (optional)
+            "minutes_url": minutes_url,  # Minutes document from listing row (optional)
             "items": items,
         }
 

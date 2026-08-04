@@ -311,6 +311,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             # Try to get agenda PDF URL from API
             agenda_url = event.get("EventAgendaFile")
             packet_url = event.get("EventMinutesFile")  # Sometimes agenda is in minutes field
+            minutes_url = event.get("EventMinutesFile")
 
             # If API didn't provide agenda URL, discover from HTML detail page.
             # Try two URL formats: GUID-based (common) then InSiteURL/LEGID (San Jose).
@@ -363,6 +364,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 meeting["agenda_url"] = agenda_url
             if packet_url and "agenda_url" not in meeting:
                 meeting["packet_url"] = packet_url
+            if minutes_url:
+                meeting["minutes_url"] = minutes_url
 
             return meeting
 
@@ -1004,13 +1007,22 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             if agenda_link:
                 packet_url = urljoin(html_base_url, agenda_link["href"])
 
+            # Minutes PDF from calendar row (View.ashx?M=M, not M=A/M=AADA)
+            minutes_url = None
+            minutes_link = row.find("a", href=lambda x: x and "View.ashx" in x and re.search(r'M=M(&|$)', x))
+            if minutes_link:
+                minutes_url = urljoin(html_base_url, minutes_link["href"])
+
             # Config-driven short-circuit: some Legistar instances (e.g. LA
             # County) expose a MeetingDetail link that technically resolves
             # but only contains stub rows. Prefer AADA for known offenders.
             if self.prefer_aada and aada_url:
-                return await self._fetch_aada_agenda_async(
+                meeting_data = await self._fetch_aada_agenda_async(
                     meeting_id, meeting_dt, title, aada_url, packet_url
                 )
+                if meeting_data and minutes_url:
+                    meeting_data["minutes_url"] = minutes_url
+                return meeting_data
 
             if detail_url:
                 meeting_data = await self._fetch_meeting_detail_html_async(
@@ -1030,12 +1042,17 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                         meeting_id, meeting_dt, title, aada_url, packet_url
                     )
                     meeting_data = self._pick_richer_meeting(meeting_data, aada_data)
+                if meeting_data and minutes_url:
+                    meeting_data["minutes_url"] = minutes_url
                 return meeting_data
 
             if aada_url:
-                return await self._fetch_aada_agenda_async(
+                meeting_data = await self._fetch_aada_agenda_async(
                     meeting_id, meeting_dt, title, aada_url, packet_url
                 )
+                if meeting_data and minutes_url:
+                    meeting_data["minutes_url"] = minutes_url
+                return meeting_data
 
             return None
 

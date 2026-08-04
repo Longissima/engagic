@@ -302,6 +302,10 @@ class AsyncWPEventsAdapter(AsyncBaseAdapter):
             if classified.get("agenda"):
                 result["agenda_url"] = classified["agenda"][0]["url"]
 
+            # Approved/draft minutes PDF
+            if classified.get("minutes"):
+                result["minutes_url"] = classified["minutes"][0]["url"]
+
             # No structured items from media -- try agenda (url) then packet (toc)
             if not classified.get("agenda_item") and classified.get("agenda"):
                 chunked = await self._chunk_agenda_then_packet(

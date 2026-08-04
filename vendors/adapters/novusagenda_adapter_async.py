@@ -157,6 +157,21 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                         if meeting_id_match:
                             meeting_id = meeting_id_match.group(1)
 
+            # Minutes publish post-meeting: a DisplayMinutesPDF handler when the
+            # portal exposes a direct PDF, else the MeetingView doctype=Minutes
+            # viewer. Rows carry MinutesMeetingID=-1 until minutes exist, so
+            # neither pattern appears pre-publication.
+            minutes_url = None
+            minutes_pdf_link = row.find("a", href=re.compile(r"DisplayMinutesPDF\.ashx", re.IGNORECASE))
+            if minutes_pdf_link:
+                minutes_url = f"{self.base_url}/agendapublic/{minutes_pdf_link.get('href', '')}"
+            else:
+                minutes_view_link = row.find("a", onclick=re.compile(r"doctype=Minutes"))
+                if minutes_view_link:
+                    minutes_match = re.search(r"MeetingView\.aspx\?[^'\"]+", minutes_view_link.get("onclick", ""))
+                    if minutes_match:
+                        minutes_url = f"{self.base_url}/agendapublic/{minutes_match.group(0)}"
+
             if not meeting_id:
                 meeting_id = self._generate_fallback_vendor_id(
                     title=meeting_type,
@@ -218,6 +233,9 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
 
             if agenda_url:
                 result["agenda_url"] = agenda_url
+
+            if minutes_url:
+                result["minutes_url"] = minutes_url
 
             if items:
                 result["items"] = items

@@ -326,6 +326,8 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
             result["agenda_url"] = docs["agenda"]
         if docs.get("agenda-packet"):
             result["packet_url"] = docs["agenda-packet"]
+        if docs.get("minutes"):
+            result["minutes_url"] = docs["minutes"]
 
         # Non-standard doc URLs and meeting page URL go into metadata
         extra: Dict[str, str] = {}
@@ -441,6 +443,8 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
                 result["agenda_url"] = docs["agenda"]
             if docs.get("agenda-packet"):
                 result["packet_url"] = docs["agenda-packet"]
+            if docs.get("minutes"):
+                result["minutes_url"] = docs["minutes"]
 
             extra: Dict[str, str] = {}
             if docs.get("minutes"):
@@ -501,6 +505,8 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
 
         # Always set minutes/video metadata
         if docs.get("minutes"):
+            # Direct PDF from the meeting page beats any list-scrape anchor URL
+            meeting["minutes_url"] = docs["minutes"]
             meeting.setdefault("metadata", {})["minutes_url"] = docs["minutes"]
         if docs.get("video"):
             meeting.setdefault("metadata", {})["video_url"] = docs["video"]

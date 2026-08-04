@@ -117,6 +117,7 @@ def build_meeting(row: Any, topics: Optional[List[str]] = None) -> Meeting:
         agenda_url=row["agenda_url"],
         agenda_sources=deserialize_agenda_sources(row.get("agenda_sources")),
         packet_url=row["packet_url"],
+        minutes_url=row.get("minutes_url"),  # .get: not every SELECT carries it
         summary=row["summary"],
         participation=participation,
         status=row["status"],
