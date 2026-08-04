@@ -47,7 +47,7 @@ On failure, raises `ExtractionError` (from `exceptions` module).
 
 **Extraction pipeline:**
 1. **Pass 1** — Extract text from all pages (main thread, PyMuPDF is not thread-safe). Pages with < `ocr_threshold` chars are queued for OCR. Page images are pre-rendered to PNG bytes in the main thread.
-2. **Legislative check** — If `detect_legislative_formatting` is enabled, scans first 5 pages for a formatting legend (all 4 keywords — addition, deletion, underline, strikethrough — clustered within 200 chars). Only then activates `[DELETED: ...]` / `[ADDED: ...]` tagging.
+2. **Legislative check** — If `detect_legislative_formatting` is enabled, scans the first 5 pages for a formatting legend and up to 30 pages for geometric redline evidence. Activates `[DELETED: ...]` / `[ADDED: ...]` tagging for a legend, three independent strike marks, or a paired strike-and-underline change.
 3. **Pass 2** — Runs OCR in parallel via `ThreadPoolExecutor`. Uses `_is_ocr_better()` to decide whether OCR output replaces native text (requires 2x more chars with >40% letters, or more chars with >70% letters).
 
 **OCR safeguards:**

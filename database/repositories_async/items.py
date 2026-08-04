@@ -338,9 +338,9 @@ class ItemRepository(BaseRepository):
                 """
                 await conn.execute(query, *values)
 
-            if "topics" in kwargs and kwargs["topics"]:
+            if "topics" in kwargs:
                 await replace_entity_topics(
-                    conn, "item_topics", "item_id", item_id, kwargs["topics"]
+                    conn, "item_topics", "item_id", item_id, kwargs["topics"] or []
                 )
 
         logger.debug("updated agenda item", item_id=item_id, fields=list(kwargs.keys()))

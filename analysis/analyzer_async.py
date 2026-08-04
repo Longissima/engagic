@@ -32,6 +32,11 @@ from parsing.pdf import PdfExtractor, extract_document_file
 from parsing.subprocess_guard import GuardCrashed, GuardTaskError, GuardTimeout, run_guarded
 from parsing.participation import parse_participation_info
 from analysis.llm.summarizer import GeminiSummarizer
+from analysis.llm.input_budget import (
+    limit_item_title,
+    limit_shared_context,
+    prepare_item_text,
+)
 from pipeline.protocols import MetricsCollector, NullMetrics
 from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 
@@ -562,6 +567,8 @@ class AsyncAnalyzer:
         if not item_requests:
             return
 
+        shared_context = limit_shared_context(shared_context)
+
         logger.info(
             "processing batch items async",
             count=len(item_requests),
@@ -572,8 +579,19 @@ class AsyncAnalyzer:
             """Process single item with timeout."""
             try:
                 text = item.get("text", "")
-                title = item.get("title", "")
+                title = limit_item_title(item.get("title", ""))
                 page_count = item.get("page_count")
+
+                # Mirror the batch lane's shared-context inlining
+                # (_submit_one_chunk); without it, items whose only documents
+                # are shared reach the model as "[Item: title]" with no
+                # document text.
+                text = prepare_item_text(
+                    title,
+                    text,
+                    shared_context,
+                    inline_shared=True,
+                )
 
                 # Summarize item (Gemini SDK is sync, run in thread pool).
                 # SDK now has its own 300s http timeout matching this wait_for,

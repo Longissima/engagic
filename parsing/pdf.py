@@ -3,10 +3,10 @@
 Moved from: infocore/processing/pdf_extractor.py
 
 Supports: PDF, DOCX (via PyMuPDF), legacy .doc (via antiword), RTF (via striprtf),
-PPTX (via python-pptx).
+PPTX (via python-pptx), XLSX (via openpyxl).
 
 Legislative formatting detection (strikethrough/underline):
-- Detects thin filled rectangles (MS Word/LibreOffice export format)
+- Detects thin filled/stroked marks and PDF markup annotations
 - Strikethrough = deletions from law (line through middle of text)
 - Underline = additions to law (line below text)
 - Outputs as [DELETED: text] and [ADDED: text] tags in markdown
@@ -21,7 +21,7 @@ import time
 import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, cast
 
 import fitz  # PyMuPDF
 import pytesseract
@@ -54,11 +54,21 @@ _ZIP_MAGIC = b'PK\x03\x04'           # .docx, .xlsx, .pptx (OOXML/ZIP)
 _PDF_MAGIC = b'%PDF-'
 _RTF_MAGIC = b'{\\rtf'
 
+# PyMuPDF exposes these at runtime, but its type stubs omit them.
+_PDF_ANNOT_UNDERLINE = cast(int, getattr(fitz, "PDF_ANNOT_UNDERLINE", 9))
+_PDF_ANNOT_STRIKE_OUT = cast(int, getattr(fitz, "PDF_ANNOT_STRIKE_OUT", 11))
+
+# Sanity bound against pathological workbooks (dimension bombs, formula
+# spew), not an editorial cap: extraction is otherwise lossless and any
+# fitting to the model budget happens at prompt assembly, where it is
+# logged and disclosed to the model.
+XLSX_SANITY_MAX_CHARS = 20_000_000
+
 
 def _detect_format(data: bytes) -> str:
     """Detect document format from magic bytes.
 
-    Returns 'pdf', 'docx', 'pptx', 'doc', 'rtf', or 'unknown'.
+    Returns 'pdf', 'docx', 'pptx', 'xlsx', 'doc', 'rtf', or 'unknown'.
     For ZIP-based OOXML, peeks at [Content_Types].xml to distinguish
     PPTX (presentationml) from DOCX (wordprocessingml).
     """
@@ -70,6 +80,8 @@ def _detect_format(data: bytes) -> str:
                 ct = zf.read("[Content_Types].xml").decode("utf-8", errors="ignore")
                 if "presentationml" in ct:
                     return "pptx"
+                if "spreadsheetml" in ct:
+                    return "xlsx"
         except Exception:
             pass
         return "docx"
@@ -132,13 +144,14 @@ def _extract_pptx(data: bytes) -> Optional[str]:
         parts = []
         for slide in prs.slides:
             for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
+                shape_obj = cast(Any, shape)
+                if shape_obj.has_text_frame:
+                    for para in shape_obj.text_frame.paragraphs:
                         text = para.text.strip()
                         if text:
                             parts.append(text)
-                if shape.has_table:
-                    for row in shape.table.rows:
+                if shape_obj.has_table:
+                    for row in shape_obj.table.rows:
                         cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
                         if cells:
                             parts.append(" | ".join(cells))
@@ -146,6 +159,55 @@ def _extract_pptx(data: bytes) -> Optional[str]:
     except Exception as e:
         logger.debug("pptx extraction failed", error=str(e))
         return None
+
+
+def _extract_xlsx(data: bytes) -> Optional[str]:
+    """Extract XLSX as markdown tables using openpyxl. Returns text or None.
+
+    Fee schedules and budget detail live in spreadsheets; without this, 800+
+    attachments were invisible to summarization. Extraction is lossless --
+    every sheet, row, and cell -- so the corpus archives the full text and
+    any trimming happens once, at prompt assembly, where it is logged and
+    disclosed to the model. Empty rows and trailing empty cells carry no
+    text and are skipped.
+    """
+    wb = None
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        parts = []
+        total_chars = 0
+        for ws in wb.worksheets:
+            wrote_header = False
+            for row in ws.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v).strip() for v in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if not any(cells):
+                    continue
+                if not wrote_header:
+                    parts.append(f"## Sheet: {ws.title}")
+                    total_chars += len(parts[-1]) + 1
+                    wrote_header = True
+                line = "| " + " | ".join(cells) + " |"
+                parts.append(line)
+                total_chars += len(line) + 1
+                if total_chars > XLSX_SANITY_MAX_CHARS:
+                    logger.warning(
+                        "xlsx sanity cap hit", sheet=ws.title, chars=total_chars
+                    )
+                    parts.append(
+                        "[remaining workbook content omitted: extraction sanity cap]"
+                    )
+                    return "\n".join(parts)
+        text = "\n".join(parts)
+        return text if text.strip() else None
+    except Exception as e:
+        logger.debug("xlsx extraction failed", error=str(e))
+        return None
+    finally:
+        if wb is not None:
+            wb.close()
 
 
 def _detect_horizontal_lines(page: fitz.Page) -> List[Tuple[float, float, float]]:
@@ -157,90 +219,177 @@ def _detect_horizontal_lines(page: fitz.Page) -> List[Tuple[float, float, float]
     Returns:
         list of (x0, x1, y_position) tuples for horizontal bars
     """
+    # Strikethrough is not one encoding. Known rendering families, each
+    # detected independently and fed into the same mid-span classifier:
+    #   A. Thin FILLED rects -- LibreOffice (black), Word track-changes (red).
+    #   B. STROKED horizontal line/thin-rect paths -- other Word export paths
+    #      and HTML-to-PDF vendors. (The old code nested 'l' handling inside
+    #      the fill branch, so stroke-only paths could never match.)
+    #   C. StrikeOut ANNOTATIONS -- PDF markup layer.
+    # Near-white marks are excluded (masking rectangles). Geometry -- thin,
+    # wide, crossing mid-span -- remains the real discriminator downstream.
     lines = []
-    paths = page.get_drawings()
 
-    for path in paths:
-        # Check if this path is a filled black rectangle (potential line)
+    def _is_visible_color(color) -> bool:
+        """Accept dark and saturated marks while rejecting white masks."""
+        if color is None:
+            return False
+        components = color if isinstance(color, (tuple, list)) else (color,)
+        return any(component < 0.9 for component in components[:3])
+
+    def _append_thin_rect(rect) -> None:
+        x0, y0, x1, y1 = rect
+        height = abs(y1 - y0)
+        width = abs(x1 - x0)
+        if height < 2 and width > 5:
+            lines.append((x0, x1, (y0 + y1) / 2))
+
+    for path in page.get_drawings():
         fill_color = path.get("fill")
-        if fill_color and fill_color == (0.0, 0.0, 0.0):  # Black fill
-            for item in path["items"]:
-                if item[0] == "re":  # Rectangle
-                    rect = item[1]
-                    x0, y0, x1, y1 = rect
+        stroke_color = path.get("color")
+        visible_fill = _is_visible_color(fill_color)
+        visible_stroke = _is_visible_color(stroke_color)
+        if not (visible_fill or visible_stroke):
+            continue
+        for item in path["items"]:
+            if item[0] == "re":
+                _append_thin_rect(item[1])
+            elif item[0] == "l" and visible_stroke:
+                p1, p2 = item[1:3]
+                if abs(p1.y - p2.y) < 0.5 and abs(p2.x - p1.x) > 5:
+                    lines.append((min(p1.x, p2.x), max(p1.x, p2.x), (p1.y + p2.y) / 2))
 
-                    height = abs(y1 - y0)
-                    width = abs(x1 - x0)
-
-                    # Thin horizontal rectangle (height < 2 points, width > 5 points)
-                    if height < 2 and width > 5:
-                        y_mid = (y0 + y1) / 2
-                        lines.append((x0, x1, y_mid))
-
-                # Also check for actual line items (just in case)
-                elif item[0] == "l":
-                    p1, p2 = item[1:]
-                    if abs(p1.y - p2.y) < 0.5:
-                        line_x0 = min(p1.x, p2.x)
-                        line_x1 = max(p1.x, p2.x)
-                        lines.append((line_x0, line_x1, p1.y))
+    annot = page.first_annot
+    while annot:
+        annot_type = annot.type[0]
+        if annot_type in (_PDF_ANNOT_STRIKE_OUT, _PDF_ANNOT_UNDERLINE):
+            vertices = annot.vertices or []
+            quads = [vertices[i : i + 4] for i in range(0, len(vertices), 4)]
+            quads = [quad for quad in quads if len(quad) == 4]
+            if quads:
+                for quad in quads:
+                    xs = [point[0] for point in quad]
+                    ys = [point[1] for point in quad]
+                    y = (
+                        (min(ys) + max(ys)) / 2
+                        if annot_type == _PDF_ANNOT_STRIKE_OUT
+                        else max(ys)
+                    )
+                    if max(xs) - min(xs) > 5:
+                        lines.append((min(xs), max(xs), y))
+            else:
+                rect = annot.rect
+                y = (
+                    (rect.y0 + rect.y1) / 2
+                    if annot_type == _PDF_ANNOT_STRIKE_OUT
+                    else rect.y1
+                )
+                lines.append((rect.x0, rect.x1, y))
+        annot = annot.next
 
     return lines
 
 
-def _match_lines_to_text(page: fitz.Page, lines: List[Tuple[float, float, float]]) -> Dict[str, List[Tuple[str, Tuple]]]:
+def _span_mark_runs(
+    chars: List[Tuple[str, float, float]],
+    span_bbox: Tuple[float, float, float, float],
+    lines: List[Tuple[float, float, float]],
+) -> List[Tuple[str, Optional[str]]]:
+    """Classify a span's characters against mark lines, character by character.
+
+    A single span can carry BOTH a strike over its old words and an underline
+    under its new words (Word emits "old new" as one span with two marks at
+    different x-ranges). Span-granular classification either misses one mark
+    or mislabels the whole span, so marks are applied per character using each
+    line's x-extent, then grouped into runs.
+
+    chars: (character, x0, x1) in reading order.
+    Returns runs of (text, mark) where mark is None, 'del', or 'add'.
     """
-    Match horizontal lines to text spans and classify as strikethrough/underline.
+    y0, y1 = span_bbox[1], span_bbox[3]
+    height = y1 - y0
+    strike_lo, strike_hi = y0 + 0.3 * height, y0 + 0.7 * height
+    under_lo, under_hi = y1 - 1, y1 + 3
 
-    Returns dict with:
-        'strikethrough': list of (text, bbox) tuples
-        'underline': list of (text, bbox) tuples
-    """
-    result = {
-        'strikethrough': [],
-        'underline': []
-    }
-
-    # Get text with detailed positioning
-    text_dict = page.get_text("dict")  # type: ignore[attr-defined]
-
-    for block in text_dict["blocks"]:
-        if block.get("type") != 0:  # Skip non-text blocks
+    marks: List[Optional[str]] = [None] * len(chars)
+    for line_x0, line_x1, line_y in lines:
+        if strike_lo <= line_y <= strike_hi:
+            mark = "del"
+        elif under_lo <= line_y <= under_hi:
+            mark = "add"
+        else:
             continue
+        for i, (_, cx0, cx1) in enumerate(chars):
+            mid = (cx0 + cx1) / 2
+            if line_x0 - 1 <= mid <= line_x1 + 1:
+                # Deletion outranks addition on the rare overlap; never
+                # downgrade an already-marked deletion.
+                if marks[i] is None or (mark == "del" and marks[i] == "add"):
+                    marks[i] = mark
 
+    runs: List[List] = []
+    for (char, _, _), mark in zip(chars, marks):
+        if runs and runs[-1][1] == mark:
+            runs[-1][0] += char
+        else:
+            runs.append([char, mark])
+    # Whitespace-only marked runs are geometric accidents (a mark line
+    # skimming a space between words); render them plain.
+    return [
+        (text, None if (mark and not text.strip()) else mark)
+        for text, mark in runs
+    ]
+
+
+def _page_mark_runs(
+    page: fitz.Page,
+    detected_lines: Optional[List[Tuple[float, float, float]]] = None,
+) -> Tuple[List[List[List[Tuple[str, Optional[str]]]]], int, int]:
+    """Compute per-span mark runs for a whole page.
+
+    Returns (blocks -> lines -> marked runs in reading order,
+    struck_span_count, underlined_span_count) so extraction and the activation
+    gate share one deterministic classification pass without flattening the
+    document's line and paragraph structure.
+    """
+    lines = detected_lines if detected_lines is not None else _detect_horizontal_lines(page)
+    page_runs: List[List[List[Tuple[str, Optional[str]]]]] = []
+    struck = 0
+    underlined = 0
+    raw = cast(
+        Dict[str, Any],
+        page.get_text("rawdict", sort=True),  # type: ignore[attr-defined]
+    )
+    for block in raw["blocks"]:
+        if block.get("type") != 0:
+            continue
+        block_runs: List[List[Tuple[str, Optional[str]]]] = []
         for line_obj in block.get("lines", []):
+            line_runs: List[Tuple[str, Optional[str]]] = []
             for span in line_obj.get("spans", []):
-                text = span.get("text", "").strip()
-                if not text:
+                chars = [
+                    (ch["c"], ch["bbox"][0], ch["bbox"][2])
+                    for ch in span.get("chars", [])
+                ]
+                if not chars:
                     continue
-
-                bbox = span["bbox"]  # (x0, y0, x1, y1)
-                text_x0, text_y0, text_x1, text_y1 = bbox
-
-                # Text vertical center and bottom
-                text_bottom_y = text_y1
-                text_height = text_y1 - text_y0
-
-                # Check each horizontal line
-                for line_x0, line_x1, line_y in lines:
-                    # Check if line horizontally overlaps with text
-                    # (with small tolerance for slight misalignment)
-                    if not (line_x1 < text_x0 - 2 or line_x0 > text_x1 + 2):
-                        # Line overlaps text horizontally
-
-                        # Strikethrough: line passes through middle of text
-                        # (within 30% to 70% of text height from top)
-                        if text_y0 + 0.3 * text_height <= line_y <= text_y0 + 0.7 * text_height:
-                            result['strikethrough'].append((text, bbox))
-                            break
-
-                        # Underline: line is just below text
-                        # (within 3 points below text bottom, or just touching)
-                        elif text_bottom_y - 1 <= line_y <= text_bottom_y + 3:
-                            result['underline'].append((text, bbox))
-                            break
-
-    return result
+                runs = (
+                    _span_mark_runs(chars, tuple(span["bbox"]), lines)
+                    if lines
+                    else [("".join(c for c, _, _ in chars), None)]
+                )
+                line_runs.extend(runs)
+                # A mark must cover at least 2 non-space characters to count
+                # as evidence -- single-character grazes are noise.
+                if any(m == "del" and len(t.strip()) >= 2 for t, m in runs):
+                    struck += 1
+                if any(m == "add" and len(t.strip()) >= 2 for t, m in runs):
+                    underlined += 1
+            if line_runs:
+                block_runs.append(line_runs)
+        if block_runs:
+            page_runs.append(block_runs)
+    return page_runs, struck, underlined
 
 
 def _has_legislative_legend(doc: fitz.Document, proximity_chars: int = 200, max_pages: int = 5) -> bool:
@@ -301,52 +450,84 @@ def _has_legislative_legend(doc: fitz.Document, proximity_chars: int = 200, max_
     return False
 
 
+# Three independent strikes are strong evidence on their own. A paired
+# deletion/addition is also sufficient: compact amendments often change only
+# one phrase, while ordinary tables and hyperlinks rarely produce both marks.
+REDLINE_ACTIVATION_STRUCK_SPANS = 3
+
+
+def _redline_evidence_activates(struck_spans: int, underlined_spans: int) -> bool:
+    return struck_spans >= REDLINE_ACTIVATION_STRUCK_SPANS or (
+        struck_spans >= 1 and underlined_spans >= 1
+    )
+
+
+def count_redline_evidence(doc: fitz.Document, max_pages: int = 30) -> Dict[str, int]:
+    """Count geometric strikethrough/underline evidence across the document.
+
+    Deterministic activation signal for legislative formatting: a thin filled
+    rectangle crossing the vertical MIDDLE of a text span (30-70% of span
+    height, per _span_mark_runs) is a strikethrough candidate. Table
+    rules and separators sit between spans and underlines sit at the
+    baseline, so mid-span crossings are the discriminator that survives the
+    false positives which motivated the old legend-only gate.
+
+    Scans up to max_pages pages, stopping early once enough strike evidence
+    accumulates to activate. Returns counts for logging/auditing:
+        {'struck_spans': N, 'underlined_spans': M, 'pages_scanned': P}
+    """
+    struck = 0
+    underlined = 0
+    pages_scanned = 0
+    for page_num in range(min(len(doc), max_pages)):
+        pages_scanned += 1
+        lines = _detect_horizontal_lines(doc[page_num])
+        if not lines:
+            continue
+        _, page_struck, page_underlined = _page_mark_runs(
+            doc[page_num], detected_lines=lines
+        )
+        struck += page_struck
+        underlined += page_underlined
+        if _redline_evidence_activates(struck, underlined):
+            break
+    return {
+        "struck_spans": struck,
+        "underlined_spans": underlined,
+        "pages_scanned": pages_scanned,
+    }
+
+
 def _extract_text_with_formatting(page: fitz.Page, page_num: int) -> str:
     """
     Extract text from page with legislative formatting tags.
 
-    Returns text with [DELETED: ...] and [ADDED: ...] tags for strikethrough/underline.
+    Returns text with [DELETED: ...] and [ADDED: ...] tags rendered at
+    character-run granularity: a single span holding both struck old text and
+    underlined new text yields separate tagged runs, not one mislabeled span.
     """
-    # Detect horizontal lines (strikethrough/underline indicators)
     lines = _detect_horizontal_lines(page)
-
     if not lines:
-        # No formatting detected, return plain text
-        return page.get_text(sort=True)  # type: ignore[attr-defined]
+        # No mark lines on this page, return plain text
+        return cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
 
-    # Match lines to text
-    matched = _match_lines_to_text(page, lines)
-    strikethrough_spans = {bbox: text for text, bbox in matched['strikethrough']}
-    underline_spans = {bbox: text for text, bbox in matched['underline']}
+    page_runs, _, _ = _page_mark_runs(page, detected_lines=lines)
 
-    # Get text with detailed positioning
-    text_dict = page.get_text("dict")  # type: ignore[attr-defined]
-    result_parts = []
+    def render_line(runs: List[Tuple[str, Optional[str]]]) -> str:
+        parts = []
+        for text, mark in runs:
+            if mark == "del":
+                parts.append(f"[DELETED: {text}]")
+            elif mark == "add":
+                parts.append(f"[ADDED: {text}]")
+            else:
+                parts.append(text)
+        return "".join(parts)
 
-    for block in text_dict["blocks"]:
-        if block.get("type") != 0:  # Skip non-text blocks
-            continue
-
-        block_parts = []
-        for line_obj in block.get("lines", []):
-            line_parts = []
-            for span in line_obj.get("spans", []):
-                text = span.get("text", "")
-                bbox = tuple(span["bbox"])
-
-                # Check if this span has formatting
-                if bbox in strikethrough_spans:
-                    line_parts.append(f"[DELETED: {text}]")
-                elif bbox in underline_spans:
-                    line_parts.append(f"[ADDED: {text}]")
-                else:
-                    line_parts.append(text)
-
-            block_parts.append("".join(line_parts))
-
-        result_parts.append("\n".join(block_parts))
-
-    return "\n\n".join(result_parts)
+    return "\n\n".join(
+        "\n".join(render_line(line_runs) for line_runs in block_runs)
+        for block_runs in page_runs
+    )
 
 
 class PdfExtractor:
@@ -369,8 +550,9 @@ class PdfExtractor:
             ocr_dpi: DPI for image rendering when using OCR (higher = better quality, slower)
                     Default 200 - balances quality vs memory on multi-core VPS
             detect_legislative_formatting: If True, detect strikethrough (deletions) and underline (additions)
-                    in legislative documents with formatting legends and tag them as [DELETED: ...] and [ADDED: ...]
-                    Only activates if document contains legislative formatting legend. Default: True (safe for all PDFs)
+                    in legislative documents and tag them as [DELETED: ...] and [ADDED: ...].
+                    Activates from a formatting legend or sufficient geometric mark evidence.
+                    Default: True.
             max_ocr_workers: Maximum parallel OCR workers. Default: CPU count (min 1, max 4).
                     OCR is CPU-bound so more workers than cores causes thrashing.
             ocr_enabled: If False, pages below ocr_threshold keep their (thin) text-layer
@@ -634,10 +816,33 @@ class PdfExtractor:
         ocr_tasks = []  # List of (page_num, png_bytes, original_text)
         ocr_pending = 0  # below-threshold pages skipped because ocr_enabled=False
 
-        # Check for legislative legend once (if formatting detection enabled)
-        use_formatting = self.detect_legislative_formatting and _has_legislative_legend(doc)
-        if use_formatting:
-            logger.info("[PyMuPDF] Legislative formatting detected - tagging additions/deletions")
+        # Activation is deterministic and auditable: a textual legend OR
+        # geometric strike evidence (spans crossed mid-height by strike
+        # rects). The legend-only gate missed every real-world redline that
+        # lacked a legend sentence -- deletions then extracted as plain text,
+        # indistinguishable from operative language.
+        use_formatting = False
+        if self.detect_legislative_formatting:
+            legend = _has_legislative_legend(doc)
+            evidence = {"struck_spans": 0, "underlined_spans": 0, "pages_scanned": 0}
+            if not legend:
+                evidence = count_redline_evidence(doc)
+            use_formatting = legend or _redline_evidence_activates(
+                evidence["struck_spans"], evidence["underlined_spans"]
+            )
+            if use_formatting:
+                logger.info(
+                    "[PyMuPDF] Legislative formatting detected - tagging additions/deletions",
+                    activated_by="legend" if legend else "geometry",
+                    struck_spans=evidence["struck_spans"],
+                    underlined_spans=evidence["underlined_spans"],
+                )
+            elif evidence["struck_spans"] > 0:
+                logger.info(
+                    "[PyMuPDF] Strike marks below activation threshold, not tagging",
+                    struck_spans=evidence["struck_spans"],
+                    threshold=REDLINE_ACTIVATION_STRUCK_SPANS,
+                )
 
         # Per-page sanity cap. A single PDF page should never yield more than
         # a few KB of real text. When PyMuPDF sees a broken font CMap or a
@@ -655,7 +860,7 @@ class PdfExtractor:
             if use_formatting:
                 page_text = _extract_text_with_formatting(page, page_num + 1)
             else:
-                page_text = page.get_text(sort=True)  # type: ignore[attr-defined]
+                page_text = cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
 
             if len(page_text) > _MAX_PAGE_CHARS:
                 logger.warning(
@@ -812,10 +1017,11 @@ class PdfExtractor:
             ) from e
 
     def extract_from_bytes(self, pdf_bytes: bytes, extract_links: bool = False) -> Dict[str, Any]:
-        """Extract text from document bytes (PDF, DOCX, legacy .doc, RTF).
+        """Extract text from document bytes (PDF, Office documents, or RTF).
 
         Detects format from magic bytes and routes to the appropriate extractor.
-        PDF and DOCX go through PyMuPDF; legacy .doc uses antiword; RTF uses striprtf.
+        PDF and DOCX go through PyMuPDF; legacy .doc uses antiword; RTF uses
+        striprtf; PPTX and XLSX use their corresponding Office libraries.
 
         Args:
             pdf_bytes: Document content as bytes
@@ -871,6 +1077,21 @@ class PdfExtractor:
                 }
             raise ExtractionError("PPTX extraction failed", document_type="pptx")
 
+        # XLSX
+        if fmt == "xlsx":
+            text = _extract_xlsx(pdf_bytes)
+            if text:
+                extraction_time = time.time() - start_time
+                logger.info("extracted xlsx via openpyxl", chars=len(text), extraction_time=round(extraction_time, 2))
+                return {
+                    "success": True,
+                    "text": text,
+                    "method": "openpyxl",
+                    "page_count": 0,
+                    "extraction_time": extraction_time,
+                }
+            raise ExtractionError("XLSX extraction failed", document_type="xlsx")
+
         # PDF, DOCX, and unknown formats -- PyMuPDF handles all of these
         try:
             with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
@@ -907,7 +1128,7 @@ def extract_document_file(pdf_path: str, ocr_threshold: int, ocr_dpi: int,
     and this one costs a parsing-stack import instead of the analyzer's
     HTTP/LLM stack. Reads the document from disk (parent wrote a temp file
     and released the bytes) and routes through extract_from_bytes for
-    format sniffing -- process attachments arrive as PDF/DOCX/RTF/PPTX.
+    format sniffing -- process attachments arrive as PDF/DOCX/RTF/PPTX/XLSX.
     """
     with open(pdf_path, "rb") as f:
         data = f.read()
