@@ -208,6 +208,14 @@ Root crontab (`sudo crontab -l`) has 11 active jobs:
 | Daily 2 PM UTC | Happening Today email (9am EST) |
 | Sundays 2 AM UTC | Watchlist sync |
 
+**Not yet scheduled** (added 2026-08-04, run manually until cadence is proven):
+`scripts/sweep_minutes.py` fills `meetings.minutes_url` for meetings the 14-day
+resync window left behind (minutes often publish 2-4 weeks post-meeting; listing
+fetches only) — suggested weekly. `scripts/ingest_minutes.py` pulls minutes bytes
+into the R2 corpus via the analyzer's extraction path (no LLM calls; URL-identity
+deduped, failed extracts never refetch) — suggested daily after sync. Sweep before
+ingest.
+
 ---
 
 ## Monitoring
