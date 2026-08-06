@@ -7,6 +7,7 @@ Usage:
     python scripts/import_census_boundaries.py --download   # Download shapefiles
     python scripts/import_census_boundaries.py --import     # Import to staging table
     python scripts/import_census_boundaries.py --match      # Match to cities
+    python scripts/import_census_boundaries.py --counties   # County boundaries (carto 500k)
     python scripts/import_census_boundaries.py --all        # Full pipeline
 
 Requirements:
@@ -29,6 +30,13 @@ logger = get_logger(__name__).bind(component="census_import")
 
 # Census TIGER/Line FTP base URL
 TIGER_BASE_URL = "https://www2.census.gov/geo/tiger/TIGER2023/PLACE"
+
+# County boundaries come from the cartographic boundary series, not TIGER/Line:
+# county legal boundaries extend into open water (Great Lakes, coastal buffers),
+# which reads as wrong on display surfaces. The carto file is shoreline-clipped,
+# pre-generalized to 1:500k, and one national zip covers every state.
+CARTO_COUNTY_FILENAME = "cb_2023_us_county_500k.zip"
+CARTO_COUNTY_URL = f"https://www2.census.gov/geo/tiger/GENZ2023/shp/{CARTO_COUNTY_FILENAME}"
 
 # State FIPS codes
 STATE_FIPS = {
@@ -236,10 +244,13 @@ async def match_cities() -> None:
 
     try:
         # Get our cities without geometry
+        # Cities only: the fuzzy fallback below once handed Clallam County a
+        # 0.6 sq mi place polygon. Counties match in match_counties(); other
+        # types (school_district, ...) have no PLACE representation at all.
         cities = await conn.fetch("""
             SELECT banana, name, state
             FROM jurisdictions
-            WHERE geom IS NULL
+            WHERE geom IS NULL AND type = 'city'
             ORDER BY state, name
         """)
 
@@ -303,6 +314,138 @@ async def match_cities() -> None:
         await conn.close()
 
 
+async def download_county_shapefile() -> None:
+    """Download the national cartographic boundary county shapefile."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    dest = DATA_DIR / CARTO_COUNTY_FILENAME
+
+    if dest.exists():
+        logger.debug("county shapefile exists, skipping")
+        return
+
+    logger.info("downloading county boundaries", url=CARTO_COUNTY_URL)
+    result = subprocess.run(
+        ["wget", "-q", "-O", str(dest), CARTO_COUNTY_URL],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error("download failed", stderr=result.stderr)
+        dest.unlink(missing_ok=True)
+
+
+async def import_counties_to_staging() -> None:
+    """Import county shapefile to census_counties staging table."""
+    dsn = config.get_postgres_dsn()
+
+    shapefile = DATA_DIR / CARTO_COUNTY_FILENAME
+    if not shapefile.exists():
+        logger.error("county shapefile not found", path=str(shapefile))
+        return
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute("DROP TABLE IF EXISTS census_counties CASCADE")
+    finally:
+        await conn.close()
+
+    result = subprocess.run(
+        [
+            "ogr2ogr",
+            "-f", "PostgreSQL",
+            f"PG:{dsn}",
+            f"/vsizip/{shapefile}",
+            "-nln", "census_counties",
+            "-nlt", "MULTIPOLYGON",
+            "-t_srs", "EPSG:4326",
+            "-overwrite",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error("ogr2ogr failed", stderr=result.stderr)
+        return
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_census_counties_namelsad
+            ON census_counties (UPPER(namelsad), stusps)
+        """)
+        count = await conn.fetchval("SELECT COUNT(*) FROM census_counties")
+        logger.info("county import complete", total_counties=count)
+    finally:
+        await conn.close()
+
+
+# Consolidated city-counties whose registered name differs from the Census
+# county record that carries their territory.
+COUNTY_ALIASES = {
+    ("MACON BIBB COUNTY", "GA"): "BIBB COUNTY",
+}
+
+
+async def match_counties() -> None:
+    """Match county jurisdictions to Census counties and populate geom.
+
+    Overwrites existing geom on match: any geometry a county row carried
+    before this existed came from the place matcher and is wrong.
+    """
+    dsn = config.get_postgres_dsn()
+    conn = await asyncpg.connect(dsn)
+
+    try:
+        counties = await conn.fetch("""
+            SELECT banana, name, state
+            FROM jurisdictions
+            WHERE type = 'county'
+            ORDER BY state, name
+        """)
+
+        logger.info("matching counties", total=len(counties))
+
+        matched = 0
+        unmatched = []
+
+        for county in counties:
+            name_upper = county["name"].strip().upper()
+            name_upper = COUNTY_ALIASES.get((name_upper, county["state"]), name_upper)
+
+            # NAMELSAD carries the full legal name ("Oakland County",
+            # "Terrebonne Parish"); NAME is the bare name ("Oakland").
+            row = await conn.fetchrow("""
+                SELECT wkb_geometry
+                FROM census_counties
+                WHERE UPPER(namelsad) = $1 AND stusps = $2
+            """, name_upper, county["state"])
+            if not row:
+                row = await conn.fetchrow("""
+                    SELECT wkb_geometry
+                    FROM census_counties
+                    WHERE UPPER(name) = $1 AND stusps = $2
+                """, name_upper, county["state"])
+
+            if row:
+                await conn.execute("""
+                    UPDATE jurisdictions SET geom = $1 WHERE banana = $2
+                """, row["wkb_geometry"], county["banana"])
+                matched += 1
+            else:
+                unmatched.append(county)
+                logger.warning(
+                    "no county match",
+                    banana=county["banana"], name=county["name"], state=county["state"],
+                )
+
+        logger.info("county matching complete", matched=matched, unmatched=len(unmatched))
+        for county in unmatched:
+            print(f"  {county['banana']}: {county['name']}, {county['state']}")
+
+    finally:
+        await conn.close()
+
+
 async def report_status() -> None:
     """Report geometry coverage status."""
     dsn = config.get_postgres_dsn()
@@ -314,9 +457,19 @@ async def report_status() -> None:
         without_geom = await conn.fetchval("SELECT COUNT(*) FROM jurisdictions WHERE geom IS NULL")
 
         print("\nGeometry Coverage:")
-        print(f"  Total cities: {total}")
+        print(f"  Total jurisdictions: {total}")
         print(f"  With geometry: {with_geom} ({100*with_geom/total:.1f}%)")
         print(f"  Without geometry: {without_geom}")
+
+        print("\nBy Type:")
+        rows = await conn.fetch("""
+            SELECT type, COUNT(*) AS total, COUNT(geom) AS with_geom
+            FROM jurisdictions
+            GROUP BY type
+            ORDER BY COUNT(*) DESC
+        """)
+        for row in rows:
+            print(f"  {row['type']}: {row['with_geom']} of {row['total']}")
 
         # By state
         print("\nBy State (top 10 missing):")
@@ -342,6 +495,7 @@ async def main():
     parser.add_argument("--download", action="store_true", help="Download shapefiles")
     parser.add_argument("--import", dest="import_", action="store_true", help="Import to staging")
     parser.add_argument("--match", action="store_true", help="Match to cities")
+    parser.add_argument("--counties", action="store_true", help="Download + import + match county boundaries")
     parser.add_argument("--status", action="store_true", help="Report status")
     parser.add_argument("--all", action="store_true", help="Full pipeline")
     args = parser.parse_args()
@@ -355,10 +509,15 @@ async def main():
     if args.all or args.match:
         await match_cities()
 
+    if args.all or args.counties:
+        await download_county_shapefile()
+        await import_counties_to_staging()
+        await match_counties()
+
     if args.status or args.all:
         await report_status()
 
-    if not any([args.download, args.import_, args.match, args.status, args.all]):
+    if not any([args.download, args.import_, args.match, args.counties, args.status, args.all]):
         parser.print_help()
 
 
