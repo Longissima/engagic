@@ -16,13 +16,10 @@ Rate limiting is handled by the summarizer via Gemini's retry instructions.
 """
 
 import asyncio
-import html as html_module
 import os
-import re
 import tempfile
 import time
 from typing import AsyncIterator, List, Dict, Any, Optional, Tuple, cast
-from urllib.parse import urljoin
 
 import aiohttp
 
@@ -38,6 +35,14 @@ from analysis.llm.input_budget import (
     prepare_item_text,
 )
 from pipeline.protocols import MetricsCollector, NullMetrics
+from pipeline.document_artifacts import (
+    DocumentArtifact,
+    DocumentFormat,
+    extract_document_links,
+    make_artifact,
+    sanitize_html_text,
+    verify_tls_for_url,
+)
 from pipeline.utils import attachment_identity
 from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 
@@ -45,51 +50,15 @@ from config import config, get_logger
 
 logger = get_logger(__name__).bind(component="pipeline")
 
-# Patterns for extracting PDF links from HTML attachment pages.
-# Ordered by specificity: direct .pdf links first, then vendor-specific patterns.
-_PDF_HREF_RE = re.compile(
-    r'href=["\']([^"\']*\.pdf(?:\?[^"\']*)?)["\']',
-    re.IGNORECASE,
-)
-_VENDOR_DOC_HREF_RE = re.compile(
-    r'href=["\']([^"\']*(?:'
-    r'/ViewFile/|/DocumentCenter/View/|/LinkClick\.aspx'
-    r'|/MetaViewer\.php|cloudfront\.net|s3\.amazonaws\.com'
-    r')[^"\']*)["\']',
-    re.IGNORECASE,
-)
-
-
 def _extract_best_pdf_link(html_bytes: bytes, base_url: str) -> Optional[str]:
-    """Parse an HTML attachment page for the best PDF download link.
-
-    Handles the generic case where a URL serves an HTML detail page
-    instead of the actual PDF. Looks for direct .pdf hrefs first,
-    then vendor-specific document viewer patterns.
-
-    Returns absolute URL or None.
-    """
-    try:
-        text = html_bytes.decode("utf-8", errors="replace")
-    except Exception:
-        return None
-
-    # Direct .pdf links -- strongest signal
-    pdf_matches = _PDF_HREF_RE.findall(text)
-    if pdf_matches:
-        return urljoin(base_url, html_module.unescape(pdf_matches[0]))
-
-    # Vendor document viewer URLs (ViewFile, DocumentCenter, MetaViewer, etc.)
-    vendor_matches = _VENDOR_DOC_HREF_RE.findall(text)
-    if vendor_matches:
-        return urljoin(base_url, html_module.unescape(vendor_matches[0]))
-
-    return None
+    """Compatibility wrapper for the former PDF-only HTML resolver."""
+    links = extract_document_links(html_bytes, base_url)
+    return links[0] if links else None
 
 
-def _extract_pdf_in_subprocess(pdf_path, ocr_threshold, ocr_dpi,
+def _extract_pdf_in_subprocess(document_path, ocr_threshold, ocr_dpi,
                                detect_legislative_formatting, max_ocr_workers):
-    """Run PDF extraction in an isolated, resource-capped subprocess.
+    """Run document extraction in an isolated, resource-capped subprocess.
 
     Thin translation over parsing.subprocess_guard.run_guarded -- the shared
     containment used by every heavy PDF path (this one and the sync chunker).
@@ -111,7 +80,7 @@ def _extract_pdf_in_subprocess(pdf_path, ocr_threshold, ocr_dpi,
     try:
         return run_guarded(
             extract_document_file,
-            (pdf_path, ocr_threshold, ocr_dpi, detect_legislative_formatting, max_ocr_workers),
+            (document_path, ocr_threshold, ocr_dpi, detect_legislative_formatting, max_ocr_workers),
             timeout=600,
             rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
         )

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS jurisdictions (
     participation JSONB,  -- Jurisdiction-level participation config: {testimony_url, testimony_email, process_url}
     population INTEGER,  -- Population from Census data
     geom geometry(MultiPolygon, 4326),  -- Boundary from Census TIGER/Line (WGS84)
+    last_synced_at TIMESTAMP,  -- Most recent aggregate-completed vendor sync; NULL means never synced
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (county_banana) REFERENCES jurisdictions(banana) ON DELETE SET NULL,
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     packet_url TEXT,
     minutes_url TEXT,  -- Minutes doc/page; published post-meeting, fills in on resync (migration 026)
     summary TEXT,
+    summary_updated_at TIMESTAMP,
     participation JSONB,  -- Complex structure: {email, phone, zoom}, keep as JSONB
     status TEXT,
     processing_status TEXT DEFAULT 'pending',
@@ -131,6 +133,7 @@ CREATE TABLE IF NOT EXISTS items (
     agenda_number TEXT,
     sponsors JSONB,        -- Array of sponsor names
     summary TEXT,
+    summary_updated_at TIMESTAMP,
     prompts_version TEXT,  -- Prompts-file version that produced the summary (NULL = pre-2026-06; backfill target)
     topics JSONB,          -- Will normalize to item_topics table
     quality_score REAL,    -- Denormalized from ratings for efficient queries
@@ -199,6 +202,10 @@ CREATE TABLE IF NOT EXISTS queue (
     failed_at TIMESTAMP,
     error_message TEXT,
     processing_metadata JSONB,  -- Was TEXT, now JSONB
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    retry_at TIMESTAMP,
+    work_version TEXT,
     FOREIGN KEY (banana) REFERENCES jurisdictions(banana) ON DELETE CASCADE,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
@@ -217,11 +224,20 @@ CREATE TABLE IF NOT EXISTS batch_jobs (
     cache_name TEXT,
     prompts_version TEXT,
     meeting_meta JSONB,
+    submission_key TEXT,
+    submit_attempts INTEGER NOT NULL DEFAULT 0,
+    poll_attempts INTEGER NOT NULL DEFAULT 0,
+    poll_error_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_poll_errors INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'submitted'
         CHECK (status IN ('submitted', 'collected', 'failed')),
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_polled_at TIMESTAMP,
+    next_poll_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_error_at TIMESTAMP,
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMP,
     collected_at TIMESTAMP,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
     FOREIGN KEY (banana) REFERENCES jurisdictions(banana) ON DELETE CASCADE
@@ -231,6 +247,98 @@ CREATE INDEX IF NOT EXISTS idx_batch_jobs_open
     WHERE status = 'submitted';
 CREATE INDEX IF NOT EXISTS idx_batch_jobs_meeting
     ON batch_jobs (meeting_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_jobs_open_submission_key
+    ON batch_jobs (submission_key)
+    WHERE status = 'submitted';
+CREATE INDEX IF NOT EXISTS idx_batch_jobs_pollable
+    ON batch_jobs (next_poll_at, created_at)
+    WHERE status = 'submitted';
+
+-- Durable lifecycle telemetry. Queue rows are current desired state; these
+-- append-only records preserve run/attempt/stage history across re-enqueues.
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id BIGSERIAL PRIMARY KEY,
+    run_key TEXT NOT NULL UNIQUE,
+    command TEXT NOT NULL,
+    targets JSONB,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+    host TEXT,
+    process_id INTEGER,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    heartbeat_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status
+    ON pipeline_runs (status, heartbeat_at);
+
+CREATE TABLE IF NOT EXISTS job_attempts (
+    id BIGSERIAL PRIMARY KEY,
+    queue_id BIGINT REFERENCES queue(id) ON DELETE SET NULL,
+    run_id BIGINT REFERENCES pipeline_runs(id) ON DELETE SET NULL,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+    job_type TEXT NOT NULL,
+    lane TEXT,
+    banana TEXT,
+    meeting_id TEXT,
+    matter_id TEXT,
+    work_version TEXT,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'succeeded', 'partial',
+                          'retryable_failure', 'terminal_failure', 'abandoned')),
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    heartbeat_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_type TEXT,
+    error_message TEXT,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (queue_id, attempt_number)
+);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_run
+    ON job_attempts (run_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_status
+    ON job_attempts (status, heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_job_attempts_entity
+    ON job_attempts (job_type, banana, meeting_id, matter_id);
+
+CREATE TABLE IF NOT EXISTS pipeline_stage_events (
+    id BIGSERIAL PRIMARY KEY,
+    attempt_id BIGINT REFERENCES job_attempts(id) ON DELETE CASCADE,
+    run_id BIGINT REFERENCES pipeline_runs(id) ON DELETE SET NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'succeeded', 'failed', 'skipped')),
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_type TEXT,
+    error_message TEXT,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_stage_attempt
+    ON pipeline_stage_events (attempt_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_pipeline_stage_run
+    ON pipeline_stage_events (run_id, stage, started_at);
+
+CREATE TABLE IF NOT EXISTS pipeline_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    event_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'publishing', 'published', 'failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_error TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_ready
+    ON pipeline_outbox (next_attempt_at, id)
+    WHERE status IN ('pending', 'failed');
 
 -- Ground-truth corpus index (see migration 025 / docs/CORPUS_ARCHITECTURE.md).
 -- Original bytes and extracted text live in R2 (engagic-corpus bucket),
@@ -615,6 +723,9 @@ CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
 CREATE INDEX IF NOT EXISTS idx_queue_city ON queue(banana);
 -- Composite index for get_next_for_processing() query (covers status, priority, created_at)
 CREATE INDEX IF NOT EXISTS idx_queue_processing ON queue(status, priority DESC, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_queue_ready
+    ON queue(status, retry_at, priority DESC, created_at ASC)
+    WHERE status = 'pending';
 
 -- Tenant tables
 CREATE INDEX IF NOT EXISTS idx_tenant_coverage_city ON tenant_coverage(banana);

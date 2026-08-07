@@ -10,6 +10,7 @@ Responsibilities:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -18,7 +19,7 @@ import tempfile
 import time
 from importlib.resources import files
 from json import JSONDecodeError
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -37,6 +38,12 @@ logger = get_logger(__name__).bind(component="analyzer")
 # Model thresholds
 FLASH_LITE_MAX_CHARS = 200000  # Use Flash-Lite for documents under ~200K chars
 FLASH_LITE_MAX_PAGES = 50  # Or under 50 pages
+
+# The google-genai client used here is synchronous. Keep every Batch/Files/
+# Caches call behind one bounded async boundary so provider I/O cannot stall
+# the event loop or grow the default thread pool without limit.
+BATCH_SDK_CONCURRENCY = 4
+BATCH_SUBMIT_CONCURRENCY = 2
 
 
 
@@ -78,6 +85,8 @@ class GeminiSummarizer:
             api_key=self.api_key,
             http_options=types.HttpOptions(timeout=300_000),
         )
+        self._batch_sdk_semaphore = asyncio.Semaphore(BATCH_SDK_CONCURRENCY)
+        self._batch_submit_semaphore = asyncio.Semaphore(BATCH_SUBMIT_CONCURRENCY)
 
         # Model IDs (env-overridable via config). Names reflect role, not generation:
         # primary = default workhorse; small_doc = cost-saver when USE_FLASH_LITE + small input.
@@ -100,6 +109,11 @@ class GeminiSummarizer:
                 self.prompts = json.load(f)
 
         logger.info("prompts loaded", prompt_categories=len(self.prompts), version=self.prompts_version)
+
+    async def _run_batch_sdk(self, call: Callable[..., Any], /, *args, **kwargs):
+        """Run one synchronous Batch/Files/Caches SDK call off-loop."""
+        async with self._batch_sdk_semaphore:
+            return await asyncio.to_thread(call, *args, **kwargs)
 
     def _calculate_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
         """Calculate API cost in dollars based on model and token usage
@@ -468,7 +482,8 @@ class GeminiSummarizer:
 
         try:
             logger.info("creating gemini cache for shared context", token_count=token_count)
-            cache = self.client.caches.create(
+            cache = await self._run_batch_sdk(
+                self.client.caches.create,
                 model=self.primary_model,
                 config=types.CreateCachedContentConfig(
                     display_name=f"meeting-{meeting_id}-shared-docs",
@@ -478,7 +493,7 @@ class GeminiSummarizer:
             )
             logger.info("cache created", cache_name=cache.name, token_count=token_count, ttl="48h")
             return cache.name
-        except (ValueError, TypeError, AttributeError, LLMError) as e:
+        except Exception as e:  # Best-effort cache optimization; submission can inline.
             logger.warning(
                 "failed to create cache proceeding without caching",
                 error=str(e),
@@ -486,7 +501,7 @@ class GeminiSummarizer:
             )
             return None
 
-    def delete_shared_context_cache(self, cache_name: Optional[str]) -> None:
+    async def delete_shared_context_cache(self, cache_name: Optional[str]) -> None:
         """Best-effort cache deletion once a meeting's last chunk is collected.
 
         Not load-bearing: if this is skipped (e.g. a crash between collect and
@@ -495,9 +510,9 @@ class GeminiSummarizer:
         if not cache_name:
             return
         try:
-            self.client.caches.delete(name=cache_name)
+            await self._run_batch_sdk(self.client.caches.delete, name=cache_name)
             logger.info("cache deleted", cache_name=cache_name)
-        except (ValueError, AttributeError, LLMError) as e:
+        except Exception as e:  # Best-effort cleanup; TTL is the final backstop.
             logger.warning(
                 "failed to delete cache",
                 cache_name=cache_name,
@@ -510,6 +525,18 @@ class GeminiSummarizer:
         item_requests: List[Dict[str, Any]],
         cache_name: Optional[str] = None,
         shared_context: Optional[str] = None,
+        *,
+        submission_scope: Optional[str] = None,
+        reserve_submission: Optional[
+            Callable[[Dict[str, Any]], Awaitable[bool]]
+        ] = None,
+        record_submission: Optional[
+            Callable[[Dict[str, Any]], Awaitable[None]]
+        ] = None,
+        fail_submission: Optional[
+            Callable[[Dict[str, Any]], Awaitable[None]]
+        ] = None,
+        include_failures: bool = False,
     ) -> List[Dict[str, Any]]:
         """Submit item summarization to the Gemini Batch API, fire-and-forget.
 
@@ -573,14 +600,104 @@ class GeminiSummarizer:
             chunks.append(current)
         logger.info("split into chunks", num_chunks=len(chunks), max_chunk_items=max_chunk_items)
 
-        submitted: List[Dict[str, Any]] = []
-        for chunk_idx, chunk in enumerate(chunks):
-            descriptor = await self._submit_one_chunk(
-                chunk, chunk_idx + 1, cache_name, shared_context
+        async def submit_chunk(
+            chunk_idx: int, chunk: List[Dict[str, Any]]
+        ) -> Dict[str, Any]:
+            chunk_num = chunk_idx + 1
+            item_ids = [str(req["item_id"]) for req in chunk]
+            key_material = "\x1f".join(
+                [
+                    submission_scope or "unscoped",
+                    self.prompts_version,
+                    self.primary_model,
+                    str(chunk_num),
+                    *item_ids,
+                ]
             )
-            if descriptor:
-                submitted.append(descriptor)
-        return submitted
+            descriptor: Dict[str, Any] = {
+                "submission_key": hashlib.sha256(
+                    key_material.encode("utf-8")
+                ).hexdigest(),
+                "item_ids": item_ids,
+                "chunk_num": chunk_num,
+            }
+
+            if reserve_submission is not None:
+                try:
+                    reserved = await reserve_submission(descriptor)
+                except Exception as exc:
+                    logger.error(
+                        "failed to reserve batch submission",
+                        chunk_num=chunk_num,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
+                    return {**descriptor, "error": str(exc), "stage": "reserve"}
+                if not reserved:
+                    # Another submitter already owns this exact logical chunk.
+                    # Its durable submitted row is the idempotency authority.
+                    return {**descriptor, "already_reserved": True}
+
+            async with self._batch_submit_semaphore:
+                provider_descriptor = await self._submit_one_chunk(
+                    chunk,
+                    chunk_num,
+                    cache_name,
+                    shared_context,
+                    submission_key=descriptor["submission_key"],
+                )
+            descriptor.update(provider_descriptor)
+
+            if descriptor.get("gemini_job_name") and record_submission is not None:
+                # The provider job now exists. Retry durable activation before
+                # yielding, collapsing the create/record window to process
+                # death or a sustained database outage.
+                last_error: Optional[Exception] = None
+                for attempt in range(4):
+                    try:
+                        await record_submission(descriptor)
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt < 3:
+                            await asyncio.sleep(2**attempt)
+                if last_error is not None:
+                    logger.error(
+                        "provider batch created but durable activation failed",
+                        chunk_num=chunk_num,
+                        gemini_job_name=descriptor["gemini_job_name"],
+                        submission_key=descriptor["submission_key"],
+                        error=str(last_error),
+                    )
+                    descriptor.update(
+                        error=str(last_error), stage="record_submission"
+                    )
+
+            elif descriptor.get("error") and fail_submission is not None:
+                try:
+                    await fail_submission(descriptor)
+                except Exception as exc:
+                    logger.error(
+                        "failed to persist batch submit failure",
+                        chunk_num=chunk_num,
+                        submission_key=descriptor["submission_key"],
+                        error=str(exc),
+                    )
+            return descriptor
+
+        # gather preserves input order while tasks execute independently, so
+        # descriptors remain deterministic without serial provider latency.
+        descriptors = await asyncio.gather(
+            *(submit_chunk(idx, chunk) for idx, chunk in enumerate(chunks))
+        )
+        if include_failures:
+            return descriptors
+        return [
+            descriptor
+            for descriptor in descriptors
+            if descriptor.get("gemini_job_name") and not descriptor.get("error")
+        ]
 
     def _extract_response_text(self, response_data: Dict[str, Any]) -> Optional[str]:
         """Extract text from nested Gemini response structure
@@ -814,7 +931,9 @@ class GeminiSummarizer:
             "JOB_STATE_EXPIRED",
         }
 
-        batch_job = self.client.batches.get(name=gemini_job_name)
+        batch_job = await self._run_batch_sdk(
+            self.client.batches.get, name=gemini_job_name
+        )
         state = batch_job.state.name if batch_job.state else "unknown"
 
         if state not in terminal_states:
@@ -835,7 +954,9 @@ class GeminiSummarizer:
 
         response_file_name = batch_job.dest.file_name
         logger.info("downloading response file", file_name=response_file_name)
-        response_content = self.client.files.download(file=response_file_name)
+        response_content = await self._run_batch_sdk(
+            self.client.files.download, file=response_file_name
+        )
         response_text = response_content.decode("utf-8")
 
         # Response parsing keys off the per-line 'key' (== item_id); the minimal
@@ -846,6 +967,20 @@ class GeminiSummarizer:
             result = self._parse_batch_response_line(line, line_num, request_map)
             if result:
                 results.append(result)
+
+        # Provider success does not guarantee one response per input line.
+        # Surface omissions explicitly so the collector promptly requeues
+        # those items instead of silently declaring them complete.
+        returned_ids = {str(result.get("item_id")) for result in results}
+        for item_id in item_ids:
+            if str(item_id) not in returned_ids:
+                results.append(
+                    {
+                        "item_id": item_id,
+                        "success": False,
+                        "error": "Batch response omitted item",
+                    }
+                )
 
         successful = sum(1 for r in results if r.get("success"))
         logger.info(
@@ -861,8 +996,9 @@ class GeminiSummarizer:
         chunk_requests: List[Dict[str, Any]],
         chunk_num: int,
         cache_name: Optional[str] = None,
-        shared_context: Optional[str] = None
-    ) -> Optional[Dict[str, Any]]:
+        shared_context: Optional[str] = None,
+        submission_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Build, upload, and submit one chunk as a Gemini batch job.
 
         Fire-and-forget: returns as soon as the job is created. Does NOT wait
@@ -875,12 +1011,12 @@ class GeminiSummarizer:
             shared_context: shared text inlined per request when not cached
 
         Returns:
-            {'gemini_job_name', 'item_ids', 'chunk_num'} on success, or None if
-            submission failed after retries (items stay unsummarized; the
-            enqueue gate re-runs the meeting on the next sync).
+            {'gemini_job_name', 'item_ids', 'chunk_num', 'attempts'} on success,
+            or the same identity fields plus {'error', 'attempts'} on failure.
         """
-        max_retries = 3
-        retry_delay = 30  # Start with 30s delay (Flash Lite: 4M TPM)
+        max_retries = 4
+        retry_delay = 5
+        item_ids = [str(req["item_id"]) for req in chunk_requests]
 
         for attempt in range(max_retries):
             temp_path = None
@@ -890,7 +1026,7 @@ class GeminiSummarizer:
                     mode='w', suffix='.json', delete=False
                 )
                 temp_path = temp_file.name
-                item_ids: List[str] = []
+                item_ids = []
 
                 for i, req in enumerate(chunk_requests):
                     item_title = limit_item_title(req["title"])
@@ -971,9 +1107,11 @@ class GeminiSummarizer:
                     max_retries=max_retries
                 )
 
-                uploaded_file = self.client.files.upload(
+                display_key = submission_key[:24] if submission_key else str(time.time())
+                uploaded_file = await self._run_batch_sdk(
+                    self.client.files.upload,
                     file=temp_path,
-                    config={"display_name": f"batch-chunk-{chunk_num}-{time.time()}"}
+                    config={"display_name": f"engagic-input-{display_key}"},
                 )
 
                 if not uploaded_file.name:
@@ -985,15 +1123,18 @@ class GeminiSummarizer:
                 logger.info("submitting batch job", chunk_num=chunk_num)
 
                 try:
-                    batch_job = self.client.batches.create(
+                    batch_job = await self._run_batch_sdk(
+                        self.client.batches.create,
                         model=self.primary_model,
                         src=uploaded_file.name,
-                        config={"display_name": f"chunk-{chunk_num}-{time.time()}"},
+                        config={"display_name": f"engagic-batch-{display_key}"},
                     )
                 except Exception:
                     # Don't leak the uploaded JSONL into the Files quota
                     try:
-                        self.client.files.delete(name=uploaded_file.name)
+                        await self._run_batch_sdk(
+                            self.client.files.delete, name=uploaded_file.name
+                        )
                     except Exception:
                         pass
                     raise
@@ -1011,18 +1152,35 @@ class GeminiSummarizer:
                     "gemini_job_name": batch_job.name,
                     "item_ids": item_ids,
                     "chunk_num": chunk_num,
+                    "attempts": attempt + 1,
                 }
 
             except Exception as e:  # Intentionally broad: retry logic with specific error checks
                 error_str = str(e)
                 is_quota_error = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
+                is_transient = is_quota_error or any(
+                    marker in error_str.upper()
+                    for marker in (
+                        "408",
+                        "500",
+                        "502",
+                        "503",
+                        "504",
+                        "UNAVAILABLE",
+                        "INTERNAL",
+                        "DEADLINE_EXCEEDED",
+                        "TIMEOUT",
+                        "CONNECTION",
+                    )
+                )
 
                 self.metrics.record_error(component="analyzer", error=e)
 
-                if is_quota_error and attempt < max_retries - 1:
-                    backoff_delay = retry_delay * (2**attempt)
+                if is_transient and attempt < max_retries - 1:
+                    base_delay = 30 if is_quota_error else retry_delay
+                    backoff_delay = min(120, base_delay * (2**attempt))
                     logger.warning(
-                        "chunk submit hit quota limit retrying",
+                        "transient chunk submit failure retrying",
                         chunk_num=chunk_num,
                         attempt=attempt + 1,
                         max_retries=max_retries,
@@ -1033,7 +1191,12 @@ class GeminiSummarizer:
 
                 # Final attempt failed or non-quota error
                 logger.error("batch chunk submit failed", chunk_num=chunk_num, attempts=attempt + 1, error=error_str, error_type=type(e).__name__)
-                return None
+                return {
+                    "item_ids": item_ids,
+                    "chunk_num": chunk_num,
+                    "attempts": attempt + 1,
+                    "error": error_str,
+                }
 
             finally:
                 # The uploaded copy lives server-side now; drop the local temp.
@@ -1043,7 +1206,12 @@ class GeminiSummarizer:
                 except OSError as cleanup_error:
                     logger.warning("failed to cleanup temp file", path=temp_path, error=str(cleanup_error), error_type=type(cleanup_error).__name__)
 
-        return None
+        return {
+            "item_ids": item_ids,
+            "chunk_num": chunk_num,
+            "attempts": max_retries,
+            "error": "Batch submission retries exhausted",
+        }
 
     def _get_prompt(self, category: str, prompt_type: str, **variables) -> str:
         """Get prompt from JSON and format with variables

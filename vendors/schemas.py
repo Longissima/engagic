@@ -7,7 +7,7 @@ Catches type errors early instead of failing at SQLite INSERT time.
 
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, field_validator, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AttachmentSchema(BaseModel):
@@ -16,7 +16,10 @@ class AttachmentSchema(BaseModel):
 
     name: str
     url: str
-    type: str  # pdf, doc, spreadsheet, unknown
+    # PrimeGov's durable history endpoint does not expose a media type. The
+    # downloader detects it later, so absence here is legitimate, not a broken
+    # attachment contract.
+    type: str = "unknown"  # pdf, doc, spreadsheet, html, document, unknown
     portal_url: Optional[str] = None  # Stable viewer URL (CivicClerk portal) -- HTML, not a download
     history_id: Optional[str] = None  # PrimeGov-specific identifier for downloading
     meta_id: Optional[str] = None  # Granicus-specific
@@ -31,6 +34,11 @@ class AttachmentSchema(BaseModel):
             raise ValueError("Attachment URL cannot be empty")
         return v.strip()
 
+    @field_validator("type", mode="before")
+    @classmethod
+    def normalize_type(cls, v: Any) -> str:
+        return str(v).strip() if v else "unknown"
+
 
 class AgendaItemSchema(BaseModel):
     """Agenda item from adapter - validates before DB storage.
@@ -43,7 +51,7 @@ class AgendaItemSchema(BaseModel):
     vendor_item_id: Optional[str] = None  # Raw vendor identifier (optional - falls back to sequence)
     title: str
     sequence: int  # MUST be int, not string
-    attachments: List[AttachmentSchema] = []
+    attachments: List[AttachmentSchema] = Field(default_factory=list)
     matter_id: Optional[str] = None  # Vendor's matter ID (not our generated ID)
     matter_file: Optional[str] = None
     matter_type: Optional[str] = None
@@ -51,6 +59,15 @@ class AgendaItemSchema(BaseModel):
     sponsors: Optional[List[str]] = None
     votes: Optional[List[Dict[str, Any]]] = None  # Vote records from adapter
     metadata: Optional[Dict[str, Any]] = None  # Vendor-specific metadata (action_name, section, etc.)
+
+    @field_validator("vendor_item_id", "matter_id", "agenda_number", mode="before")
+    @classmethod
+    def normalize_identifiers(cls, v: Any) -> Any:
+        # HTML data attributes and JSON APIs disagree on whether numeric IDs
+        # are strings or integers. Canonical item identity is textual.
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        return v
 
     @field_validator("sequence")
     @classmethod
@@ -62,6 +79,13 @@ class AgendaItemSchema(BaseModel):
             except ValueError:
                 raise ValueError(f"Sequence must be integer, got string: {v}")
         return int(v)
+
+    @field_validator("attachments", mode="before")
+    @classmethod
+    def normalize_attachments(cls, v: Any) -> Any:
+        # A few vendor APIs distinguish a missing collection with null. The
+        # pipeline has always treated that identically to an empty collection.
+        return [] if v is None else v
 
     @field_validator("title")
     @classmethod
@@ -92,6 +116,15 @@ class MeetingSchema(BaseModel):
     meeting_status: Optional[str] = None
     vendor_body_id: Optional[str] = None  # Vendor's committee/body ID (Legistar provides this)
     metadata: Optional[Dict[str, Any]] = None
+
+    @field_validator("vendor_id", mode="before")
+    @classmethod
+    def normalize_vendor_id(cls, v: Any) -> Any:
+        # Vendor APIs commonly use integer primary keys. Our canonical IDs are
+        # textual, so normalize losslessly at the boundary.
+        if isinstance(v, int) and not isinstance(v, bool):
+            return str(v)
+        return v
 
     @field_validator("start")
     @classmethod

@@ -7,7 +7,7 @@ Runtime validation catches type errors before queue insertion.
 """
 
 from pydantic.dataclasses import dataclass
-from dataclasses import asdict
+from dataclasses import asdict, field
 from typing import Literal, Union, List, Dict, Any, Optional
 import json
 
@@ -36,24 +36,34 @@ class MatterJob:
     1. Runs only when MatterEnqueueDecider saw a substantive attachment
        hash change (unchanged-hash case is handled at sync-time via a
        prior-appearance copy onto the new item, no LLM call)
-    2. Calls the LLM on the aggregated attachment set across appearances
-    3. Writes the fresh summary to city_matters.canonical_summary
-    4. Fills items.summary for any appearance in the payload that has no
+    2. Loads the current appearances from the database at claim time
+    3. Calls the LLM on the aggregated attachment set across appearances
+    4. Writes the fresh summary to city_matters.canonical_summary
+    5. Fills items.summary for any appearance that has no
        snapshot yet (temporal snapshots already set stay frozen)
+
+    New payloads intentionally do not snapshot appearance item IDs. The
+    item_ids field remains as a processor compatibility shim, but deserialization
+    deliberately discards legacy snapshots so every release queries the
+    authoritative matter appearances.
     """
     matter_id: str  # Composite ID: {banana}_{matter_key}
     meeting_id: str  # Representative meeting where matter appears
-    item_ids: List[str]  # All agenda item IDs for this matter
+    item_ids: List[str] = field(default_factory=list)  # Legacy payload only
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload: Dict[str, Any] = {
+            "matter_id": self.matter_id,
+            "meeting_id": self.meeting_id,
+        }
+        return payload
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MatterJob":
         return cls(
             matter_id=data["matter_id"],
             meeting_id=data["meeting_id"],
-            item_ids=data["item_ids"]
+            item_ids=[],
         )
 
 
@@ -79,6 +89,7 @@ class QueueJob:
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    work_version: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for database storage"""
@@ -116,7 +127,8 @@ class QueueJob:
             error_message=row.get("error_message"),
             created_at=row.get("created_at"),
             started_at=row.get("started_at"),
-            completed_at=row.get("completed_at")
+            completed_at=row.get("completed_at"),
+            work_version=row.get("work_version"),
         )
 
 
@@ -139,15 +151,19 @@ def create_meeting_job(meeting_id: str, banana: str, priority: int = 0) -> Dict[
 def create_matter_job(
     matter_id: str,
     meeting_id: str,
-    item_ids: List[str],
     banana: str,
-    priority: int = 0
+    priority: int = 0,
+    work_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Helper to create matter job data for enqueueing"""
-    payload = MatterJob(matter_id=matter_id, meeting_id=meeting_id, item_ids=item_ids)
+    payload = MatterJob(
+        matter_id=matter_id,
+        meeting_id=meeting_id,
+    )
     return {
         "job_type": "matter",
         "payload": serialize_payload(payload),
         "banana": banana,
-        "priority": priority
+        "priority": priority,
+        "work_version": work_version,
     }

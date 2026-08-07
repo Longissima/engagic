@@ -10,7 +10,7 @@ import re
 
 import requests
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Iterable, Optional
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from config import get_logger
@@ -25,6 +25,7 @@ logger = get_logger(__name__).bind(component="engagic")
 # wave; stored values upgrade to the current format on the next
 # confirmed-unchanged sync or successful matter job.
 ATTACHMENT_HASH_VERSION = "sv1"
+MEETING_WORK_VERSION = "mv1"
 
 # Query keys that mark a signed URL (Azure SAS / S3 presigned). When any of
 # these is present the whole query string is an auth envelope that rotates on
@@ -230,6 +231,115 @@ def hash_substantive_attachments_legacy(attachments: List[Any]) -> str:
         if not is_public_comment_attachment(att.name or "")
     ]
     return hash_attachments_fast_legacy(substantive)
+
+
+def aggregate_matter_attachments(appearances: Iterable[Any]) -> List[Any]:
+    """Reproduce the processor's authoritative matter attachment set.
+
+    Appearances are ordered deterministically, then attachments are deduplicated
+    by their stored URL. This intentionally matches ``Processor.process_matter``
+    before both paths call ``hash_substantive_attachments``. Keeping the
+    aggregation contract here prevents sync from comparing one appearance with
+    a canonical summary produced from every appearance.
+    """
+    ordered = sorted(
+        appearances,
+        key=lambda item: (
+            str(getattr(item, "meeting_id", "") or ""),
+            int(getattr(item, "sequence", 0) or 0),
+            str(getattr(item, "id", "") or ""),
+        ),
+    )
+    attachments: List[Any] = []
+    seen_urls: set[str] = set()
+    for item in ordered:
+        for attachment in (getattr(item, "attachments", None) or []):
+            url = getattr(attachment, "url", None)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            attachments.append(attachment)
+    return attachments
+
+
+def matter_work_version(appearances: Iterable[Any]) -> str:
+    """Hash the exact aggregate matter inputs summarized by the processor."""
+    return hash_substantive_attachments(aggregate_matter_attachments(appearances))
+
+
+def matter_work_version_legacy(appearances: Iterable[Any]) -> str:
+    """Pre-sv1 counterpart for upgrading unchanged legacy matter hashes."""
+    return hash_substantive_attachments_legacy(
+        aggregate_matter_attachments(appearances)
+    )
+
+
+def _stable_input(value: Any) -> Any:
+    """Normalize nested meeting inputs for deterministic JSON hashing."""
+    if hasattr(value, "model_dump"):
+        return _stable_input(value.model_dump(exclude_none=True))
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        return attachment_identity(value) if value.startswith(("http://", "https://")) else value
+    if isinstance(value, dict):
+        return {str(key): _stable_input(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple, set)):
+        normalized = [_stable_input(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, default=str))
+    return value
+
+
+def meeting_work_version(meeting: Any, agenda_items: Iterable[Any]) -> str:
+    """Hash all stable inputs that can affect a meeting summarization job."""
+    item_inputs = []
+    for item in sorted(
+        agenda_items,
+        key=lambda value: (
+            int(getattr(value, "sequence", 0) or 0),
+            str(getattr(value, "id", "") or ""),
+        ),
+    ):
+        attachments = [
+            {
+                "url": attachment_identity(getattr(attachment, "url", "") or ""),
+                "name": getattr(attachment, "name", "") or "",
+                "type": getattr(attachment, "type", "") or "",
+            }
+            for attachment in (getattr(item, "attachments", None) or [])
+        ]
+        attachments.sort(key=lambda value: (value["url"], value["name"], value["type"]))
+        item_inputs.append(
+            {
+                "id": getattr(item, "id", None),
+                "sequence": getattr(item, "sequence", None),
+                "title": getattr(item, "title", None),
+                "body_text": getattr(item, "body_text", None),
+                "matter_id": getattr(item, "matter_id", None),
+                "matter_file": getattr(item, "matter_file", None),
+                "matter_type": getattr(item, "matter_type", None),
+                "agenda_number": getattr(item, "agenda_number", None),
+                "sponsors": _stable_input(getattr(item, "sponsors", None)),
+                "filter_reason": getattr(item, "filter_reason", None),
+                "attachments": attachments,
+            }
+        )
+
+    canonical = {
+        "meeting": {
+            "id": getattr(meeting, "id", None),
+            "title": getattr(meeting, "title", None),
+            "date": _stable_input(getattr(meeting, "date", None)),
+            "agenda_url": _stable_input(getattr(meeting, "agenda_url", None)),
+            "agenda_sources": _stable_input(getattr(meeting, "agenda_sources", None)),
+            "packet_url": _stable_input(getattr(meeting, "packet_url", None)),
+            "minutes_url": _stable_input(getattr(meeting, "minutes_url", None)),
+            "participation": _stable_input(getattr(meeting, "participation", None)),
+        },
+        "items": item_inputs,
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
+    return f"{MEETING_WORK_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"
 
 
 def _fetch_attachment_metadata(url: str, timeout: int = 3) -> Dict[str, str]:

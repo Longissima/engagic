@@ -24,12 +24,14 @@ from database.repositories_async import (
     QueueRepository,
     BatchJobRepository,
     DocumentBlobRepository,
+    PipelineLifecycleRepository,
     SearchRepository,
 )
 from database.repositories_async.deliberation import DeliberationRepository
 from database.repositories_async.engagement import EngagementRepository
 from database.repositories_async.feedback import FeedbackRepository
 from database.repositories_async.userland import UserlandRepository
+from database.migrate import assert_schema_current
 from corpus.store import close_corpus, init_corpus
 from exceptions import DatabaseConnectionError
 
@@ -63,6 +65,7 @@ class Database:
     queue: QueueRepository
     batch_jobs: BatchJobRepository
     document_blobs: DocumentBlobRepository
+    pipeline_lifecycle: PipelineLifecycleRepository
     search: SearchRepository
     userland: UserlandRepository
     deliberation: DeliberationRepository
@@ -80,6 +83,7 @@ class Database:
         self.queue = QueueRepository(pool)
         self.batch_jobs = BatchJobRepository(pool)
         self.document_blobs = DocumentBlobRepository(pool)
+        self.pipeline_lifecycle = PipelineLifecycleRepository(pool)
         self.search = SearchRepository(pool)
         self.userland = UserlandRepository(pool)
         self.engagement = EngagementRepository(pool)
@@ -97,7 +101,9 @@ class Database:
         cls,
         dsn: Optional[str] = None,
         min_size: int = config.POSTGRES_POOL_MIN_SIZE,
-        max_size: int = config.POSTGRES_POOL_MAX_SIZE
+        max_size: int = config.POSTGRES_POOL_MAX_SIZE,
+        *,
+        require_current_schema: bool = True,
     ) -> "Database":
         """Create database with connection pool."""
         if dsn is None:
@@ -128,6 +134,13 @@ class Database:
                 max_size=max_size,
                 init=init_connection,
             )
+            if require_current_schema:
+                try:
+                    async with pool.acquire() as conn:
+                        await assert_schema_current(conn)
+                except Exception:
+                    await pool.close()
+                    raise
             logger.info("connection pool created", min_size=min_size, max_size=max_size)
             return cls(pool)
         except (asyncpg.PostgresError, OSError, ConnectionError) as e:

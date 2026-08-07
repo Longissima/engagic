@@ -12,6 +12,7 @@ import aiohttp
 
 from database.db_postgres import Database
 from database.models import Jurisdiction
+from database.repositories_async.jurisdictions import JurisdictionSyncStats
 from exceptions import VendorError
 from vendors.adapters.base_adapter_async import FetchResult
 from vendors.adapters.parsers.router import seed_city_hints
@@ -131,24 +132,39 @@ class Fetcher:
     async def sync_all(self) -> List[SyncResult]:
         """Sync all active jurisdictions due for refresh.
 
-        Thin wrapper over `sync_cities`. Filters out jurisdictions that aren't
-        due based on adaptive scheduling (`_should_sync_city`), then delegates.
+        Loads adaptive scheduling inputs once, filters jurisdictions that are
+        not due, then enters the same canonical vendor-parallel path used by
+        explicit targets.
         """
+        start_time = time.time()
+        self.failed_cities.clear()
+        await self._ensure_chunker_hints()
+
         cities = await self.db.jurisdictions.get_all_cities(status="active")
         logger.info("starting full sync", candidate_count=len(cities))
 
-        due_bananas: List[str] = []
+        sync_stats = await self.db.jurisdictions.get_city_sync_stats(
+            [city.banana for city in cities]
+        )
+
+        due_cities: List[Jurisdiction] = []
         skipped_not_due = 0
         for city in cities:
-            if not await self._should_sync_city(city):
+            if not await self._should_sync_city(
+                city, sync_stats.get(city.banana, JurisdictionSyncStats())
+            ):
                 skipped_not_due += 1
                 continue
-            due_bananas.append(city.banana)
+            due_cities.append(city)
 
         if skipped_not_due:
             logger.info("cities skipped - not due for sync", skipped_count=skipped_not_due)
 
-        return await self.sync_cities(due_bananas)
+        return await self._sync_resolved_cities(
+            due_cities,
+            sync_stats=sync_stats,
+            start_time=start_time,
+        )
 
     async def sync_cities(self, city_bananas: List[str]) -> List[SyncResult]:
         """Canonical sync path. Sync the given jurisdictions.
@@ -165,19 +181,56 @@ class Fetcher:
         self.failed_cities.clear()
         await self._ensure_chunker_hints()
 
-        by_vendor: Dict[str, List[Jurisdiction]] = {}
+        city_map = await self.db.jurisdictions.get_cities_by_bananas(
+            list(dict.fromkeys(city_bananas))
+        )
+        cities: List[Jurisdiction] = []
         results: List[SyncResult] = []
         for banana in city_bananas:
-            city = await self.db.jurisdictions.get_city(banana=banana)
+            city = city_map.get(banana)
             if not city:
                 logger.warning("city not found", banana=banana)
                 results.append(SyncResult(city_banana=banana, status=SyncStatus.FAILED, error_message="City not found in database"))
                 continue
+            cities.append(city)
+
+        return await self._sync_resolved_cities(
+            cities,
+            initial_results=results,
+            start_time=start_time,
+        )
+
+    async def _sync_resolved_cities(
+        self,
+        cities: List[Jurisdiction],
+        *,
+        initial_results: Optional[List[SyncResult]] = None,
+        sync_stats: Optional[Dict[str, JurisdictionSyncStats]] = None,
+        start_time: Optional[float] = None,
+    ) -> List[SyncResult]:
+        """Run the canonical vendor-parallel path for resolved jurisdictions.
+
+        Both full-sync and explicitly targeted CLI/daemon calls converge here,
+        so target resolution never forces a second round of point lookups.
+        """
+        start_time = start_time if start_time is not None else time.time()
+        by_vendor: Dict[str, List[Jurisdiction]] = {}
+        results = list(initial_results or [])
+        for city in cities:
             if city.vendor not in VENDOR_ADAPTERS:
-                logger.debug("skipping city - no adapter", banana=banana, vendor=city.vendor)
-                results.append(SyncResult(city_banana=banana, status=SyncStatus.SKIPPED, error_message=f"No adapter for vendor {city.vendor}"))
+                logger.debug(
+                    "skipping city - no adapter",
+                    banana=city.banana,
+                    vendor=city.vendor,
+                )
+                results.append(SyncResult(city_banana=city.banana, status=SyncStatus.SKIPPED, error_message=f"No adapter for vendor {city.vendor}"))
                 continue
             by_vendor.setdefault(city.vendor, []).append(city)
+
+        if sync_stats is None:
+            sync_stats = await self.db.jurisdictions.get_city_sync_stats(
+                list(dict.fromkeys(city.banana for city in cities))
+            )
 
         total_supported = sum(len(v) for v in by_vendor.values())
         logger.info(
@@ -188,7 +241,9 @@ class Fetcher:
         )
 
         async def sync_vendor_batch(vendor: str, vendor_cities: List[Jurisdiction]) -> List[SyncResult]:
-            sorted_cities = await self._prioritize_cities(vendor_cities)
+            sorted_cities = await self._prioritize_cities(
+                vendor_cities, sync_stats
+            )
             sem = asyncio.Semaphore(CITY_SYNC_CONCURRENCY)
 
             async def sync_one(city: Jurisdiction) -> Optional[SyncResult]:
@@ -197,30 +252,47 @@ class Fetcher:
                 async with sem:
                     if not self.is_running:
                         return None
-                    result = await self._sync_city_with_retry(city)
+                    city_start = time.time()
+                    try:
+                        result = await self._sync_city_with_retry(city)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        # A database/integration bug used to be returned by
+                        # gather as a bare exception, logged, and omitted from
+                        # results entirely. Preserve one terminal result per
+                        # attempted city so operators can reconcile a run.
+                        result = SyncResult(
+                            city_banana=city.banana,
+                            status=SyncStatus.FAILED,
+                            duration_seconds=time.time() - city_start,
+                            error_message=(
+                                f"Unexpected {type(e).__name__}: {e}"
+                            ),
+                        )
+                        self.metrics.vendor_requests.labels(
+                            vendor=vendor, status="unexpected_error"
+                        ).inc()
+                        self.metrics.record_error("fetcher", e)
+                        logger.exception(
+                            "unexpected sync exception",
+                            vendor=vendor,
+                            city=city.banana,
+                            error=str(e),
+                        )
                     logger.info("sync completed", city=city.banana, status=result.status.value)
                     if result.status == SyncStatus.FAILED:
                         self.failed_cities.add(city.banana)
                     return result
 
-            raw = await asyncio.gather(*[sync_one(c) for c in sorted_cities], return_exceptions=True)
-            out: List[SyncResult] = []
-            for r in raw:
-                if isinstance(r, BaseException):
-                    logger.error("unexpected sync exception", vendor=vendor, error=str(r))
-                elif r is not None:
-                    out.append(r)
-            return out
+            raw = await asyncio.gather(*[sync_one(c) for c in sorted_cities])
+            return [result for result in raw if result is not None]
 
         vendor_batches = await asyncio.gather(
             *[sync_vendor_batch(v, cs) for v, cs in by_vendor.items()],
-            return_exceptions=True,
         )
         for batch in vendor_batches:
-            if isinstance(batch, BaseException):
-                logger.error("vendor batch failed", error=str(batch))
-            else:
-                results.extend(batch)
+            results.extend(batch)
 
         total_meetings = sum(r.meetings_found for r in results)
         total_processed = sum(r.meetings_processed for r in results)
@@ -239,7 +311,7 @@ class Fetcher:
 
     async def sync_city(self, city_banana: str) -> SyncResult:
         """Sync a single city by city_banana."""
-        city = await self.db.get_city(banana=city_banana)
+        city = await self.db.jurisdictions.get_city(banana=city_banana)
         if not city:
             return SyncResult(city_banana=city_banana, status=SyncStatus.FAILED, error_message="City not found")
         return await self._sync_city_with_retry(city)
@@ -335,6 +407,7 @@ class Fetcher:
             matters_tracked_count = 0
             matters_duplicate_count = 0
             skipped_meetings = 0
+            interrupted = False
 
             logger.info("storing meetings", city=city.banana, vendor=vendor, meeting_count=len(all_meetings))
             for i, meeting_dict in enumerate(all_meetings):
@@ -343,6 +416,7 @@ class Fetcher:
 
                 if not self.is_running:
                     logger.warning("processing stopped - is_running flag is false")
+                    interrupted = True
                     break
 
                 stored_meeting, storage_stats = await self.meeting_sync.sync_meeting(meeting_dict, city)
@@ -356,6 +430,18 @@ class Fetcher:
                 items_stored_count += storage_stats.get('items_stored', 0)
                 matters_tracked_count += storage_stats.get('matters_tracked', 0)
                 matters_duplicate_count += storage_stats.get('matters_duplicate', 0)
+
+            if interrupted:
+                result.meetings_processed = processed_count
+                result.meetings_skipped = skipped_meetings
+                result.items_stored = items_stored_count
+                result.status = SyncStatus.SKIPPED
+                result.error_message = "Sync interrupted before all meetings were stored"
+                result.duration_seconds = time.time() - start_time
+                self.metrics.vendor_requests.labels(
+                    vendor=vendor, status="interrupted"
+                ).inc()
+                return result
 
             result.meetings_processed = processed_count
             result.meetings_skipped = skipped_meetings
@@ -397,7 +483,34 @@ class Fetcher:
             try:
                 result = await self._sync_city(city)
                 last_result = result
-                if result.status in (SyncStatus.COMPLETED, SyncStatus.SKIPPED):
+                if result.status == SyncStatus.COMPLETED:
+                    try:
+                        checkpointed = await self.db.jurisdictions.mark_city_synced(
+                            city.banana
+                        )
+                        if not checkpointed:
+                            raise RuntimeError(
+                                "jurisdiction disappeared before sync checkpoint"
+                            )
+                    except Exception as e:
+                        # Meeting writes are already durable, but without this
+                        # checkpoint the scheduler must regard the city as due.
+                        result.status = SyncStatus.FAILED
+                        result.error_message = (
+                            "Sync completed but lifecycle checkpoint failed: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        self.metrics.vendor_requests.labels(
+                            vendor=city.vendor, status="checkpoint_error"
+                        ).inc()
+                        self.metrics.record_error("fetcher", e)
+                        logger.exception(
+                            "sync checkpoint failed",
+                            city=city.banana,
+                            error=str(e),
+                        )
+                    return result
+                if result.status == SyncStatus.SKIPPED:
                     return result
                 last_error = result.error_message or "Sync failed"
             except (VendorError, asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -421,11 +534,19 @@ class Fetcher:
             return last_result
         return SyncResult(city_banana=city.banana, status=SyncStatus.FAILED, error_message=last_error)
 
-    async def _should_sync_city(self, city: Jurisdiction) -> bool:
+    async def _should_sync_city(
+        self,
+        city: Jurisdiction,
+        stats: Optional[JurisdictionSyncStats] = None,
+    ) -> bool:
         """Determine if city needs syncing based on activity patterns."""
         try:
-            recent_meetings = await self.db.jurisdictions.get_city_meeting_frequency(city.banana, days=30)
-            last_sync = await self.db.jurisdictions.get_city_last_sync(city.banana)
+            if stats is None:
+                stats = (
+                    await self.db.jurisdictions.get_city_sync_stats([city.banana])
+                ).get(city.banana, JurisdictionSyncStats())
+            recent_meetings = stats.recent_meetings
+            last_sync = stats.last_synced_at
 
             if not last_sync:
                 return True
@@ -444,20 +565,31 @@ class Fetcher:
             logger.warning("error checking sync schedule", city=city.banana, error=str(e))
             return True
 
-    async def _prioritize_cities(self, cities: List[Jurisdiction]) -> List[Jurisdiction]:
+    async def _prioritize_cities(
+        self,
+        cities: List[Jurisdiction],
+        sync_stats: Optional[Dict[str, JurisdictionSyncStats]] = None,
+    ) -> List[Jurisdiction]:
         """Sort cities by sync priority (high activity first)."""
-        async def get_priority(city: Jurisdiction) -> float:
+        if sync_stats is None:
+            sync_stats = await self.db.jurisdictions.get_city_sync_stats(
+                [city.banana for city in cities]
+            )
+        now = datetime.now()
+
+        def get_priority(city: Jurisdiction) -> float:
             try:
-                recent_meetings = await self.db.jurisdictions.get_city_meeting_frequency(city.banana, days=30)
-                last_sync = await self.db.jurisdictions.get_city_last_sync(city.banana)
+                stats = sync_stats.get(city.banana, JurisdictionSyncStats())
+                recent_meetings = stats.recent_meetings
+                last_sync = stats.last_synced_at
                 if not last_sync:
                     return 1000
-                hours_since_sync = (datetime.now() - last_sync).total_seconds() / 3600
+                hours_since_sync = (now - last_sync).total_seconds() / 3600
                 return recent_meetings * 10 + min(hours_since_sync / 24, 10)
             except (AttributeError, TypeError) as e:
                 logger.warning("failed to calculate priority", city=city.banana, error=str(e))
                 return 100
 
-        priorities = [(await get_priority(city), city) for city in cities]
+        priorities = [(get_priority(city), city) for city in cities]
         priorities.sort(key=lambda x: x[0], reverse=True)
         return [city for _, city in priorities]

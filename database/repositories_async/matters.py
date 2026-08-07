@@ -66,10 +66,12 @@ class MatterRepository(BaseRepository):
 
         logger.debug("stored matter", matter_id=matter.id, banana=matter.banana)
 
-    async def get_matter(self, matter_id: str) -> Optional[Matter]:
+    async def get_matter(
+        self, matter_id: str, conn: Optional[Connection] = None
+    ) -> Optional[Matter]:
         """Get a matter by ID with accurate appearance count."""
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
+        async with self._ensure_conn(conn) as c:
+            row = await c.fetchrow(
                 """
                 SELECT
                     cm.id, cm.banana, cm.matter_id, cm.matter_file, cm.matter_type,
@@ -98,7 +100,7 @@ class MatterRepository(BaseRepository):
                     return None
 
             topics_map = await fetch_topics_for_ids(
-                conn, "matter_topics", "matter_id", [matter_id]
+                c, "matter_topics", "matter_id", [matter_id]
             )
             topics = topics_map.get(matter_id, [])
 
@@ -309,10 +311,15 @@ class MatterRepository(BaseRepository):
                 logger.debug("updated matter tracking", matter_id=matter_id, increment=False)
                 return None
 
-    async def has_appearance(self, matter_id: str, meeting_id: str) -> bool:
+    async def has_appearance(
+        self,
+        matter_id: str,
+        meeting_id: str,
+        conn: Optional[Connection] = None,
+    ) -> bool:
         """Check if a matter already has an appearance record for a specific meeting."""
-        async with self.pool.acquire() as conn:
-            exists = await conn.fetchval(
+        async with self._ensure_conn(conn) as c:
+            exists = await c.fetchval(
                 """
                 SELECT EXISTS(
                     SELECT 1 FROM matter_appearances
@@ -322,7 +329,7 @@ class MatterRepository(BaseRepository):
                 matter_id,
                 meeting_id,
             )
-            return exists
+            return bool(exists)
 
     async def create_appearance(
         self,

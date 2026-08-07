@@ -26,6 +26,8 @@ class QueueRepository(BaseRepository):
     - Queue statistics for monitoring
     """
 
+    _RETRY_BASE_SECONDS = 30
+
     async def enqueue_job(
         self,
         source_url: str,
@@ -35,10 +37,17 @@ class QueueRepository(BaseRepository):
         banana: Optional[str] = None,
         priority: int = 0,
         processing_metadata: Optional[Dict[str, Any]] = None,
+        work_version: Optional[str] = None,
     ) -> None:
         """Add job to processing queue with deduplication
 
-        Uses source_url as unique key. If job already exists, resets status to pending.
+        Uses source_url as the stable deduplication key. An accepted re-enqueue
+        replaces the mutable work descriptor and starts a fresh attempt cycle.
+
+        Versioned work is accepted only when its desired version changes. This
+        protects retries and terminal jobs from being reset by an identical
+        sync. Legacy unversioned work preserves the old re-enqueue behavior,
+        except that a healthy active claim is never reset.
 
         Args:
             source_url: Unique identifier for job (used for deduplication)
@@ -47,25 +56,47 @@ class QueueRepository(BaseRepository):
             meeting_id: Associated meeting ID
             banana: Associated city banana
             priority: Job priority (higher = processed first, default: 0)
-            processing_metadata: Diagnostic trail (e.g. chunker cascade audit);
-                on re-enqueue, a None keeps the previously stored value
+            processing_metadata: Diagnostic trail (e.g. chunker cascade audit).
+                Re-enqueue replaces it when supplied; None retains the prior
+                audit because it also serves as the sticky chunk-routing hint.
+            work_version: Authoritative input version. For matter jobs this is
+                the substantive attachment hash.
         """
         await self._execute(
             """
             INSERT INTO queue (
                 source_url, meeting_id, banana, job_type, payload,
-                status, priority, retry_count, processing_metadata
+                status, priority, retry_count, processing_metadata, work_version
             )
-            VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0, $7)
+            VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0, $7, $8)
             ON CONFLICT (source_url) DO UPDATE SET
+                meeting_id = EXCLUDED.meeting_id,
+                banana = EXCLUDED.banana,
+                job_type = EXCLUDED.job_type,
+                payload = EXCLUDED.payload,
                 status = 'pending',
                 priority = EXCLUDED.priority,
                 retry_count = 0,
-                error_message = NULL,
+                started_at = NULL,
+                completed_at = NULL,
                 failed_at = NULL,
+                error_message = NULL,
                 processing_metadata = COALESCE(
                     EXCLUDED.processing_metadata, queue.processing_metadata
-                )
+                ),
+                work_version = EXCLUDED.work_version,
+                retry_at = NULL,
+                last_enqueued_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE (
+                    EXCLUDED.work_version IS NOT NULL
+                    AND queue.work_version IS DISTINCT FROM EXCLUDED.work_version
+                  )
+               OR (
+                    EXCLUDED.work_version IS NULL
+                    AND queue.work_version IS NULL
+                    AND queue.status <> 'processing'
+                  )
             """,
             source_url,
             meeting_id,
@@ -74,6 +105,7 @@ class QueueRepository(BaseRepository):
             payload,
             priority,
             processing_metadata,
+            work_version,
         )
 
         logger.debug("job enqueued", source_url=source_url, job_type=job_type)
@@ -149,9 +181,10 @@ class QueueRepository(BaseRepository):
             row = await conn.fetchrow(
                 """
                 SELECT id, source_url, meeting_id, banana, job_type, payload,
-                       priority, retry_count
+                       priority, retry_count, work_version
                 FROM queue
                 WHERE status = 'pending'
+                  AND (retry_at IS NULL OR retry_at <= NOW())
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -180,6 +213,7 @@ class QueueRepository(BaseRepository):
                 "payload": row["payload"],  # Already deserialized by asyncpg
                 "priority": row["priority"],
                 "retry_count": row["retry_count"],
+                "work_version": row["work_version"],
             }
 
     # Meeting jobs whose date falls outside the urgent window are batch-lane
@@ -216,7 +250,10 @@ class QueueRepository(BaseRepository):
         Returns:
             QueueJob object or None if queue empty
         """
-        conditions = ["q.status = 'pending'"]
+        conditions = [
+            "q.status = 'pending'",
+            "(q.retry_at IS NULL OR q.retry_at <= NOW())",
+        ]
         params: list = []
         if banana:
             params.append(banana)
@@ -249,7 +286,7 @@ class QueueRepository(BaseRepository):
                 f"""
                 SELECT q.id, q.source_url, q.meeting_id, q.banana, q.job_type,
                        q.payload, q.priority, q.retry_count, q.status,
-                       q.created_at, q.started_at
+                       q.created_at, q.started_at, q.work_version
                 FROM queue q
                 {join}
                 WHERE {" AND ".join(conditions)}
@@ -293,7 +330,8 @@ class QueueRepository(BaseRepository):
                 retry_count=row.get("retry_count", 0),
                 error_message=None,
                 created_at=row.get("created_at").isoformat() if row.get("created_at") else None,
-                started_at=row.get("started_at").isoformat() if row.get("started_at") else None
+                started_at=row.get("started_at").isoformat() if row.get("started_at") else None,
+                work_version=row.get("work_version"),
             )
 
     async def get_chunk_quality(self, meeting_id: str) -> Optional[Dict[str, Any]]:
@@ -326,7 +364,7 @@ class QueueRepository(BaseRepository):
         await self._execute(
             """
             UPDATE queue
-            SET started_at = NOW()
+            SET started_at = NOW(), updated_at = NOW()
             WHERE id = $1 AND status = 'processing'
             """,
             queue_id,
@@ -341,8 +379,8 @@ class QueueRepository(BaseRepository):
         await self._execute(
             """
             UPDATE queue
-            SET status = 'completed', completed_at = NOW()
-            WHERE id = $1
+            SET status = 'completed', completed_at = NOW(), updated_at = NOW()
+            WHERE id = $1 AND status = 'processing'
             """,
             queue_id,
         )
@@ -350,58 +388,8 @@ class QueueRepository(BaseRepository):
         logger.info("job completed", queue_id=queue_id)
 
     async def mark_job_failed(self, queue_id: int, error_message: str) -> None:
-        """Mark job as failed with retry logic
-
-        Implements retry logic:
-        - retry_count < 3: Increment retry, set status back to pending
-        - retry_count >= 3: Set status to dead_letter
-
-        Args:
-            queue_id: Queue entry ID
-            error_message: Error description
-        """
-        async with self.transaction() as conn:
-            # Get current retry count with row lock to prevent race
-            row = await conn.fetchrow(
-                "SELECT retry_count FROM queue WHERE id = $1 FOR UPDATE",
-                queue_id,
-            )
-
-            if not row:
-                return
-
-            retry_count = row["retry_count"]
-
-            if retry_count < 3:
-                # Retry
-                await conn.execute(
-                    """
-                    UPDATE queue
-                    SET status = 'pending',
-                        retry_count = retry_count + 1,
-                        error_message = $2,
-                        failed_at = NOW()
-                    WHERE id = $1
-                    """,
-                    queue_id,
-                    error_message,
-                )
-                logger.warning("job failed, retrying", queue_id=queue_id, retry_count=retry_count + 1)
-            else:
-                # Dead letter
-                await conn.execute(
-                    """
-                    UPDATE queue
-                    SET status = 'dead_letter',
-                        retry_count = retry_count + 1,
-                        error_message = $2,
-                        failed_at = NOW()
-                    WHERE id = $1
-                    """,
-                    queue_id,
-                    error_message,
-                )
-                logger.error("job dead lettered", queue_id=queue_id, error=error_message)
+        """Backward-compatible alias for the single failure state machine."""
+        await self.mark_processing_failed(queue_id, error_message)
 
     async def mark_processing_failed(
         self, queue_id: int, error_message: str, increment_retry: bool = True
@@ -426,8 +414,10 @@ class QueueRepository(BaseRepository):
                     UPDATE queue
                     SET status = 'failed',
                         error_message = $2,
-                        completed_at = NOW()
-                    WHERE id = $1
+                        failed_at = NOW(),
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1 AND status = 'processing'
                     """,
                     queue_id,
                     error_message,
@@ -437,12 +427,15 @@ class QueueRepository(BaseRepository):
 
             # Get current retry_count and priority with row lock to prevent race
             row = await conn.fetchrow(
-                "SELECT retry_count, priority FROM queue WHERE id = $1 FOR UPDATE",
+                """SELECT retry_count, priority
+                   FROM queue
+                   WHERE id = $1 AND status = 'processing'
+                   FOR UPDATE""",
                 queue_id,
             )
 
             if not row:
-                logger.error("queue item not found", queue_id=queue_id)
+                logger.info("queue item no longer actively claimed", queue_id=queue_id)
                 return
 
             current_retry_count = row["retry_count"]
@@ -451,6 +444,7 @@ class QueueRepository(BaseRepository):
             if current_retry_count < 2:  # Will be 3 after increment (0 -> 1 -> 2)
                 # Retry with exponential backoff priority
                 new_priority = current_priority - (20 * (current_retry_count + 1))
+                retry_delay_seconds = self._RETRY_BASE_SECONDS * (2 ** current_retry_count)
 
                 await conn.execute(
                     """
@@ -459,12 +453,17 @@ class QueueRepository(BaseRepository):
                         priority = $2,
                         retry_count = retry_count + 1,
                         error_message = $3,
-                        completed_at = NULL
-                    WHERE id = $1
+                        failed_at = NOW(),
+                        completed_at = NULL,
+                        started_at = NULL,
+                        retry_at = NOW() + make_interval(secs => $4),
+                        updated_at = NOW()
+                    WHERE id = $1 AND status = 'processing'
                     """,
                     queue_id,
                     new_priority,
                     error_message,
+                    retry_delay_seconds,
                 )
                 logger.warning(
                     "job retry scheduled",
@@ -484,8 +483,10 @@ class QueueRepository(BaseRepository):
                         retry_count = retry_count + 1,
                         error_message = $2,
                         failed_at = NOW(),
-                        completed_at = NOW()
-                    WHERE id = $1
+                        completed_at = NOW(),
+                        retry_at = NULL,
+                        updated_at = NOW()
+                    WHERE id = $1 AND status = 'processing'
                     """,
                     queue_id,
                     error_message,

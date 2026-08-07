@@ -15,9 +15,10 @@ import logging
 import signal
 import sys
 from contextlib import contextmanager
-from typing import Dict, Any, Optional, List, AsyncGenerator
+from typing import Dict, Any, Optional, List, AsyncGenerator, cast
 
 from database.db_postgres import Database
+from database.models import Jurisdiction
 from pipeline.fetcher import Fetcher, SyncResult, SyncStatus
 from pipeline.processor import Processor
 from pipeline.protocols import MetricsCollector
@@ -413,35 +414,70 @@ async def _expand_jurisdictions(db: Database, bananas: List[str]) -> List[str]:
 
     Preserves order, deduplicates.
     """
-    expanded = []
-    seen = set()
+    unique_inputs = list(dict.fromkeys(bananas))
+    state_codes = [
+        banana
+        for banana in unique_inputs
+        if len(banana) == 2 and banana.isalpha() and banana.isupper()
+    ]
+    state_code_set = set(state_codes)
+    literal_bananas = [
+        banana for banana in unique_inputs if banana not in state_code_set
+    ]
+
+    resolved, state_expansions = await asyncio.gather(
+        db.jurisdictions.get_cities_by_bananas(literal_bananas),
+        db.jurisdictions.get_cities_by_states(state_codes),
+    )
+    county_inputs = [
+        banana
+        for banana in literal_bananas
+        if (city := resolved.get(banana)) is not None and city.type == "county"
+    ]
+    county_expansions = await db.jurisdictions.get_county_jurisdictions_batch(
+        county_inputs
+    )
+
+    expanded: List[str] = []
+    seen: set[str] = set()
+    processed_inputs: set[str] = set()
     for banana in bananas:
-        if banana in seen:
+        if banana in processed_inputs or banana in seen:
             continue
+        processed_inputs.add(banana)
 
         # State code: 2 uppercase letters
         if len(banana) == 2 and banana.isalpha() and banana.isupper():
-            state_jurisdictions = await db.jurisdictions.get_cities(state=banana)
+            state_jurisdictions = state_expansions.get(banana, [])
             state_bananas = [j.banana for j in state_jurisdictions]
             logger.info("expanded state", state=banana, jurisdictions=len(state_bananas))
-            for b in state_bananas:
-                if b not in seen:
-                    seen.add(b)
-                    expanded.append(b)
-            continue
-
-        city = await db.jurisdictions.get_city(banana)
-        if city and city.type == "county":
-            county_bananas = await db.jurisdictions.get_county_jurisdictions(banana)
-            logger.info("expanded county", county=banana, jurisdictions=len(county_bananas))
-            for b in county_bananas:
-                if b not in seen:
-                    seen.add(b)
-                    expanded.append(b)
+            candidates = state_bananas
+        elif (city := resolved.get(banana)) is not None and city.type == "county":
+            candidates = county_expansions.get(banana, [])
+            logger.info(
+                "expanded county", county=banana, jurisdictions=len(candidates)
+            )
         else:
-            seen.add(banana)
-            expanded.append(banana)
+            # Known non-county and unknown literals both pass through. Fetcher
+            # is the canonical place that classifies missing/unsupported cities.
+            candidates = [banana]
+
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                expanded.append(candidate)
     return expanded
+
+
+async def _partition_known_jurisdictions(
+    db: Database, bananas: List[str]
+) -> tuple[List[str], List[str], Dict[str, Jurisdiction]]:
+    """Batch-partition jurisdiction IDs, preserving first-seen order."""
+    ordered = list(dict.fromkeys(bananas))
+    resolved = await db.jurisdictions.get_cities_by_bananas(ordered)
+    valid = [banana for banana in ordered if banana in resolved]
+    unknown = [banana for banana in ordered if banana not in resolved]
+    return valid, unknown, resolved
 
 
 def main():
@@ -633,17 +669,20 @@ def main():
                 if not demanded:
                     return {"message": "No cities in user watchlists", "valid": [], "unknown": []}
 
-                valid_cities = []
-                unknown_cities = []
-                for banana in demanded:
-                    city = await db.jurisdictions.get_city(banana)
-                    if city:
-                        valid_cities.append({"banana": banana, "name": city.name, "state": city.state})
-                    else:
-                        unknown_cities.append(banana)
+                valid_bananas, unknown_cities, resolved = (
+                    await _partition_known_jurisdictions(db, demanded)
+                )
+                valid_cities = [
+                    {
+                        "banana": banana,
+                        "name": resolved[banana].name,
+                        "state": resolved[banana].state,
+                    }
+                    for banana in valid_bananas
+                ]
 
                 return {
-                    "total": len(demanded),
+                    "total": len(valid_bananas) + len(unknown_cities),
                     "valid": valid_cities,
                     "unknown": unknown_cities
                 }
@@ -678,14 +717,9 @@ def main():
                     return {"message": "No cities in user watchlists", "cities": []}
 
                 # Filter to cities that exist in our database
-                valid_cities = []
-                unknown_cities = []
-                for banana in demanded:
-                    city = await db.jurisdictions.get_city(banana)
-                    if city:
-                        valid_cities.append(banana)
-                    else:
-                        unknown_cities.append(banana)
+                valid_cities, unknown_cities, _ = (
+                    await _partition_known_jurisdictions(db, demanded)
+                )
 
                 if unknown_cities:
                     click.echo(f"Unknown cities (need manual setup): {', '.join(unknown_cities)}")
@@ -737,14 +771,9 @@ def main():
                     return {"message": "No cities in user watchlists"}
 
                 # Filter to valid cities
-                valid_cities = []
-                unknown_cities = []
-                for banana in demanded:
-                    city = await db.jurisdictions.get_city(banana)
-                    if city:
-                        valid_cities.append(banana)
-                    else:
-                        unknown_cities.append(banana)
+                valid_cities, unknown_cities, _ = (
+                    await _partition_known_jurisdictions(db, demanded)
+                )
 
                 if unknown_cities:
                     # Record unknown cities for tracking
@@ -772,7 +801,8 @@ def main():
         if "message" in results:
             click.echo(results["message"])
         else:
-            click.echo(f"Watchlist processing complete: {results['cities_processed']} cities, {results['totals']['items_new']} new items")
+            totals = cast(Dict[str, int], results["totals"])
+            click.echo(f"Watchlist processing complete: {results['cities_processed']} cities, {totals['items_new']} new items")
 
     @cli.command("city-requests")
     def city_requests():

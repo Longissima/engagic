@@ -18,9 +18,10 @@ Pattern:
 Confidence: 8/10 - Standard pattern, asyncpg-native
 """
 
+import argparse
 import asyncio
-import sys
 from pathlib import Path
+from typing import Any, Protocol
 
 import asyncpg
 
@@ -29,6 +30,18 @@ from config import config, get_logger
 logger = get_logger(__name__).bind(component="migrations")
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+
+class MigrationReadConnection(Protocol):
+    async def fetch(self, query: str, *args: Any) -> Any: ...
+
+
+class MigrationFailedError(RuntimeError):
+    """A pending migration failed and the deployment must stop."""
+
+
+class PendingMigrationsError(RuntimeError):
+    """Runtime startup was attempted against an out-of-date schema."""
 
 
 async def get_connection() -> asyncpg.Connection:
@@ -47,7 +60,7 @@ async def ensure_migrations_table(conn: asyncpg.Connection) -> None:
     """)
 
 
-async def get_applied_migrations(conn: asyncpg.Connection) -> set[str]:
+async def get_applied_migrations(conn: MigrationReadConnection) -> set[str]:
     """Get set of applied migration versions."""
     rows = await conn.fetch("SELECT version FROM schema_migrations ORDER BY version")
     return {row["version"] for row in rows}
@@ -78,6 +91,31 @@ def get_pending_migrations(applied: set[str]) -> list[tuple[str, str, Path]]:
             pending.append((version, name, sql_file))
 
     return pending
+
+
+async def assert_schema_current(conn: Any) -> None:
+    """Fail fast when runtime code is newer than the database schema.
+
+    This check is intentionally read-only. Deployments must run the migration
+    command explicitly before starting application processes; a worker should
+    never discover a missing relation after it has already claimed work.
+    """
+    try:
+        applied = await get_applied_migrations(conn)
+    except asyncpg.UndefinedTableError as exc:
+        raise PendingMigrationsError(
+            "schema_migrations is missing; initialize and migrate the database "
+            "before starting the application"
+        ) from exc
+
+    pending = get_pending_migrations(applied)
+    if not pending:
+        return
+
+    names = ", ".join(f"{version}_{name}" for version, name, _ in pending)
+    raise PendingMigrationsError(
+        f"database schema is not current; apply pending migrations: {names}"
+    )
 
 
 async def apply_migration(conn: asyncpg.Connection, version: str, name: str, sql_file: Path) -> bool:
@@ -169,7 +207,9 @@ async def migrate() -> int:
                 applied_count += 1
             else:
                 logger.error("stopping due to failed migration")
-                break
+                raise MigrationFailedError(
+                    f"migration {version}_{name} failed; schema is not current"
+                )
 
         return applied_count
 
@@ -246,20 +286,33 @@ async def rollback(count: int = 1) -> int:
         await conn.close()
 
 
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Inspect, apply, or roll back versioned database migrations."
+    )
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
+        "--status", action="store_true", help="show applied and pending migrations"
+    )
+    action.add_argument(
+        "--rollback",
+        nargs="?",
+        const=1,
+        type=int,
+        metavar="COUNT",
+        help="roll back COUNT migrations (default: 1)",
+    )
+    return parser
+
+
 def main():
-    """CLI entry point."""
-    args = sys.argv[1:]
+    """CLI entry point. Parsing completes before any database connection."""
+    args = _build_parser().parse_args()
 
-    if "--status" in args:
+    if args.status:
         asyncio.run(status())
-    elif "--rollback" in args:
-        try:
-            idx = args.index("--rollback")
-            count = int(args[idx + 1]) if idx + 1 < len(args) else 1
-        except (ValueError, IndexError):
-            count = 1
-
-        rolled_back = asyncio.run(rollback(count))
+    elif args.rollback is not None:
+        rolled_back = asyncio.run(rollback(args.rollback))
         print(f"Rolled back {rolled_back} migration(s)")
     else:
         applied = asyncio.run(migrate())

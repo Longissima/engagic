@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 import aiohttp
+from pydantic import ValidationError
 
 from config import config, get_logger
 from pipeline.ground_truth import archive_bytes, produce_ground_truth
@@ -27,6 +28,7 @@ from vendors.adapters.parsers.router import (
     summarize_runs,
 )
 from vendors.rate_limiter_async import get_rate_limiter
+from vendors.schemas import validate_meeting_output
 from vendors.session_manager_async import AsyncSessionManager
 from exceptions import VendorHTTPError
 
@@ -439,11 +441,27 @@ class AsyncBaseAdapter:
         return status
 
     def _validate_meeting(self, meeting: Dict[str, Any]) -> bool:
-        """Check meeting has vendor_id, title, start. Returns False if missing."""
-        required = {"vendor_id", "title", "start"}
-        missing = required - set(meeting.keys())
-        if missing:
-            logger.warning("meeting missing required fields", vendor=self.vendor, slug=self.slug, missing=list(missing), title=str(meeting.get("title", "unknown"))[:50])
+        """Validate the complete typed adapter contract.
+
+        Kept as a boolean compatibility shim for tests and custom adapter code.
+        ``fetch_meetings`` additionally uses the model output so safe
+        normalizations cross the canonical boundary.
+        """
+        try:
+            validate_meeting_output(meeting)
+        except (ValidationError, TypeError) as e:
+            title = (
+                meeting.get("title", "unknown")
+                if isinstance(meeting, dict)
+                else "unknown"
+            )
+            logger.warning(
+                "meeting failed schema validation",
+                vendor=self.vendor,
+                slug=self.slug,
+                title=str(title)[:50],
+                error=str(e),
+            )
             return False
         return True
 
@@ -920,7 +938,28 @@ class AsyncBaseAdapter:
             self._chunk_audits = {}
             self._html_audits = {}
             meetings = await self._fetch_meetings_impl(days_back, days_forward)
-            valid = [m for m in meetings if self._validate_meeting(m)]
+            valid: List[Dict[str, Any]] = []
+            for index, meeting in enumerate(meetings):
+                try:
+                    validated = validate_meeting_output(meeting)
+                except (ValidationError, TypeError) as e:
+                    logger.warning(
+                        "meeting failed schema validation",
+                        vendor=self.vendor,
+                        slug=self.slug,
+                        meeting_index=index,
+                        title=(
+                            str(meeting.get("title", "unknown"))[:50]
+                            if isinstance(meeting, dict)
+                            else "unknown"
+                        ),
+                        error=str(e),
+                    )
+                    continue
+                # Preserve adapter-specific extras while applying the schema's
+                # compatibility normalizations. Omit None-valued optional fields
+                # to retain the prior sparse-dict contract.
+                valid.append(validated.model_dump(exclude_none=True))
             if len(valid) < len(meetings):
                 logger.warning("filtered invalid meetings", vendor=self.vendor, slug=self.slug, total=len(meetings), valid=len(valid))
 

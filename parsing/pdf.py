@@ -2,7 +2,7 @@
 
 Moved from: infocore/processing/pdf_extractor.py
 
-Supports: PDF, DOCX (via PyMuPDF), legacy .doc (via antiword), RTF (via striprtf),
+Supports: PDF (via PyMuPDF), DOCX (via python-docx), legacy .doc (via antiword), RTF (via striprtf),
 PPTX (via python-pptx), XLSX (via openpyxl).
 
 Legislative formatting detection (strikethrough/underline):
@@ -65,7 +65,7 @@ _PDF_ANNOT_STRIKE_OUT = cast(int, getattr(fitz, "PDF_ANNOT_STRIKE_OUT", 11))
 XLSX_SANITY_MAX_CHARS = 20_000_000
 
 
-def _detect_format(data: bytes) -> str:
+def detect_document_format(data: bytes) -> str:
     """Detect document format from magic bytes.
 
     Returns 'pdf', 'docx', 'pptx', 'xlsx', 'doc', 'rtf', or 'unknown'.
@@ -90,6 +90,11 @@ def _detect_format(data: bytes) -> str:
     if data[:5] == _RTF_MAGIC:
         return "rtf"
     return "unknown"
+
+
+# Kept for callers/tests that imported the old private helper while the typed
+# artifact boundary uses the public name.
+_detect_format = detect_document_format
 
 
 def _extract_legacy_doc(data: bytes) -> Optional[str]:
@@ -122,6 +127,24 @@ def _extract_legacy_doc(data: bytes) -> Optional[str]:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _extract_docx(data: bytes) -> Optional[str]:
+    """Extract paragraphs and tables from OOXML Word documents."""
+    try:
+        from docx import Document
+
+        document = Document(io.BytesIO(data))
+        parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts) if parts else None
+    except Exception as e:
+        logger.debug("docx extraction failed", error=str(e))
+        return None
 
 
 def _extract_rtf(data: bytes) -> Optional[str]:
@@ -1020,7 +1043,7 @@ class PdfExtractor:
         """Extract text from document bytes (PDF, Office documents, or RTF).
 
         Detects format from magic bytes and routes to the appropriate extractor.
-        PDF and DOCX go through PyMuPDF; legacy .doc uses antiword; RTF uses
+        PDF uses PyMuPDF; DOCX uses python-docx; legacy .doc uses antiword; RTF uses
         striprtf; PPTX and XLSX use their corresponding Office libraries.
 
         Args:
@@ -1030,7 +1053,26 @@ class PdfExtractor:
         Returns dict with extraction results (same format as extract_from_url)
         """
         start_time = time.time()
-        fmt = _detect_format(pdf_bytes)
+        fmt = detect_document_format(pdf_bytes)
+
+        # DOCX
+        if fmt == "docx":
+            text = _extract_docx(pdf_bytes)
+            if text:
+                extraction_time = time.time() - start_time
+                logger.info(
+                    "extracted docx via python-docx",
+                    chars=len(text),
+                    extraction_time=round(extraction_time, 2),
+                )
+                return {
+                    "success": True,
+                    "text": text,
+                    "method": "python-docx",
+                    "page_count": 0,
+                    "extraction_time": extraction_time,
+                }
+            raise ExtractionError("DOCX extraction failed", document_type="docx")
 
         # Legacy .doc (OLE2) -- fitz can't handle this format
         if fmt == "doc":
@@ -1092,7 +1134,8 @@ class PdfExtractor:
                 }
             raise ExtractionError("XLSX extraction failed", document_type="xlsx")
 
-        # PDF, DOCX, and unknown formats -- PyMuPDF handles all of these
+        # PDF and unknown formats -- PyMuPDF handles PDFs and produces a
+        # useful typed failure for unsupported/garbled inputs.
         try:
             with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
                 return self._extract_from_document(doc, extract_links, start_time)

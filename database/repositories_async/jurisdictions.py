@@ -8,7 +8,8 @@ Handles CRUD operations for jurisdictions (cities, counties, utility boards, etc
 """
 
 import json
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence
 from datetime import datetime
 
 from database.repositories_async.base import BaseRepository
@@ -17,6 +18,14 @@ from database.models import Jurisdiction
 from config import get_logger
 
 logger = get_logger(__name__).bind(component="jurisdiction_repository")
+
+
+@dataclass(frozen=True)
+class JurisdictionSyncStats:
+    """Activity and durable lifecycle inputs for adaptive scheduling."""
+
+    recent_meetings: int = 0
+    last_synced_at: Optional[datetime] = None
 
 
 def _build_jurisdiction(row, zipcodes: List[str]) -> Jurisdiction:
@@ -168,6 +177,89 @@ class JurisdictionRepository(BaseRepository):
             zipcodes = [str(r["zipcode"]) for r in zipcodes_rows]
 
             return _build_jurisdiction(row, zipcodes)
+
+    async def get_cities_by_bananas(
+        self,
+        bananas: Sequence[str],
+        *,
+        include_zipcodes: bool = False,
+    ) -> Dict[str, Jurisdiction]:
+        """Resolve jurisdiction identifiers in one database acquisition.
+
+        Results are keyed by banana. Missing identifiers are absent, allowing
+        callers to preserve their input order (and duplicate semantics) while
+        handling missing jurisdictions explicitly.
+        """
+        unique_bananas = list(dict.fromkeys(bananas))
+        if not unique_bananas:
+            return {}
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT banana, name, state, vendor, slug, extra_vendors, type,
+                       county_banana, status, participation
+                FROM jurisdictions
+                WHERE banana = ANY($1::text[])
+                """,
+                unique_bananas,
+            )
+
+            zipcodes_map: Dict[str, List[str]] = {}
+            if include_zipcodes and rows:
+                zipcode_rows = await conn.fetch(
+                    """
+                    SELECT banana, zipcode
+                    FROM zipcodes
+                    WHERE banana = ANY($1::text[])
+                    """,
+                    [row["banana"] for row in rows],
+                )
+                for row in zipcode_rows:
+                    zipcodes_map.setdefault(row["banana"], []).append(
+                        str(row["zipcode"])
+                    )
+
+        return {
+            row["banana"]: _build_jurisdiction(
+                row, zipcodes_map.get(row["banana"], [])
+            )
+            for row in rows
+        }
+
+    async def get_cities_by_states(
+        self,
+        states: Sequence[str],
+        *,
+        status: str = "active",
+    ) -> Dict[str, List[Jurisdiction]]:
+        """Resolve multiple state expansions in one query.
+
+        Jurisdictions retain the same per-state name ordering as
+        :meth:`get_cities`. Requested states with no matches map to an empty
+        list so callers can distinguish an empty expansion without more I/O.
+        """
+        unique_states = list(dict.fromkeys(states))
+        result: Dict[str, List[Jurisdiction]] = {
+            state: [] for state in unique_states
+        }
+        if not unique_states:
+            return result
+
+        rows = await self._fetch(
+            """
+            SELECT banana, name, state, vendor, slug, extra_vendors, type,
+                   county_banana, status, participation
+            FROM jurisdictions
+            WHERE state = ANY($1::text[]) AND status = $2
+            ORDER BY state, name
+            """,
+            unique_states,
+            status,
+        )
+        for row in rows:
+            result[row["state"]].append(_build_jurisdiction(row, []))
+        return result
 
     async def get_city_by_zipcode(self, zipcode: str) -> Optional[Jurisdiction]:
         """Get jurisdiction by zipcode lookup
@@ -335,15 +427,37 @@ class JurisdictionRepository(BaseRepository):
         Returns:
             List of bananas: [county_banana, city1, city2, ...]
         """
+        return (
+            await self.get_county_jurisdictions_batch([county_banana])
+        ).get(county_banana, [])
+
+    async def get_county_jurisdictions_batch(
+        self, county_bananas: Sequence[str]
+    ) -> Dict[str, List[str]]:
+        """Expand multiple counties in one query, preserving member order."""
+        unique_counties = list(dict.fromkeys(county_bananas))
+        result: Dict[str, List[str]] = {
+            county_banana: [] for county_banana in unique_counties
+        }
+        if not unique_counties:
+            return result
+
         rows = await self._fetch(
             """
-            SELECT banana FROM jurisdictions
-            WHERE banana = $1 OR county_banana = $1
-            ORDER BY type DESC, name
+            SELECT requested.county_banana, jurisdiction.banana
+            FROM unnest($1::text[]) WITH ORDINALITY
+                AS requested(county_banana, input_order)
+            JOIN jurisdictions AS jurisdiction
+              ON jurisdiction.banana = requested.county_banana
+              OR jurisdiction.county_banana = requested.county_banana
+            ORDER BY requested.input_order, jurisdiction.type DESC,
+                     jurisdiction.name
             """,
-            county_banana,
+            unique_counties,
         )
-        return [row["banana"] for row in rows]
+        for row in rows:
+            result[row["county_banana"]].append(row["banana"])
+        return result
 
     async def get_city_meeting_frequency(self, banana: str, days: int = 30) -> int:
         """Get count of meetings for a jurisdiction in the last N days
@@ -368,7 +482,7 @@ class JurisdictionRepository(BaseRepository):
         return row["count"] if row else 0
 
     async def get_city_last_sync(self, banana: str) -> Optional[datetime]:
-        """Get timestamp of most recent meeting for a jurisdiction
+        """Get the most recent successful vendor-sync checkpoint.
 
         Used by fetcher to determine if jurisdiction needs syncing.
 
@@ -376,15 +490,71 @@ class JurisdictionRepository(BaseRepository):
             banana: Jurisdiction banana
 
         Returns:
-            Datetime of most recent meeting, or None
+            Datetime of the last completed sync, or None if never successful.
         """
         row = await self._fetchrow(
             """
-            SELECT MAX(date) as last_sync
-            FROM meetings
+            SELECT last_synced_at
+            FROM jurisdictions
             WHERE banana = $1
             """,
             banana,
         )
 
-        return row["last_sync"] if row else None
+        return row["last_synced_at"] if row else None
+
+    async def mark_city_synced(self, banana: str) -> bool:
+        """Durably checkpoint an aggregate-completed jurisdiction sync.
+
+        Uses the database clock and never participates in meeting persistence;
+        callers invoke it only after the fetcher's aggregate policy succeeds.
+        """
+        result = await self._execute(
+            """
+            UPDATE jurisdictions
+            SET last_synced_at = CURRENT_TIMESTAMP
+            WHERE banana = $1
+            """,
+            banana,
+        )
+        return self._parse_row_count(result) == 1
+
+    async def get_city_sync_stats(
+        self,
+        bananas: Sequence[str],
+        *,
+        days: int = 30,
+    ) -> Dict[str, JurisdictionSyncStats]:
+        """Load adaptive-scheduling inputs for many jurisdictions at once.
+
+        Meeting frequency remains event-date based; scheduling freshness comes
+        exclusively from the jurisdiction's successful-sync checkpoint.
+        """
+        unique_bananas = list(dict.fromkeys(bananas))
+        if not unique_bananas:
+            return {}
+
+        rows = await self._fetch(
+            """
+            SELECT
+                requested.banana,
+                COUNT(m.id) FILTER (
+                    WHERE m.date >= NOW() - INTERVAL '1 day' * $2
+                ) AS recent_meetings,
+                jurisdiction.last_synced_at
+            FROM unnest($1::text[]) AS requested(banana)
+            LEFT JOIN jurisdictions AS jurisdiction
+              ON jurisdiction.banana = requested.banana
+            LEFT JOIN meetings m ON m.banana = requested.banana
+            GROUP BY requested.banana, jurisdiction.last_synced_at
+            """,
+            unique_bananas,
+            days,
+        )
+        return {
+            row["banana"]: JurisdictionSyncStats(
+                recent_meetings=int(row["recent_meetings"] or 0),
+                last_synced_at=row["last_synced_at"],
+            )
+            for row in rows
+        }

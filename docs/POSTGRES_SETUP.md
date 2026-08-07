@@ -83,13 +83,18 @@ import asyncio
 from database.db_postgres import Database
 
 async def init():
-    db = await Database.create()
+    # Bootstrap is the only supported reason to bypass the read-only
+    # schema-current startup gate.
+    db = await Database.create(require_current_schema=False)
     await db.init_schema()
     print('Schema initialized!')
     await db.close()
 
 asyncio.run(init())
 "
+
+# Record/apply every versioned migration before starting application code.
+python3 -m database.migrate
 ```
 
 ### 6. Verify Setup
@@ -196,13 +201,17 @@ import asyncio
 from database.db_postgres import Database
 
 async def init():
-    db = await Database.create()
+    # Bootstrap is the only supported reason to bypass the read-only
+    # schema-current startup gate.
+    db = await Database.create(require_current_schema=False)
     await db.init_schema()
     print('Schema initialized!')
     await db.close()
 
 asyncio.run(init())
 "
+
+python3 -m database.migrate
 ```
 
 ---

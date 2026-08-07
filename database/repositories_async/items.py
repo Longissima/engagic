@@ -354,13 +354,15 @@ class ItemRepository(BaseRepository):
                 item_id,
             )
 
-    async def get_all_items_for_matter(self, matter_id: str) -> List[AgendaItem]:
+    async def get_all_items_for_matter(
+        self, matter_id: str, conn: Optional[Connection] = None
+    ) -> List[AgendaItem]:
         """Get all agenda items across all meetings for a given matter."""
         if not matter_id:
             return []
 
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
+        async with self._ensure_conn(conn) as c:
+            rows = await c.fetch(
                 """
                 SELECT
                     id, meeting_id, title, sequence, attachments,
@@ -379,7 +381,7 @@ class ItemRepository(BaseRepository):
 
             item_ids = [row["id"] for row in rows]
             topics_by_item = await fetch_topics_for_ids(
-                conn, "item_topics", "item_id", item_ids
+                c, "item_topics", "item_id", item_ids
             )
 
             return [

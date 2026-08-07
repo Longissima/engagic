@@ -20,6 +20,7 @@ through, and there is exactly one corpus.
 
 import hashlib
 import time
+from dataclasses import dataclass
 from typing import Any, BinaryIO, Dict, Optional
 
 from config import config, get_logger
@@ -51,7 +52,24 @@ def sha256_hex(data: bytes) -> str:
 def _sniff_content_type(head: bytes) -> str:
     if head.startswith(b"%PDF"):
         return "application/pdf"
+    if head.startswith(b"{\\rtf"):
+        return "application/rtf"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        return "application/msword"
+    if head.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    if head.lstrip().lower().startswith((b"<!doctype", b"<html")):
+        return "text/html; charset=utf-8"
     return "application/octet-stream"
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusOriginal:
+    """Archived source bytes with their content-addressed provenance."""
+
+    data: bytes
+    content_sha256: str
+    content_type: Optional[str]
 
 
 class CorpusStore:
@@ -73,6 +91,7 @@ class CorpusStore:
         file_obj: Optional[BinaryIO] = None,
         source_url: Optional[str] = None,
         banana: Optional[str] = None,
+        content_type: Optional[str] = None,
     ) -> bool:
         """Stage 1's archive step: ensure these bytes exist in the corpus.
 
@@ -103,7 +122,7 @@ class CorpusStore:
                 file_obj.seek(0)
             else:
                 head = (data or b"")[:8]
-            content_type = _sniff_content_type(head)
+            content_type = content_type or _sniff_content_type(head)
 
             await self.blobs.upsert_blob(content_sha256, byte_count, content_type)
 
@@ -235,20 +254,28 @@ class CorpusStore:
             )
             return None
 
-    async def get_original_by_identity(self, source_url: str) -> Optional[bytes]:
+    async def get_original_artifact_by_identity(
+        self, source_url: str
+    ) -> Optional[CorpusOriginal]:
         """Fetch archived original bytes for a URL identity -- the well.
 
-        The processor's shape-manufacturing step drinks from here instead of
-        re-downloading what sync already archived. Resolves to the NEWEST
-        blob seen at the identity (a URL that served revised bytes gets its
-        latest revision). None on unknown identity, unarchived blob, or any
-        corpus trouble -- callers fall back to downloading.
+        Resolves to the NEWEST blob seen at the identity (a URL that served
+        revised bytes gets its latest revision).  The typed return keeps the
+        database's content identity/media metadata attached to the bytes so
+        acquisition does not need to hash a corpus hit again.
         """
         try:
             blob = await self.blobs.get_blob_for_identity(attachment_identity(source_url))
             if not blob or not blob.get("original_key"):
                 return None
-            return await self.r2.get(blob["original_key"])
+            data = await self.r2.get(blob["original_key"])
+            if data is None:
+                return None
+            return CorpusOriginal(
+                data=data,
+                content_sha256=blob["content_sha256"],
+                content_type=blob.get("content_type"),
+            )
         except Exception as e:
             logger.warning(
                 "corpus original fetch failed, caller falls back to download",
@@ -257,6 +284,15 @@ class CorpusStore:
                 error_type=type(e).__name__,
             )
             return None
+
+    async def get_original_by_identity(self, source_url: str) -> Optional[bytes]:
+        """Compatibility read returning bytes only.
+
+        New acquisition code should use :meth:`get_original_artifact_by_identity`
+        to preserve content identity and media metadata across the boundary.
+        """
+        original = await self.get_original_artifact_by_identity(source_url)
+        return original.data if original else None
 
     async def record_sighting(
         self, content_sha256: str, source_url: Optional[str], banana: Optional[str] = None

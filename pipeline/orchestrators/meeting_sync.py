@@ -10,7 +10,12 @@ from database.id_generation import generate_meeting_id, generate_matter_id, gene
 from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
-from pipeline.utils import hash_substantive_attachments, hash_substantive_attachments_legacy
+from pipeline.utils import (
+    aggregate_matter_attachments,
+    matter_work_version,
+    matter_work_version_legacy,
+    meeting_work_version,
+)
 from pipeline.orchestrators.matter_filter import MatterFilter
 from pipeline.orchestrators.enqueue_decider import EnqueueDecider, MatterEnqueueDecider
 from pipeline.orchestrators.vote_processor import VoteProcessor
@@ -28,10 +33,6 @@ class MeetingStoreStats(TypedDict, total=False):
     appearances_created: int
     skip_reason: Optional[str]
     skipped_title: Optional[str]
-    enqueue_failures: int
-
-
-QUEUE_PRIORITY_BASE_SCORE = 150
 
 
 class MeetingSyncOrchestrator:
@@ -169,43 +170,17 @@ class MeetingSyncOrchestrator:
                         )
                         stats['appearances_created'] = appearances_count
 
-            # Enqueue jobs after transaction commits (queue has FK to meetings)
-            # Wrapped in try/except - meeting data is committed, jobs can be recovered via re-sync
-            enqueue_failures = 0
-            for job in pending_jobs:
-                try:
-                    await self._enqueue_matter_job(**job)
-                except Exception as e:
-                    enqueue_failures += 1
-                    logger.warning(
-                        "failed to enqueue matter job",
-                        matter_id=job.get('matter_id'),
-                        error=str(e),
-                        error_type=type(e).__name__
+                    for job in pending_jobs:
+                        await self._enqueue_matter_job(**job, conn=conn)
+
+                    await self._enqueue_if_needed(
+                        meeting_obj,
+                        meeting_date,
+                        agenda_items,
+                        conn=conn,
+                        chunk_audit=meeting_dict.get("chunk_audit"),
+                        html_audit=meeting_dict.get("html_audit"),
                     )
-
-            try:
-                await self._enqueue_if_needed(
-                    meeting_obj, meeting_date, agenda_items, items_data, stats,
-                    chunk_audit=meeting_dict.get("chunk_audit"),
-                    html_audit=meeting_dict.get("html_audit"),
-                )
-            except Exception as e:
-                enqueue_failures += 1
-                logger.warning(
-                    "failed to enqueue meeting processing job",
-                    meeting_id=meeting_obj.id,
-                    error=str(e),
-                    error_type=type(e).__name__
-                )
-
-            if enqueue_failures > 0:
-                stats['enqueue_failures'] = enqueue_failures
-                logger.warning(
-                    "some jobs failed to enqueue - meeting data committed, jobs recoverable via re-sync",
-                    meeting_id=meeting_obj.id,
-                    failures=enqueue_failures
-                )
 
             # Notify users if this was the first meeting for the city
             if is_first_meeting:
@@ -351,16 +326,8 @@ class MeetingSyncOrchestrator:
                     stored_meeting, agenda_items, conn=conn
                 )
 
-        for job in pending_jobs:
-            try:
-                await self._enqueue_matter_job(**job)
-            except Exception as e:
-                logger.warning(
-                    "failed to enqueue matter job from attach_items",
-                    matter_id=job.get('matter_id'),
-                    error=str(e),
-                    error_type=type(e).__name__,
-                )
+                for job in pending_jobs:
+                    await self._enqueue_matter_job(**job, conn=conn)
 
         logger.info(
             "attached manufactured items to meeting",
@@ -502,11 +469,28 @@ class MeetingSyncOrchestrator:
                 stats['skipped_item_ids'].add(agenda_item.id)
                 logger.debug("procedural matter - will track but skip queue", matter=agenda_item.matter_file or raw_vendor_matter_id, matter_type=matter_type)
 
-            existing_matter = await self.db.matters.get_matter(agenda_item.matter_id)
-            attachment_hash = hash_substantive_attachments(agenda_item.attachments or [])
+            existing_matter = await self.db.matters.get_matter(
+                agenda_item.matter_id, conn=conn
+            )
+            prior_appearances = (
+                await self.db.items.get_all_items_for_matter(
+                    agenda_item.matter_id, conn=conn
+                )
+                if existing_matter
+                else []
+            )
+            authoritative_appearances = [
+                item for item in prior_appearances if item.id != agenda_item.id
+            ] + [agenda_item]
+            aggregate_attachments = aggregate_matter_attachments(
+                authoritative_appearances
+            )
+            attachment_hash = matter_work_version(authoritative_appearances)
 
             if existing_matter:
-                appearance_exists = await self.db.matters.has_appearance(agenda_item.matter_id, meeting.id)
+                appearance_exists = await self.db.matters.has_appearance(
+                    agenda_item.matter_id, meeting.id, conn=conn
+                )
 
                 # Decide BEFORE updating tracking: the decider compares the
                 # stored hash (what the canonical summary was computed from)
@@ -517,9 +501,9 @@ class MeetingSyncOrchestrator:
                     should_enqueue, skip_reason = self.matter_enqueue_decider.should_enqueue_matter(
                         existing_matter=existing_matter,
                         current_attachment_hash=attachment_hash,
-                        has_attachments=bool(agenda_item.attachments),
-                        current_attachment_hash_legacy=hash_substantive_attachments_legacy(
-                            agenda_item.attachments or []
+                        has_attachments=bool(aggregate_attachments),
+                        current_attachment_hash_legacy=matter_work_version_legacy(
+                            authoritative_appearances
                         ),
                     )
 
@@ -545,11 +529,10 @@ class MeetingSyncOrchestrator:
                     continue
 
                 if should_enqueue:
-                    item_ids = await self._collect_item_ids_for_matter(agenda_item.matter_id)
                     stats['pending_jobs'].append({
                         'matter_id': agenda_item.matter_id,
                         'meeting_id': meeting.id,
-                        'item_ids': item_ids,
+                        'attachment_hash': attachment_hash,
                         'banana': meeting.banana,
                         'meeting_date': meeting.date
                     })
@@ -599,7 +582,7 @@ class MeetingSyncOrchestrator:
                     stats['pending_jobs'].append({
                         'matter_id': agenda_item.matter_id,
                         'meeting_id': meeting.id,
-                        'item_ids': [agenda_item.id],
+                        'attachment_hash': attachment_hash,
                         'banana': meeting.banana,
                         'meeting_date': meeting.date
                     })
@@ -654,8 +637,7 @@ class MeetingSyncOrchestrator:
         stored_meeting: Meeting,
         meeting_date: Optional[datetime],
         agenda_items: List[AgendaItem],
-        items_data: Optional[List[Dict[str, Any]]],
-        stats: MeetingStoreStats,
+        conn: Connection,
         chunk_audit: Optional[Dict[str, Any]] = None,
         html_audit: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -669,13 +651,16 @@ class MeetingSyncOrchestrator:
 
         priority = self.enqueue_decider.calculate_priority(meeting_date)
 
-        await self.db.queue.enqueue_job(
+        work_version = meeting_work_version(stored_meeting, agenda_items)
+        await self.db.pipeline_lifecycle.enqueue_queue_job(
             source_url=f"meeting://{stored_meeting.id}",
             job_type="meeting",
             payload={"meeting_id": stored_meeting.id},
+            aggregate_id=stored_meeting.id,
             meeting_id=stored_meeting.id,
             priority=priority,
             banana=stored_meeting.banana,
+            work_version=work_version,
             processing_metadata=(
                 {
                     k: v
@@ -684,6 +669,7 @@ class MeetingSyncOrchestrator:
                 }
                 or None
             ),
+            conn=conn,
         )
 
         logger.info("enqueued meeting for processing", meeting_id=stored_meeting.id, priority=priority)
@@ -692,26 +678,29 @@ class MeetingSyncOrchestrator:
         self,
         matter_id: str,
         meeting_id: str,
-        item_ids: List[str],
+        attachment_hash: str,
         banana: str,
-        meeting_date: Optional[datetime]
+        meeting_date: Optional[datetime],
+        conn: Connection,
     ) -> None:
         priority = self.matter_enqueue_decider.calculate_priority(meeting_date)
 
-        await self.db.queue.enqueue_job(
+        await self.db.pipeline_lifecycle.enqueue_queue_job(
             source_url=f"matter://{matter_id}",
             job_type="matter",
-            payload={"matter_id": matter_id, "meeting_id": meeting_id, "item_ids": item_ids},
+            payload={
+                "matter_id": matter_id,
+                "meeting_id": meeting_id,
+            },
+            aggregate_id=matter_id,
             meeting_id=meeting_id,
             banana=banana,
             priority=priority,
+            work_version=attachment_hash,
+            conn=conn,
         )
 
         logger.info("enqueued matter for processing", matter_id=matter_id, priority=priority)
-
-    async def _collect_item_ids_for_matter(self, matter_id: str) -> List[str]:
-        items = await self.db.items.get_all_items_for_matter(matter_id)
-        return [item.id for item in items]
 
     async def _is_first_meeting_for_city(self, banana: str) -> bool:
         """Check if city has no existing meetings (first sync detection)."""
