@@ -320,7 +320,7 @@ Tracks each time a matter appears in a meeting (junction table).
 | `matter_id` | TEXT NOT NULL | FK to city_matters |
 | `meeting_id` | TEXT NOT NULL | FK to meetings |
 | `item_id` | TEXT NOT NULL | FK to items |
-| `appeared_at` | TIMESTAMP NOT NULL | Meeting date |
+| `appeared_at` | TIMESTAMP | Authoritative meeting date; NULL for undated meetings |
 | `committee` | TEXT | Committee name (denormalized) |
 | `committee_id` | TEXT | FK to committees |
 | `action` | TEXT | Action taken (e.g., "First Reading") |

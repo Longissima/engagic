@@ -175,13 +175,45 @@ class ItemRepository(BaseRepository):
         logger.debug("stored agenda items", count=len(items), meeting_id=meeting_id)
         return len(items)
 
+    async def get_item_matter_links(
+        self,
+        meeting_id: str,
+        *,
+        conn: Connection,
+    ) -> Dict[str, str]:
+        """Read the meeting's current item-to-matter links without row locks.
+
+        Meeting sync calls this only after it owns the meeting row lock. That
+        lock serializes writers for one meeting, while the returned old matter
+        IDs let the caller acquire the sorted old+new aggregate union before it
+        locks any item rows. Taking item locks during discovery would invert the
+        global matter -> items order for A -> B relinks.
+        """
+        rows = await conn.fetch(
+            """
+            SELECT id, matter_id
+            FROM items
+            WHERE meeting_id = $1
+              AND matter_id IS NOT NULL
+            ORDER BY id
+            """,
+            meeting_id,
+        )
+        return {row["id"]: row["matter_id"] for row in rows}
+
     async def get_agenda_items(
-        self, meeting_id: str, load_matters: bool = False
+        self,
+        meeting_id: str,
+        load_matters: bool = False,
+        conn: Optional[Connection] = None,
+        *,
+        lock_for_update: bool = False,
     ) -> List[AgendaItem]:
         """Get all agenda items for a meeting."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
+        async with self._ensure_conn(conn) as c:
+            lock_clause = "FOR UPDATE" if lock_for_update else ""
+            rows = await c.fetch(
+                f"""
                 SELECT
                     id, meeting_id, title, sequence, attachments,
                     attachment_hash, body_text, matter_id, matter_file, matter_type,
@@ -190,6 +222,7 @@ class ItemRepository(BaseRepository):
                 FROM items
                 WHERE meeting_id = $1
                 ORDER BY sequence
+                {lock_clause}
                 """,
                 meeting_id,
             )
@@ -199,7 +232,7 @@ class ItemRepository(BaseRepository):
 
             item_ids = [row["id"] for row in rows]
             topics_by_item = await fetch_topics_for_ids(
-                conn, "item_topics", "item_id", item_ids
+                c, "item_topics", "item_id", item_ids
             )
 
             return [
@@ -301,6 +334,7 @@ class ItemRepository(BaseRepository):
         item_id: str,
         summary: Optional[str] = None,
         topics: Optional[List[str]] = None,
+        conn: Optional[Connection] = None,
         **kwargs
     ) -> None:
         """Update agenda item fields.
@@ -326,9 +360,10 @@ class ItemRepository(BaseRepository):
             set_clauses.append(f"{key} = ${param_num}")
             values.append(value)
             param_num += 1
+        if summary is not None:
+            set_clauses.append("summary_updated_at = CURRENT_TIMESTAMP")
 
-        # Single transaction for both item update and topics update
-        async with self.transaction() as conn:
+        async def update(connection: Connection) -> None:
             if set_clauses:
                 values.append(item_id)  # WHERE clause parameter
                 query = f"""
@@ -336,58 +371,106 @@ class ItemRepository(BaseRepository):
                     SET {', '.join(set_clauses)}
                     WHERE id = ${param_num}
                 """
-                await conn.execute(query, *values)
+                await connection.execute(query, *values)
 
             if "topics" in kwargs:
                 await replace_entity_topics(
-                    conn, "item_topics", "item_id", item_id, kwargs["topics"] or []
+                    connection,
+                    "item_topics",
+                    "item_id",
+                    item_id,
+                    kwargs["topics"] or [],
                 )
+
+        if conn is not None:
+            await update(conn)
+        else:
+            # Single transaction for both item update and topics update.
+            async with self.transaction() as transaction_conn:
+                await update(transaction_conn)
 
         logger.debug("updated agenda item", item_id=item_id, fields=list(kwargs.keys()))
 
-    async def update_filter_reason(self, item_id: str, reason: str) -> None:
+    async def update_filter_reason(
+        self,
+        item_id: str,
+        reason: str,
+        conn: Optional[Connection] = None,
+    ) -> None:
         """Update the filter_reason for an item."""
-        async with self.pool.acquire() as conn:
-            await conn.execute(
+        async with self._ensure_conn(conn) as connection:
+            await connection.execute(
                 "UPDATE items SET filter_reason = $1 WHERE id = $2",
                 reason,
                 item_id,
             )
 
     async def get_all_items_for_matter(
-        self, matter_id: str, conn: Optional[Connection] = None
+        self,
+        matter_id: str,
+        conn: Optional[Connection] = None,
+        *,
+        lock_for_update: bool = False,
     ) -> List[AgendaItem]:
         """Get all agenda items across all meetings for a given matter."""
         if not matter_id:
             return []
 
+        items_by_matter = await self.get_all_items_for_matters(
+            [matter_id],
+            conn=conn,
+            lock_for_update=lock_for_update,
+        )
+        return items_by_matter.get(matter_id, [])
+
+    async def get_all_items_for_matters(
+        self,
+        matter_ids: List[str],
+        conn: Optional[Connection] = None,
+        *,
+        lock_for_update: bool = False,
+    ) -> Dict[str, List[AgendaItem]]:
+        """Batch-load every historical item appearance for several matters.
+
+        When locking is requested, rows are acquired in deterministic
+        ``matter_id, meeting_id, sequence, id`` order. Meeting sync calls this
+        only after locking the corresponding matter rows, preserving the
+        system-wide matter -> items lock hierarchy.
+        """
+        unique_ids = sorted(set(matter_ids))
+        if not unique_ids:
+            return {}
+
         async with self._ensure_conn(conn) as c:
+            lock_clause = "FOR UPDATE" if lock_for_update else ""
             rows = await c.fetch(
-                """
+                f"""
                 SELECT
                     id, meeting_id, title, sequence, attachments,
                     attachment_hash, body_text, matter_id, matter_file, matter_type,
                     agenda_number, sponsors, summary, topics, quality_score, rating_count,
                     filter_reason
                 FROM items
-                WHERE matter_id = $1
-                ORDER BY meeting_id, sequence
+                WHERE matter_id = ANY($1::text[])
+                ORDER BY matter_id, meeting_id, sequence, id
+                {lock_clause}
                 """,
-                matter_id,
+                unique_ids,
             )
 
             if not rows:
-                return []
+                return {}
 
             item_ids = [row["id"] for row in rows]
             topics_by_item = await fetch_topics_for_ids(
                 c, "item_topics", "item_id", item_ids
             )
 
-            return [
-                build_agenda_item(row, topics_by_item.get(row["id"], []))
-                for row in rows
-            ]
+            items_by_matter: Dict[str, List[AgendaItem]] = defaultdict(list)
+            for row in rows:
+                item = build_agenda_item(row, topics_by_item.get(row["id"], []))
+                items_by_matter[row["matter_id"]].append(item)
+            return dict(items_by_matter)
 
     async def bulk_fill_null_item_summaries(
         self,
@@ -395,6 +478,7 @@ class ItemRepository(BaseRepository):
         summary: str,
         topics: List[str],
         prompts_version: Optional[str] = None,
+        conn: Optional[Connection] = None,
     ) -> int:
         """Fill in item summaries for items that do not yet have one.
 
@@ -411,13 +495,15 @@ class ItemRepository(BaseRepository):
         if not item_ids:
             return 0
 
-        async with self.transaction() as conn:
-            result = await conn.execute(
+        async def fill(connection: Connection) -> int:
+            touched_rows = await connection.fetch(
                 """
                 UPDATE items
-                SET summary = $1, topics = $2, prompts_version = $4
+                SET summary = $1, topics = $2, prompts_version = $4,
+                    summary_updated_at = CURRENT_TIMESTAMP
                 WHERE id = ANY($3::text[])
                   AND summary IS NULL
+                RETURNING id
                 """,
                 summary,
                 topics,
@@ -425,25 +511,23 @@ class ItemRepository(BaseRepository):
                 prompts_version,
             )
 
-            updated_count = self._parse_row_count(result)
+            updated_count = len(touched_rows)
 
-            if topics and updated_count > 0:
-                # Refresh topics only for the rows we actually touched.
-                touched_rows = await conn.fetch(
-                    """
-                    SELECT id FROM items
-                    WHERE id = ANY($1::text[])
-                      AND summary = $2
-                    """,
-                    item_ids,
-                    summary,
-                )
+            if updated_count > 0:
                 touched_ids = [r["id"] for r in touched_rows]
                 if touched_ids:
                     entity_topics = {item_id: topics for item_id in touched_ids}
                     await replace_entity_topics_batch(
-                        conn, "item_topics", "item_id", entity_topics
+                        connection, "item_topics", "item_id", entity_topics
                     )
+
+            return updated_count
+
+        if conn is not None:
+            updated_count = await fill(conn)
+        else:
+            async with self.transaction() as transaction_conn:
+                updated_count = await fill(transaction_conn)
 
         logger.debug("bulk filled null item summaries", count=updated_count)
         return updated_count
@@ -503,7 +587,8 @@ class ItemRepository(BaseRepository):
             result = await c.execute(
                 """
                 UPDATE items
-                SET summary = $1, topics = $2, prompts_version = $4
+                SET summary = $1, topics = $2, prompts_version = $4,
+                    summary_updated_at = CURRENT_TIMESTAMP
                 WHERE id = $3 AND summary IS NULL
                 """,
                 prior_summary,
@@ -518,10 +603,9 @@ class ItemRepository(BaseRepository):
                 # items row is absent.
                 return False
 
-            if prior_topics:
-                await replace_entity_topics(
-                    c, "item_topics", "item_id", target_item_id, prior_topics
-                )
+            await replace_entity_topics(
+                c, "item_topics", "item_id", target_item_id, prior_topics
+            )
 
             logger.debug(
                 "copied prior-appearance summary",
@@ -594,10 +678,14 @@ class ItemRepository(BaseRepository):
                 JOIN meetings m ON i.meeting_id = m.id
                 JOIN jurisdictions c ON m.banana = c.banana
                 WHERE m.banana = $1
-                  AND m.date >= $2
+                  AND COALESCE(
+                      m.date, i.summary_updated_at, i.created_at
+                  ) >= $2
                   {status_filter}
                   AND i.summary LIKE $3
-                ORDER BY m.date DESC
+                ORDER BY m.date DESC NULLS LAST,
+                         i.summary_updated_at DESC NULLS LAST,
+                         i.created_at DESC
                 """,
                 banana,
                 since_date,

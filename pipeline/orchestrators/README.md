@@ -1,26 +1,31 @@
-# pipeline/orchestrators/
+# `pipeline/orchestrators/`
 
-Business logic extracted from Database. Workflow coordination across repositories.
+Business workflow coordination above the repository layer. Repositories own SQL;
+orchestrators own cross-repository decisions and transaction boundaries.
 
 ## Classes
 
-| Class | Purpose | Used By |
-|-------|---------|---------|
-| `MatterFilter` | Skip procedural matter types | `db._track_matters_async()` |
-| `EnqueueDecider` | Queue priority + skip logic | `db._enqueue_if_needed_async()` |
-| `VoteProcessor` | Tally votes, determine outcome | `db._track_matters_async()` |
+| Class | Purpose | Used by |
+|---|---|---|
+| `MeetingSyncOrchestrator` | Transform and persist one fetched meeting, its items/matters/appearances, and downstream intents in one unit of work | `Fetcher` |
+| `EnqueueDecider` | Decide whether current meeting inputs require processing and calculate urgency | `MeetingSyncOrchestrator` |
+| `MatterEnqueueDecider` | Compare authoritative matter artifact/work versions and bound repeated attempts | `MeetingSyncOrchestrator` |
+| `MatterFilter` | Exclude procedural matter types from LLM work while preserving relational records | `MeetingSyncOrchestrator` |
+| `VoteProcessor` | Normalize vote tallies and outcomes | `MeetingSyncOrchestrator` |
 
-## Pattern
+## Transaction pattern
 
-Database delegates business decisions to orchestrators:
+`MeetingSyncOrchestrator.sync_meeting()` is the canonical sync persistence
+boundary. It loads matter/appearance state set-wise, locks aggregates in stable
+order, writes meeting domain rows, and records queue and city-activation outbox
+intents on the caller's connection. A successful commit therefore contains both
+the authoritative domain state and its durable publication intent.
 
-```python
-# In database/db_postgres.py
-matter_filter = MatterFilter()
-if matter_filter.should_skip(matter_type):
-    continue
-```
+Queue intent identity combines the stable source and `work_version`. Publication
+for one source is advisory-lock serialized and carries a monotonic generation. If
+authoritative inputs recur A -> B -> A, the existing A event is reopened with a
+fresh generation; an older delivery cannot replace the later desired state.
 
-## Future
-
-`MeetingSyncOrchestrator` to move entire `store_meeting_from_sync()` workflow out of Database. See REFACTORING.md.
+Workers do not trust relationship snapshots in queue payloads. Meeting jobs carry
+meeting identity; matter jobs carry matter identity. The processor reloads current
+rows and checks the claimed `work_version` before projection writes.

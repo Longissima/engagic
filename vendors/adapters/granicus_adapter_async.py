@@ -18,7 +18,7 @@ import os
 import re
 import asyncio
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin, urlparse, unquote, parse_qs
 
@@ -29,6 +29,7 @@ from vendors.adapters.parsers.granicus_parser import (
     parse_viewpublisher_listing,
     parse_granicus_html,
 )
+from pipeline.document_artifacts import DocumentFormat
 from pipeline.protocols import MetricsCollector
 
 
@@ -579,8 +580,13 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         """
         soup = BeautifulSoup(html, "html.parser")
         attachments = []
-        for link in soup.find_all("a", href=lambda x: x and "DownloadFile" in x and "isAttachment=True" in x):
-            href = link.get("href", "")
+        for link in soup.find_all(
+            "a",
+            href=lambda value: isinstance(value, str)
+            and "DownloadFile" in value
+            and "isAttachment=True" in value,
+        ):
+            href = str(link.get("href") or "")
             name = link.get_text(strip=True)
             full_url = base_host + href if href.startswith("/") else href
             # Translate to ViewDocument URL for direct fetching
@@ -618,8 +624,13 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
             staff_report_url = pdf_attachments[0]["url"]
             tmp_path = None
             try:
-                response = await self._get(staff_report_url)
-                pdf_bytes = await response.read()
+                artifact = await self._document_acquirer.acquire(
+                    staff_report_url,
+                    banana=self.banana,
+                )
+                if artifact.document_format is not DocumentFormat.PDF:
+                    return item
+                pdf_bytes = artifact.data
 
                 if len(pdf_bytes) < 500:
                     return item
@@ -627,6 +638,10 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
                     tmp_path = tmp.name
                     tmp.write(pdf_bytes)
+                # PyMuPDF reopens the tempfile; do not retain the parent-side
+                # artifact while link extraction runs in its worker thread.
+                del artifact
+                pdf_bytes = b""
 
                 def _extract_links():
                     doc = fitz.open(tmp_path)
@@ -720,7 +735,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
 
                     pdf_attachments = []
                     for link in soup.find_all("a", href=True):
-                        href = link.get("href", "")
+                        href = str(link.get("href") or "")
                         name = link.get_text(strip=True)
                         if not href or not name:
                             continue
@@ -784,7 +799,15 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         """Parse a PDF from an already-fetched response (e.g. DocumentViewer redirect)."""
         try:
             pdf_bytes = await response.read()
-            return await self._parse_pdf_bytes(pdf_bytes, vendor_id=event_id, force_method=force_method)
+            parse = self._parse_pdf_bytes(
+                pdf_bytes,
+                vendor_id=event_id,
+                force_method=force_method,
+            )
+            # Transfer the buffer to the parser coroutine instead of retaining
+            # a second reference for the duration of guarded extraction.
+            pdf_bytes = b""
+            return await parse
         except Exception as e:
             logger.warning(
                 "pdf redirect parse failed",
@@ -807,7 +830,10 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         packet_url = None
 
         # MetaViewer links are typically the full packet
-        meta_link = soup.find('a', href=lambda x: x and 'MetaViewer' in x if x else False)
+        meta_link = soup.find(
+            "a",
+            href=lambda value: isinstance(value, str) and "MetaViewer" in value,
+        )
         if meta_link:
             href = str(meta_link['href'])
             if href.startswith('//'):
@@ -842,7 +868,11 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
 
         # If we only found one PDF and couldn't distinguish, use it as the agenda
         if not agenda_url and not packet_url:
-            pdf_link = soup.find('a', href=lambda x: x and '.pdf' in x.lower() if x else False)
+            pdf_link = soup.find(
+                "a",
+                href=lambda value: isinstance(value, str)
+                and ".pdf" in value.lower(),
+            )
             if pdf_link:
                 href = str(pdf_link['href'])
                 if href.startswith('//'):

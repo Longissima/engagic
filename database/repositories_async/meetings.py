@@ -59,18 +59,25 @@ class MeetingRepository(BaseRepository):
                 meeting.committee_id,
             )
 
-            if meeting.topics:
+            if meeting.topics is not None:
                 await replace_entity_topics(
                     c, "meeting_topics", "meeting_id", meeting.id, meeting.topics
                 )
 
         logger.info("meeting stored", meeting_id=meeting.id, banana=meeting.banana)
 
-    async def get_meeting(self, meeting_id: str) -> Optional[Meeting]:
+    async def get_meeting(
+        self,
+        meeting_id: str,
+        conn: Optional[Connection] = None,
+        *,
+        lock_for_update: bool = False,
+    ) -> Optional[Meeting]:
         """Get a meeting by ID."""
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
+        async with self._ensure_conn(conn) as c:
+            lock_clause = "FOR UPDATE" if lock_for_update else ""
+            row = await c.fetchrow(
+                f"""
                 SELECT
                     id, banana, title, date, agenda_url, agenda_sources, packet_url,
                     minutes_url, summary, participation, status, processing_status,
@@ -78,6 +85,7 @@ class MeetingRepository(BaseRepository):
                     created_at, updated_at
                 FROM meetings
                 WHERE id = $1
+                {lock_clause}
                 """,
                 meeting_id,
             )
@@ -86,7 +94,7 @@ class MeetingRepository(BaseRepository):
                 return None
 
             topics_map = await fetch_topics_for_ids(
-                conn, "meeting_topics", "meeting_id", [meeting_id]
+                c, "meeting_topics", "meeting_id", [meeting_id]
             )
 
             return build_meeting(row, topics_map.get(meeting_id, []))
@@ -132,6 +140,15 @@ class MeetingRepository(BaseRepository):
                 for row in rows
             ]
 
+    async def has_meetings_for_city(self, banana: str) -> bool:
+        """Return whether any meeting exists without hydrating a timeline row."""
+        return bool(
+            await self._fetchrow(
+                "SELECT 1 FROM meetings WHERE banana = $1 LIMIT 1",
+                banana,
+            )
+        )
+
     async def get_meeting_by_packet_url(self, packet_url: str) -> Optional[Meeting]:
         """Get meeting by packet_url for cache lookup."""
         async with self.pool.acquire() as conn:
@@ -166,10 +183,11 @@ class MeetingRepository(BaseRepository):
         processing_time: float,
         participation: Optional[ParticipationInfo] = None,
         topics: Optional[List[str]] = None,
+        conn: Optional[Connection] = None,
     ) -> None:
         """Update meeting summary and processing metadata."""
-        async with self.transaction() as conn:
-            await conn.execute(
+        async def update(connection: Connection) -> None:
+            await connection.execute(
                 """
                 UPDATE meetings
                 SET summary = $2,
@@ -177,6 +195,7 @@ class MeetingRepository(BaseRepository):
                     processing_method = $3,
                     processing_time = $4,
                     participation = $5,
+                    summary_updated_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1
                 """,
@@ -187,12 +206,38 @@ class MeetingRepository(BaseRepository):
                 participation,
             )
 
-            if topics:
+            if topics is not None:
                 await replace_entity_topics(
-                    conn, "meeting_topics", "meeting_id", meeting_id, topics
+                    connection, "meeting_topics", "meeting_id", meeting_id, topics
                 )
 
+        if conn is not None:
+            await update(conn)
+        else:
+            async with self.transaction() as transaction_conn:
+                await update(transaction_conn)
+
         logger.info("updated meeting summary", meeting_id=meeting_id, topic_count=len(topics) if topics else 0)
+
+    async def update_processing_status(
+        self,
+        meeting_id: str,
+        status: str,
+        *,
+        conn: Optional[Connection] = None,
+    ) -> None:
+        """Set processing state inside a caller-owned projection transaction."""
+        async with self._ensure_conn(conn) as connection:
+            await connection.execute(
+                """
+                UPDATE meetings
+                SET processing_status = $2,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                meeting_id,
+                status,
+            )
 
     async def get_recent_meetings(self, limit: int = 50) -> List[Meeting]:
         """Get most recent meetings across all cities."""

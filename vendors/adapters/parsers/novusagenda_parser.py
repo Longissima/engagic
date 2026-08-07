@@ -55,7 +55,8 @@ def parse_html_agenda(html: str) -> Dict[str, Any]:
 
         for sequence, link in enumerate(coversheet_links, 1):
             # Extract ItemID from href
-            href = link.get('href', '')
+            href_value = link.get('href')
+            href = href_value if isinstance(href_value, str) else ''
             item_id_match = re.search(r'ItemID=(\d+)', href)
             if not item_id_match:
                 continue

@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from config import config, get_logger
 from database.db_postgres import Database
+from server.utils.meeting_urls import generate_meeting_slug
 from userland.auth.jwt import generate_unsubscribe_token, init_jwt
 from userland.email.emailer import EmailService
 
@@ -353,8 +354,7 @@ def _truncate_title(title: str, max_len: int = 65) -> str:
 
 
 def _meeting_url(app_url: str, banana: str, meeting_id: str, meeting_date: str) -> str:
-    date_obj = datetime.fromisoformat(meeting_date)
-    slug = f"{date_obj.strftime('%Y-%m-%d')}-{meeting_id}"
+    slug = generate_meeting_slug(meeting_id, meeting_date)
     return f"{app_url}/{banana}/{slug}"
 
 

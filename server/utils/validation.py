@@ -5,6 +5,13 @@ import re
 from fastapi import HTTPException
 from fastapi import Query
 
+from config import config
+from server.utils.constants import (
+    RATABLE_ENTITY_TYPES,
+    VALID_ISSUE_TYPES,
+    WATCHABLE_ENTITY_TYPES,
+)
+
 # Hard ceiling for pagination limit across all API endpoints.
 # Frontend never requests more than 50; anything above 100 is scraper behavior.
 MAX_API_LIMIT = 100
@@ -18,14 +25,6 @@ def capped_limit(default: int = 50) -> int:
 def clamp_limit(value: int) -> int:
     """Clamp a limit value to MAX_API_LIMIT."""
     return min(max(value, 1), MAX_API_LIMIT)
-
-from config import config
-from server.utils.constants import (
-    RATABLE_ENTITY_TYPES,
-    VALID_ISSUE_TYPES,
-    WATCHABLE_ENTITY_TYPES,
-)
-
 
 def sanitize_string(value: str) -> str:
     """Sanitize string input to prevent injection attacks"""

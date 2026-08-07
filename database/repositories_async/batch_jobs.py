@@ -13,6 +13,8 @@ terminal FAILED/EXPIRED/CANCELLED, or an unrecoverable ingest error).
 import uuid
 from typing import Any, Dict, List, Optional
 
+from asyncpg import Connection
+
 from database.repositories_async.base import BaseRepository
 from config import get_logger
 
@@ -27,11 +29,14 @@ class BatchJobRepository(BaseRepository):
         submission_key: str,
         meeting_id: str,
         item_ids: List[str],
+        lease_owner: str,
         chunk_num: int = 1,
         banana: Optional[str] = None,
         cache_name: Optional[str] = None,
         prompts_version: Optional[str] = None,
         meeting_meta: Optional[Dict[str, Any]] = None,
+        lease_seconds: int = 1800,
+        conn: Optional[Connection] = None,
     ) -> bool:
         """Reserve one logical chunk before making the provider create call.
 
@@ -43,28 +48,34 @@ class BatchJobRepository(BaseRepository):
         # unique while open. A fresh suffix lets a terminal logical chunk be
         # retried without colliding with its prior intent row.
         intent_name = f"intent:{submission_key}:{uuid.uuid4()}"
-        row = await self._fetchrow(
-            """
-            INSERT INTO batch_jobs (
-                gemini_job_name, submission_key, meeting_id, banana, chunk_num,
-                item_ids, cache_name, prompts_version, meeting_meta, status,
-                submit_attempts, next_poll_at
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                INSERT INTO batch_jobs (
+                    gemini_job_name, submission_key, meeting_id, banana, chunk_num,
+                    item_ids, cache_name, prompts_version, meeting_meta, status,
+                    submit_attempts, next_poll_at, lease_owner, lease_expires_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, 'submitted', 0,
+                    NOW(), $10, NOW() + ($11 * INTERVAL '1 second')
+                )
+                ON CONFLICT (submission_key) WHERE status = 'submitted'
+                DO NOTHING
+                RETURNING id
+                """,
+                intent_name,
+                submission_key,
+                meeting_id,
+                banana,
+                chunk_num,
+                item_ids,
+                cache_name,
+                prompts_version,
+                meeting_meta,
+                lease_owner,
+                lease_seconds,
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'submitted', 0, NOW())
-            ON CONFLICT (submission_key) WHERE status = 'submitted'
-            DO NOTHING
-            RETURNING id
-            """,
-            intent_name,
-            submission_key,
-            meeting_id,
-            banana,
-            chunk_num,
-            item_ids,
-            cache_name,
-            prompts_version,
-            meeting_meta,
-        )
         reserved = row is not None
         logger.info(
             "batch submission intent",
@@ -80,6 +91,7 @@ class BatchJobRepository(BaseRepository):
         submission_key: str,
         gemini_job_name: str,
         submit_attempts: int,
+        lease_owner: str,
     ) -> None:
         """Attach the provider job name to its durable pre-create intent."""
         row = await self._fetchrow(
@@ -87,16 +99,21 @@ class BatchJobRepository(BaseRepository):
             UPDATE batch_jobs
             SET gemini_job_name = $2,
                 submit_attempts = GREATEST(submit_attempts, $3),
+                submitted_at = NOW(),
                 error_message = NULL,
-                next_poll_at = NOW()
+                next_poll_at = NOW(),
+                lease_owner = NULL,
+                lease_expires_at = NULL
             WHERE submission_key = $1
               AND status = 'submitted'
               AND gemini_job_name LIKE 'intent:%'
+              AND lease_owner = $4
             RETURNING id
             """,
             submission_key,
             gemini_job_name,
             submit_attempts,
+            lease_owner,
         )
         if row is None:
             raise RuntimeError(
@@ -113,40 +130,102 @@ class BatchJobRepository(BaseRepository):
         submission_key: str,
         error_message: str,
         submit_attempts: int,
-    ) -> None:
+        lease_owner: str,
+    ) -> bool:
         """Release a pre-create intent after provider submission exhausts retries."""
-        await self._execute(
+        row = await self._fetchrow(
             """
             UPDATE batch_jobs
             SET status = 'failed', error_message = $2,
                 submit_attempts = GREATEST(submit_attempts, $3),
-                collected_at = NOW()
+                collected_at = NOW(), lease_owner = NULL, lease_expires_at = NULL
             WHERE submission_key = $1
               AND status = 'submitted'
               AND gemini_job_name LIKE 'intent:%'
+              AND lease_owner = $4
+            RETURNING id
             """,
             submission_key,
             error_message,
             submit_attempts,
+            lease_owner,
         )
+        return row is not None
 
-    async def expire_stale_submission_intents(
-        self, meeting_id: str, max_age_minutes: int = 30
+    async def claim_expired_submission_intents(
+        self,
+        collector_id: str,
+        *,
+        bananas: Optional[List[str]] = None,
+        limit: int = 100,
+        recovery_lease_seconds: int = 900,
+    ) -> List[Dict[str, Any]]:
+        """Lease abandoned pre-provider intents for durable recovery.
+
+        Legacy intents created before submission leases use created_at + 30m
+        as their expiry. New intents carry an explicit lease_expires_at.
+        """
+        if bananas is not None and not bananas:
+            return []
+        rows = await self._fetch(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM batch_jobs
+                WHERE status = 'submitted'
+                  AND gemini_job_name LIKE 'intent:%'
+                  AND ($1::text[] IS NULL OR banana = ANY($1))
+                  AND COALESCE(
+                        lease_expires_at,
+                        created_at + INTERVAL '30 minutes'
+                      ) <= NOW()
+                ORDER BY created_at, id
+                FOR UPDATE SKIP LOCKED
+                LIMIT $3
+            )
+            UPDATE batch_jobs AS job
+            SET lease_owner = $2,
+                lease_expires_at = NOW() + ($4 * INTERVAL '1 second'),
+                error_message = 'Recovering abandoned submission intent'
+            FROM candidates
+            WHERE job.id = candidates.id
+            RETURNING job.id, job.gemini_job_name, job.meeting_id, job.banana,
+                      job.chunk_num, job.item_ids, job.cache_name,
+                      job.prompts_version, job.meeting_meta, job.created_at,
+                      job.submitted_at,
+                      job.submission_key, job.submit_attempts,
+                      job.poll_attempts, job.poll_error_count,
+                      job.consecutive_poll_errors, job.next_poll_at
+            """,
+            list(bananas) if bananas is not None else None,
+            collector_id,
+            limit,
+            recovery_lease_seconds,
+        )
+        return [self._row_to_dict(row) for row in (rows or [])]
+
+    async def defer_submission_intent_recovery(
+        self,
+        job_id: int,
+        collector_id: str,
+        error_message: str,
+        retry_seconds: int = 60,
     ) -> None:
-        """Release intents abandoned before their provider name was recorded."""
+        """Release a failed recovery lease for a bounded later retry."""
         await self._execute(
             """
             UPDATE batch_jobs
-            SET status = 'failed',
-                error_message = 'Submission intent expired before provider activation',
-                collected_at = NOW()
-            WHERE meeting_id = $1
-              AND status = 'submitted'
+            SET lease_owner = NULL,
+                lease_expires_at = NOW() + ($4 * INTERVAL '1 second'),
+                error_message = $3
+            WHERE id = $1 AND status = 'submitted'
               AND gemini_job_name LIKE 'intent:%'
-              AND created_at < NOW() - ($2 * INTERVAL '1 minute')
+              AND lease_owner = $2
             """,
-            meeting_id,
-            max_age_minutes,
+            job_id,
+            collector_id,
+            error_message[:2000],
+            retry_seconds,
         )
 
     async def record_submission(
@@ -173,9 +252,12 @@ class BatchJobRepository(BaseRepository):
             INSERT INTO batch_jobs (
                 gemini_job_name, meeting_id, banana, chunk_num, item_ids,
                 cache_name, prompts_version, meeting_meta, status,
-                submission_key, submit_attempts, next_poll_at
+                submission_key, submit_attempts, next_poll_at, submitted_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'submitted', $9, $10, NOW())
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, 'submitted', $9, $10,
+                NOW(), NOW()
+            )
             ON CONFLICT (gemini_job_name) DO UPDATE SET
                 status = 'submitted',
                 error_message = NULL,
@@ -184,7 +266,8 @@ class BatchJobRepository(BaseRepository):
                 meeting_meta = EXCLUDED.meeting_meta,
                 submission_key = EXCLUDED.submission_key,
                 submit_attempts = EXCLUDED.submit_attempts,
-                next_poll_at = NOW()
+                next_poll_at = NOW(),
+                submitted_at = NOW()
             """,
             gemini_job_name,
             meeting_id,
@@ -215,7 +298,8 @@ class BatchJobRepository(BaseRepository):
             """
             SELECT id, gemini_job_name, meeting_id, banana, chunk_num,
                    item_ids, cache_name, prompts_version, meeting_meta,
-                   created_at, submission_key, submit_attempts, poll_attempts,
+                   created_at, submitted_at, submission_key, submit_attempts,
+                   poll_attempts,
                    poll_error_count, consecutive_poll_errors, next_poll_at
             FROM batch_jobs
             WHERE status = 'submitted'
@@ -256,6 +340,7 @@ class BatchJobRepository(BaseRepository):
             RETURNING job.id, job.gemini_job_name, job.meeting_id, job.banana,
                       job.chunk_num, job.item_ids, job.cache_name,
                       job.prompts_version, job.meeting_meta, job.created_at,
+                      job.submitted_at,
                       job.submission_key, job.submit_attempts,
                       job.poll_attempts, job.poll_error_count,
                       job.consecutive_poll_errors, job.next_poll_at
@@ -299,6 +384,7 @@ class BatchJobRepository(BaseRepository):
             RETURNING job.id, job.gemini_job_name, job.meeting_id, job.banana,
                       job.chunk_num, job.item_ids, job.cache_name,
                       job.prompts_version, job.meeting_meta, job.created_at,
+                      job.submitted_at,
                       job.submission_key, job.submit_attempts,
                       job.poll_attempts, job.poll_error_count,
                       job.consecutive_poll_errors, job.next_poll_at
@@ -320,7 +406,8 @@ class BatchJobRepository(BaseRepository):
             """
             SELECT id, gemini_job_name, meeting_id, banana, chunk_num,
                    item_ids, cache_name, prompts_version, meeting_meta,
-                   created_at, submission_key, submit_attempts, poll_attempts,
+                   created_at, submitted_at, submission_key, submit_attempts,
+                   poll_attempts,
                    poll_error_count, consecutive_poll_errors, next_poll_at
             FROM batch_jobs
             WHERE status = 'submitted' AND meeting_id = ANY($1)
@@ -340,7 +427,8 @@ class BatchJobRepository(BaseRepository):
             """
             SELECT id, gemini_job_name, meeting_id, banana, chunk_num,
                    item_ids, cache_name, prompts_version, meeting_meta,
-                   created_at, submission_key, submit_attempts, poll_attempts,
+                   created_at, submitted_at, submission_key, submit_attempts,
+                   poll_attempts,
                    poll_error_count, consecutive_poll_errors, next_poll_at
             FROM batch_jobs
             WHERE status = 'submitted' AND banana = ANY($1)
@@ -378,21 +466,74 @@ class BatchJobRepository(BaseRepository):
         )
         return {str(row["item_id"]) for row in (rows or [])}
 
-    async def count_open_for_meeting(self, meeting_id: str) -> int:
+    async def count_open_for_meeting(
+        self,
+        meeting_id: str,
+        *,
+        conn: Optional[Connection] = None,
+    ) -> int:
         """In-flight chunk count for a meeting -- the double-submit guard."""
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT COUNT(*) AS n
+                FROM batch_jobs
+                WHERE meeting_id = $1 AND status = 'submitted'
+                """,
+                meeting_id,
+            )
+        return int(row["n"]) if row else 0
+
+    async def count_open_for_cache(self, cache_name: Optional[str]) -> int:
+        """Count open chunks that still reference one exact provider cache."""
+        if not cache_name:
+            return 0
         row = await self._fetchrow(
             """
             SELECT COUNT(*) AS n
             FROM batch_jobs
-            WHERE meeting_id = $1 AND status = 'submitted'
+            WHERE cache_name = $1 AND status = 'submitted'
             """,
-            meeting_id,
+            cache_name,
         )
         return int(row["n"]) if row else 0
 
-    async def mark_polled(self, job_id: int, poll_after_seconds: int = 60) -> None:
+    async def count_other_open_for_meeting(
+        self,
+        meeting_id: str,
+        job_id: int,
+        *,
+        conn: Connection,
+    ) -> int:
+        """Count sibling chunks inside a collector's domain transaction.
+
+        The caller already holds the meeting/items locks, which serialize new
+        reservations and sibling collection commits. Excluding the current
+        still-submitted row lets the last collector finalize before its
+        lease-checked close without a post-close race.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS n
+            FROM batch_jobs
+            WHERE meeting_id = $1
+              AND status = 'submitted'
+              AND id <> $2
+            """,
+            meeting_id,
+            job_id,
+        )
+        return int(row["n"]) if row else 0
+
+    async def mark_polled(
+        self,
+        job_id: int,
+        *,
+        lease_owner: str,
+        poll_after_seconds: int = 60,
+    ) -> bool:
         """Record a poll that found the job still running (observability)."""
-        await self._execute(
+        row = await self._fetchrow(
             """
             UPDATE batch_jobs
             SET last_polled_at = NOW(),
@@ -401,13 +542,18 @@ class BatchJobRepository(BaseRepository):
                 error_message = NULL,
                 lease_owner = NULL,
                 lease_expires_at = NULL
-            WHERE id = $1 AND status = 'submitted'
+            WHERE id = $1 AND status = 'submitted' AND lease_owner = $3
+            RETURNING id
             """,
             job_id,
             poll_after_seconds,
+            lease_owner,
         )
+        return row is not None
 
-    async def mark_transient_failure(self, job_id: int, error_message: str) -> int:
+    async def mark_transient_failure(
+        self, job_id: int, error_message: str, *, lease_owner: str
+    ) -> int:
         """Persist a collector failure and release its lease with backoff.
 
         Returns the new consecutive error count.  Backoff starts at 30 seconds
@@ -429,46 +575,72 @@ class BatchJobRepository(BaseRepository):
                 ),
                 lease_owner = NULL,
                 lease_expires_at = NULL
-            WHERE id = $1 AND status = 'submitted'
+            WHERE id = $1 AND status = 'submitted' AND lease_owner = $3
             RETURNING consecutive_poll_errors
             """,
             job_id,
             error_message[:2000],
+            lease_owner,
         )
         return int(row["consecutive_poll_errors"]) if row else 0
 
-    async def mark_collected(self, job_id: int) -> None:
+    async def mark_collected(
+        self,
+        job_id: int,
+        *,
+        lease_owner: str,
+        conn: Optional[Connection] = None,
+    ) -> bool:
         """Mark a job's results successfully ingested."""
-        await self._execute(
-            """
-            UPDATE batch_jobs
-            SET status = 'collected', collected_at = NOW(), last_polled_at = NOW(),
-                lease_owner = NULL, lease_expires_at = NULL,
-                consecutive_poll_errors = 0, error_message = NULL
-            WHERE id = $1
-            """,
-            job_id,
-        )
-        logger.info("batch job collected", job_id=job_id)
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE batch_jobs
+                SET status = 'collected', collected_at = NOW(),
+                    last_polled_at = NOW(), lease_owner = NULL,
+                    lease_expires_at = NULL, consecutive_poll_errors = 0,
+                    error_message = NULL
+                WHERE id = $1 AND status = 'submitted' AND lease_owner = $2
+                RETURNING id
+                """,
+                job_id,
+                lease_owner,
+            )
+        if row is not None:
+            logger.info("batch job collected", job_id=job_id)
+        return row is not None
 
-    async def mark_failed(self, job_id: int, error_message: str) -> None:
+    async def mark_failed(
+        self,
+        job_id: int,
+        error_message: str,
+        *,
+        lease_owner: str,
+        conn: Optional[Connection] = None,
+    ) -> bool:
         """Mark a job failed (Gemini terminal failure or ingest error)."""
-        await self._execute(
-            """
-            UPDATE batch_jobs
-            SET status = 'failed', error_message = $2,
-                collected_at = NOW(), last_polled_at = NOW(),
-                lease_owner = NULL, lease_expires_at = NULL
-            WHERE id = $1
-            """,
-            job_id,
-            error_message,
-        )
-        logger.warning("batch job failed", job_id=job_id, error=error_message)
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE batch_jobs
+                SET status = 'failed', error_message = $2,
+                    collected_at = NOW(), last_polled_at = NOW(),
+                    lease_owner = NULL, lease_expires_at = NULL
+                WHERE id = $1 AND status = 'submitted' AND lease_owner = $3
+                RETURNING id
+                """,
+                job_id,
+                error_message,
+                lease_owner,
+            )
+        if row is not None:
+            logger.warning("batch job failed", job_id=job_id, error=error_message)
+        return row is not None
 
     @staticmethod
     def _row_to_dict(row) -> Dict[str, Any]:
         # item_ids / meeting_meta arrive already decoded by the jsonb codec.
+        submitted_at = row.get("submitted_at")
         return {
             "id": row["id"],
             "gemini_job_name": row["gemini_job_name"],
@@ -480,6 +652,9 @@ class BatchJobRepository(BaseRepository):
             "prompts_version": row["prompts_version"],
             "meeting_meta": row["meeting_meta"] or {},
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "submitted_at": (
+                submitted_at.isoformat() if submitted_at else None
+            ),
             "submission_key": row["submission_key"],
             "submit_attempts": row["submit_attempts"],
             "poll_attempts": row["poll_attempts"],

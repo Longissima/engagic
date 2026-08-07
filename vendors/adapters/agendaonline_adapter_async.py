@@ -21,7 +21,7 @@ Per-site config in data/agendaonline_sites.json, keyed by banana.
 
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import unquote
 
@@ -166,11 +166,19 @@ class AsyncAgendaOnlineAdapter(AsyncBaseAdapter):
                 continue
 
             # Find meeting ID from ViewMeeting link (doctype=1 = agenda)
-            agenda_link = row.find("a", href=lambda x: x and "ViewMeeting" in x and "doctype=1" in x if x else False)
+            agenda_link = row.find(
+                "a",
+                href=lambda x: bool(
+                    x and "ViewMeeting" in x and "doctype=1" in x
+                ),
+            )
             if not agenda_link:
                 continue
 
-            id_match = _MEETING_ID_RE.search(agenda_link.get("href", ""))
+            agenda_href = agenda_link.get("href")
+            if not isinstance(agenda_href, str):
+                continue
+            id_match = _MEETING_ID_RE.search(agenda_href)
             if not id_match:
                 continue
 
@@ -209,9 +217,13 @@ class AsyncAgendaOnlineAdapter(AsyncBaseAdapter):
             # OnBase sibling, Aug 2026).
             minutes_link = row.find("a", href=_MINUTES_DOC_RE)
             if minutes_link:
-                href = minutes_link.get("href", "")
+                minutes_href = minutes_link.get("href")
+                if not isinstance(minutes_href, str):
+                    minutes_href = ""
                 meeting_ref["minutes_url"] = (
-                    self.base_url + href if href.startswith("/") else href
+                    self.base_url + minutes_href
+                    if minutes_href.startswith("/")
+                    else minutes_href
                 )
             else:
                 viewer_link = row.find(
@@ -306,9 +318,15 @@ class AsyncAgendaOnlineAdapter(AsyncBaseAdapter):
         soup = BeautifulSoup(html, "html.parser")
         attachments = []
         for link in soup.find_all(
-            "a", href=lambda x: x and "DownloadFile" in x and "isAttachment=True" in x if x else False
+            "a",
+            href=lambda x: bool(
+                x and "DownloadFile" in x and "isAttachment=True" in x
+            ),
         ):
-            href = link.get("href", "")
+            href_value = link.get("href")
+            if not isinstance(href_value, str):
+                continue
+            href = href_value
             name = link.get_text(strip=True)
             full_url = self.base_url + href if href.startswith("/") else href
             full_url = _translate_downloadfile_to_viewdocument(full_url)

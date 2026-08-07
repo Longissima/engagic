@@ -88,6 +88,12 @@ include = ["vendors", "parsing", "analysis", "pipeline", "database", "server", "
 extraPaths = ["tests/chunker"]
 exclude = ["**/__pycache__", ".venv", "venv", "scripts", "docs", "motioncount"]
 typeCheckingMode = "basic"  # or "standard" or "strict"
-pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.14"
 reportMissingImports = true
 reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

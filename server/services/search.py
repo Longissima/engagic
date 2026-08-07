@@ -41,7 +41,9 @@ async def _log_city_search(db: Database, banana: str, query: str) -> None:
         logger.warning("failed to log city search", banana=banana, error=str(e))
 
 
-def _apply_stats_to_options(options: List[Dict[str, Any]], stats: Dict[str, Dict[str, int]]) -> None:
+def _apply_stats_to_options(
+    options: List["CityOption"], stats: Dict[str, Dict[str, int]]
+) -> None:
     """Apply meeting stats to city options in-place."""
     default_stats = {"total_meetings": 0, "meetings_with_packet": 0, "summarized_meetings": 0}
     for option in options:
@@ -51,7 +53,7 @@ def _apply_stats_to_options(options: List[Dict[str, Any]], stats: Dict[str, Dict
         option["summarized_meetings"] = city_stats["summarized_meetings"]
 
 
-def _make_uncovered_option(city_name: str, state: str) -> Dict[str, Any]:
+def _make_uncovered_option(city_name: str, state: str) -> "CityOption":
     """Create a city option for an uncovered city."""
     city_name_clean = city_name.lower().replace(" ", "")
     return {
@@ -95,6 +97,8 @@ class SearchSuccessResponse(TypedDict):
     cached: bool
     query: str
     type: str
+    message: NotRequired[str]
+    ambiguous: NotRequired[Literal[False]]
 
 
 class SearchNotFoundResponse(TypedDict):
@@ -272,22 +276,25 @@ async def handle_state_search(state_input: str, db: Database) -> SearchResponse:
             "meetings": [],
         })
 
-    city_options = [
-        {
-            "city_name": city.name,
-            "state": city.state,
-            "banana": city.banana,
-            "vendor": city.vendor,
-            "display_name": f"{city.name}, {city.state}",
-            "covered": True,
-        }
-        for city in cities
-    ]
+    city_options = cast(
+        List[CityOption],
+        [
+            {
+                "city_name": city.name,
+                "state": city.state,
+                "banana": city.banana,
+                "vendor": city.vendor,
+                "display_name": f"{city.name}, {city.state}",
+                "covered": True,
+            }
+            for city in cities
+        ],
+    )
 
     stats = await db.get_city_meeting_stats([city.banana for city in cities])
     _apply_stats_to_options(city_options, stats)
 
-    return {
+    response: SearchAmbiguousResponse = {
         "success": False,
         "message": f"Found {len(city_options)} cities in {state_full} -- [<span style='color: #64748b'>total</span> | <span style='color: #4f46e5'>with packet</span> | <span style='color: #10b981'>summarized</span>]\n\nSelect a city to view its meetings:",
         "query": state_input,
@@ -296,6 +303,7 @@ async def handle_state_search(state_input: str, db: Database) -> SearchResponse:
         "city_options": city_options,
         "meetings": [],
     }
+    return response
 
 
 async def handle_ambiguous_city_search(
@@ -362,7 +370,7 @@ async def _handle_unknown_city(
     if len(resolved_states) > 1:
         logger.info("uszipcode found multiple states", city=city_name, states=resolved_states[:5])
         city_options = [_make_uncovered_option(city_name, state) for state in resolved_states[:5]]
-        return {
+        ambiguous_response: SearchAmbiguousResponse = {
             "success": False,
             "message": f"'{city_name.title()}' exists in multiple states. Which one are you looking for?",
             "query": original_input,
@@ -371,6 +379,7 @@ async def _handle_unknown_city(
             "city_options": city_options,
             "meetings": [],
         }
+        return ambiguous_response
 
     # Record demand
     if resolved_states:
@@ -384,7 +393,7 @@ async def _handle_unknown_city(
 
     await _record_city_request(db, requested_banana)
 
-    return {
+    not_found_response: SearchNotFoundResponse = {
         "success": False,
         "message": message,
         "query": original_input,
@@ -392,6 +401,7 @@ async def _handle_unknown_city(
         "meetings": [],
         "ambiguous": False,
     }
+    return not_found_response
 
 
 async def _handle_single_city_match(
@@ -405,7 +415,7 @@ async def _handle_single_city_match(
         await _log_city_search(db, city.banana, original_input)
         logger.info("found cached meetings", count=len(meetings), city=city.name, state=city.state)
         meetings_with_items = await get_meetings_for_listing(meetings, db)
-        return {
+        success_response: SearchSuccessResponse = {
             "success": True,
             "city_name": city.name,
             "state": city.state,
@@ -421,13 +431,15 @@ async def _handle_single_city_match(
             "type": "city",
             "ambiguous": False,
         }
+        return success_response
 
     # No meetings - check if other states exist for disambiguation
     other_states = [s for s in await db.get_states_for_city_name(city_name) if s != city.state]
 
     if other_states:
         logger.info("no meetings, disambiguating with other states", city=city_name, covered=city.state, uncovered=other_states)
-        city_options = [
+        covered_option = cast(
+            CityOption,
             {
                 "city_name": city.name,
                 "state": city.state,
@@ -435,13 +447,16 @@ async def _handle_single_city_match(
                 "vendor": city.vendor,
                 "display_name": f"{city.name}, {city.state}",
                 "covered": True,
-            }
-        ] + [_make_uncovered_option(city_name, state) for state in other_states[:4]]
+            },
+        )
+        city_options = [covered_option] + [
+            _make_uncovered_option(city_name, state) for state in other_states[:4]
+        ]
 
         stats = await db.get_city_meeting_stats([city.banana])
         _apply_stats_to_options(city_options[:1], stats)
 
-        return {
+        ambiguous_response: SearchAmbiguousResponse = {
             "success": False,
             "message": f"Multiple cities named '{city_name.title()}' exist. Which one are you looking for?",
             "query": original_input,
@@ -450,9 +465,10 @@ async def _handle_single_city_match(
             "city_options": city_options,
             "meetings": [],
         }
+        return ambiguous_response
 
     # No meetings and no other states
-    return {
+    not_found_response: SearchNotFoundResponse = {
         "success": False,
         "city_name": city.name,
         "state": city.state,
@@ -469,6 +485,7 @@ async def _handle_single_city_match(
         "message": f"No meetings cached yet for {city.name}, {city.state}, please check back soon!",
         "ambiguous": False,
     }
+    return not_found_response
 
 
 async def _handle_multiple_city_matches(
@@ -477,22 +494,25 @@ async def _handle_multiple_city_matches(
     """Handle multiple DB matches - return ambiguous result."""
     logger.info("multiple db matches", city=city_name, count=len(cities), states=[c.state for c in cities])
 
-    city_options = [
-        {
-            "city_name": city.name,
-            "state": city.state,
-            "banana": city.banana,
-            "vendor": city.vendor,
-            "display_name": f"{city.name}, {city.state}",
-            "covered": True,
-        }
-        for city in cities
-    ]
+    city_options = cast(
+        List[CityOption],
+        [
+            {
+                "city_name": city.name,
+                "state": city.state,
+                "banana": city.banana,
+                "vendor": city.vendor,
+                "display_name": f"{city.name}, {city.state}",
+                "covered": True,
+            }
+            for city in cities
+        ],
+    )
 
     stats = await db.get_city_meeting_stats([city.banana for city in cities])
     _apply_stats_to_options(city_options, stats)
 
-    return {
+    response: SearchAmbiguousResponse = {
         "success": False,
         "message": f"Multiple cities named '{city_name.title()}' found. Which one are you looking for?",
         "query": original_input,
@@ -501,3 +521,4 @@ async def _handle_multiple_city_matches(
         "city_options": city_options,
         "meetings": [],
     }
+    return response

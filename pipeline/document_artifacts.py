@@ -62,7 +62,9 @@ _VENDOR_DOCUMENT_PATHS = (
     "/documents/viewdocument/",
     "/documents/downloadfilebytes/",
 )
-_HTML_PREFIX_RE = re.compile(br"^\s*(?:<!doctype\s+html\b|<html\b)", re.IGNORECASE)
+_HTML_PREFIX_RE = re.compile(
+    br"(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)", re.IGNORECASE
+)
 _SPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_LINES_RE = re.compile(r"\n\s*\n(?:\s*\n)+")
 
@@ -89,7 +91,8 @@ def sniff_document_format(
         return DocumentFormat(detected)
 
     media_type = _content_type_base(content_type)
-    if media_type in {"text/html", "application/xhtml+xml"} or _HTML_PREFIX_RE.match(data[:512]):
+    html_sample = data[:1024].lstrip(b"\xef\xbb\xbf\x00\t\r\n ")
+    if media_type in {"text/html", "application/xhtml+xml"} or _HTML_PREFIX_RE.search(html_sample):
         return DocumentFormat.HTML
 
     media_hints = {
@@ -137,6 +140,7 @@ class DocumentArtifact:
     document_format: DocumentFormat
     media_type: str
     from_corpus: bool = False
+    corpus_persisted: bool = False
 
     @property
     def source_identity(self) -> str:
@@ -155,6 +159,7 @@ def make_artifact(
     content_sha256: str,
     content_type: str | None = None,
     from_corpus: bool = False,
+    corpus_persisted: bool = False,
 ) -> DocumentArtifact:
     document_format = sniff_document_format(
         data,
@@ -169,6 +174,7 @@ def make_artifact(
         document_format=document_format,
         media_type=media_type_for(document_format),
         from_corpus=from_corpus,
+        corpus_persisted=corpus_persisted,
     )
 
 
@@ -210,8 +216,12 @@ def sanitize_html_text(html_bytes: bytes) -> str:
     """Extract readable fallback text without scripts, chrome, or hidden UI."""
     soup = BeautifulSoup(html_bytes, "lxml")
     for tag in soup.find_all(
-        ["script", "style", "noscript", "svg", "template", "nav", "header", "footer", "form"]
+        ["script", "style", "noscript", "svg", "template", "nav", "header", "footer"]
     ):
+        tag.decompose()
+    # ASP.NET municipal sites commonly wrap the entire useful page in one
+    # giant ``form``. Remove controls, not the form subtree and its text.
+    for tag in soup.find_all(["input", "button", "select", "textarea"]):
         tag.decompose()
     for tag in soup.select("[hidden], [aria-hidden='true']"):
         tag.decompose()
@@ -229,6 +239,7 @@ def sanitize_html_text(html_bytes: bytes) -> str:
 
 
 _TLS_BYPASS_HOST = "s3.amazonaws.com"
+_TLS_BYPASS_VIRTUAL_HOST = "granicus_production_attachments.s3.amazonaws.com"
 _TLS_BYPASS_PATH_PREFIX = "/granicus_production_attachments/"
 
 
@@ -238,8 +249,11 @@ def verify_tls_for_url(url: str) -> bool:
         parsed = urlparse(url)
     except ValueError:
         return True
+    host = (parsed.hostname or "").lower()
     return not (
-        (parsed.hostname or "").lower() == _TLS_BYPASS_HOST
-        and parsed.path.lower().startswith(_TLS_BYPASS_PATH_PREFIX)
+        host == _TLS_BYPASS_VIRTUAL_HOST
+        or (
+            host == _TLS_BYPASS_HOST
+            and parsed.path.lower().startswith(_TLS_BYPASS_PATH_PREFIX)
+        )
     )
-

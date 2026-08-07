@@ -113,13 +113,13 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
 
         meetings: List[Dict[str, Any]] = []
         for idx, result in enumerate(results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.warning(
                     "meeting detail failed",
                     vendor="boardbook", slug=self.slug,
                     meeting_id=meeting_refs[idx]["meeting_id"], error=str(result),
                 )
-            elif result:
+            elif isinstance(result, dict) and result:
                 meetings.append(result)
 
         logger.info(
@@ -182,7 +182,10 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
             )
             if not agenda_link:
                 continue
-            href = agenda_link.get("href", "")
+            href_value = agenda_link.get("href")
+            if not isinstance(href_value, str):
+                continue
+            href = href_value
             id_match = _MEETING_ID_RE.search(href)
             if not id_match:
                 continue
@@ -197,10 +200,11 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
             minutes_link = cells[2].find(
                 "a", href=lambda h: bool(h) and "/Public/Minutes/" in h
             )
-            minutes_url = (
-                urljoin(self.base_url, minutes_link.get("href", ""))
-                if minutes_link else None
-            )
+            minutes_url = None
+            if minutes_link:
+                minutes_href = minutes_link.get("href")
+                if isinstance(minutes_href, str):
+                    minutes_url = urljoin(self.base_url, minutes_href)
 
             title = body_name or "Board Meeting"
             if meeting_type:
@@ -307,8 +311,8 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
         doc_input = soup.find("input", id="NewDocumentViewerDocumentID")
         if not doc_input:
             return None
-        doc_id = doc_input.get("value", "")
-        if not doc_id:
+        doc_id = doc_input.get("value")
+        if not isinstance(doc_id, str) or not doc_id:
             return None
         return f"{self.base_url}/Documents/DownloadPDF/{doc_id}?org={self.org_id}"
 
@@ -335,12 +339,19 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
         for row in rows:
             if not isinstance(row, Tag):
                 continue
-            item_id = row.get("data-agendaitemid", "")
-            if not item_id:
+            item_id = row.get("data-agendaitemid")
+            if not isinstance(item_id, str) or not item_id:
                 continue
 
             parent_id = "0"
-            for cls in row.get("class", []):
+            classes = row.get("class")
+            if isinstance(classes, str):
+                class_names = [classes]
+            elif isinstance(classes, list):
+                class_names = [value for value in classes if isinstance(value, str)]
+            else:
+                class_names = []
+            for cls in class_names:
                 m = _PARENT_CLASS_RE.match(cls)
                 if m:
                     parent_id = m.group(1)

@@ -9,7 +9,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, cast
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -17,6 +17,9 @@ import aiohttp
 from pydantic import ValidationError
 
 from config import config, get_logger
+from corpus.store import get_corpus
+from pipeline.document_acquisition import DocumentResponse, DocumentSourceAcquirer
+from pipeline.document_artifacts import DocumentFormat
 from pipeline.ground_truth import archive_bytes, produce_ground_truth
 from pipeline.protocols import MetricsCollector, NullMetrics
 from vendors.adapters.parsers.agenda_chunker import _normalize_link_url
@@ -99,7 +102,14 @@ class AsyncBaseAdapter:
         # so corpus provenance (document_source.banana) knows which government
         # produced the bytes. None is fine -- provenance degrades, tee still works.
         self.banana: Optional[str] = None
-        self.metrics = metrics or NullMetrics()
+        self.metrics = cast(MetricsCollector, metrics or NullMetrics())
+        self._document_acquirer = DocumentSourceAcquirer(
+            self._load_document_response,
+            fetch_errors=(VendorHTTPError,),
+            corpus_getter=lambda: get_corpus(),
+            metrics=self.metrics,
+            metric_component="sync",
+        )
         # chunker cascade audits collected during a fetch, keyed by vendor_id;
         # fetch_meetings() stamps them onto the outgoing meeting dicts
         self._chunk_audits: Dict[str, List[Dict[str, Any]]] = {}
@@ -329,6 +339,59 @@ class AsyncBaseAdapter:
                 text = "(unable to read body)"
             logger.error("vendor json parse failed", vendor=self.vendor, slug=self.slug, url=url[:100], error=str(e), body_preview=text[:200] if text else None)
             raise VendorHTTPError(f"JSON parse failed: {e}", vendor=self.vendor, url=url, city_slug=self.slug) from e
+
+    async def _load_document_response(
+        self,
+        url: str,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+    ) -> DocumentResponse:
+        """Load document bytes through the adapter's auth/rate/retry policy."""
+        conditional_headers = {
+            key: value
+            for key, value in (
+                ("If-None-Match", etag),
+                ("If-Modified-Since", last_modified),
+            )
+            if value
+        }
+        try:
+            response = (
+                await self._get(url, headers=conditional_headers)
+                if conditional_headers
+                else await self._get(url)
+            )
+        except VendorHTTPError as exc:
+            if exc.status_code != 412 or not conditional_headers:
+                raise
+            logger.info(
+                "vendor document validator rejected, retrying unconditionally",
+                vendor=self.vendor,
+                slug=self.slug,
+                url=url[:120],
+            )
+            response = await self._get(url)
+
+        response_url = str(getattr(response, "url", url))
+        response_etag = response.headers.get("ETag")
+        response_last_modified = response.headers.get("Last-Modified")
+        if response.status == 304 and conditional_headers:
+            response.release()
+            return DocumentResponse(
+                data=None,
+                content_type=response.headers.get("Content-Type", ""),
+                response_url=response_url,
+                etag=response_etag or etag,
+                last_modified=response_last_modified or last_modified,
+            )
+
+        return DocumentResponse(
+            data=await response.read(),
+            content_type=response.headers.get("Content-Type", ""),
+            response_url=response_url,
+            etag=response_etag,
+            last_modified=response_last_modified,
+        )
 
     def _parse_date(self, date_str: str) -> Optional[datetime]:
         """Parse vendor date formats. Returns naive datetime or None."""
@@ -584,6 +647,7 @@ class AsyncBaseAdapter:
         vendor_id: Optional[str] = None,
         ladder: str = "auto",
         source_url: Optional[str] = None,
+        archived_content_sha256: Optional[str] = None,
     ) -> ChunkResult:
         """Run the chunker cascade on raw PDF bytes. Returns full ChunkResult.
 
@@ -603,7 +667,8 @@ class AsyncBaseAdapter:
         # "no items" and falls through its URL ladder, archiving each
         # candidate on the way -- which is exactly stage 1's job.
         if not config.SYNC_CHUNKING:
-            await archive_bytes(pdf_bytes, source_url, self.banana)
+            if archived_content_sha256 is None:
+                await archive_bytes(pdf_bytes, source_url, self.banana)
             result = ChunkResult(failure_reason=DEFERRED, ladder=ladder)
             self._record_chunk_audit(vendor_id, result)
             return result
@@ -611,14 +676,19 @@ class AsyncBaseAdapter:
         # The single producer (pipeline/ground_truth.py): archive tee +
         # guarded chunk + provably-complete text persist, shared with the
         # processor's shape-manufacturing step.
-        result = await produce_ground_truth(
+        producer = produce_ground_truth(
             pdf_bytes,
             vendor=self.vendor,
             slug=self.slug,
             ladder=ladder,
             source_url=source_url,
             banana=self.banana,
+            archived_content_sha256=archived_content_sha256,
         )
+        # Transfer the sole local byte reference into the producer coroutine so
+        # this adapter frame does not retain it while the guarded child runs.
+        pdf_bytes = b""
+        result = await producer
 
         self._record_chunk_audit(vendor_id, result)
 
@@ -694,8 +764,10 @@ class AsyncBaseAdapter:
             return ChunkResult(failure_reason=DEFERRED, ladder=ladder)
 
         try:
-            response = await self._get(pdf_url)
-            pdf_bytes = await response.read()
+            artifact = await self._document_acquirer.acquire(
+                pdf_url,
+                banana=self.banana,
+            )
         except Exception as e:
             logger.debug(
                 "pdf download failed",
@@ -707,7 +779,29 @@ class AsyncBaseAdapter:
             result = ChunkResult(failure_reason=DOWNLOAD_FAILED, ladder=ladder)
             self._record_chunk_audit(vendor_id, result)
             return result
-        return await self._chunk_pdf_bytes(pdf_bytes, vendor_id, ladder, source_url=pdf_url)
+        if artifact.document_format is not DocumentFormat.PDF:
+            logger.debug(
+                "packet source was not a pdf",
+                vendor=self.vendor,
+                slug=self.slug,
+                vendor_id=vendor_id,
+                document_format=artifact.document_format.value,
+            )
+            result = ChunkResult(failure_reason=DOWNLOAD_FAILED, ladder=ladder)
+            self._record_chunk_audit(vendor_id, result)
+            return result
+
+        chunk = self._chunk_pdf_bytes(
+            artifact.data,
+            vendor_id,
+            ladder,
+            source_url=pdf_url,
+            archived_content_sha256=(
+                artifact.content_sha256 if artifact.corpus_persisted else None
+            ),
+        )
+        del artifact
+        return await chunk
 
     async def _parse_packet_pdf(
         self,
@@ -765,14 +859,23 @@ class AsyncBaseAdapter:
             tmp_path = None
             async with semaphore:
                 try:
-                    response = await self._get(primary_url)
-                    pdf_bytes = await response.read()
+                    artifact = await self._document_acquirer.acquire(
+                        primary_url,
+                        banana=self.banana,
+                    )
+                    if artifact.document_format is not DocumentFormat.PDF:
+                        return item
+                    pdf_bytes = artifact.data
                     if len(pdf_bytes) < 500:
                         return item
 
                     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                         tmp_path = tmp.name
                         tmp.write(pdf_bytes)
+                    # Link extraction reopens the tempfile; release the parent
+                    # artifact and bytes before entering the worker thread.
+                    del artifact
+                    pdf_bytes = b""
 
                     def _extract_links():
                         doc = fitz.open(tmp_path)

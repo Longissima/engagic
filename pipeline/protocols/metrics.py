@@ -39,6 +39,10 @@ class MetricsCollector(Protocol):
     items_extracted: LabeledCounter
     matters_tracked: LabeledCounter
 
+    # Shared document acquisition metrics
+    document_acquisitions: LabeledCounter
+    document_acquisition_duration: LabeledHistogram
+
     def record_error(self, component: str, error: Exception) -> None: ...
 
     def record_llm_call(
@@ -84,6 +88,8 @@ class NullMetrics:
         self.meetings_synced = _NullCounter()
         self.items_extracted = _NullCounter()
         self.matters_tracked = _NullCounter()
+        self.document_acquisitions = _NullCounter()
+        self.document_acquisition_duration = _NullHistogram()
 
     def record_error(self, component: str, error: Exception) -> None:
         pass

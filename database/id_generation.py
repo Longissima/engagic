@@ -308,7 +308,7 @@ def matter_ids_match(
 def generate_meeting_id(
     banana: str,
     vendor_id: str,
-    date: datetime,
+    date: Optional[datetime],
     title: str
 ) -> str:
     """Generate deterministic meeting ID from inputs.
@@ -318,7 +318,7 @@ def generate_meeting_id(
     Args:
         banana: City identifier (e.g., "paloaltoCA")
         vendor_id: Vendor's native meeting ID (EventId, UUID, extracted from URL, etc.)
-        date: Meeting datetime
+        date: Authoritative meeting datetime, or ``None`` when undated
         title: Meeting title
 
     Returns:
@@ -332,10 +332,13 @@ def generate_meeting_id(
 
     Confidence: 9/10 - Deterministic, collision-resistant for practical use
     """
-    if not banana or not vendor_id or not date or not title:
-        raise ValueError("All arguments required: banana, vendor_id, date, title")
+    if not banana or not vendor_id or not title:
+        raise ValueError("Required arguments: banana, vendor_id, title")
 
-    date_str = date.strftime("%Y%m%dT%H%M%S")
+    # Never invent wall-clock input for an undated source meeting. A stable
+    # sentinel keeps repeated syncs on one aggregate until the source publishes
+    # a real date, at which point the explicit identity transition is visible.
+    date_str = date.strftime("%Y%m%dT%H%M%S") if date else "undated"
     key = f"{banana}:{vendor_id}:{date_str}:{title}"
     hash_hex = hashlib.md5(key.encode()).hexdigest()[:8]
     return f"{banana}_{hash_hex}"

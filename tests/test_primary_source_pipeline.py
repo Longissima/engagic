@@ -263,7 +263,7 @@ def test_backfill_preserves_identity_query_parameters_and_spreadsheets():
 
 def test_processor_routes_spreadsheet_attachments_to_extraction():
     class Analyzer:
-        async def extract_pdf_async(self, url, banana=None):
+        async def extract_document_async(self, url, banana=None):
             return {"success": True, "text": "sheet text", "page_count": 0}
 
     processor = object.__new__(Processor)

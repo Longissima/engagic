@@ -7,10 +7,11 @@ Contains utilities used across pipeline modules for matters-first processing.
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 
 import requests
 from datetime import datetime
-from typing import List, Dict, Any, Iterable, Optional
+from typing import List, Dict, Any, Iterable, Literal, Optional, TypeAlias
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from config import get_logger
@@ -25,7 +26,18 @@ logger = get_logger(__name__).bind(component="engagic")
 # wave; stored values upgrade to the current format on the next
 # confirmed-unchanged sync or successful matter job.
 ATTACHMENT_HASH_VERSION = "sv1"
+MATTER_WORK_VERSION = "mw1"
+MATTER_NO_WORK_VERSION = "mnw1"
 MEETING_WORK_VERSION = "mv1"
+
+MatterNoWorkReason: TypeAlias = Literal[
+    "procedural",
+    "no_appearances",
+    "no_substantive_work",
+]
+_MATTER_NO_WORK_REASONS = frozenset(
+    {"procedural", "no_appearances", "no_substantive_work"}
+)
 
 # Query keys that mark a signed URL (Azure SAS / S3 presigned). When any of
 # these is present the whole query string is an auth envelope that rotates on
@@ -237,7 +249,7 @@ def aggregate_matter_attachments(appearances: Iterable[Any]) -> List[Any]:
     """Reproduce the processor's authoritative matter attachment set.
 
     Appearances are ordered deterministically, then attachments are deduplicated
-    by their stored URL. This intentionally matches ``Processor.process_matter``
+    by stable source identity. This intentionally matches ``Processor.process_matter``
     before both paths call ``hash_substantive_attachments``. Keeping the
     aggregation contract here prevents sync from comparing one appearance with
     a canonical summary produced from every appearance.
@@ -251,27 +263,137 @@ def aggregate_matter_attachments(appearances: Iterable[Any]) -> List[Any]:
         ),
     )
     attachments: List[Any] = []
-    seen_urls: set[str] = set()
+    seen_identities: set[str] = set()
     for item in ordered:
         for attachment in (getattr(item, "attachments", None) or []):
             url = getattr(attachment, "url", None)
-            if not url or url in seen_urls:
+            identity = attachment_identity(url or "")
+            if not identity or identity in seen_identities:
                 continue
-            seen_urls.add(url)
+            seen_identities.add(identity)
             attachments.append(attachment)
     return attachments
 
 
+@dataclass(frozen=True, slots=True)
+class MatterWorkSnapshot:
+    """One pure authoritative view shared by sync, workers, and repair tools."""
+
+    appearances: tuple[Any, ...]
+    attachments: tuple[Any, ...]
+    substantive_attachments: tuple[Any, ...]
+    attachment_version: str
+    work_version: str
+    legacy_attachment_version: str
+    normalized_titles: tuple[str, ...]
+
+    @property
+    def is_summarizable(self) -> bool:
+        return bool(self.substantive_attachments)
+
+    @classmethod
+    def from_appearances(cls, appearances: Iterable[Any]) -> "MatterWorkSnapshot":
+        from pipeline.filters.item_filters import is_public_comment_attachment
+
+        ordered = tuple(
+            sorted(
+                appearances,
+                key=lambda item: (
+                    str(getattr(item, "meeting_id", "") or ""),
+                    int(getattr(item, "sequence", 0) or 0),
+                    str(getattr(item, "id", "") or ""),
+                ),
+            )
+        )
+        attachments = tuple(aggregate_matter_attachments(ordered))
+        substantive = tuple(
+            attachment
+            for attachment in attachments
+            if not is_public_comment_attachment(
+                str(getattr(attachment, "name", "") or "")
+            )
+        )
+        attachment_version = hash_attachments(list(substantive))
+        legacy_attachment_version = hash_attachments_fast_legacy(list(substantive))
+        titles = tuple(
+            sorted(
+                {
+                    identity
+                    for item in ordered
+                    if (identity := matter_title_identity(
+                        str(getattr(item, "title", "") or "")
+                    ))
+                }
+            )
+        )
+        descriptor = {
+            "attachment_version": attachment_version,
+            "titles": titles,
+        }
+        encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+        work_version = (
+            f"{MATTER_WORK_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"
+        )
+        return cls(
+            appearances=ordered,
+            attachments=attachments,
+            substantive_attachments=substantive,
+            attachment_version=attachment_version,
+            work_version=work_version,
+            legacy_attachment_version=legacy_attachment_version,
+            normalized_titles=titles,
+        )
+
+
+def matter_attachment_version(appearances: Iterable[Any]) -> str:
+    """Hash the substantive aggregate artifact set behind a projection."""
+    return MatterWorkSnapshot.from_appearances(appearances).attachment_version
+
+
+def matter_title_identity(title: Optional[str]) -> str:
+    """Normalize cosmetic reading prefixes without hiding substantive edits."""
+    stripped = re.sub(
+        r"^(?:(?:REINTRODUCED\s+)?(?:FIRST|SECOND|THIRD|FINAL)\s+"
+        r"READ(?:ING)?\s*:\s*)+",
+        "",
+        title or "",
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", stripped).strip().lower()
+
+
 def matter_work_version(appearances: Iterable[Any]) -> str:
-    """Hash the exact aggregate matter inputs summarized by the processor."""
-    return hash_substantive_attachments(aggregate_matter_attachments(appearances))
+    """Hash every stable input that can influence a matter summarization."""
+    return MatterWorkSnapshot.from_appearances(appearances).work_version
+
+
+def matter_no_work_version(
+    executable_work_version: str,
+    reason: MatterNoWorkReason,
+) -> str:
+    """Return one bounded, deterministic terminal desired-work descriptor.
+
+    A no-work policy decision is material desired state, but it must never
+    compare equal to the executable snapshot it suppresses. The distinct
+    ``mnw1`` namespace lets an identical procedural -> substantive snapshot
+    reopen normally, while the bounded visible reason makes policy changes
+    and recurrences deterministic and operationally legible.
+    """
+    if not isinstance(executable_work_version, str) or not (
+        executable_work_version.startswith(f"{MATTER_WORK_VERSION}:")
+    ):
+        raise ValueError("executable_work_version must be a matter work version")
+    if reason not in _MATTER_NO_WORK_REASONS:
+        raise ValueError(f"unsupported matter no-work reason: {reason}")
+    digest = hashlib.sha256(executable_work_version.encode()).hexdigest()
+    return f"{MATTER_NO_WORK_VERSION}:{reason}:{digest}"
 
 
 def matter_work_version_legacy(appearances: Iterable[Any]) -> str:
     """Pre-sv1 counterpart for upgrading unchanged legacy matter hashes."""
-    return hash_substantive_attachments_legacy(
-        aggregate_matter_attachments(appearances)
-    )
+    return MatterWorkSnapshot.from_appearances(
+        appearances
+    ).legacy_attachment_version
 
 
 def _stable_input(value: Any) -> Any:

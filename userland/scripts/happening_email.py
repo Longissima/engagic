@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from config import get_logger
 from database.db_postgres import Database
+from server.utils.meeting_urls import generate_meeting_slug
 from userland.email.emailer import EmailService
 from userland.email.templates import (
     email_wrapper_start,
@@ -65,11 +66,11 @@ def build_happening_email(items: list, today_str: str) -> str:
                 meeting_date = item['meeting_date']
                 if isinstance(meeting_date, datetime):
                     meeting_time = meeting_date.strftime("%I:%M %p")
-                    date_str = meeting_date.strftime("%Y-%m-%d")
                 else:
                     meeting_time = str(meeting_date)
-                    date_str = str(meeting_date).split()[0]
-                meeting_slug = f"{date_str}-{item['meeting_id']}"
+                meeting_slug = generate_meeting_slug(
+                    item["meeting_id"], meeting_date
+                )
                 item_url = f"https://engagic.org/{city_banana}/{meeting_slug}#item-{item['item_id']}"
 
                 html += f"""

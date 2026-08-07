@@ -18,7 +18,7 @@ import os
 import re
 import asyncio
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse, urljoin, parse_qs
 
@@ -330,7 +330,10 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 continue
 
             text = link.get_text(strip=True)
-            href = link["href"]
+            href_value = link.get("href")
+            if not isinstance(href_value, str):
+                continue
+            href = href_value
 
             skip_patterns = [
                 "<<<", "◄", "Back to", "back to",
@@ -466,11 +469,16 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         pdfs = []
 
         for link in soup.find_all("a", href=True):
-            href = link["href"]
+            href_value = link.get("href")
+            if not isinstance(href_value, str):
+                continue
+            href = href_value
+            type_value = link.get("type")
+            media_type = type_value if isinstance(type_value, str) else ""
             text = link.get_text().lower()
             is_pdf = (
                 ".pdf" in href.lower()
-                or "pdf" in link.get("type", "").lower()
+                or "pdf" in media_type.lower()
                 or any(kw in text for kw in keywords)
             )
 

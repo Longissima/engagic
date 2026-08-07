@@ -600,9 +600,8 @@ class GeminiSummarizer:
             chunks.append(current)
         logger.info("split into chunks", num_chunks=len(chunks), max_chunk_items=max_chunk_items)
 
-        async def submit_chunk(
-            chunk_idx: int, chunk: List[Dict[str, Any]]
-        ) -> Dict[str, Any]:
+        planned: List[tuple[List[Dict[str, Any]], Dict[str, Any]]] = []
+        for chunk_idx, chunk in enumerate(chunks):
             chunk_num = chunk_idx + 1
             item_ids = [str(req["item_id"]) for req in chunk]
             key_material = "\x1f".join(
@@ -621,14 +620,16 @@ class GeminiSummarizer:
                 "item_ids": item_ids,
                 "chunk_num": chunk_num,
             }
+            planned.append((chunk, descriptor))
 
+        async def reserve_chunk(descriptor: Dict[str, Any]) -> Dict[str, Any]:
             if reserve_submission is not None:
                 try:
                     reserved = await reserve_submission(descriptor)
                 except Exception as exc:
                     logger.error(
                         "failed to reserve batch submission",
-                        chunk_num=chunk_num,
+                        chunk_num=descriptor["chunk_num"],
                         error=str(exc),
                         error_type=type(exc).__name__,
                     )
@@ -637,6 +638,22 @@ class GeminiSummarizer:
                     # Another submitter already owns this exact logical chunk.
                     # Its durable submitted row is the idempotency authority.
                     return {**descriptor, "already_reserved": True}
+            return descriptor
+
+        # Seal every logical chunk durably before any provider create call.
+        # Besides eliminating partial intent visibility, this makes exact
+        # shared-cache reference counting safe even if a tiny first chunk
+        # completes while a slower sibling is still being submitted.
+        reserved_descriptors = await asyncio.gather(
+            *(reserve_chunk(descriptor) for _, descriptor in planned)
+        )
+
+        async def submit_chunk(
+            chunk: List[Dict[str, Any]], descriptor: Dict[str, Any]
+        ) -> Dict[str, Any]:
+            if descriptor.get("error") or descriptor.get("already_reserved"):
+                return descriptor
+            chunk_num = int(descriptor["chunk_num"])
 
             async with self._batch_submit_semaphore:
                 provider_descriptor = await self._submit_one_chunk(
@@ -689,7 +706,10 @@ class GeminiSummarizer:
         # gather preserves input order while tasks execute independently, so
         # descriptors remain deterministic without serial provider latency.
         descriptors = await asyncio.gather(
-            *(submit_chunk(idx, chunk) for idx, chunk in enumerate(chunks))
+            *(
+                submit_chunk(chunk, descriptor)
+                for (chunk, _), descriptor in zip(planned, reserved_descriptors)
+            )
         )
         if include_failures:
             return descriptors

@@ -2,17 +2,28 @@
 
 import asyncio
 from datetime import datetime
+import hashlib
 
 import pytest
 
 import analysis.analyzer_async as analyzer_module
 from analysis.analyzer_async import AsyncAnalyzer
+from database.id_generation import generate_meeting_id
 from exceptions import DocumentDownloadError, ExtractionError
 import scripts.ingest_minutes as ingest_minutes
 from scripts.ingest_minutes import select_candidates
 import scripts.sweep_minutes as sweep_minutes
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, FetchResult
 from vendors.adapters.parsers.router import ChunkResult, DEFERRED
+
+
+@pytest.fixture(autouse=True)
+def _inline_thread_offloads_in_restricted_test_sandbox(monkeypatch):
+    async def inline(call, *args, **kwargs):
+        await asyncio.sleep(0)
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", inline)
 
 
 class _DiscoveryAdapter(AsyncBaseAdapter):
@@ -161,9 +172,12 @@ def test_download_http_status_classification_and_url_redaction(
             return False
 
     class Session:
+        calls = 0
+
         def get(self, url, ssl):
             assert url == signed_url
-            assert ssl is False
+            assert ssl is True
+            self.calls += 1
             return Response()
 
     class Limiter:
@@ -176,6 +190,7 @@ def test_download_http_status_classification_and_url_redaction(
         return Session()
 
     analyzer._get_session = get_session
+    analyzer._sleep_download_retry = lambda *args: asyncio.sleep(0)
     monkeypatch.setattr(analyzer_module, "get_rate_limiter", lambda: Limiter())
 
     with pytest.raises(DocumentDownloadError) as raised:
@@ -307,10 +322,18 @@ def test_extract_pdf_surfaces_corpus_persistence_failure(monkeypatch):
 
     analyzer = AsyncAnalyzer(enable_llm=False)
 
-    async def download(url: str, _depth: int = 0) -> bytes:
-        return b"%PDF-1.4 test"
+    async def acquire(url: str, banana=None):
+        from pipeline.document_artifacts import make_artifact
 
-    analyzer.download_pdf_async = download
+        data = b"%PDF-1.4 test"
+        return make_artifact(
+            requested_url=url,
+            source_url=url,
+            data=data,
+            content_sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+    analyzer.acquire_document_async = acquire
     monkeypatch.setattr(analyzer_module, "get_corpus", lambda: Corpus())
     monkeypatch.setattr(
         analyzer_module,
@@ -424,3 +447,69 @@ def test_sweep_city_uses_minutes_discovery_for_primary_and_extra(monkeypatch):
     assert counts["would_fill"] == 1
     assert counts["id_miss"] == 1
     assert counts["filled"] == 0
+
+
+def test_sweep_city_reuses_stable_undated_meeting_identity(monkeypatch):
+    class Adapter:
+        MINUTES_DISCOVERY_SUPPORTED = True
+        banana = None
+
+        async def fetch_minutes(self, days_back, days_forward):
+            return FetchResult(
+                meetings=[
+                    {
+                        "vendor_id": "vendor-undated-1",
+                        "title": "Council",
+                        "start": None,
+                        "minutes_url": "https://example.test/undated.pdf",
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        sweep_minutes,
+        "get_async_adapter",
+        lambda *_args, **_kwargs: Adapter(),
+    )
+    expected_id = generate_meeting_id(
+        "exampleCA",
+        "vendor-undated-1",
+        None,
+        "Council",
+    )
+    looked_up = []
+
+    class Connection:
+        async def fetchrow(self, query, meeting_id):
+            assert query == sweep_minutes.MEETING_STATE_SQL
+            looked_up.append(meeting_id)
+            return {"minutes_url": None}
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    counts = asyncio.run(
+        sweep_minutes.sweep_city(
+            type("Database", (), {"pool": Pool()})(),
+            lambda _meeting: None,
+            {
+                "banana": "exampleCA",
+                "vendor": "onbase",
+                "slug": "primary",
+            },
+            days_back=60,
+            dry_run=True,
+        )
+    )
+
+    assert looked_up == [expected_id]
+    assert counts["would_fill"] == 1
+    assert counts["id_miss"] == 0

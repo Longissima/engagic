@@ -17,16 +17,13 @@ Dependencies: PyMuPDF (fitz)
 
 import fitz
 import re
-from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple
 
 from config import get_logger
 
 from vendors.adapters.parsers.agenda_chunker import (
     _Attachment,
-    _MemoContent,
     _AgendaItem,
-    _AgendaMetadata,
     _ParsedAgenda,
     _extract_page_text_with_positions,
     _extract_links,
@@ -217,7 +214,9 @@ def _cluster_links_by_position(
     if not links:
         return []
 
-    sorted_links = sorted(links, key=lambda l: (l["page"], l["y_center"]))
+    sorted_links = sorted(
+        links, key=lambda link: (link["page"], link["y_center"])
+    )
     gap_threshold = median_line_height * 2.5
 
     clusters = [[sorted_links[0]]]
@@ -251,7 +250,11 @@ def _estimate_median_line_height(lines: List[dict]) -> float:
     """Estimate median line height from first page text lines."""
     if not lines:
         return 14.0
-    heights = [l["y1"] - l["y0"] for l in lines[:50] if l["y1"] - l["y0"] > 2]
+    heights = [
+        line["y1"] - line["y0"]
+        for line in lines[:50]
+        if line["y1"] - line["y0"] > 2
+    ]
     if not heights:
         return 14.0
     heights.sort()
@@ -279,7 +282,9 @@ def _find_heading_above_cluster(
 
     Returns dict with title, number, page, y0 or None.
     """
-    first_link = min(cluster, key=lambda l: (l["page"], l["y_center"]))
+    first_link = min(
+        cluster, key=lambda link: (link["page"], link["y_center"])
+    )
     ceiling_page = first_link["page"]
     ceiling_y = first_link["y_center"]
 
@@ -302,7 +307,9 @@ def _find_heading_above_cluster(
         return None
 
     # Walk backwards from the bottom of the zone (closest to links)
-    candidates.sort(key=lambda l: (l["page"], l["y0"]), reverse=True)
+    candidates.sort(
+        key=lambda line: (line["page"], line["y0"]), reverse=True
+    )
 
     heading_lines = []
     section = ""
@@ -340,12 +347,12 @@ def _find_heading_above_cluster(
 
     # Heading lines were collected bottom-up, reverse for natural order
     heading_lines.reverse()
-    full_title = " ".join(l["text"].strip() for l in heading_lines)
+    full_title = " ".join(line["text"].strip() for line in heading_lines)
     number, title_text = _extract_item_number_permissive(full_title)
 
     # Collect body text: everything between heading and links that isn't the heading itself
-    heading_y_top = min(l["y0"] for l in heading_lines)
-    heading_page = min(l["page"] for l in heading_lines)
+    heading_y_top = min(line["y0"] for line in heading_lines)
+    heading_page = min(line["page"] for line in heading_lines)
     body_parts = []
     for line in all_lines:
         if line["page"] < heading_page or line["page"] > ceiling_page:
@@ -433,7 +440,9 @@ def _parse_url_v2(doc, result: _ParsedAgenda):
                 ))
 
         # Update floor for next cluster
-        last_link = max(cluster, key=lambda l: (l["page"], l["y_center"]))
+        last_link = max(
+            cluster, key=lambda link: (link["page"], link["y_center"])
+        )
         prev_floor_page = last_link["page"]
         prev_floor_y = last_link["y_center"]
 
@@ -479,7 +488,9 @@ def _collect_internal_page_links(doc) -> List[dict]:
                 "text": " ".join(text.split()),
             })
     # Sort by position on the agenda pages
-    links.sort(key=lambda l: (l["source_page"], l["rect"].y0))
+    links.sort(
+        key=lambda link: (link["source_page"], link["rect"].y0)
+    )
     return links
 
 
@@ -615,13 +626,11 @@ def _parse_toc_v2(doc, result: _ParsedAgenda):
             next_level = sorted_levels[i + 1]
             next_pages = level_counts[next_level]
             next_count = len(next_pages)
-            ratio = next_count / max(count, 1)
 
             if count <= 5 and next_count > count:
                 # Current level has few entries, next has more.
                 # Decide: are the next-level entries real items (multi-page)
                 # or slides/pages (one per page)?
-                next_distinct = len(set(next_pages))
                 next_span = max(next_pages) - min(next_pages) if next_pages else 0
                 avg_gap = next_span / max(next_count, 1)
 
@@ -644,11 +653,19 @@ def _parse_toc_v2(doc, result: _ParsedAgenda):
             # Deepest level -- use it
             item_level = level
 
-    child_levels = [l for l in level_counts.keys() if l > item_level]
+    child_levels = [level for level in level_counts if level > item_level]
 
     # Build items from entries at the item level
-    raw_item_entries = [(t, p) for l, t, p in entries if l == item_level]
-    child_entries = [(l, t, p) for l, t, p in entries if l in child_levels]
+    raw_item_entries = [
+        (title, page)
+        for level, title, page in entries
+        if level == item_level
+    ]
+    child_entries = [
+        (level, title, page)
+        for level, title, page in entries
+        if level in child_levels
+    ]
 
     # Group flat TOC entries that share the same item number prefix.
     # e.g. Portola Valley: multiple L1 entries "Item 7.a - Cover Page",
@@ -721,8 +738,13 @@ def _parse_toc_v2(doc, result: _ParsedAgenda):
 
         # Find child entries within this item's page range
         item_children = [
-            (l, t, p) for l, t, p in child_entries
-            if p >= page and (i + 1 >= len(item_entries) or p < item_entries[i + 1][1])
+            (level, child_title, child_page)
+            for level, child_title, child_page in child_entries
+            if child_page >= page
+            and (
+                i + 1 >= len(item_entries)
+                or child_page < item_entries[i + 1][1]
+            )
         ]
 
         # Merge synthetic children (same-numbered flat TOC entries) into children

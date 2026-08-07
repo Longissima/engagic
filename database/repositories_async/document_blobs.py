@@ -88,25 +88,81 @@ class DocumentBlobRepository(BaseRepository):
             text_chars,
         )
 
-    async def record_source(
+    async def record_source_observation(
         self,
         content_sha256: str,
         source_identity: str,
         banana: Optional[str] = None,
     ) -> None:
-        """Remember that these bytes were seen at this (stable) URL identity.
-
-        Re-sightings backfill provenance and advance last_seen. The latter is
-        intentionally mutable: stable vendor URLs can serve revised bytes, so
-        ingestion uses it to schedule bounded revalidation without downloading
-        every document on every run."""
+        """Record use of archived bytes without claiming an origin fetch."""
         await self._execute(
             """
-            INSERT INTO document_source (content_sha256, source_identity, banana)
-            VALUES ($1, $2, $3)
+            INSERT INTO document_source (
+                content_sha256, source_identity, banana, last_observed_at
+            )
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
             ON CONFLICT (content_sha256, source_identity) DO UPDATE
                 SET banana = COALESCE(document_source.banana, EXCLUDED.banana),
-                    last_seen = CURRENT_TIMESTAMP
+                    last_observed_at = CURRENT_TIMESTAMP
+            """,
+            content_sha256,
+            source_identity,
+            banana,
+        )
+
+    async def record_source_validation(
+        self,
+        content_sha256: str,
+        source_identity: str,
+        banana: Optional[str] = None,
+        *,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+    ) -> None:
+        """Record a successful HTTP 200/304 validation of one revision."""
+        await self._execute(
+            """
+            INSERT INTO document_source (
+                content_sha256, source_identity, banana, last_seen,
+                last_observed_at, last_validated_at,
+                last_validation_attempt_at, etag, last_modified
+            )
+            VALUES (
+                $1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $4, $5
+            )
+            ON CONFLICT (content_sha256, source_identity) DO UPDATE
+                SET banana = COALESCE(document_source.banana, EXCLUDED.banana),
+                    last_seen = CURRENT_TIMESTAMP,
+                    last_observed_at = CURRENT_TIMESTAMP,
+                    last_validated_at = CURRENT_TIMESTAMP,
+                    last_validation_attempt_at = CURRENT_TIMESTAMP,
+                    etag = COALESCE(EXCLUDED.etag, document_source.etag),
+                    last_modified = COALESCE(
+                        EXCLUDED.last_modified, document_source.last_modified
+                    )
+            """,
+            content_sha256,
+            source_identity,
+            banana,
+            etag,
+            last_modified,
+        )
+
+    async def record_source_validation_failure(
+        self,
+        content_sha256: str,
+        source_identity: str,
+        banana: Optional[str] = None,
+    ) -> None:
+        """Throttle retries after a failed origin check while serving cache."""
+        await self._execute(
+            """
+            UPDATE document_source
+            SET banana = COALESCE(document_source.banana, $3),
+                last_observed_at = CURRENT_TIMESTAMP,
+                last_validation_attempt_at = CURRENT_TIMESTAMP
+            WHERE content_sha256 = $1 AND source_identity = $2
             """,
             content_sha256,
             source_identity,
@@ -119,11 +175,13 @@ class DocumentBlobRepository(BaseRepository):
         revised bytes over time resolves to the latest revision."""
         row = await self._fetchrow(
             """
-            SELECT b.*
+            SELECT b.*, s.source_identity, s.last_observed_at,
+                   s.last_validated_at, s.last_validation_attempt_at,
+                   s.etag, s.last_modified
             FROM document_source s
             JOIN document_blob b USING (content_sha256)
             WHERE s.source_identity = $1
-            ORDER BY s.last_seen DESC
+            ORDER BY s.last_validated_at DESC NULLS LAST, s.first_seen DESC
             LIMIT 1
             """,
             source_identity,

@@ -4,8 +4,8 @@ Async PrimeGov Adapter - API integration for PrimeGov municipal calendar
 Cities using PrimeGov: Palo Alto CA, Mountain View CA, Sunnyvale CA, and many others
 """
 
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, cast
 from urllib.parse import urlencode
 import asyncio
 import aiohttp
@@ -170,7 +170,14 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         )
 
         meeting_tasks = [self._process_meeting(meeting) for meeting in meetings_in_range]
-        processed_meetings = await self._bounded_gather(meeting_tasks, max_concurrent=5, return_exceptions=False)
+        processed_meetings = cast(
+            List[Optional[Dict[str, Any]]],
+            await self._bounded_gather(
+                meeting_tasks,
+                max_concurrent=5,
+                return_exceptions=False,
+            ),
+        )
 
         return [m for m in processed_meetings if m is not None]
 
@@ -195,7 +202,14 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
             url = f"{self.base_url}/api/v2/PublicPortal/ListArchivedMeetings?year={year}"
             tasks.append(self._fetch_archived_year(url, year))
 
-        results = await self._bounded_gather(tasks, max_concurrent=5, return_exceptions=False)
+        results = cast(
+            List[List[Dict[str, Any]]],
+            await self._bounded_gather(
+                tasks,
+                max_concurrent=5,
+                return_exceptions=False,
+            ),
+        )
         for year_meetings in results:
             archived_meetings.extend(year_meetings)
 
@@ -296,7 +310,7 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         html_patterns = []
 
         for items_data in results:
-            if isinstance(items_data, Exception):
+            if isinstance(items_data, BaseException):
                 continue
             if items_data.get("participation") and not participation:
                 participation = items_data["participation"]

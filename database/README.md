@@ -102,15 +102,18 @@ metrics = await db.get_platform_metrics()
 # --- Direct repository access ---
 
 # Queue
+# Domain writers normally publish through pipeline_lifecycle.enqueue_queue_job()
+# on their transaction connection. Direct enqueue is for dispatch/retry tooling.
 await db.queue.enqueue_job(
     source_url, job_type="meeting", payload={...}, priority=150,
+    work_version="mv1:...",
     processing_metadata={"chunk": audit},  # optional diagnostic trail (chunker cascade audit)
 )
 job = await db.queue.get_next_for_processing()           # any job (legacy)
 job = await db.queue.get_next_for_processing(lane="streaming")  # urgent-window meetings, matters, undated
 job = await db.queue.get_next_for_processing(lane="batch")      # non-urgent meetings -> Gemini Batch lane
-await db.queue.heartbeat_job(job.id)   # refresh claim during long batch polls (stale-sweep protection)
-await db.queue.mark_processing_complete(job.id)
+await db.queue.heartbeat_job(job.id, job.claim_token, job.work_version)
+await db.queue.mark_processing_complete(job.id, job.claim_token, job.work_version)
 hints = await db.queue.get_chunker_hints()  # latest winning chunker rung per (vendor, slug, ladder)
 
 # Council members
@@ -265,7 +268,7 @@ CREATE TABLE matter_appearances (
     matter_id TEXT NOT NULL,
     meeting_id TEXT NOT NULL,
     item_id TEXT NOT NULL,
-    appeared_at TIMESTAMP NOT NULL,
+    appeared_at TIMESTAMP,              -- NULL when the source meeting is undated
     committee TEXT,                    -- Committee name (text, for display)
     action TEXT,                       -- Action taken at this appearance
     vote_outcome TEXT CHECK (... IN ('passed', 'failed', 'tabled', 'withdrawn', 'referred', 'amended', 'unknown', 'no_vote')),
@@ -293,11 +296,20 @@ CREATE TABLE queue (
     priority INTEGER DEFAULT 0,        -- Higher = processed first
     retry_count INTEGER DEFAULT 0,
     created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    last_enqueued_at TIMESTAMP,
+    retry_at TIMESTAMP,
+    ready_at TIMESTAMP NOT NULL,
     started_at TIMESTAMP,
+    claim_token UUID,
+    claimed_at TIMESTAMP,
+    heartbeat_at TIMESTAMP,
     completed_at TIMESTAMP,
     failed_at TIMESTAMP,
     error_message TEXT,
     processing_metadata JSONB,
+    work_version TEXT,
+    desired_generation BIGINT NOT NULL,
     FOREIGN KEY (banana) REFERENCES jurisdictions(banana) ON DELETE CASCADE,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
@@ -923,7 +935,7 @@ exists = await db.matters.check_existing_match(alert_id, matter_id)
 
 ---
 
-### 5. QueueRepository (460 lines)
+### 5. QueueRepository
 
 **Methods:**
 
@@ -935,19 +947,27 @@ await db.queue.enqueue_job(
     payload={"meeting_id": "...", "source_url": "https://..."},
     meeting_id="paloaltoCA_a3f2c8d1",
     banana="paloaltoCA",
-    priority=150
+    priority=150,
+    work_version="mv1:...",
 )
 
-# Get next job for processing (atomic dequeue with FOR UPDATE SKIP LOCKED)
-jobs = await db.queue.get_next_for_processing(job_type="meeting", limit=1)
+# Read-only preview
+jobs = await db.queue.preview_jobs(banana="paloaltoCA", limit=10)
 
-# Non-blocking single job
-job = await db.queue.get_next_job()
+# Atomic claim; lane is None, "streaming", or "batch"
+job = await db.queue.get_next_for_processing(lane="streaming")
 
-# Mark complete / failed
-await db.queue.mark_processing_complete(job_id)
-await db.queue.mark_job_failed(job_id, "Error message")
-await db.queue.mark_processing_failed(job_id, "Error", retry_limit=3)  # With retry logic
+# Every heartbeat/final transition is fenced by claim token + work version
+await db.queue.heartbeat_job(job.id, job.claim_token, job.work_version)
+await db.queue.mark_processing_complete(
+    job.id, job.claim_token, job.work_version
+)
+await db.queue.mark_processing_failed(
+    job.id,
+    "temporary error",
+    claim_token=job.claim_token,
+    work_version=job.work_version,
+)
 
 # Reset stuck jobs
 count = await db.queue.reset_stale_processing_jobs(stale_minutes=10)
@@ -960,8 +980,20 @@ dead_jobs = await db.queue.get_dead_letter_jobs(limit=100)
 ```
 
 **Retry Logic:**
-- Failed jobs re-enqueued with lower priority
-- After `retry_limit` failures -> moved to `dead_letter` status
+- Retryable failures return to `pending` with exponential `retry_at`/`ready_at`
+  backoff and reduced priority.
+- The third failed attempt moves the exact claimed version to `dead_letter`.
+- Terminal failures move directly to `failed`; a newer desired generation clears
+  the old claim and begins a fresh attempt cycle.
+
+`PipelineLifecycleRepository.get_operational_snapshot()` is the durable status
+read model. In addition to current queue/Batch/outbox state, it reports actionable
+outbox age, unresolved queue-publication dead letters, tokenless/stale claims,
+last-hour latency percentiles, a 24-hour attempt series grouped by job type/lane/
+outcome, and a separate submitted/terminal Batch series. After migration 035,
+newly activated Batch rows measure provider elapsed time from `submitted_at`;
+the migration uses `created_at` only as the best available estimate for legacy
+rows.
 
 ---
 
@@ -1286,7 +1318,7 @@ outcome = determine_vote_outcome(tally)  # "passed" | "failed" | "tabled" | "no_
 ```python
 from database.id_generation import (
     # Meeting IDs
-    generate_meeting_id(banana, vendor_id, date, title),    # -> "chicagoIL_a3f2c1d4"
+    generate_meeting_id(banana, vendor_id, date, title),    # date may be None -> stable undated ID
     validate_meeting_id(meeting_id),                         # -> bool
     hash_meeting_id(meeting_id),                            # -> 16-char hex (for URL slugs)
 
@@ -1428,32 +1460,34 @@ Generated columns auto-update when title/summary change. GIN indexes on these st
 
 ### Atomic Queue Dequeue
 
-```sql
--- FOR UPDATE SKIP LOCKED prevents race conditions in concurrent processing
-UPDATE queue SET status = 'processing', started_at = NOW()
-WHERE id = (
-    SELECT id FROM queue WHERE status = 'pending'
-    ORDER BY priority DESC, created_at ASC
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-)
-RETURNING *;
-```
+The repository selects one ready row with `FOR UPDATE OF q SKIP LOCKED`, ordered
+by priority, `last_enqueued_at`, and ID. In the same transaction it changes the
+row to `processing`, assigns a fresh UUID `claim_token`, and sets `claimed_at`,
+`heartbeat_at`, and `started_at`. Heartbeats and final transitions require
+`id + claim_token + work_version`, so an expired worker cannot settle a replacement
+claim.
 
 ---
 
 ## Migration System (`migrate.py`, 271 lines)
 
 ```bash
-python -m database.migrate              # Apply pending migrations
-python -m database.migrate --status     # Show migration status
-python -m database.migrate --rollback 1 # Rollback last migration
+uv run python -m database.migrate              # Apply pending migrations
+uv run python -m database.migrate --status     # Show migration status
+uv run python -m database.migrate --rollback 1 # Rollback last migration
 ```
 
 - Migrations: numbered SQL files in `database/migrations/` (e.g., `001_name.sql`)
 - Each runs in a transaction (all-or-nothing)
 - Applied migrations tracked in `schema_migrations` table
 - Optional rollback via `001_name.down.sql` files
+
+At the 2026-08-07 rollout handoff, production had applied migrations 029-036 in
+quiescent migration windows. Migration 035 adds the Batch provider-acceptance
+clock (`submitted_at`); migration 036 permits an authoritative appearance date
+to remain NULL when its meeting is undated. Check live status before acting
+rather than treating this point-in-time note as a substitute for the migration
+ledger.
 
 ---
 

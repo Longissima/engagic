@@ -12,17 +12,42 @@ Supports multiple HTML formats:
 """
 
 import re
+from collections.abc import Callable
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 
 from config import get_logger
 from vendors.utils.attachments import classify_attachment_type
 from parsing.participation import parse_participation_info
 
 logger = get_logger(__name__).bind(component="vendor")
+
+
+def _attribute_contains(
+    needle: str, *, case_insensitive: bool = False
+) -> Callable[[str | None], bool]:
+    """Build a typed BeautifulSoup attribute predicate."""
+
+    expected = needle.lower() if case_insensitive else needle
+
+    def matches(value: str | None) -> bool:
+        if not isinstance(value, str):
+            return False
+        candidate = value.lower() if case_insensitive else value
+        return expected in candidate
+
+    return matches
+
+
+def _string_attribute(element: Tag, name: str) -> str:
+    """Return a scalar HTML attribute, rejecting list-valued attributes."""
+
+    value = element.get(name)
+    return value if isinstance(value, str) else ""
 
 
 def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]]:
@@ -74,35 +99,40 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
 
         # Find AgendaViewer link: try <a> tags first, then <option> tags
         # inside <select> dropdowns (Grand Island style)
-        agenda_link = row.find('a', href=lambda x: x and 'AgendaViewer' in x if x else False)
-        agenda_href = None
-        packet_href = None
+        agenda_link = row.find('a', href=_attribute_contains('AgendaViewer'))
+        agenda_href: Optional[str] = None
+        packet_href: Optional[str] = None
 
         if agenda_link:
-            agenda_href = agenda_link['href']
+            agenda_href = _string_attribute(agenda_link, 'href') or None
         else:
-            option = row.find('option', value=lambda x: x and 'AgendaViewer' in x if x else False)
+            option = row.find(
+                'option', value=_attribute_contains('AgendaViewer')
+            )
             if option:
-                agenda_href = option['value']
+                agenda_href = _string_attribute(option, 'value') or None
 
         # Also grab direct packet PDF links (CloudFront-hosted packets).
         # Prefer a non-minutes PDF; fall back to the first PDF so rows whose
         # only document is a minutes PDF keep their pre-existing behavior.
-        pdf_links = row.find_all('a', href=lambda x: x and '.pdf' in x.lower() if x else False)
+        pdf_links = row.find_all(
+            'a', href=_attribute_contains('.pdf', case_insensitive=True)
+        )
         if pdf_links:
             non_minutes_pdfs = [
                 link for link in pdf_links
                 if 'minutes' not in link.get_text(strip=True).lower()
-                and 'minutes' not in link['href'].lower()
+                and 'minutes' not in _string_attribute(link, 'href').lower()
             ]
-            packet_href = (non_minutes_pdfs[0] if non_minutes_pdfs else pdf_links[0])['href']
+            packet_link = non_minutes_pdfs[0] if non_minutes_pdfs else pdf_links[0]
+            packet_href = _string_attribute(packet_link, 'href') or None
 
         # Minutes column: direct document links (services/minutes attachment,
         # minutes PDF) preferred over MinutesViewer.php viewer pages.
         minutes_doc_href = None
         minutes_viewer_href = None
         for link in row.find_all('a', href=True):
-            link_href = link['href']
+            link_href = _string_attribute(link, 'href')
             if not link_href or link_href.startswith(('#', 'javascript:')):
                 continue
             if 'MinutesViewer' in link_href:
@@ -112,14 +142,18 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
             if 'minutes' in link_text or '/minutes/' in link_href.lower():
                 minutes_doc_href = minutes_doc_href or link_href
         if not minutes_doc_href and not minutes_viewer_href:
-            option = row.find('option', value=lambda x: x and 'MinutesViewer' in x if x else False)
+            option = row.find(
+                'option', value=_attribute_contains('MinutesViewer')
+            )
             if option:
-                minutes_viewer_href = option['value']
+                minutes_viewer_href = _string_attribute(option, 'value') or None
 
         if not agenda_href and not packet_href:
             continue
 
-        href = agenda_href or packet_href
+        href = agenda_href if agenda_href is not None else packet_href
+        if href is None:  # Explicitly narrow the fallback for static analysis.
+            continue
         if href.startswith('//'):
             href = 'https:' + href
         elif not href.startswith('http'):
@@ -274,10 +308,13 @@ def parse_agendaonline_html(html: str, base_url: str) -> Dict[str, Any]:
     # Parse accessible view format (ViewMeetingAgenda)
     sequence_counter = 0
     for item_div in soup.find_all('div', class_='accessible-item'):
-        link = item_div.find('a', onclick=lambda x: x and 'loadAgendaItem' in x if x else False)
+        link = item_div.find(
+            'a', onclick=_attribute_contains('loadAgendaItem')
+        )
         if not link:
             continue
-        if not (id_match := re.search(r'loadAgendaItem\((\d+)\)', link.get('onclick', ''))):
+        onclick = _string_attribute(link, 'onclick')
+        if not (id_match := re.search(r'loadAgendaItem\((\d+)\)', onclick)):
             continue
         item_id = id_match.group(1)
         if item_id in seen_ids:
@@ -311,7 +348,10 @@ def parse_agendaonline_html(html: str, base_url: str) -> Dict[str, Any]:
         return {'participation': participation, 'items': items}
 
     # Strategy 2: Fallback to table-based parsing (older format)
-    all_tables = soup.find_all('table', style=lambda x: x and 'border-collapse' in x.lower() if x else False)
+    all_tables = soup.find_all(
+        'table',
+        style=_attribute_contains('border-collapse', case_insensitive=True),
+    )
     sequence_counter = 0
 
     for table in all_tables:
@@ -335,7 +375,9 @@ def parse_agendaonline_html(html: str, base_url: str) -> Dict[str, Any]:
             for idx, cell in enumerate(cells):
                 bold = cell.find(
                     'span',
-                    style=lambda x: x and 'font-weight:bold' in x.lower() if x else False,
+                    style=_attribute_contains(
+                        'font-weight:bold', case_insensitive=True
+                    ),
                 ) or cell.find('b') or cell.find('strong')
                 candidate = bold.get_text(strip=True) if bold else cell.get_text(strip=True)
                 if candidate and _NUM_RE.match(candidate):
@@ -352,16 +394,19 @@ def parse_agendaonline_html(html: str, base_url: str) -> Dict[str, Any]:
 
             anchor = content_cell.find('a', attrs={'name': True})
             if anchor:
-                name = anchor.get('name', '')
+                name = _string_attribute(anchor, 'name')
                 if name.startswith(('S', 'I')):
                     item_id = name[1:]
                 elif name:
                     item_id = name
 
             if not item_id:
-                load_link = content_cell.find('a', href=lambda x: x and 'loadAgendaItem' in x if x else False)
+                load_link = content_cell.find(
+                    'a', href=_attribute_contains('loadAgendaItem')
+                )
                 if load_link:
-                    match = re.search(r'loadAgendaItem\((\d+)', load_link.get('href', ''))
+                    href = _string_attribute(load_link, 'href')
+                    match = re.search(r'loadAgendaItem\((\d+)', href)
                     if match:
                         item_id = match.group(1)
 
@@ -403,8 +448,10 @@ def parse_agendaonline_html(html: str, base_url: str) -> Dict[str, Any]:
     if not items:
         seen_ids = set()
         sequence_counter = 0
-        for link in soup.find_all('a', href=lambda x: x and 'loadAgendaItem' in x if x else False):
-            href = link.get('href', '')
+        for link in soup.find_all(
+            'a', href=_attribute_contains('loadAgendaItem')
+        ):
+            href = _string_attribute(link, 'href')
             match = re.search(r'loadAgendaItem\((\d+)', href)
             if not match:
                 continue
@@ -452,7 +499,9 @@ def _extract_council_members(soup: BeautifulSoup) -> List[str]:
     seen = set()
 
     # Look for spans with blue color styling (common in Granicus agendas)
-    blue_spans = soup.find_all('span', style=lambda x: x and '#0070c2' in x.lower() if x else False)
+    blue_spans = soup.find_all(
+        'span', style=_attribute_contains('#0070c2', case_insensitive=True)
+    )
 
     current_name = []
     for span in blue_spans:
@@ -494,7 +543,9 @@ def parse_agendaviewer_html(html: str) -> Dict[str, Any]:
     """Parse original Granicus AgendaViewer HTML for items with File IDs and MetaViewer attachments."""
     soup = BeautifulSoup(html, 'html.parser')
     items = []
-    tables = soup.find_all('table', {'style': lambda x: x and 'BORDER-COLLAPSE: collapse' in x})
+    tables = soup.find_all(
+        'table', style=_attribute_contains('BORDER-COLLAPSE: collapse')
+    )
     sequence_counter = 0
 
     for table in tables:
@@ -527,9 +578,11 @@ def parse_agendaviewer_html(html: str) -> Dict[str, Any]:
         if parent:
             next_blockquote = parent.find_next_sibling('blockquote')
             if next_blockquote:
-                meta_links = next_blockquote.find_all('a', href=lambda x: x and 'MetaViewer' in x)
+                meta_links = next_blockquote.find_all(
+                    'a', href=_attribute_contains('MetaViewer')
+                )
                 for link in meta_links:
-                    href = link['href']
+                    href = _string_attribute(link, 'href')
                     link_text = link.get_text(strip=True)
                     meta_id_match = re.search(r'meta_id=(\d+)', href)
                     meta_id = meta_id_match.group(1) if meta_id_match else None
@@ -588,7 +641,11 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
     sequence_counter = 0
 
     # Walk all grid-row divs (direct children of container with grid-column styles)
-    for grid_cell in container.find_all('div', style=lambda x: x and 'grid-column-start' in x if x else False, recursive=False):
+    for grid_cell in container.find_all(
+        'div',
+        style=_attribute_contains('grid-column-start'),
+        recursive=False,
+    ):
         inner = grid_cell.find('div', recursive=False)
         if not inner:
             continue
@@ -598,7 +655,9 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
 
         if h2:
             # Section header: extract letter prefix
-            spans = h2.find_all('span', style=lambda x: x and 'float' in x if x else False)
+            spans = h2.find_all(
+                'span', style=_attribute_contains('float')
+            )
             if spans:
                 letter_span = spans[0]
                 letter_text = letter_span.get_text(strip=True).rstrip('.\xa0 ')
@@ -610,7 +669,9 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
 
         elif h3:
             # Agenda item: extract letter.number prefix, title, staff, attachment
-            spans = h3.find_all('span', style=lambda x: x and 'float' in x if x else False)
+            spans = h3.find_all(
+                'span', style=_attribute_contains('float')
+            )
             if not spans:
                 continue
 
@@ -628,7 +689,7 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
                 for sibling in inner.find_all('div', recursive=False):
                     if sibling.find('h3') or sibling.find('h2'):
                         continue
-                    style = sibling.get('style', '')
+                    style = _string_attribute(sibling, 'style')
                     if 'float' in style and sibling.find('a', href=True):
                         content_div = sibling
                         break
@@ -639,7 +700,7 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
             link = content_span.find('a', href=True)
             if link:
                 title = link.get_text(strip=True)
-                attachment_url = link.get('href', '')
+                attachment_url = _string_attribute(link, 'href')
 
                 # Staff name comes after the link as bare text: <a>Title</a>(StaffName)
                 # Get all text in the span, remove the link text, extract parens
@@ -667,7 +728,7 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
                     continue
                 # Check for attachment links in sibling divs (Carson City style: "Click Here for Staff Report")
                 for sibling_link in sibling_div.find_all('a', href=True):
-                    href = sibling_link.get('href', '')
+                    href = _string_attribute(sibling_link, 'href')
                     if href and ('cloudfront.net' in href or 's3.amazonaws.com' in href or '.pdf' in href.lower()):
                         link_text = sibling_link.get_text(strip=True)
                         extra_attachments.append({
@@ -725,7 +786,11 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
         procedural = {'roll call', 'pledge of allegiance', 'adjournment', 'adjourn',
                       'interpreter services', 'council reports'}
 
-        for grid_cell in container.find_all('div', style=lambda x: x and 'grid-column-start' in x if x else False, recursive=False):
+        for grid_cell in container.find_all(
+            'div',
+            style=_attribute_contains('grid-column-start'),
+            recursive=False,
+        ):
             text = grid_cell.get_text(strip=True)
             if not text:
                 continue
@@ -744,7 +809,7 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
                 # Numbered items with links are substantive too
                 link = grid_cell.find('a', href=True)
                 if link:
-                    href = link.get('href', '')
+                    href = _string_attribute(link, 'href')
                     sequence_counter += 1
                     items.append({
                         'vendor_item_id': num_match.group(1),
@@ -760,7 +825,7 @@ def parse_granicus_s3_html(html: str) -> Dict[str, Any]:
             elif letter_match:
                 title = letter_match.group(2).split('\n')[0].strip()
                 link = grid_cell.find('a', href=True)
-                href = link.get('href', '') if link else ''
+                href = _string_attribute(link, 'href') if link else ''
 
                 sequence_counter += 1
                 item_dict = {
@@ -822,8 +887,10 @@ def parse_generated_agendaviewer_html(html: str) -> Dict[str, Any]:
         attachments = []
         if not blockquote:
             return attachments
-        for link in blockquote.find_all('a', href=lambda x: x and 'MetaViewer' in x if x else False):
-            href = link['href']
+        for link in blockquote.find_all(
+            'a', href=_attribute_contains('MetaViewer')
+        ):
+            href = _string_attribute(link, 'href')
             name = link.get_text(strip=True) or 'Supporting Document'
             meta_id_match = re.search(r'meta_id=(\d+)', href)
             attachments.append({
@@ -882,7 +949,7 @@ def parse_generated_agendaviewer_html(html: str) -> Dict[str, Any]:
     current_section = ""
 
     for elem in body.children:
-        if not hasattr(elem, 'name') or not elem.name:
+        if not isinstance(elem, Tag) or not elem.name:
             continue
 
         # Get the item table - either the element itself or nested in a div
@@ -1021,9 +1088,9 @@ def parse_generated_agendaviewer_html(html: str) -> Dict[str, Any]:
         out = []
         if not bq:
             return out
-        def _walk(node):
+        def _walk(node: Tag) -> None:
             for child in node.children:
-                if not getattr(child, 'name', None):
+                if not isinstance(child, Tag) or not child.name:
                     continue
                 if child.name == 'div':
                     inner_strongs = child.find_all('strong')
@@ -1035,8 +1102,8 @@ def parse_generated_agendaviewer_html(html: str) -> Dict[str, Any]:
                     if is_section_scope:
                         continue  # handled by its own <strong> iteration
                     # Otherwise it's just a wrapper — recurse in
-                if child.name == 'a' and child.get('href') and 'MetaViewer' in child.get('href', ''):
-                    href = child['href']
+                href = _string_attribute(child, 'href')
+                if child.name == 'a' and 'MetaViewer' in href:
                     name = child.get_text(strip=True) or 'Supporting Document'
                     meta_match = re.search(r'meta_id=(\d+)', href)
                     out.append({
@@ -1251,15 +1318,23 @@ def _parse_numberspace_layout(soup: BeautifulSoup) -> List[Dict[str, Any]]:
         attachments: List[Dict[str, Any]] = []
         seen_meta_ids = set()
         for node in td.find_all_next():
-            node_name = getattr(node, 'name', None)
-            if node_name == 'td' and 'numberspace' in (node.get('class') or []):
+            if not isinstance(node, Tag):
+                continue
+            node_name = node.name
+            class_value = node.get('class')
+            class_names = (
+                [value for value in class_value if isinstance(value, str)]
+                if isinstance(class_value, list)
+                else []
+            )
+            if node_name == 'td' and 'numberspace' in class_names:
                 peek = node.get_text(strip=True).rstrip('.')
                 if peek and not _NS_SUBSTEP_RE.match(peek):
                     break
                 continue
             if node_name != 'a':
                 continue
-            href = node.get('href', '')
+            href = _string_attribute(node, 'href')
             if not href or 'MetaViewer' not in href:
                 continue
             meta_id_match = re.search(r'meta_id=(\d+)', href)
@@ -1353,7 +1428,9 @@ def parse_questys_html(html: str, base_url: str) -> Dict[str, Any]:
         # Extract vendor item ID from AI anchor
         vendor_item_id = item_number
         for anchor in p.find_all('a', attrs={'name': True}):
-            ai_match = _QUESTYS_AI_RE.match(anchor.get('name', ''))
+            ai_match = _QUESTYS_AI_RE.match(
+                _string_attribute(anchor, 'name')
+            )
             if ai_match:
                 vendor_item_id = ai_match.group(1)
                 break
@@ -1373,7 +1450,7 @@ def parse_questys_html(html: str, base_url: str) -> Dict[str, Any]:
             continue
 
         # Build attachment URL from relative Documents.htm path
-        href = doc_link.get('href', '')
+        href = _string_attribute(doc_link, 'href')
         attachments = []
         if href:
             doc_url = urljoin(base_url, href)

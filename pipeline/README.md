@@ -11,6 +11,8 @@ pipeline/
   conductor.py      # Daemon lifecycle, CLI entry point
   fetcher.py        # City sync, vendor routing
   processor.py      # Queue processing, item assembly
+  document_acquisition.py # Corpus-first source acquisition and validation
+  outbox_dispatch.py # Typed delivery for queue and notification intents
   models.py         # Job type definitions (Pydantic dataclasses)
   utils.py          # Matter-first utilities
   admin.py          # Debug commands (standalone)
@@ -38,8 +40,11 @@ Conductor
 **Key patterns:**
 - Conductor delegates to Fetcher and Processor
 - Processor uses orchestrators for business logic
-- MeetingSyncOrchestrator coordinates all sync-side decisions
-- Metrics injected via Protocol (no server dependency)
+- MeetingSyncOrchestrator coordinates all sync-side decisions and publishes
+  downstream work through the transaction-scoped outbox
+- Durable run/attempt/Batch metrics back the relational-only
+  `engagic-conductor status` path; optional process-local metrics remain
+  injected through a Protocol
 
 ---
 
@@ -51,7 +56,7 @@ Conductor
 
 #### Responsibilities
 - Start/stop background daemon (async tasks)
-- Sync loop (runs every 24 hours)
+- Adaptive sync loop (per-jurisdiction cadence from recent activity)
 - Processing loop (continuously processes queue)
 - Admin commands (force sync, status, preview)
 - Watchlist operations (user-demanded cities)
@@ -83,9 +88,9 @@ async for result in conductor.sync_and_process_cities(["paloaltoCA"]):
 
 ```bash
 # Background services
-engagic-conductor daemon       # Combined sync + processing (two async tasks)
+engagic-conductor daemon       # Combined sync + processing; canonical recovery per runtime
 engagic-conductor fetcher      # Sync only, no processing
-engagic-conductor processor    # Processing only, no sync (stale job recovery on start)
+engagic-conductor processor    # Processing only; canonical recovery before each runtime
 
 # Inspection
 engagic-conductor preview-queue paloaltoCA
@@ -115,10 +120,13 @@ engagic-conductor preview-items MEETING_ID --extract-text
 
 #### Async Architecture
 - **Single event loop:** Uses `asyncio.create_task()` for concurrent loops
-- **Sync task:** Runs every 24 hours (calls `fetcher.sync_all()`)
+- **Sync task:** Runs the adaptive due-jurisdiction schedule (`fetcher.sync_all()`)
 - **Processing task:** Runs continuously (calls `processor.process_queue()`)
 - **Graceful shutdown:** `asyncio.Event`-based, checked via `is_running` property; SIGTERM/SIGINT handlers
 - **Interruptible sleep:** 1-second poll interval during 72-hour waits (immediate shutdown response)
+- **Processor supervision:** a failed continuous runtime closes its durable run,
+  waits on a shutdown-aware backoff, and starts a fresh run; combined mode fails
+  fast when analyzer configuration is unavailable instead of becoming sync-only
 
 ---
 
@@ -159,7 +167,7 @@ result: SyncResult = await fetcher.sync_city("paloaltoCA")
 @dataclass
 class SyncResult:
     city_banana: str
-    status: SyncStatus  # COMPLETED, FAILED, SKIPPED
+    status: SyncStatus  # COMPLETED, FAILED, SKIPPED, CANCELLED
     meetings_found: int = 0
     meetings_processed: int = 0
     meetings_skipped: int = 0
@@ -173,16 +181,24 @@ class SyncResult:
 1. **Group cities by vendor** (primegov, legistar, novusagenda, iqm2, etc.)
 2. **Prioritize by activity** (high activity cities first via `_prioritize_cities()`)
 3. **Check sync schedule** (`_should_sync_city()` - adaptive intervals)
-4. **Parallel sync** with semaphore (`CITY_SYNC_CONCURRENCY = 2` per vendor)
+4. **Parallel sync** across vendor groups with a semaphore
+   (`CITY_SYNC_CONCURRENCY = 8` cities per vendor)
 5. **Apply rate limiting** (`AsyncRateLimiter.wait_if_needed(vendor)`)
-6. **Fetch meetings** (`adapter.fetch_meetings()`)
+6. **Fetch meetings** (`adapter.fetch_meetings()`); each primary or extra vendor
+   pass owns its retry budget, so one failed source cannot replay a successful one
 7. **Store via orchestrator** (`MeetingSyncOrchestrator.sync_meeting()`)
    - Creates Meeting + AgendaItem objects
    - Tracks matters (city_matters + matter_appearances)
    - Looks up or creates committees
-   - Enqueues for processing (meetings and matters separately)
+   - Records version-keyed, source-serialized processing intents in the
+     transactional outbox; a reverted A -> B -> A version is reopened with a
+     fresh monotonic generation
+   - On the first stored meeting, records deterministic per-user city-activation
+     notification intents under an advisory lock
 8. **Track failures** (`failed_cities` set)
-9. **Vendor break** (30-40s between vendor groups)
+
+Shutdown between primary and extra vendor streams yields a cancelled result. The
+city lifecycle checkpoint is written only after every configured stream completes.
 
 #### Adaptive Sync Scheduling
 
@@ -198,19 +214,23 @@ Based on meeting frequency in the last 30 days:
 #### Vendor Rate Limiting
 
 - **Per-vendor rate limiting** via `AsyncRateLimiter.wait_if_needed(vendor)`
-- **30-40 second break** between vendor groups
+- Vendor groups run concurrently; one shared limiter coordinates every request
+  for a vendor, including extra-vendor passes
 - **Polite crawling** to avoid overloading civic tech platforms
 
 ---
 
-### 3. `processor.py` - Queue Processing & Item Assembly (~930 lines)
+### 3. `processor.py` - Shared Queue Runtime & Item Assembly
 
-**Processes jobs from the queue.** Extracts text from PDFs, assembles items, orchestrates LLM analysis.
+**Processes jobs from the queue.** Acquires typed document artifacts, assembles
+items, and orchestrates guarded extraction and LLM analysis.
 
 #### Responsibilities
-- Process queue continuously (`process_queue()`) — streaming lane
+- Run the canonical finite/continuous queue runtime (`run_pipeline_runtime()`)
 - Batch API lane (`_batch_lane_loop()`) — non-urgent meetings at 50% cost
-- Extract text from PDFs (via `AsyncAnalyzer.extract_pdf_async()`)
+- Acquire and extract PDF/HTML/Office/RTF artifacts through
+  `AsyncAnalyzer.extract_document_async()` and the shared
+  `DocumentSourceAcquirer`
 - Multi-tier filtering (procedural items, public comments, EIRs, boilerplate)
 - Document-level caching (deduplication within meeting)
 - Document version filtering (keep latest version only)
@@ -234,9 +254,10 @@ Meeting jobs split into two lanes at dequeue time
 - **Batch lane** (BATCH_JOB_CONCURRENCY=3, BATCH_JOB_TIMEOUT=7200s):
   everything else, routed through `summarizer.summarize_batch` — Gemini
   Batch API at 50% token cost on a **separate quota pool** (bulk work never
-  competes with fresh meetings for TPM). Jobs park on Gemini poll loops, so
-  the lane heartbeats `queue.started_at` every 5min to stay clear of the
-  stale sweep, and gets its own generous wall-clock ceiling.
+  competes with fresh meetings for TPM). Submission creates a durable local
+  intent before the provider call. Provider jobs are polled by the shared
+  leased collector while new chunks continue submitting; queue and provider
+  heartbeats are distinct durable clocks.
 
 Lanes are disjoint SQL predicates over `FOR UPDATE SKIP LOCKED` — no double
 claims. A meeting whose date drifts into the urgent window between retries
@@ -253,15 +274,13 @@ processor = Processor(db=db, analyzer=optional_analyzer, metrics=optional_metric
 # Continuous queue processing (production)
 await processor.process_queue()
 
-# Process specific city (admin/testing)
-stats = await processor.process_city_jobs("paloaltoCA")
-# Returns: {"processed_count": 5, "failed_count": 1, "items_processed": 12, ...}
+# Drain a finite scope (the manual CLI uses this same primitive)
+stats = await processor.run_pipeline_runtime(
+    bananas=["paloaltoCA"], continuous=False, command="process-cli"
+)
 
-# Process single meeting (internal)
-await processor.process_meeting(meeting)  # Agenda-first: items > packet
-
-# Process matter across appearances (internal)
-await processor.process_matter(matter_id, meeting_id, {"item_ids": [...]})
+# Meeting and matter projection are queue-owned. `JobRunner` supplies the
+# claimed desired descriptor and token; direct handler invocation is rejected.
 
 # Cleanup
 await processor.close()  # Closes analyzer + vendor HTTP sessions
@@ -277,7 +296,8 @@ Meeting has agenda_items
   ├─ Build document cache (meeting-level, shared URLs)
   │   ├─ Filter document versions (keep latest Ver2 over Ver1)
   │   ├─ Filter low-value attachments (public comments, EIRs, boilerplate)
-  │   ├─ Extract each unique PDF once concurrently (semaphore-limited)
+  │   ├─ Acquire each unique supported document once (single-flight)
+  │   ├─ Dispatch by observed media type under extraction resource limits
   │   └─ Detect public comment compilations (page count, OCR ratio, signatures)
   ├─ Separate shared vs item-specific documents
   ├─ Build batch requests (item-specific text, shared context separate)
@@ -301,12 +321,15 @@ Meeting has packet_url (no items)
 
 **Path 3: Matter Processing (via queue)**
 ```
-MatterJob from queue (matter_id + item_ids)
+MatterJob from queue (matter_id identity only; desired version is on QueueJob)
   ├─ Validate matter_id format and extract banana
-  ├─ Aggregate unique attachments from all item appearances
+  ├─ Lock matter → appearances → desired queue state at write time
+  ├─ Compare mw1 domain content, the original queue descriptor, and claim token
+  ├─ Compare the separate sv1 attachment-artifact version
+  ├─ Aggregate unique attachments by stable source identity
   ├─ Process representative item via _process_single_item()
-  ├─ Store canonical_summary + attachment_hash in city_matters
-  └─ Backfill all item appearances with canonical summary
+  ├─ CAS-store canonical_summary + both versions in city_matters
+  └─ Fill only still-null appearance snapshots (existing snapshots stay frozen)
 ```
 
 #### Document Caching (Item-Level Path)
@@ -420,8 +443,6 @@ class MeetingJob:
 class MatterJob:
     """Process a matter across all its appearances (matters-first)"""
     matter_id: str  # Composite ID: {banana}_{matter_key}
-    meeting_id: str  # Representative meeting where matter appears
-    item_ids: List[str]  # All agenda item IDs for this matter
 
 @dataclass
 class QueueJob:
@@ -437,6 +458,12 @@ class QueueJob:
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+    work_version: Optional[str] = None
+    last_enqueued_at: Optional[str] = None
+    claim_token: Optional[str] = None
+    claimed_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
+    ready_at: Optional[str] = None
 ```
 
 #### Helper Functions
@@ -452,10 +479,9 @@ job_data = create_meeting_job(
 # Create matter job
 job_data = create_matter_job(
     matter_id="sanfranciscoCA_251041",
-    meeting_id="sanfranciscoCA_2025-11-10",
-    item_ids=["item_1", "item_2", "item_3"],
     banana="sanfranciscoCA",
-    priority=150
+    priority=150,
+    work_version="mw1:...",
 )
 
 # Deserialize from database row
@@ -467,13 +493,13 @@ job = QueueJob.from_db_row(db_row)
 **Discriminated union pattern:** `job_type` field determines which payload type is present.
 
 ```python
-# Type-safe dispatch
+# Type-safe payload narrowing inside the JobRunner-owned dispatch boundary.
+# Application code uses `run_pipeline_runtime()` rather than calling either
+# processing handler directly.
 if job.job_type == "meeting":
     assert isinstance(job.payload, MeetingJob)
-    process_meeting(job.payload.meeting_id)
 elif job.job_type == "matter":
     assert isinstance(job.payload, MatterJob)
-    process_matter(job.payload.matter_id, job.payload.item_ids)
 ```
 
 ---
@@ -613,7 +639,7 @@ def sync_city(banana: str):
 
 ### 8. `orchestrators/` - Business Logic Coordinators
 
-Four orchestrators coordinate complex workflows across repositories:
+Five coordination components handle cross-repository workflow decisions:
 
 #### `MeetingSyncOrchestrator` (~580 lines)
 Main coordinator for sync operations. Called by Fetcher.
@@ -628,14 +654,26 @@ meeting, stats = await orchestrator.sync_meeting(meeting_dict, city)
 - Generate deterministic IDs (meeting, item, matter) via `database.id_generation`
 - Look up or create committees (vendor_body_id preferred, title-parsing fallback)
 - Track legislative matters (new vs duplicate appearances)
-- Create matter_appearances with committee and sequence tracking
-- Process votes and update outcomes (via VoteProcessor)
+- Reconcile matter appearances exactly after item writes, including A → B relinks
+- Reconcile retained sponsor evidence and observed votes, then update outcomes
+  only after the appearance row exists
 - Enqueue meetings and matters for LLM processing (separate priority tiers)
 - Preserve existing summaries and processing state on resync
 - Deduplicate items by matter_id before DB operations
 - Detect first meeting for city and notify subscribed users (city activation emails)
-- Record sponsor-to-matter links and vote records for council members
-- Handle enqueue failures gracefully (meeting data committed, jobs recoverable via re-sync)
+- Lock the sorted retained-old + proposed-new matter union before item rows;
+  concurrent opposite relinks therefore share one global lock order
+- Re-read retained rows after every freeze/COALESCE rule, refresh exact matter
+  counts/date bounds/title/sponsors, and publish their exact work versions
+- Publish a deterministic `mnw1:<reason>:<digest>` no-work tombstone for
+  procedural, empty, or non-substantive aggregates. This descriptor is distinct
+  from executable `mw1` work, so unchanged content can reopen after a policy
+  transition while repeated identical tombstones remain no-ops. An empty
+  aggregate clears stale canonical projection fields; every tombstone fences
+  older queue/outbox intent plus any in-flight matter commit through the
+  desired-descriptor/token CAS.
+- Commit meeting/items/matters and their queue-publication intents atomically;
+  the leased publisher retries delivery without requiring a re-sync
 
 **Stats returned:**
 ```python
@@ -672,7 +710,11 @@ Determines if matters should be enqueued for processing. Lower priority than mee
 ```python
 decider = MatterEnqueueDecider()
 should_enqueue, reason = decider.should_enqueue_matter(
-    existing_matter, attachment_hash, has_attachments
+    existing_matter,
+    attachment_hash,
+    has_attachments,
+    current_work_version=work_version,
+    current_title=current_title,
 )
 priority = decider.calculate_priority(meeting_date)  # Returns -100 to 50
 ```
@@ -680,7 +722,8 @@ priority = decider.calculate_priority(meeting_date)  # Returns -100 to 50
 **Logic:**
 - Skip if no attachments
 - Enqueue if new matter or no canonical_summary
-- Enqueue if attachment_hash changed (re-process)
+- Enqueue if attachment artifacts or any summary input changed
+- Bound repeated failed attempts for one desired-work version
 - Priority: 50 - days_distance (lower than meetings' 0-150)
 
 #### `MatterFilter` (~12 lines)
@@ -713,7 +756,7 @@ outcome = processor.determine_outcome(tally)
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ Conductor (Async Event Loop)                                    │
-│  ├─ Sync Task (every 24 hours)                                  │
+│  ├─ Sync Task (adaptive per-jurisdiction cadence)                │
 │  │   └─> Fetcher.sync_all()                                     │
 │  │                                                               │
 │  └─ Processing Task (continuous)                                │
@@ -725,16 +768,16 @@ outcome = processor.determine_outcome(tally)
 │ Fetcher (City Sync)                                             │
 │  ├─ Group cities by vendor                                      │
 │  ├─ Prioritize by activity                                      │
-│  ├─ Parallel sync (semaphore concurrency=2 per vendor)          │
+│  ├─ Parallel sync (semaphore concurrency=8 per vendor)          │
 │  ├─ Rate limit per vendor (AsyncRateLimiter)                    │
 │  ├─ Adapter.fetch_meetings()                                    │
 │  └─ MeetingSyncOrchestrator.sync_meeting()                      │
 │      ├─ Store Meeting + AgendaItem objects                      │
-│      ├─ Track matters (city_matters + matter_appearances)       │
+│      ├─ Lock sorted old+new matters, then retained item rows    │
 │      ├─ Look up / create committees                             │
-│      ├─ Record votes and sponsor links                          │
-│      ├─ EnqueueDecider → Enqueue meetings for processing        │
-│      ├─ MatterEnqueueDecider → Enqueue matters for processing   │
+│      ├─ Exactly reconcile appearances, sponsors, and votes      │
+│      ├─ Refresh retained matter projections/count/date bounds   │
+│      ├─ Publish exact work intent or a no-work tombstone        │
 │      └─ City activation notifications (first meeting detected)  │
 └─────────────────────────────────────────────────────────────────┘
                          │
@@ -743,7 +786,7 @@ outcome = processor.determine_outcome(tally)
 │ Processing Queue (PostgreSQL)                                   │
 │  ├─ Priority-based (recent meetings first)                      │
 │  ├─ Typed jobs (MeetingJob, MatterJob)                          │
-│  ├─ Retry logic (retry_count tracked, DLQ on threshold)         │
+│  ├─ Token-fenced claims + time-based retry/DLQ                  │
 │  └─ Status tracking (pending, processing, completed, failed)    │
 └─────────────────────────────────────────────────────────────────┘
                          │
@@ -771,14 +814,14 @@ outcome = processor.determine_outcome(tally)
 │  └─ MATTERS-FIRST PATH (MatterJob):                             │
 │      ├─ Aggregate unique attachments across all appearances     │
 │      ├─ Process representative item                             │
-│      ├─ Store canonical_summary + attachment_hash               │
-│      └─ Backfill all item appearances with canonical summary    │
+│      ├─ CAS-store canonical summary + sv1/mw1 versions          │
+│      └─ Fill only missing appearance snapshots                  │
 └─────────────────────────────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ AsyncAnalyzer (LLM Analysis) - lives in analysis/              │
-│  ├─ extract_pdf_async()                                         │
+│  ├─ extract_document_async() via shared typed acquisition       │
 │  ├─ process_batch_items_async() [generator]                     │
 │  └─ process_agenda_with_cache_async()                           │
 └─────────────────────────────────────────────────────────────────┘
@@ -797,7 +840,7 @@ outcome = processor.determine_outcome(tally)
 
 ## Processing Queue Architecture
 
-**Location:** `database/repositories/queue.py` (managed by `database/`)
+**Location:** `database/repositories_async/queue.py` (managed by `database/`)
 
 **Schema:**
 ```sql
@@ -811,9 +854,19 @@ CREATE TABLE queue (
     status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'dead_letter')),
     priority INTEGER DEFAULT 0,
     retry_count INTEGER DEFAULT 0,
+    processing_metadata JSONB,
+    work_version TEXT,
+    desired_generation BIGINT NOT NULL,
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    retry_at TIMESTAMP,
+    ready_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
+    claim_token UUID,
+    claimed_at TIMESTAMP,
+    heartbeat_at TIMESTAMP,
     completed_at TIMESTAMP,
     failed_at TIMESTAMP
 );
@@ -828,15 +881,26 @@ CREATE TABLE queue (
 **Status Flow:**
 ```
 pending → processing → completed
-                    └──> failed (retry_count tracked)
+   ↑          └──────> pending (retryable failure after retry_at)
+   │                └> failed (terminal failure)
+   └── newer desired generation replaces and fences the old claim
                     └──> dead_letter (threshold exceeded)
 ```
+
+Claims carry a UUID token and exact `work_version`; heartbeat and final
+transitions must match both. `desired_generation` is the monotonic publication
+order. Queue intents are source-serialized, so a recurring version sequence such
+as A -> B -> A reopens A with a new generation instead of reusing stale order.
+A definitive false heartbeat cancels the handler and journals abandonment; a
+transient heartbeat exception retries, while every domain write remains fenced
+inside its own transaction.
 
 **Priority Scoring:**
 ```python
 # Meetings: max(0, 150 - days_distance)    → range 0-150
 # Matters:  max(-100, 50 - days_distance)   → range -100 to 50
-# Meetings always processed before matters
+# Claim order is priority, then desired-work age; the ranges overlap.
+# Lane routing sends urgent meetings/matters to streaming and older meetings to Batch.
 ```
 
 ---
@@ -874,6 +938,9 @@ engagic-conductor sync-and-process paloaltoCA
 # Preview queue
 engagic-conductor preview-queue paloaltoCA
 
+# Relational-only queue/outbox/claim health plus 24-hour streaming and Batch series
+engagic-conductor status
+
 # Extract text for debugging
 engagic-conductor extract-text MEETING_ID --output-file text.txt
 ```
@@ -892,7 +959,7 @@ engagic-conductor daemon
 ```
 
 **Deployment:** VPS runs two systemd services:
-1. **`engagic-fetcher.service`** - Syncs cities every 24 hours
+1. **`engagic-fetcher.service`** - Runs adaptive due-jurisdiction sync cycles
 2. **`engagic-processor.service`** - Processes queue continuously (recovers stale jobs on startup)
 
 ---
@@ -920,11 +987,18 @@ engagic-conductor daemon
 
 ### Enqueue Errors (MeetingSyncOrchestrator)
 
-**Graceful degradation:** Meeting data is committed in a transaction first, then jobs are enqueued separately. If enqueue fails, meeting data is preserved and jobs can be recovered via re-sync.
+**Atomic publication:** Meeting/item/matter writes and version-keyed queue intents
+commit in one transaction. A leased outbox publisher retries queue publication;
+the sync never has a committed domain write with a silently lost enqueue. Outbox
+intents and direct queue writes share one monotonic database generation, so an
+older overlapping publisher cannot replace newer desired work.
 
 ---
 
 ## Performance Characteristics
+
+Measured baselines, stage definitions, queries, and post-rollout comparison
+instructions live in [`docs/PIPELINE_PERFORMANCE.md`](../docs/PIPELINE_PERFORMANCE.md).
 
 - **Sync cycle:** ~2 hours for 500 cities (rate-limited)
 - **Item processing:** 10-30s per item (Gemini latency)
@@ -960,4 +1034,6 @@ engagic-conductor daemon
 
 ---
 
-**Last Updated:** 2026-02-10 (Audit: fixed line counts, SyncResult fields, admin.py signatures, CLI commands, filtering tiers, retry logic, added parallel sync/committee/city activation/processor CLI, updated data flow diagram, corrected Analyzer references)
+**Last Updated:** 2026-08-07 (pipeline remediation reconciliation: adaptive sync,
+typed acquisition, atomic generation-ordered publication, fenced queue claims,
+and streaming/Batch lifecycle observability)

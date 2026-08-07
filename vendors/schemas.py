@@ -106,7 +106,7 @@ class MeetingSchema(BaseModel):
 
     vendor_id: str  # Raw vendor identifier (REQUIRED)
     title: str
-    start: str  # ISO format string, NOT datetime object
+    start: Optional[str] = None  # ISO string, or None when source is undated
     location: Optional[str] = None
     agenda_url: Optional[str] = None
     packet_url: Optional[str] = None
@@ -128,8 +128,10 @@ class MeetingSchema(BaseModel):
 
     @field_validator("start")
     @classmethod
-    def validate_start_is_string(cls, v: Any) -> str:
-        """Ensure start is ISO string, not datetime object"""
+    def validate_start_is_string(cls, v: Any) -> Optional[str]:
+        """Accept an authoritative absence; otherwise require an ISO string."""
+        if v is None:
+            return None
         if isinstance(v, datetime):
             raise ValueError(
                 "Meeting 'start' must be ISO string, not datetime object. "

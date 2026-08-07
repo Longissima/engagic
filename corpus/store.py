@@ -21,6 +21,7 @@ through, and there is exactly one corpus.
 import hashlib
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, BinaryIO, Dict, Optional
 
 from config import config, get_logger
@@ -70,6 +71,42 @@ class CorpusOriginal:
     data: bytes
     content_sha256: str
     content_type: Optional[str]
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
+    last_observed_at: Optional[datetime] = None
+    last_validated_at: Optional[datetime] = None
+    last_validation_attempt_at: Optional[datetime] = None
+
+    def needs_revalidation(
+        self,
+        *,
+        max_age_seconds: int,
+        failure_retry_seconds: int,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Return whether origin validation is due for this source revision."""
+        reference = self.last_validated_at or self.last_validation_attempt_at
+        current = now or datetime.now(reference.tzinfo if reference else None)
+        if (
+            self.last_validated_at is not None
+            and current - self.last_validated_at
+            < timedelta(seconds=max(0, max_age_seconds))
+        ):
+            return False
+
+        # Only a post-validation attempt represents a failed refresh. A recent
+        # successful validation is handled by the freshness check above.
+        if (
+            self.last_validation_attempt_at is not None
+            and (
+                self.last_validated_at is None
+                or self.last_validation_attempt_at > self.last_validated_at
+            )
+            and current - self.last_validation_attempt_at
+            < timedelta(seconds=max(0, failure_retry_seconds))
+        ):
+            return False
+        return True
 
 
 class CorpusStore:
@@ -92,6 +129,8 @@ class CorpusStore:
         source_url: Optional[str] = None,
         banana: Optional[str] = None,
         content_type: Optional[str] = None,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
     ) -> bool:
         """Stage 1's archive step: ensure these bytes exist in the corpus.
 
@@ -114,7 +153,13 @@ class CorpusStore:
                     bytes=byte_count,
                 )
                 await self.blobs.upsert_blob(content_sha256, byte_count)
-                await self._record_source(content_sha256, source_url, banana)
+                await self._record_validation(
+                    content_sha256,
+                    source_url,
+                    banana,
+                    etag=etag,
+                    last_modified=last_modified,
+                )
                 return False
 
             if file_obj is not None:
@@ -131,12 +176,15 @@ class CorpusStore:
             if not archived:
                 key = _ORIGINAL_PREFIX + content_sha256
                 start = time.monotonic()
+                payload = file_obj if file_obj is not None else data
+                if payload is None:  # narrowed above; defensive for type/runtime drift
+                    raise ValueError("archive_original payload disappeared")
                 # The content hash IS the payload hash -- SigV4 signs the
                 # true body digest for free because content addressing
                 # already computed it.
                 await self.r2.put(
                     key,
-                    file_obj if file_obj is not None else data,
+                    payload,
                     content_type,
                     payload_sha256=content_sha256,
                     content_length=byte_count,
@@ -149,7 +197,13 @@ class CorpusStore:
                     duration_ms=int((time.monotonic() - start) * 1000),
                 )
 
-            await self._record_source(content_sha256, source_url, banana)
+            await self._record_validation(
+                content_sha256,
+                source_url,
+                banana,
+                etag=etag,
+                last_modified=last_modified,
+            )
             return True
         except Exception as e:
             logger.warning(
@@ -275,6 +329,11 @@ class CorpusStore:
                 data=data,
                 content_sha256=blob["content_sha256"],
                 content_type=blob.get("content_type"),
+                etag=blob.get("etag"),
+                last_modified=blob.get("last_modified"),
+                last_observed_at=blob.get("last_observed_at"),
+                last_validated_at=blob.get("last_validated_at"),
+                last_validation_attempt_at=blob.get("last_validation_attempt_at"),
             )
         except Exception as e:
             logger.warning(
@@ -297,9 +356,12 @@ class CorpusStore:
     async def record_sighting(
         self, content_sha256: str, source_url: Optional[str], banana: Optional[str] = None
     ) -> None:
-        """Remember a URL identity for already-known bytes (corpus-hit path)."""
+        """Record a cache observation without advancing origin freshness."""
         try:
-            await self._record_source(content_sha256, source_url, banana)
+            if source_url:
+                await self.blobs.record_source_observation(
+                    content_sha256, attachment_identity(source_url), banana
+                )
         except Exception as e:
             logger.warning(
                 "corpus source record failed",
@@ -308,12 +370,69 @@ class CorpusStore:
                 error_type=type(e).__name__,
             )
 
-    async def _record_source(
-        self, content_sha256: str, source_url: Optional[str], banana: Optional[str]
+    async def record_validation(
+        self,
+        content_sha256: str,
+        source_url: Optional[str],
+        banana: Optional[str] = None,
+        *,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+    ) -> None:
+        """Record a successful conditional or full origin validation."""
+        try:
+            await self._record_validation(
+                content_sha256,
+                source_url,
+                banana,
+                etag=etag,
+                last_modified=last_modified,
+            )
+        except Exception as e:
+            logger.warning(
+                "corpus validation record failed",
+                sha=content_sha256[:16],
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+    async def record_validation_failure(
+        self,
+        content_sha256: str,
+        source_url: Optional[str],
+        banana: Optional[str] = None,
+    ) -> None:
+        """Record a failed origin check so fail-open reads back off."""
+        if not source_url:
+            return
+        try:
+            await self.blobs.record_source_validation_failure(
+                content_sha256, attachment_identity(source_url), banana
+            )
+        except Exception as e:
+            logger.warning(
+                "corpus validation failure record failed",
+                sha=content_sha256[:16],
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+
+    async def _record_validation(
+        self,
+        content_sha256: str,
+        source_url: Optional[str],
+        banana: Optional[str],
+        *,
+        etag: Optional[str],
+        last_modified: Optional[str],
     ) -> None:
         if source_url:
-            await self.blobs.record_source(
-                content_sha256, attachment_identity(source_url), banana
+            await self.blobs.record_source_validation(
+                content_sha256,
+                attachment_identity(source_url),
+                banana,
+                etag=etag,
+                last_modified=last_modified,
             )
 
 

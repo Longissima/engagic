@@ -8,12 +8,24 @@ Handles job queue management with PostgreSQL optimizations:
 """
 
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from asyncpg import Connection
 
 from database.repositories_async.base import BaseRepository
 from pipeline.models import QueueJob, MeetingJob, MatterJob
 from config import get_logger
 
 logger = get_logger(__name__).bind(component="queue_repository")
+
+
+def _validate_desired_generation(desired_generation: Optional[int]) -> None:
+    if desired_generation is not None and (
+        isinstance(desired_generation, bool)
+        or not isinstance(desired_generation, int)
+        or desired_generation <= 0
+    ):
+        raise ValueError("desired_generation must be a positive integer")
 
 
 class QueueRepository(BaseRepository):
@@ -28,6 +40,40 @@ class QueueRepository(BaseRepository):
 
     _RETRY_BASE_SECONDS = 30
 
+    async def lock_desired_state(
+        self,
+        source_url: str,
+        *,
+        conn: Connection,
+    ) -> Optional[Dict[str, Any]]:
+        """Lock one desired-work slot in the canonical global order.
+
+        Callers that must inspect and then upsert a queue descriptor inside a
+        larger domain transaction use this boundary instead of locking the
+        queue row directly.  The transaction-scoped advisory lock is acquired
+        first, matching :meth:`enqueue_job`; the row lock follows.  A missing
+        row still leaves the source slot serialized so a subsequent enqueue in
+        the same transaction cannot race another writer.
+        """
+        await conn.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('queue-intent:' || $1, 0)
+            )
+            """,
+            source_url,
+        )
+        row = await conn.fetchrow(
+            """
+            SELECT status, work_version, desired_generation, claim_token
+            FROM queue
+            WHERE source_url = $1
+            FOR UPDATE
+            """,
+            source_url,
+        )
+        return dict(row) if row is not None else None
+
     async def enqueue_job(
         self,
         source_url: str,
@@ -38,7 +84,9 @@ class QueueRepository(BaseRepository):
         priority: int = 0,
         processing_metadata: Optional[Dict[str, Any]] = None,
         work_version: Optional[str] = None,
-    ) -> None:
+        desired_generation: Optional[int] = None,
+        conn: Optional[Connection] = None,
+    ) -> bool:
         """Add job to processing queue with deduplication
 
         Uses source_url as the stable deduplication key. An accepted re-enqueue
@@ -59,16 +107,35 @@ class QueueRepository(BaseRepository):
             processing_metadata: Diagnostic trail (e.g. chunker cascade audit).
                 Re-enqueue replaces it when supplied; None retains the prior
                 audit because it also serves as the sticky chunk-routing hint.
-            work_version: Authoritative input version. For matter jobs this is
-                the substantive attachment hash.
+            work_version: Authoritative desired-work descriptor. Matter jobs
+                use the versioned ``mw1`` attachment-and-title identity.
+            desired_generation: Durable total-order value allocated with the
+                originating outbox intent. Direct callers omit it and let the
+                database allocate one from the shared work-generation sequence.
+
+        Returns:
+            True when the desired row was inserted or advanced; False when an
+            equal/newer queue generation already made this request a no-op.
         """
-        await self._execute(
+        _validate_desired_generation(desired_generation)
+
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
             """
+            WITH serialized AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended('queue-intent:' || $1, 0)
+                )
+            )
             INSERT INTO queue (
                 source_url, meeting_id, banana, job_type, payload,
-                status, priority, retry_count, processing_metadata, work_version
+                status, priority, retry_count, processing_metadata, work_version,
+                desired_generation
             )
-            VALUES ($1, $2, $3, $4, $5, 'pending', $6, 0, $7, $8)
+            SELECT
+                $1, $2, $3, $4, $5, 'pending', $6, 0, $7, $8,
+                COALESCE($9, nextval('pipeline_work_generation_seq'))
+            FROM serialized
             ON CONFLICT (source_url) DO UPDATE SET
                 meeting_id = EXCLUDED.meeting_id,
                 banana = EXCLUDED.banana,
@@ -85,30 +152,169 @@ class QueueRepository(BaseRepository):
                     EXCLUDED.processing_metadata, queue.processing_metadata
                 ),
                 work_version = EXCLUDED.work_version,
+                desired_generation = EXCLUDED.desired_generation,
                 retry_at = NULL,
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL,
+                last_enqueued_at = CURRENT_TIMESTAMP,
+                ready_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE EXCLUDED.desired_generation > queue.desired_generation
+              AND (
+                    (
+                        EXCLUDED.work_version IS NOT NULL
+                        AND queue.work_version IS DISTINCT FROM
+                            EXCLUDED.work_version
+                    )
+                    OR (
+                        EXCLUDED.work_version IS NULL
+                        AND queue.work_version IS NULL
+                        AND queue.status <> 'processing'
+                    )
+                  )
+            RETURNING id
+            """,
+                source_url,
+                meeting_id,
+                banana,
+                job_type,
+                payload,
+                priority,
+                processing_metadata,
+                work_version,
+                desired_generation,
+            )
+
+        accepted = row is not None
+        logger.debug(
+            "queue desired work evaluated",
+            source_url=source_url,
+            job_type=job_type,
+            accepted=accepted,
+            desired_generation=desired_generation,
+        )
+        return accepted
+
+    async def invalidate_desired_work(
+        self,
+        source_url: str,
+        job_type: str,
+        payload: Dict[str, Any],
+        *,
+        work_version: str,
+        meeting_id: Optional[str] = None,
+        banana: Optional[str] = None,
+        desired_generation: Optional[int] = None,
+        conn: Connection,
+    ) -> bool:
+        """Publish an authoritative terminal descriptor for no desired work.
+
+        This is a desired-state tombstone, not an executable queue job.  It
+        participates in the same per-source advisory lock and global
+        generation order as :meth:`enqueue_job`, so it can atomically fence a
+        claimed older version and supersede older queue/outbox publications.
+        A later real-work enqueue can reopen the source only with a newer
+        generation and a distinct work version.
+
+        The caller supplies the exact version of the authoritative empty (or
+        otherwise non-executable) work snapshot and an existing transaction.
+        Policy-driven tombstones must use a dedicated no-work descriptor that
+        is distinct from the executable work version; otherwise a later policy
+        change cannot reopen identical content under version deduplication.
+        Repeating an already-completed version is a no-op unless an
+        intervening outbox generation expresses different desired work.  In
+        that recurrence case the tombstone advances its generation so the
+        older publication cannot resurrect work after this transaction.
+        """
+        if not isinstance(work_version, str) or not work_version:
+            raise ValueError("work_version must be non-empty text")
+        _validate_desired_generation(desired_generation)
+
+        row = await conn.fetchrow(
+            """
+            WITH serialized AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended('queue-intent:' || $1, 0)
+                )
+            ), desired AS MATERIALIZED (
+                SELECT COALESCE(
+                    $7::bigint,
+                    nextval('pipeline_work_generation_seq')
+                ) AS desired_generation
+                FROM serialized
+            )
+            INSERT INTO queue (
+                source_url, meeting_id, banana, job_type, payload,
+                status, priority, retry_count, completed_at, work_version,
+                desired_generation
+            )
+            SELECT
+                $1, $2, $3, $4, $5, 'completed', 0, 0,
+                CURRENT_TIMESTAMP, $6, desired.desired_generation
+            FROM desired
+            ON CONFLICT (source_url) DO UPDATE SET
+                meeting_id = EXCLUDED.meeting_id,
+                banana = EXCLUDED.banana,
+                job_type = EXCLUDED.job_type,
+                payload = EXCLUDED.payload,
+                status = 'completed',
+                priority = 0,
+                retry_count = 0,
+                started_at = NULL,
+                completed_at = CURRENT_TIMESTAMP,
+                failed_at = NULL,
+                error_message = NULL,
+                work_version = EXCLUDED.work_version,
+                desired_generation = EXCLUDED.desired_generation,
+                retry_at = NULL,
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL,
+                ready_at = CURRENT_TIMESTAMP,
                 last_enqueued_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE (
-                    EXCLUDED.work_version IS NOT NULL
-                    AND queue.work_version IS DISTINCT FROM EXCLUDED.work_version
+            WHERE EXCLUDED.desired_generation > queue.desired_generation
+              AND (
+                    NOT (
+                        queue.status = 'completed'
+                        AND queue.work_version IS NOT DISTINCT FROM
+                            EXCLUDED.work_version
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM pipeline_outbox intervening
+                        WHERE intervening.event_type = 'queue.enqueue'
+                          AND intervening.payload->>'source_url' =
+                              queue.source_url
+                          AND intervening.payload->>'work_version'
+                              IS DISTINCT FROM EXCLUDED.work_version
+                          AND intervening.work_generation >
+                              queue.desired_generation
+                          AND intervening.work_generation <
+                              EXCLUDED.desired_generation
+                    )
                   )
-               OR (
-                    EXCLUDED.work_version IS NULL
-                    AND queue.work_version IS NULL
-                    AND queue.status <> 'processing'
-                  )
+            RETURNING id
             """,
             source_url,
             meeting_id,
             banana,
             job_type,
             payload,
-            priority,
-            processing_metadata,
             work_version,
+            desired_generation,
         )
-
-        logger.debug("job enqueued", source_url=source_url, job_type=job_type)
+        accepted = row is not None
+        logger.debug(
+            "queue desired work invalidated",
+            source_url=source_url,
+            job_type=job_type,
+            accepted=accepted,
+            work_version=work_version,
+            desired_generation=desired_generation,
+        )
+        return accepted
 
     async def get_chunker_hints(self) -> list:
         """Latest winning chunker rung per (vendor, slug, ladder).
@@ -133,7 +339,9 @@ class QueueRepository(BaseRepository):
             ORDER BY
                 j.vendor, j.slug,
                 q.processing_metadata->'chunk'->>'winning_ladder',
-                q.created_at DESC
+                q.last_enqueued_at DESC NULLS LAST,
+                q.updated_at DESC NULLS LAST,
+                q.id DESC
             """
         )
         return [dict(r) for r in (rows or [])]
@@ -154,11 +362,27 @@ class QueueRepository(BaseRepository):
         result = await self._fetch(
             """
             UPDATE queue
-            SET status = 'pending',
+            SET status = CASE WHEN retry_count >= 2
+                              THEN 'dead_letter' ELSE 'pending' END,
                 retry_count = retry_count + 1,
+                started_at = NULL,
+                claim_token = NULL,
+                claimed_at = NULL,
+                heartbeat_at = NULL,
+                retry_at = CASE WHEN retry_count >= 2 THEN NULL ELSE NOW() END,
+                ready_at = CASE WHEN retry_count >= 2 THEN ready_at ELSE NOW() END,
+                failed_at = NOW(),
+                completed_at = CASE WHEN retry_count >= 2 THEN NOW() ELSE NULL END,
+                error_message = CASE WHEN retry_count >= 2
+                    THEN 'claim repeatedly abandoned; moved to dead letter'
+                    ELSE 'stale processing claim reclaimed' END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE status = 'processing'
-              AND started_at < NOW() - INTERVAL '1 minute' * $1
+              AND (
+                  COALESCE(heartbeat_at, claimed_at, started_at)
+                      < NOW() - INTERVAL '1 minute' * $1
+                  OR COALESCE(heartbeat_at, claimed_at, started_at) IS NULL
+              )
             RETURNING id
             """,
             stale_minutes,
@@ -168,54 +392,6 @@ class QueueRepository(BaseRepository):
             logger.info("reset stale processing jobs", count=count, stale_minutes=stale_minutes)
         return count
 
-    async def get_next_job(self) -> Optional[Dict[str, Any]]:
-        """Get next pending job from queue (highest priority first)
-
-        Uses FOR UPDATE SKIP LOCKED for safe concurrent access.
-
-        Returns:
-            Job dict with id, source_url, job_type, payload, etc., or None if queue empty
-        """
-        async with self.transaction() as conn:
-            # Atomic SELECT-UPDATE with row-level locking
-            row = await conn.fetchrow(
-                """
-                SELECT id, source_url, meeting_id, banana, job_type, payload,
-                       priority, retry_count, work_version
-                FROM queue
-                WHERE status = 'pending'
-                  AND (retry_at IS NULL OR retry_at <= NOW())
-                ORDER BY priority DESC, created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-                """
-            )
-
-            if not row:
-                return None
-
-            # Mark as processing
-            await conn.execute(
-                """
-                UPDATE queue
-                SET status = 'processing', started_at = CURRENT_TIMESTAMP
-                WHERE id = $1
-                """,
-                row["id"],
-            )
-
-            return {
-                "id": row["id"],
-                "source_url": row["source_url"],
-                "meeting_id": row["meeting_id"],
-                "banana": row["banana"],
-                "job_type": row["job_type"],
-                "payload": row["payload"],  # Already deserialized by asyncpg
-                "priority": row["priority"],
-                "retry_count": row["retry_count"],
-                "work_version": row["work_version"],
-            }
-
     # Meeting jobs whose date falls outside the urgent window are batch-lane
     # eligible: nobody is waiting on them minute-to-minute, so they can take
     # the Gemini Batch API's multi-hour turnaround for the 50% discount.
@@ -223,6 +399,30 @@ class QueueRepository(BaseRepository):
     _BATCH_ELIGIBLE_SQL = """q.job_type = 'meeting' AND m.date IS NOT NULL
                   AND (m.date < NOW() - make_interval(days => $__PAST__)
                        OR m.date > NOW() + make_interval(days => $__FUTURE__))"""
+
+    async def preview_jobs(
+        self, banana: Optional[str] = None, limit: int = 10
+    ) -> List[QueueJob]:
+        """Return ready pending jobs without claiming or mutating them."""
+        if limit <= 0:
+            return []
+        rows = await self._fetch(
+            """
+            SELECT id, source_url, meeting_id, banana, job_type, payload,
+                   priority, retry_count, status, error_message, created_at,
+                   started_at, completed_at, work_version, last_enqueued_at,
+                   claim_token, claimed_at, heartbeat_at, ready_at
+            FROM queue
+            WHERE status = 'pending'
+              AND (retry_at IS NULL OR retry_at <= NOW())
+              AND ($1::text IS NULL OR banana = $1)
+            ORDER BY priority DESC, last_enqueued_at ASC, id ASC
+            LIMIT $2
+            """,
+            banana,
+            limit,
+        )
+        return [QueueJob.from_db_row(dict(row)) for row in (rows or [])]
 
     async def get_next_for_processing(
         self,
@@ -250,6 +450,9 @@ class QueueRepository(BaseRepository):
         Returns:
             QueueJob object or None if queue empty
         """
+        if bananas is not None and not bananas:
+            return None
+
         conditions = [
             "q.status = 'pending'",
             "(q.retry_at IS NULL OR q.retry_at <= NOW())",
@@ -258,7 +461,7 @@ class QueueRepository(BaseRepository):
         if banana:
             params.append(banana)
             conditions.append(f"q.banana = ${len(params)}")
-        if bananas:
+        if bananas is not None:
             params.append(list(bananas))
             conditions.append(f"q.banana = ANY(${len(params)})")
 
@@ -286,11 +489,12 @@ class QueueRepository(BaseRepository):
                 f"""
                 SELECT q.id, q.source_url, q.meeting_id, q.banana, q.job_type,
                        q.payload, q.priority, q.retry_count, q.status,
-                       q.created_at, q.started_at, q.work_version
+                       q.created_at, q.started_at, q.work_version,
+                       q.last_enqueued_at, q.ready_at
                 FROM queue q
                 {join}
                 WHERE {" AND ".join(conditions)}
-                ORDER BY q.priority DESC, q.created_at ASC
+                ORDER BY q.priority DESC, q.last_enqueued_at ASC, q.id ASC
                 LIMIT 1
                 FOR UPDATE OF q SKIP LOCKED
                 """,
@@ -300,15 +504,24 @@ class QueueRepository(BaseRepository):
             if not row:
                 return None
 
-            # Mark as processing
-            await conn.execute(
+            claim_token = str(uuid4())
+            claim = await conn.fetchrow(
                 """
                 UPDATE queue
-                SET status = 'processing', started_at = NOW()
+                SET status = 'processing',
+                    claim_token = $2::uuid,
+                    claimed_at = NOW(),
+                    heartbeat_at = NOW(),
+                    started_at = NOW(),
+                    updated_at = NOW()
                 WHERE id = $1
+                RETURNING claimed_at, heartbeat_at, started_at
                 """,
                 row["id"],
+                claim_token,
             )
+            if claim is None:  # pragma: no cover - row is locked above
+                return None
 
             # Get payload (JSONB automatically deserialized by codec)
             payload_data = row["payload"]
@@ -330,8 +543,21 @@ class QueueRepository(BaseRepository):
                 retry_count=row.get("retry_count", 0),
                 error_message=None,
                 created_at=row.get("created_at").isoformat() if row.get("created_at") else None,
-                started_at=row.get("started_at").isoformat() if row.get("started_at") else None,
+                started_at=claim["started_at"].isoformat(),
                 work_version=row.get("work_version"),
+                last_enqueued_at=(
+                    row.get("last_enqueued_at").isoformat()
+                    if row.get("last_enqueued_at")
+                    else None
+                ),
+                claim_token=claim_token,
+                claimed_at=claim["claimed_at"].isoformat(),
+                heartbeat_at=claim["heartbeat_at"].isoformat(),
+                ready_at=(
+                    row.get("ready_at").isoformat()
+                    if row.get("ready_at")
+                    else None
+                ),
             )
 
     async def get_chunk_quality(self, meeting_id: str) -> Optional[Dict[str, Any]]:
@@ -348,52 +574,219 @@ class QueueRepository(BaseRepository):
             FROM queue
             WHERE meeting_id = $1
               AND processing_metadata->'chunk'->'quality' IS NOT NULL
-            ORDER BY created_at DESC
+            ORDER BY last_enqueued_at DESC NULLS LAST,
+                     updated_at DESC NULLS LAST,
+                     id DESC
             LIMIT 1
             """,
             meeting_id,
         )
         return row["quality"] if row else None
 
-    async def heartbeat_job(self, queue_id: int) -> None:
-        """Refresh a processing job's claim so the stale sweep doesn't reclaim it.
-
-        Batch-lane jobs legitimately park on Gemini poll loops far past
-        STALE_SWEEP_MINUTES; bumping started_at marks them alive.
-        """
-        await self._execute(
+    async def heartbeat_job(
+        self,
+        queue_id: int,
+        claim_token: str,
+        work_version: Optional[str],
+    ) -> bool:
+        """Renew only the caller's active claim without changing its start time."""
+        row = await self._fetchrow(
             """
             UPDATE queue
-            SET started_at = NOW(), updated_at = NOW()
-            WHERE id = $1 AND status = 'processing'
+            SET heartbeat_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND claim_token = $2::uuid
+              AND work_version IS NOT DISTINCT FROM $3
+            RETURNING id
             """,
             queue_id,
+            claim_token,
+            work_version,
         )
+        return row is not None
 
-    async def mark_processing_complete(self, queue_id: int) -> None:
+    async def get_scope_activity(
+        self, bananas: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Return finite-runtime termination state for a jurisdiction scope."""
+        row = await self._fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+                COUNT(*) FILTER (
+                    WHERE status = 'pending'
+                      AND (retry_at IS NULL OR retry_at <= NOW())
+                ) AS ready,
+                MIN(retry_at) FILTER (
+                    WHERE status = 'pending' AND retry_at > NOW()
+                ) AS next_retry_at
+            FROM queue
+            WHERE ($1::text[] IS NULL OR banana = ANY($1))
+              AND status IN ('pending', 'processing')
+            """,
+            list(bananas) if bananas is not None else None,
+        )
+        if not row:
+            return {
+                "pending": 0,
+                "processing": 0,
+                "ready": 0,
+                "next_retry_at": None,
+            }
+        return {
+            "pending": int(row["pending"] or 0),
+            "processing": int(row["processing"] or 0),
+            "ready": int(row["ready"] or 0),
+            "next_retry_at": row["next_retry_at"],
+        }
+
+    async def reactivate_job_version(
+        self,
+        *,
+        source_url: str,
+        work_version: str,
+        priority: Optional[int] = None,
+        conn: Optional[Connection] = None,
+    ) -> bool:
+        """Explicitly schedule one exact descriptor without weakening enqueue dedup.
+
+        Ordinary sync enqueue cannot revive an unchanged failed/completed
+        version. Provider reconciliation is an explicit retry authority and may
+        do so only while the row still carries exactly that version. An active
+        same-version claim is invalidated: a later batch sibling may have exposed
+        additional missing work that requires a fresh pass.
+        """
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE queue
+                SET status = 'pending',
+                    priority = COALESCE($3, priority),
+                    retry_count = 0,
+                    started_at = NULL,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    completed_at = NULL,
+                    failed_at = NULL,
+                    error_message = NULL,
+                    retry_at = NULL,
+                    last_enqueued_at = NOW(),
+                    ready_at = NOW(),
+                    updated_at = NOW()
+                WHERE source_url = $1
+                  AND work_version IS NOT DISTINCT FROM $2
+                  AND status IN ('completed', 'failed', 'dead_letter', 'processing')
+                RETURNING id
+                """,
+                source_url,
+                work_version,
+                priority,
+            )
+            if row is not None:
+                return True
+            active = await connection.fetchrow(
+                """
+                SELECT id
+                FROM queue
+                WHERE source_url = $1
+                  AND work_version IS NOT DISTINCT FROM $2
+                  AND status IN ('pending', 'processing')
+                """,
+                source_url,
+                work_version,
+            )
+            return active is not None
+
+    async def release_processing_claim(
+        self,
+        queue_id: int,
+        claim_token: str,
+        work_version: Optional[str],
+        *,
+        error_message: str = "worker cancelled before completion",
+    ) -> bool:
+        """Immediately release an unsettled claim without reviving newer work."""
+        row = await self._fetchrow(
+            """
+            UPDATE queue
+            SET status = 'pending', started_at = NULL,
+                claim_token = NULL, claimed_at = NULL, heartbeat_at = NULL,
+                retry_at = NOW(),
+                ready_at = NOW(),
+                error_message = $4,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND claim_token = $2::uuid
+              AND work_version IS NOT DISTINCT FROM $3
+            RETURNING id
+            """,
+            queue_id,
+            claim_token,
+            work_version,
+            error_message,
+        )
+        return row is not None
+
+    async def mark_processing_complete(
+        self,
+        queue_id: int,
+        claim_token: str,
+        work_version: Optional[str],
+    ) -> bool:
         """Mark job as completed
 
         Args:
             queue_id: Queue job ID
         """
-        await self._execute(
+        row = await self._fetchrow(
             """
             UPDATE queue
-            SET status = 'completed', completed_at = NOW(), updated_at = NOW()
-            WHERE id = $1 AND status = 'processing'
+            SET status = 'completed', completed_at = NOW(), updated_at = NOW(),
+                claim_token = NULL
+            WHERE id = $1
+              AND status = 'processing'
+              AND claim_token = $2::uuid
+              AND work_version IS NOT DISTINCT FROM $3
+            RETURNING id
             """,
             queue_id,
+            claim_token,
+            work_version,
         )
 
-        logger.info("job completed", queue_id=queue_id)
+        if row is not None:
+            logger.info("job completed", queue_id=queue_id)
+        return row is not None
 
-    async def mark_job_failed(self, queue_id: int, error_message: str) -> None:
+    async def mark_job_failed(
+        self,
+        queue_id: int,
+        error_message: str,
+        *,
+        claim_token: str,
+        work_version: Optional[str],
+    ) -> bool:
         """Backward-compatible alias for the single failure state machine."""
-        await self.mark_processing_failed(queue_id, error_message)
+        return await self.mark_processing_failed(
+            queue_id,
+            error_message,
+            claim_token=claim_token,
+            work_version=work_version,
+        )
 
     async def mark_processing_failed(
-        self, queue_id: int, error_message: str, increment_retry: bool = True
-    ) -> None:
+        self,
+        queue_id: int,
+        error_message: str,
+        *,
+        claim_token: str,
+        work_version: Optional[str],
+        increment_retry: bool = True,
+    ) -> bool:
         """Mark job as failed with smart retry logic
 
         Implements exponential backoff retry (3 attempts) before moving to DLQ.
@@ -409,34 +802,47 @@ class QueueRepository(BaseRepository):
         async with self.transaction() as conn:
             if not increment_retry:
                 # Non-retryable error
-                await conn.execute(
+                row = await conn.fetchrow(
                     """
                     UPDATE queue
                     SET status = 'failed',
                         error_message = $2,
                         failed_at = NOW(),
                         completed_at = NOW(),
+                        claim_token = NULL,
                         updated_at = NOW()
-                    WHERE id = $1 AND status = 'processing'
+                    WHERE id = $1
+                      AND status = 'processing'
+                      AND claim_token = $3::uuid
+                      AND work_version IS NOT DISTINCT FROM $4
+                    RETURNING id
                     """,
                     queue_id,
                     error_message,
+                    claim_token,
+                    work_version,
                 )
-                logger.warning("marked queue item as failed (non-retryable)", queue_id=queue_id, error=error_message)
-                return
+                if row is not None:
+                    logger.warning("marked queue item as failed (non-retryable)", queue_id=queue_id, error=error_message)
+                return row is not None
 
             # Get current retry_count and priority with row lock to prevent race
             row = await conn.fetchrow(
                 """SELECT retry_count, priority
                    FROM queue
-                   WHERE id = $1 AND status = 'processing'
+                   WHERE id = $1
+                     AND status = 'processing'
+                     AND claim_token = $2::uuid
+                     AND work_version IS NOT DISTINCT FROM $3
                    FOR UPDATE""",
                 queue_id,
+                claim_token,
+                work_version,
             )
 
             if not row:
                 logger.info("queue item no longer actively claimed", queue_id=queue_id)
-                return
+                return False
 
             current_retry_count = row["retry_count"]
             current_priority = row["priority"]
@@ -456,14 +862,23 @@ class QueueRepository(BaseRepository):
                         failed_at = NOW(),
                         completed_at = NULL,
                         started_at = NULL,
+                        claim_token = NULL,
+                        claimed_at = NULL,
+                        heartbeat_at = NULL,
                         retry_at = NOW() + make_interval(secs => $4),
+                        ready_at = NOW() + make_interval(secs => $4),
                         updated_at = NOW()
-                    WHERE id = $1 AND status = 'processing'
+                    WHERE id = $1
+                      AND status = 'processing'
+                      AND claim_token = $5::uuid
+                      AND work_version IS NOT DISTINCT FROM $6
                     """,
                     queue_id,
                     new_priority,
                     error_message,
                     retry_delay_seconds,
+                    claim_token,
+                    work_version,
                 )
                 logger.warning(
                     "job retry scheduled",
@@ -485,11 +900,17 @@ class QueueRepository(BaseRepository):
                         failed_at = NOW(),
                         completed_at = NOW(),
                         retry_at = NULL,
+                        claim_token = NULL,
                         updated_at = NOW()
-                    WHERE id = $1 AND status = 'processing'
+                    WHERE id = $1
+                      AND status = 'processing'
+                      AND claim_token = $3::uuid
+                      AND work_version IS NOT DISTINCT FROM $4
                     """,
                     queue_id,
                     error_message,
+                    claim_token,
+                    work_version,
                 )
                 logger.error(
                     "job moved to dead letter queue",
@@ -497,6 +918,7 @@ class QueueRepository(BaseRepository):
                     total_failures=current_retry_count + 1,
                     error=error_message
                 )
+            return True
 
     async def get_queue_stats(self) -> dict:
         """Get queue statistics for Prometheus
@@ -521,13 +943,16 @@ class QueueRepository(BaseRepository):
             for status in ['pending', 'processing', 'completed', 'failed', 'dead_letter']:
                 stats.setdefault(f"{status}_count", 0)
 
-            # Average processing time (completed jobs only)
+            # Average processing time (completed jobs only). claimed_at is a
+            # stable claim start; heartbeat_at moves while the lease is alive.
             avg_row = await conn.fetchrow("""
-                SELECT AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) as avg_seconds
+                SELECT AVG(EXTRACT(EPOCH FROM (
+                    completed_at - COALESCE(claimed_at, started_at)
+                ))) as avg_seconds
                 FROM queue
                 WHERE status = 'completed'
                 AND completed_at IS NOT NULL
-                AND started_at IS NOT NULL
+                AND COALESCE(claimed_at, started_at) IS NOT NULL
             """)
 
             stats['avg_processing_seconds'] = float(avg_row['avg_seconds']) if avg_row['avg_seconds'] else 0.0

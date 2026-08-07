@@ -1,7 +1,7 @@
 """Async MatterRepository for matter operations."""
 
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from asyncpg import Connection
 
@@ -37,7 +37,16 @@ class MatterRepository(BaseRepository):
                     canonical_topics = COALESCE(EXCLUDED.canonical_topics, city_matters.canonical_topics),
                     attachments = EXCLUDED.attachments,
                     metadata = EXCLUDED.metadata,
-                    last_seen = COALESCE(city_matters.last_seen, EXCLUDED.last_seen),
+                    first_seen = CASE
+                        WHEN city_matters.first_seen IS NULL THEN EXCLUDED.first_seen
+                        WHEN EXCLUDED.first_seen IS NULL THEN city_matters.first_seen
+                        ELSE LEAST(city_matters.first_seen, EXCLUDED.first_seen)
+                    END,
+                    last_seen = CASE
+                        WHEN city_matters.last_seen IS NULL THEN EXCLUDED.last_seen
+                        WHEN EXCLUDED.last_seen IS NULL THEN city_matters.last_seen
+                        ELSE GREATEST(city_matters.last_seen, EXCLUDED.last_seen)
+                    END,
                     appearance_count = GREATEST(city_matters.appearance_count, EXCLUDED.appearance_count),
                     status = EXCLUDED.status,
                     updated_at = CURRENT_TIMESTAMP
@@ -59,7 +68,7 @@ class MatterRepository(BaseRepository):
                 matter.status or "active",
             )
 
-            if matter.canonical_topics:
+            if matter.canonical_topics is not None:
                 await replace_entity_topics(
                     c, "matter_topics", "matter_id", matter.id, matter.canonical_topics
                 )
@@ -67,12 +76,17 @@ class MatterRepository(BaseRepository):
         logger.debug("stored matter", matter_id=matter.id, banana=matter.banana)
 
     async def get_matter(
-        self, matter_id: str, conn: Optional[Connection] = None
+        self,
+        matter_id: str,
+        conn: Optional[Connection] = None,
+        *,
+        lock_for_update: bool = False,
     ) -> Optional[Matter]:
         """Get a matter by ID with accurate appearance count."""
         async with self._ensure_conn(conn) as c:
+            lock_clause = "FOR UPDATE OF cm" if lock_for_update else ""
             row = await c.fetchrow(
-                """
+                f"""
                 SELECT
                     cm.id, cm.banana, cm.matter_id, cm.matter_file, cm.matter_type,
                     cm.title, cm.sponsors, cm.canonical_summary, cm.canonical_topics,
@@ -83,6 +97,7 @@ class MatterRepository(BaseRepository):
                     (SELECT COUNT(*) FROM items i WHERE i.matter_id = cm.id) as actual_item_count
                 FROM city_matters cm
                 WHERE cm.id = $1
+                {lock_clause}
                 """,
                 matter_id,
             )
@@ -157,6 +172,254 @@ class MatterRepository(BaseRepository):
                 for row in valid_rows
             }
 
+    async def get_matters_for_sync_snapshot(
+        self,
+        matter_ids: List[str],
+        *,
+        conn: Connection,
+        include_unsummarized_orphans: bool = False,
+    ) -> Dict[str, Matter]:
+        """Load and lock the matter portion of one meeting-sync snapshot.
+
+        All rows are locked in stable ID order before the sync reads any item
+        rows. This preserves the global matter -> items lock order while
+        replacing one ``get_matter`` query pair per agenda item with one
+        set-wise query pair for the meeting unit of work.
+
+        The orphan behavior deliberately matches :meth:`get_matter`: an orphan
+        with a canonical summary remains authoritative, while an unsummarized
+        orphan is treated as absent and can be rebuilt by sync.
+        """
+        unique_ids = sorted(set(matter_ids))
+        if not unique_ids:
+            return {}
+
+        rows = await conn.fetch(
+            """
+            WITH requested AS MATERIALIZED (
+                SELECT matter_id,
+                       pg_advisory_xact_lock(
+                           hashtextextended(matter_id, 0)
+                       ) AS identity_lock
+                FROM unnest($1::text[]) AS ids(matter_id)
+                ORDER BY matter_id
+            )
+            SELECT
+                cm.id, cm.banana, cm.matter_id, cm.matter_file, cm.matter_type,
+                cm.title, cm.sponsors, cm.canonical_summary, cm.canonical_topics,
+                cm.attachments, cm.metadata, cm.first_seen, cm.last_seen,
+                GREATEST(
+                    1,
+                    (SELECT COUNT(*) FROM items i WHERE i.matter_id = cm.id)
+                ) AS appearance_count,
+                cm.status, cm.created_at, cm.updated_at,
+                cm.final_vote_date, cm.quality_score, cm.rating_count,
+                (SELECT COUNT(*) FROM items i WHERE i.matter_id = cm.id)
+                    AS actual_item_count
+            FROM requested
+            JOIN city_matters cm ON cm.id = requested.matter_id
+            ORDER BY cm.id
+            FOR UPDATE OF cm
+            """,
+            unique_ids,
+        )
+        if not rows:
+            return {}
+
+        valid_rows = []
+        for row in rows:
+            if (
+                not include_unsummarized_orphans
+                and row["actual_item_count"] == 0
+                and not row["canonical_summary"]
+            ):
+                logger.warning(
+                    "orphan matter without summary skipped",
+                    matter_id=row["id"],
+                )
+                continue
+            valid_rows.append(row)
+        if not valid_rows:
+            return {}
+
+        valid_ids = [row["id"] for row in valid_rows]
+        topics_by_matter = await fetch_topics_for_ids(
+            conn, "matter_topics", "matter_id", valid_ids
+        )
+        return {
+            row["id"]: build_matter(
+                row, topics_by_matter.get(row["id"]) or None
+            )
+            for row in valid_rows
+        }
+
+    async def reconcile_meeting_appearances(
+        self,
+        *,
+        meeting_id: str,
+        appeared_at: Optional[datetime],
+        committee: Optional[str],
+        committee_id: Optional[str],
+        conn: Connection,
+    ) -> Dict[str, int]:
+        """Make appearance relationships exactly match retained item links.
+
+        The schema uniqueness key includes matter_id, so an A -> B item relink
+        can otherwise leave both relationships alive. Delete every relationship
+        whose item no longer points at that matter, then insert the one current
+        relationship for each linked item. Callers hold the meeting row, sorted
+        affected matter rows, and their item rows before entering this method.
+        """
+        deleted = await conn.execute(
+            """
+            DELETE FROM matter_appearances ma
+            WHERE ma.meeting_id = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM items i
+                  WHERE i.id = ma.item_id
+                    AND i.meeting_id = ma.meeting_id
+                    AND i.matter_id = ma.matter_id
+              )
+            """,
+            meeting_id,
+        )
+        inserted = await conn.execute(
+            """
+            INSERT INTO matter_appearances (
+                matter_id, meeting_id, item_id, appeared_at,
+                committee, committee_id, sequence
+            )
+            SELECT
+                i.matter_id, i.meeting_id, i.id, $2,
+                $3, $4, i.sequence
+            FROM items i
+            WHERE i.meeting_id = $1
+              AND i.matter_id IS NOT NULL
+            ORDER BY i.matter_id, i.sequence, i.id
+            ON CONFLICT (matter_id, meeting_id, item_id) DO NOTHING
+            """,
+            meeting_id,
+            appeared_at,
+            committee,
+            committee_id,
+        )
+        return {
+            "deleted": self._parse_row_count(deleted),
+            "inserted": self._parse_row_count(inserted),
+        }
+
+    async def get_authoritative_tracking_for_matters(
+        self,
+        matter_ids: List[str],
+        *,
+        conn: Connection,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return exact retained appearance count and meeting-date bounds."""
+        unique_ids = sorted(set(matter_ids))
+        if not unique_ids:
+            return {}
+        rows = await conn.fetch(
+            """
+            SELECT
+                requested.matter_id,
+                COUNT(i.id)::int AS appearance_count,
+                MIN(m.date) AS first_seen,
+                MAX(m.date) AS last_seen
+            FROM unnest($1::text[]) AS requested(matter_id)
+            LEFT JOIN items i ON i.matter_id = requested.matter_id
+            LEFT JOIN meetings m ON m.id = i.meeting_id
+            GROUP BY requested.matter_id
+            ORDER BY requested.matter_id
+            """,
+            unique_ids,
+        )
+        return {
+            row["matter_id"]: {
+                "appearance_count": int(row["appearance_count"] or 0),
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"],
+            }
+            for row in rows
+        }
+
+    async def refresh_matter_tracking(
+        self,
+        *,
+        matter_id: str,
+        attachments: List[AttachmentInfo],
+        appearance_count: int,
+        first_seen: Optional[datetime],
+        last_seen: Optional[datetime],
+        sponsors: List[str],
+        title: str,
+        attachment_hash: Optional[str],
+        work_version: Optional[str],
+        conn: Connection,
+    ) -> None:
+        """Replace tracking from one locked authoritative appearance view.
+
+        The representative title and denormalized sponsor list come from the
+        same retained rows as normalized relationships. A zero-appearance
+        aggregate has no source left for its canonical projection, so sponsors,
+        summary, topic projections, and processing-verdict metadata are
+        invalidated in the same transaction; its stable identity title remains.
+        """
+        await conn.execute(
+            """
+            UPDATE city_matters
+            SET attachments = $2::jsonb,
+                appearance_count = $3,
+                first_seen = $4,
+                last_seen = $5,
+                metadata = CASE
+                    WHEN $3::int = 0 THEN '{}'::jsonb
+                    WHEN $6::text IS NULL AND $7::text IS NULL THEN metadata
+                    ELSE COALESCE(metadata, '{}'::jsonb)
+                        || CASE WHEN $6::text IS NULL THEN '{}'::jsonb
+                                ELSE jsonb_build_object(
+                                    'attachment_hash', $6::text
+                                ) END
+                        || CASE WHEN $7::text IS NULL THEN '{}'::jsonb
+                                ELSE jsonb_build_object(
+                                    'work_version', $7::text
+                                ) END
+                END,
+                canonical_summary = CASE
+                    WHEN $3::int = 0 THEN NULL
+                    ELSE canonical_summary
+                END,
+                canonical_topics = CASE
+                    WHEN $3::int = 0 THEN NULL
+                    ELSE canonical_topics
+                END,
+                sponsors = CASE
+                    WHEN $3::int = 0 THEN '[]'::jsonb
+                    ELSE $8::jsonb
+                END,
+                title = CASE
+                    WHEN $3::int = 0 THEN title
+                    ELSE $9::text
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            """,
+            matter_id,
+            attachments,
+            appearance_count,
+            first_seen,
+            last_seen,
+            attachment_hash,
+            work_version,
+            sponsors,
+            title,
+        )
+        if appearance_count == 0:
+            await conn.execute(
+                "DELETE FROM matter_topics WHERE matter_id = $1",
+                matter_id,
+            )
+
     async def update_matter_summary(
         self,
         matter_id: str,
@@ -179,43 +442,53 @@ class MatterRepository(BaseRepository):
                 attachment_hash,
             )
 
-            if canonical_topics:
-                await replace_entity_topics(
-                    conn, "matter_topics", "matter_id", matter_id, canonical_topics
-                )
+            await replace_entity_topics(
+                conn, "matter_topics", "matter_id", matter_id, canonical_topics
+            )
 
         logger.debug("updated matter with canonical summary", matter_id=matter_id)
 
-    async def update_attachment_hash(self, matter_id: str, attachment_hash: str) -> None:
-        """Rewrite only metadata.attachment_hash (hash-format upgrades).
+    async def update_attachment_hash(
+        self,
+        matter_id: str,
+        attachment_hash: str,
+        work_version: Optional[str] = None,
+        conn: Optional[Connection] = None,
+    ) -> None:
+        """Rewrite the confirmed projection versions (format upgrades).
 
         Used when a stored legacy-format hash is confirmed equal to the
         current-format hash of the same attachments: a semantic no-op that
         retires the legacy value without touching summary or tracking fields.
         """
-        async with self.transaction() as conn:
-            await conn.execute(
+        async with self._ensure_conn(conn) as connection:
+            await connection.execute(
                 """
                 UPDATE city_matters
                 SET metadata = COALESCE(metadata, '{}'::jsonb)
-                        || jsonb_build_object('attachment_hash', $2::text),
+                        || jsonb_build_object('attachment_hash', $2::text)
+                        || CASE WHEN $3::text IS NULL THEN '{}'::jsonb
+                                ELSE jsonb_build_object('work_version', $3::text) END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1
                 """,
                 matter_id,
                 attachment_hash,
+                work_version,
             )
 
     async def record_matter_outcome(
         self,
         matter_id: str,
         attachment_hash: str,
+        work_version: str,
         disposition: Optional[str] = None,
         increment_attempts: bool = False,
+        conn: Optional[Connection] = None,
     ) -> None:
         """Record a non-success processing outcome in matter metadata.
 
-        Stores the hash that was attempted so the enqueue decider can scope
+        Stores the artifact and desired-work versions so the enqueue decider can scope
         the verdict: a disposition or exhausted attempt count only suppresses
         re-enqueueing while the attachments still hash to this value. The
         attempt counter restarts at 1 when the hash changed since the last
@@ -223,29 +496,33 @@ class MatterRepository(BaseRepository):
         successful store_matter replaces metadata wholesale, clearing both
         fields.
         """
-        async with self.transaction() as conn:
-            await conn.execute(
+        async with self._ensure_conn(conn) as connection:
+            await connection.execute(
                 """
                 UPDATE city_matters
-                SET metadata = COALESCE(metadata, '{}'::jsonb)
+                SET metadata = (COALESCE(metadata, '{}'::jsonb) - 'disposition')
                         || jsonb_build_object(
                             'attachment_hash', $2::text,
+                            'work_version', $3::text,
                             'attempts',
                             CASE
-                                WHEN $4::bool THEN
-                                    CASE WHEN COALESCE(metadata->>'attachment_hash', '') = $2::text
+                                WHEN $5::bool THEN
+                                    CASE WHEN COALESCE(metadata->>'work_version', '') = $3::text
                                          THEN COALESCE((metadata->>'attempts')::int, 0) + 1
                                          ELSE 1 END
-                                ELSE COALESCE((metadata->>'attempts')::int, 0)
+                                WHEN COALESCE(metadata->>'work_version', '') = $3::text
+                                    THEN COALESCE((metadata->>'attempts')::int, 0)
+                                ELSE 0
                             END
                         )
-                        || CASE WHEN $3::text IS NULL THEN '{}'::jsonb
-                                ELSE jsonb_build_object('disposition', $3::text) END,
+                        || CASE WHEN $4::text IS NULL THEN '{}'::jsonb
+                                ELSE jsonb_build_object('disposition', $4::text) END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1
                 """,
                 matter_id,
                 attachment_hash,
+                work_version,
                 disposition,
                 increment_attempts,
             )
@@ -256,6 +533,7 @@ class MatterRepository(BaseRepository):
         meeting_date: Optional[datetime],
         attachments: Optional[List[AttachmentInfo]],
         attachment_hash: Optional[str],
+        work_version: Optional[str] = None,
         increment_appearance_count: bool = False,
         conn: Optional[Connection] = None
     ) -> Optional[int]:
@@ -272,11 +550,22 @@ class MatterRepository(BaseRepository):
                 new_count = await c.fetchval(
                     """
                     UPDATE city_matters
-                    SET last_seen = $2,
+                    SET first_seen = CASE
+                            WHEN first_seen IS NULL THEN $2
+                            WHEN $2::timestamp IS NULL THEN first_seen
+                            ELSE LEAST(first_seen, $2)
+                        END,
+                        last_seen = CASE
+                            WHEN last_seen IS NULL THEN $2
+                            WHEN $2::timestamp IS NULL THEN last_seen
+                            ELSE GREATEST(last_seen, $2)
+                        END,
                         attachments = $3::jsonb,
                         metadata = CASE
-                            WHEN $4::text IS NULL THEN metadata
-                            ELSE COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment_hash', $4::text)
+                            WHEN $4::text IS NULL AND $5::text IS NULL THEN metadata
+                            ELSE COALESCE(metadata, '{}'::jsonb)
+                                || CASE WHEN $4::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('attachment_hash', $4::text) END
+                                || CASE WHEN $5::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('work_version', $5::text) END
                         END,
                         updated_at = CURRENT_TIMESTAMP,
                         appearance_count = appearance_count + 1
@@ -287,6 +576,7 @@ class MatterRepository(BaseRepository):
                     meeting_date,
                     attachments,
                     attachment_hash,
+                    work_version,
                 )
                 logger.debug("updated matter tracking", matter_id=matter_id, new_count=new_count)
                 return new_count
@@ -294,11 +584,22 @@ class MatterRepository(BaseRepository):
                 await c.execute(
                     """
                     UPDATE city_matters
-                    SET last_seen = $2,
+                    SET first_seen = CASE
+                            WHEN first_seen IS NULL THEN $2
+                            WHEN $2::timestamp IS NULL THEN first_seen
+                            ELSE LEAST(first_seen, $2)
+                        END,
+                        last_seen = CASE
+                            WHEN last_seen IS NULL THEN $2
+                            WHEN $2::timestamp IS NULL THEN last_seen
+                            ELSE GREATEST(last_seen, $2)
+                        END,
                         attachments = $3::jsonb,
                         metadata = CASE
-                            WHEN $4::text IS NULL THEN metadata
-                            ELSE COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('attachment_hash', $4::text)
+                            WHEN $4::text IS NULL AND $5::text IS NULL THEN metadata
+                            ELSE COALESCE(metadata, '{}'::jsonb)
+                                || CASE WHEN $4::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('attachment_hash', $4::text) END
+                                || CASE WHEN $5::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('work_version', $5::text) END
                         END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1
@@ -307,6 +608,7 @@ class MatterRepository(BaseRepository):
                     meeting_date,
                     attachments,
                     attachment_hash,
+                    work_version,
                 )
                 logger.debug("updated matter tracking", matter_id=matter_id, increment=False)
                 return None
@@ -330,6 +632,31 @@ class MatterRepository(BaseRepository):
                 meeting_id,
             )
             return bool(exists)
+
+    async def get_existing_appearance_matter_ids(
+        self,
+        matter_ids: List[str],
+        meeting_id: str,
+        *,
+        conn: Connection,
+    ) -> Set[str]:
+        """Return set-wise membership for matter appearances at one meeting."""
+        unique_ids = sorted(set(matter_ids))
+        if not unique_ids:
+            return set()
+
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT matter_id
+            FROM matter_appearances
+            WHERE matter_id = ANY($1::text[])
+              AND meeting_id = $2
+            ORDER BY matter_id
+            """,
+            unique_ids,
+            meeting_id,
+        )
+        return {row["matter_id"] for row in rows}
 
     async def create_appearance(
         self,
@@ -570,10 +897,18 @@ class MatterRepository(BaseRepository):
                        c.name as city_name, c.state
                 FROM city_matters cm
                 JOIN jurisdictions c ON cm.banana = c.banana
+                JOIN LATERAL (
+                    SELECT MAX(
+                        COALESCE(ma.appeared_at, appearance_meeting.created_at)
+                    ) AS latest_activity_at
+                    FROM matter_appearances ma
+                    JOIN meetings appearance_meeting
+                      ON appearance_meeting.id = ma.meeting_id
+                    WHERE ma.matter_id = cm.id
+                ) freshness ON freshness.latest_activity_at >= $2
                 WHERE cm.banana = ANY($1::text[])
-                  AND cm.last_seen >= $2
                   AND cm.canonical_summary LIKE $3
-                ORDER BY cm.last_seen DESC
+                ORDER BY freshness.latest_activity_at DESC
                 """,
                 bananas,
                 since_date,

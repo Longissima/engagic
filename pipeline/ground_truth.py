@@ -89,6 +89,7 @@ async def produce_ground_truth(
     ladder: str = "auto",
     source_url: Optional[str] = None,
     banana: Optional[str] = None,
+    archived_content_sha256: Optional[str] = None,
 ) -> ChunkResult:
     """Bytes in; shape + persisted text out. The one write path.
 
@@ -102,7 +103,9 @@ async def produce_ground_truth(
     if len(pdf_bytes) < MIN_PDF_BYTES:
         return ChunkResult(failure_reason=TOO_SMALL, ladder=ladder)
 
-    content_sha256 = await archive_bytes(pdf_bytes, source_url, banana)
+    content_sha256 = archived_content_sha256
+    if content_sha256 is None:
+        content_sha256 = await archive_bytes(pdf_bytes, source_url, banana)
 
     hint = get_city_hint(vendor, slug, ladder)
 
@@ -111,6 +114,9 @@ async def produce_ground_truth(
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = tmp.name
             tmp.write(pdf_bytes)
+        # The guarded child reads the tempfile. Drop the parent-side byte
+        # buffer before waiting for a potentially long-running parser.
+        pdf_bytes = b""
 
         # The guarded dispatch (parsing/subprocess_guard.py): chunk_pdf --
         # and its ground-truth text pass -- runs in a resource-capped

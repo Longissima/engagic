@@ -218,17 +218,25 @@ async def migrate() -> int:
 
 
 async def status() -> None:
-    """Print migration status."""
+    """Print migration status without changing the database."""
     conn = await get_connection()
 
     try:
-        await ensure_migrations_table(conn)
-        applied = await get_applied_migrations(conn)
+        table_missing = False
+        try:
+            applied = await get_applied_migrations(conn)
+        except asyncpg.UndefinedTableError:
+            applied = set()
+            table_missing = True
         pending = get_pending_migrations(applied)
 
         # Get applied migration details
-        rows = await conn.fetch(
-            "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+        rows = (
+            []
+            if table_missing
+            else await conn.fetch(
+                "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+            )
         )
 
         print("\n=== Applied Migrations ===")
@@ -236,7 +244,7 @@ async def status() -> None:
             for row in rows:
                 print(f"  [{row['version']}] {row['name']} - {row['applied_at']}")
         else:
-            print("  (none)")
+            print("  (schema_migrations table missing)" if table_missing else "  (none)")
 
         print("\n=== Pending Migrations ===")
         if pending:

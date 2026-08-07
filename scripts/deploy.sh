@@ -8,6 +8,9 @@ API_SERVICE="engagic-api"
 API_SERVICE_FILE="/etc/systemd/system/${API_SERVICE}.service"
 FETCHER_SERVICE="engagic-fetcher"
 FETCHER_SERVICE_FILE="/etc/systemd/system/${FETCHER_SERVICE}.service"
+PROCESSOR_SERVICE="engagic-processor"
+MIGRATIONS_CHECKED=false
+MIGRATION_FETCHER_WAS_ACTIVE=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -59,6 +62,70 @@ load_env() {
     fi
     # Use colored dev logs for interactive CLI (systemd services use JSON)
     export ENGAGIC_LOG_FORMAT=dev
+}
+
+list_migration_worker_blockers() {
+    local include_fetcher="${1:-true}"
+    local process_sessions
+
+    process_sessions=$(list_process_sessions)
+    if [ -n "$process_sessions" ]; then
+        echo "$process_sessions" | sed 's/^/manual screen: /'
+    fi
+    if systemctl is-active --quiet "$PROCESSOR_SERVICE"; then
+        echo "systemd service: $PROCESSOR_SERVICE"
+    fi
+    if [ "$include_fetcher" = true ] && systemctl is-active --quiet "$FETCHER_SERVICE"; then
+        echo "systemd service: $FETCHER_SERVICE"
+    fi
+}
+
+assert_migration_workers_quiescent() {
+    local include_fetcher="${1:-true}"
+    local blockers
+
+    blockers=$(list_migration_worker_blockers "$include_fetcher")
+    if [ -n "$blockers" ]; then
+        warn "Database migrations deferred while pipeline workers are active:"
+        echo "$blockers" | sed 's/^/  /'
+        error "Let manual jobs finish and stop managed workers before migrating; detaching a screen does not drain its work"
+    fi
+}
+
+quiesce_fetcher_for_migrations() {
+    MIGRATION_FETCHER_WAS_ACTIVE=false
+    if [ "$MIGRATIONS_CHECKED" = true ]; then
+        return
+    fi
+
+    # Refuse before touching the managed fetcher when a manual or separately
+    # managed processor worker would block the migration anyway.
+    assert_migration_workers_quiescent false
+    if systemctl is-active --quiet "$FETCHER_SERVICE"; then
+        MIGRATION_FETCHER_WAS_ACTIVE=true
+        log "Stopping fetcher before database migrations..."
+        systemctl stop "$FETCHER_SERVICE"
+        log "Fetcher quiesced for database migrations"
+    fi
+}
+
+run_migrations() {
+    # Every process surface expects the current schema. Keep migration
+    # application at the deployment/start boundary so workers never claim a
+    # job and only then discover that a required relation is missing.
+    if [ "$MIGRATIONS_CHECKED" = true ]; then
+        return
+    fi
+
+    # Queue ownership migrations are additive, but every claimant/publisher
+    # must drain before schema ownership changes. Dead/completed screen entries
+    # are deliberately ignored by list_process_sessions().
+    assert_migration_workers_quiescent true
+
+    log "Applying pending database migrations..."
+    load_env
+    uv run python -m database.migrate
+    MIGRATIONS_CHECKED=true
 }
 
 setup_env() {
@@ -160,7 +227,7 @@ EOF
 
 
 # API Management
-start_api() {
+start_api_service() {
     if [ ! -f "$API_SERVICE_FILE" ]; then
         create_api_service
     fi
@@ -184,6 +251,11 @@ start_api() {
     fi
 }
 
+start_api() {
+    run_migrations
+    start_api_service
+}
+
 stop_api() {
     if systemctl is-active --quiet "$API_SERVICE"; then
         log "Stopping API..."
@@ -194,7 +266,7 @@ stop_api() {
     fi
 }
 
-restart_api() {
+restart_api_service() {
     log "Restarting API..."
     systemctl restart "$API_SERVICE"
     sleep 2
@@ -205,8 +277,19 @@ restart_api() {
     fi
 }
 
+restart_api() {
+    quiesce_fetcher_for_migrations
+    local restore_fetcher="$MIGRATION_FETCHER_WAS_ACTIVE"
+
+    run_migrations
+    restart_api_service
+    if [ "$restore_fetcher" = true ]; then
+        start_fetcher_service
+    fi
+}
+
 # Fetcher Management
-start_fetcher() {
+start_fetcher_service() {
     if [ ! -f "$FETCHER_SERVICE_FILE" ]; then
         create_fetcher_service
     fi
@@ -230,6 +313,12 @@ start_fetcher() {
     fi
 }
 
+start_fetcher() {
+    quiesce_fetcher_for_migrations
+    run_migrations
+    start_fetcher_service
+}
+
 stop_fetcher() {
     if systemctl is-active --quiet "$FETCHER_SERVICE"; then
         log "Stopping fetcher..."
@@ -240,7 +329,7 @@ stop_fetcher() {
     fi
 }
 
-restart_fetcher() {
+restart_fetcher_service() {
     # Create service file if doesn't exist
     if [ ! -f "$FETCHER_SERVICE_FILE" ]; then
         create_fetcher_service
@@ -255,6 +344,12 @@ restart_fetcher() {
     else
         error "Failed to restart fetcher"
     fi
+}
+
+restart_fetcher() {
+    quiesce_fetcher_for_migrations
+    run_migrations
+    restart_fetcher_service
 }
 
 # Background Process Management (Manual Commands Only)
@@ -297,19 +392,31 @@ kill_background_processes() {
 
 # Combined operations
 start_all() {
-    start_api
-    start_fetcher
+    quiesce_fetcher_for_migrations
+    run_migrations
+    start_api_service
+    start_fetcher_service
 }
 
 stop_all() {
     stop_api
     stop_fetcher
-    kill_background_processes
+    # Manual screen jobs are independent, resumable operator work. Service
+    # management must never kill them implicitly; use kill-process (scoped)
+    # or the explicit legacy `kill` command when that is truly intended.
+    local sessions
+    sessions=$(list_process_sessions)
+    if [ -n "$sessions" ]; then
+        warn "Manual process screens were left running:"
+        echo "$sessions" | sed 's/^/  /'
+    fi
 }
 
 restart_all() {
-    restart_api
-    restart_fetcher
+    quiesce_fetcher_for_migrations
+    run_migrations
+    restart_api_service
+    restart_fetcher_service
 }
 
 status_all() {
@@ -341,11 +448,30 @@ status_all() {
 
     echo ""
 
-    # Background processes (manual)
-    echo -e "${BLUE}Manual Background Processes:${NC}"
-    if pgrep -f "engagic-daemon|pipeline.conductor|engagic-conductor" > /dev/null; then
-        echo -e "${YELLOW}  Running (manual):${NC}"
-        pgrep -fa "engagic-daemon|pipeline.conductor|engagic-conductor" | sed 's/^/    /'
+    # Processor visibility only. This script does not provision, start, stop,
+    # or restart the independently managed processor service.
+    echo -e "${BLUE}Processor Status:${NC}"
+    if systemctl is-active --quiet "$PROCESSOR_SERVICE"; then
+        echo -e "${GREEN}  Running${NC}"
+        echo "  Logs: journalctl -u $PROCESSOR_SERVICE -f"
+        systemctl status "$PROCESSOR_SERVICE" --no-pager | grep -E "Active:|Main PID:" | sed 's/^/  /'
+    elif systemctl cat "$PROCESSOR_SERVICE" > /dev/null 2>&1; then
+        echo -e "${YELLOW}  Not running${NC}"
+    else
+        echo -e "${YELLOW}  Not provisioned${NC}"
+    fi
+
+    echo ""
+
+    # Manual screens are independent operator-owned jobs. Report exactly the
+    # same live set used by the migration guard, without duplicating systemd
+    # workers in this section.
+    echo -e "${BLUE}Manual Process Screens:${NC}"
+    local process_sessions
+    process_sessions=$(list_process_sessions)
+    if [ -n "$process_sessions" ]; then
+        echo -e "${YELLOW}  Running:${NC}"
+        echo "$process_sessions" | sed 's/^/    /'
     else
         echo -e "${GREEN}  None${NC}"
     fi
@@ -443,9 +569,8 @@ deploy_full() {
 
 # Daemon-specific commands
 daemon_status() {
-    cd "$APP_DIR"
-    source "$VENV_DIR/bin/activate"
-    uv run engagic-daemon --status
+    load_env
+    uv run engagic-conductor status
 }
 
 # Expand a friendly sync/process target into what engagic-conductor expects.
@@ -504,6 +629,7 @@ PROCESS_SCREEN_PREFIX="engagic-process"
 # Live session names matching the process prefix, one per line.
 list_process_sessions() {
     screen -list 2>/dev/null \
+        | grep -E '\((Attached|Detached)\)' \
         | grep -oE "[0-9]+\.${PROCESS_SCREEN_PREFIX}[^[:space:]]*" \
         | sed 's/^[0-9]*\.//'
 }

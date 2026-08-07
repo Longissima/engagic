@@ -15,12 +15,13 @@ Confidence: 8/10 - Tested against Raleigh NC, may need adjustments for other cit
 
 import re
 from typing import Dict, Any, Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
+from vendors.adapters.html_attrs import string_attr, string_list_attr
 from pipeline.protocols import MetricsCollector
 
 
@@ -356,20 +357,20 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         """Extract item ID from AgendaItem class or SelectItem link."""
         agenda_item_div = container.find("div", class_=re.compile(r"AgendaItem\d+"))
         if not agenda_item_div:
-            for cls in container.get("class", []):
+            for cls in string_list_attr(container, "class"):
                 if re.match(r"AgendaItem\d+", cls):
                     agenda_item_div = container
                     break
 
         if agenda_item_div:
-            for cls in agenda_item_div.get("class", []):
+            for cls in string_list_attr(agenda_item_div, "class"):
                 match = re.match(r"AgendaItem(\d+)", cls)
                 if match:
                     return match.group(1)
 
         select_link = container.find("a", href=re.compile(r"SelectItem\(\d+\)"))
         if select_link:
-            match = re.search(r"SelectItem\((\d+)\)", select_link.get("href", ""))
+            match = re.search(r"SelectItem\((\d+)\)", string_attr(select_link, "href"))
             if match:
                 return match.group(1)
 
@@ -440,7 +441,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         child_containers = set(container.find_all("div", class_="AgendaItemContainer"))
 
         for link in container.find_all("a", href=re.compile(r"FileStream\.ashx\?DocumentId=", re.IGNORECASE)):
-            href = link.get("href", "")
+            href = string_attr(link, "href")
             if not href:
                 continue
 
@@ -452,8 +453,8 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
 
             name = (
                 link.get_text(strip=True)
-                or link.get("aria-label", "")
-                or link.get("title", "")
+                or string_attr(link, "aria-label")
+                or string_attr(link, "title")
             )
             if not name:
                 doc_id_match = re.search(r"DocumentId=(\d+)", href)

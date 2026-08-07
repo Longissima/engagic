@@ -24,8 +24,6 @@ from pipeline.orchestrators import MeetingSyncOrchestrator
 
 logger = get_logger(__name__).bind(component="fetcher")
 
-SYNC_ERROR_DELAY_BASE = 2
-SYNC_ERROR_DELAY_JITTER = 1
 # Concurrent cities per vendor - balances throughput vs vendor politeness.
 # Legistar dominates the long tail (~30 cities, 4 req/matter), so this is mainly
 # its dial. 8 stays under the legistar rate limiter's 12 slots (rate_limiter_async.py).
@@ -38,6 +36,7 @@ class SyncStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -57,6 +56,7 @@ class SyncResult:
 # FAILED is sticky (any failed pass degrades the aggregate). PENDING/IN_PROGRESS
 # shouldn't appear in merged results but rank lowest for safety.
 _STATUS_SEVERITY = {
+    SyncStatus.CANCELLED: 4,
     SyncStatus.FAILED: 3,
     SyncStatus.COMPLETED: 2,
     SyncStatus.SKIPPED: 1,
@@ -186,7 +186,7 @@ class Fetcher:
         )
         cities: List[Jurisdiction] = []
         results: List[SyncResult] = []
-        for banana in city_bananas:
+        for banana in dict.fromkeys(city_bananas):
             city = city_map.get(banana)
             if not city:
                 logger.warning("city not found", banana=banana)
@@ -316,7 +316,12 @@ class Fetcher:
             return SyncResult(city_banana=city_banana, status=SyncStatus.FAILED, error_message="City not found")
         return await self._sync_city_with_retry(city)
 
-    async def _sync_city(self, city: Jurisdiction) -> SyncResult:
+    async def _sync_city(
+        self,
+        city: Jurisdiction,
+        *,
+        max_retries: int = 3,
+    ) -> SyncResult:
         """Sync a city across its primary vendor and any extra_vendors.
 
         Primary runs first; extras run sequentially afterward (rate-limited per vendor).
@@ -327,7 +332,12 @@ class Fetcher:
             return SyncResult(city_banana=city.banana, status=SyncStatus.SKIPPED,
                               error_message="No vendor configured")
 
-        aggregate = await self._sync_with_vendor(city, city.vendor, city.slug)
+        aggregate = await self._sync_vendor_with_retry(
+            city,
+            city.vendor,
+            city.slug,
+            max_retries=max_retries,
+        )
 
         extras = city.extra_vendors or []
         if not extras:
@@ -335,14 +345,23 @@ class Fetcher:
 
         for extra in extras:
             if not self.is_running:
-                break
+                aggregate.status = SyncStatus.CANCELLED
+                aggregate.error_message = (
+                    "Sync interrupted before all vendor streams completed"
+                )
+                return aggregate
             vendor, slug = extra.get("vendor"), extra.get("slug")
             if not vendor or not slug:
                 logger.warning("malformed extra_vendor", city=city.banana, extra=extra)
                 continue
 
             # Per-request gating in adapter `_request` handles vendor delay
-            extra_result = await self._sync_with_vendor(city, vendor, slug)
+            extra_result = await self._sync_vendor_with_retry(
+                city,
+                vendor,
+                slug,
+                max_retries=max_retries,
+            )
             aggregate = _merge_sync_results(aggregate, extra_result)
 
         return aggregate
@@ -396,6 +415,9 @@ class Fetcher:
                 return result
 
             all_meetings = fetch_result.meetings
+            activation_pending = bool(all_meetings) and not (
+                await self.db.meetings.has_meetings_for_city(city.banana)
+            )
             total_items = sum(len(m.get("items", [])) for m in all_meetings)
             total_matters = sum(1 for m in all_meetings for item in m.get("items", []) if item.get("matter_file") or item.get("matter_id"))
 
@@ -419,7 +441,13 @@ class Fetcher:
                     interrupted = True
                     break
 
-                stored_meeting, storage_stats = await self.meeting_sync.sync_meeting(meeting_dict, city)
+                stored_meeting, storage_stats = await self.meeting_sync.sync_meeting(
+                    meeting_dict,
+                    city,
+                    check_city_activation=activation_pending,
+                )
+                if storage_stats.get("activation_checked"):
+                    activation_pending = False
                 if not stored_meeting:
                     if storage_stats.get('meetings_skipped', 0):
                         skipped_meetings += 1
@@ -435,7 +463,7 @@ class Fetcher:
                 result.meetings_processed = processed_count
                 result.meetings_skipped = skipped_meetings
                 result.items_stored = items_stored_count
-                result.status = SyncStatus.SKIPPED
+                result.status = SyncStatus.CANCELLED
                 result.error_message = "Sync interrupted before all meetings were stored"
                 result.duration_seconds = time.time() - start_time
                 self.metrics.vendor_requests.labels(
@@ -463,12 +491,17 @@ class Fetcher:
             self.metrics.vendor_requests.labels(vendor=vendor, status='error').inc()
             self.metrics.record_error(component="fetcher", error=e)
             logger.error("sync failed", city=city.banana, vendor=vendor, duration_seconds=round(result.duration_seconds, 1), error=str(e))
-            await asyncio.sleep(SYNC_ERROR_DELAY_BASE + random.uniform(0, SYNC_ERROR_DELAY_JITTER))
-
         return result
 
-    async def _sync_city_with_retry(self, city: Jurisdiction, max_retries: int = 3) -> SyncResult:
-        """Sync city with retry on transient failures.
+    async def _sync_vendor_with_retry(
+        self,
+        city: Jurisdiction,
+        vendor: str,
+        slug: str,
+        *,
+        max_retries: int = 3,
+    ) -> SyncResult:
+        """Retry one vendor pass without replaying successful sibling passes.
 
         max_retries=3 yields up to 2 backoff attempts after the initial try
         (waits 5s then 20s before each retry). Bumped from 1 on 2026-05-20 after
@@ -481,43 +514,26 @@ class Fetcher:
 
         for attempt in range(max_retries):
             try:
-                result = await self._sync_city(city)
+                result = await self._sync_with_vendor(city, vendor, slug)
                 last_result = result
                 if result.status == SyncStatus.COMPLETED:
-                    try:
-                        checkpointed = await self.db.jurisdictions.mark_city_synced(
-                            city.banana
-                        )
-                        if not checkpointed:
-                            raise RuntimeError(
-                                "jurisdiction disappeared before sync checkpoint"
-                            )
-                    except Exception as e:
-                        # Meeting writes are already durable, but without this
-                        # checkpoint the scheduler must regard the city as due.
-                        result.status = SyncStatus.FAILED
-                        result.error_message = (
-                            "Sync completed but lifecycle checkpoint failed: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                        self.metrics.vendor_requests.labels(
-                            vendor=city.vendor, status="checkpoint_error"
-                        ).inc()
-                        self.metrics.record_error("fetcher", e)
-                        logger.exception(
-                            "sync checkpoint failed",
-                            city=city.banana,
-                            error=str(e),
-                        )
                     return result
                 if result.status == SyncStatus.SKIPPED:
+                    return result
+                if result.status == SyncStatus.CANCELLED:
                     return result
                 last_error = result.error_message or "Sync failed"
             except (VendorError, asyncio.TimeoutError, aiohttp.ClientError) as e:
                 last_error = str(e)
 
             if attempt >= max_retries - 1:
-                logger.error("final sync failure after retries", city=city.name, attempts=max_retries, error=last_error)
+                logger.error(
+                    "final vendor sync failure after retries",
+                    city=city.name,
+                    vendor=vendor,
+                    attempts=max_retries,
+                    error=last_error,
+                )
                 if last_result:
                     last_result.status = SyncStatus.FAILED
                     last_result.error_message = last_error
@@ -525,7 +541,15 @@ class Fetcher:
                 return SyncResult(city_banana=city.banana, status=SyncStatus.FAILED, error_message=last_error)
 
             wait_time = wait_times[attempt] + random.uniform(0, 2)
-            logger.warning("sync failed - retrying", city=city.name, attempt=attempt + 1, max_retries=max_retries, wait_seconds=round(wait_time, 1), error=last_error)
+            logger.warning(
+                "vendor sync failed - retrying",
+                city=city.name,
+                vendor=vendor,
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                wait_seconds=round(wait_time, 1),
+                error=last_error,
+            )
             await asyncio.sleep(wait_time)
 
         if last_result:
@@ -533,6 +557,40 @@ class Fetcher:
             last_result.error_message = last_error
             return last_result
         return SyncResult(city_banana=city.banana, status=SyncStatus.FAILED, error_message=last_error)
+
+    async def _sync_city_with_retry(
+        self,
+        city: Jurisdiction,
+        max_retries: int = 3,
+    ) -> SyncResult:
+        """Run independently retried vendor passes, then checkpoint the city."""
+        result = await self._sync_city(city, max_retries=max_retries)
+        if result.status != SyncStatus.COMPLETED:
+            return result
+
+        try:
+            checkpointed = await self.db.jurisdictions.mark_city_synced(city.banana)
+            if not checkpointed:
+                raise RuntimeError("jurisdiction disappeared before sync checkpoint")
+        except Exception as e:
+            # Meeting writes are already durable, but without this checkpoint
+            # the scheduler must regard the city as due. Do not refetch data to
+            # retry an independent lifecycle write.
+            result.status = SyncStatus.FAILED
+            result.error_message = (
+                "Sync completed but lifecycle checkpoint failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            self.metrics.vendor_requests.labels(
+                vendor=city.vendor, status="checkpoint_error"
+            ).inc()
+            self.metrics.record_error("fetcher", e)
+            logger.exception(
+                "sync checkpoint failed",
+                city=city.banana,
+                error=str(e),
+            )
+        return result
 
     async def _should_sync_city(
         self,

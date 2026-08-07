@@ -23,7 +23,7 @@ from typing import AsyncIterator, List, Dict, Any, Optional, Tuple, cast
 
 import aiohttp
 
-from corpus.store import get_corpus, sha256_hex
+from corpus.store import get_corpus
 from exceptions import DocumentDownloadError, ExtractionError, LLMError
 from parsing.pdf import PdfExtractor, extract_document_file
 from parsing.subprocess_guard import GuardCrashed, GuardTaskError, GuardTimeout, run_guarded
@@ -35,11 +35,11 @@ from analysis.llm.input_budget import (
     prepare_item_text,
 )
 from pipeline.protocols import MetricsCollector, NullMetrics
+from pipeline.document_acquisition import DocumentResponse, DocumentSourceAcquirer
 from pipeline.document_artifacts import (
     DocumentArtifact,
     DocumentFormat,
     extract_document_links,
-    make_artifact,
     sanitize_html_text,
     verify_tls_for_url,
 )
@@ -49,6 +49,7 @@ from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 from config import config, get_logger
 
 logger = get_logger(__name__).bind(component="pipeline")
+
 
 def _extract_best_pdf_link(html_bytes: bytes, base_url: str) -> Optional[str]:
     """Compatibility wrapper for the former PDF-only HTML resolver."""
@@ -85,13 +86,13 @@ def _extract_pdf_in_subprocess(document_path, ocr_threshold, ocr_dpi,
             rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
         )
     except GuardTimeout:
-        raise ExtractionError("PDF extraction subprocess timed out after 600s")
+        raise ExtractionError("Document extraction subprocess timed out after 600s")
     except GuardCrashed as e:
         raise ExtractionError(
-            f"PDF extraction subprocess crashed (exit code {e.exitcode}, likely segfault on malformed PDF)"
+            f"Document extraction subprocess crashed (exit code {e.exitcode})"
         )
     except GuardTaskError as e:
-        raise ExtractionError(f"PDF extraction failed: {e} ({e.error_type})")
+        raise ExtractionError(f"Document extraction failed: {e} ({e.error_type})")
 
 
 class AnalysisError(Exception):
@@ -136,9 +137,16 @@ class AsyncAnalyzer:
         self.http_session: Optional[aiohttp.ClientSession] = None
         self._request_count = 0
         self._recycle_after = 100  # Recycle session after N requests to prevent memory accumulation
-        self._in_flight = 0  # Track concurrent downloads to prevent recycling mid-download
         self._recycle_lock = asyncio.Lock()  # Serialize recycle checks
-
+        self._session_in_flight: Dict[aiohttp.ClientSession, int] = {}
+        self._retired_sessions: set[aiohttp.ClientSession] = set()
+        self._source_acquirer = DocumentSourceAcquirer(
+            self._download_url_bytes,
+            fetch_errors=(DocumentDownloadError,),
+            corpus_getter=lambda: get_corpus(),
+            metrics=self.metrics,
+            metric_component="processor",
+        )
         logger.info(
             "async analyzer initialized",
             pdf_extractor="pymupdf",
@@ -160,24 +168,19 @@ class AsyncAnalyzer:
 
     async def close(self):
         """Close HTTP session (cleanup)"""
-        if self.http_session and not self.http_session.closed:
-            await self.http_session.close()
-            logger.debug("http session closed")
-
-    async def _drain_and_close_session(self, session: aiohttp.ClientSession) -> None:
-        """Close a rotated session after a grace period for in-flight requests.
-
-        When rotating sessions under load, we drop our reference but callers that
-        already grabbed a pointer to the old session keep using it. A grace period
-        lets their requests complete naturally before we force-close the connector.
-        """
-        try:
-            await asyncio.sleep(60)
+        async with self._recycle_lock:
+            sessions = set(self._retired_sessions)
+            sessions.update(self._session_in_flight)
+            if self.http_session is not None:
+                sessions.add(self.http_session)
+            self.http_session = None
+            self._retired_sessions.clear()
+            self._session_in_flight.clear()
+        for session in sessions:
             if not session.closed:
                 await session.close()
-                logger.debug("rotated http session closed after grace period")
-        except (aiohttp.ClientError, asyncio.CancelledError, OSError) as e:
-            logger.warning("failed to close rotated session", error=str(e))
+        if sessions:
+            logger.debug("http sessions closed", count=len(sessions))
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -188,32 +191,9 @@ class AsyncAnalyzer:
         await self.close()
         return False  # Don't suppress exceptions
 
-    async def download_pdf_async(self, url: str, _depth: int = 0) -> bytes:
-        """
-        Download PDF asynchronously (non-blocking).
-
-        If the URL serves HTML instead of a PDF, parses the page for PDF links
-        and follows through to the actual document (generic 2nd-pass resolution).
-        This handles intermediate "attachment detail" pages across vendors.
-
-        Args:
-            url: PDF or attachment-page URL
-            _depth: recursion guard (internal)
-
-        Returns:
-            PDF bytes
-
-        Raises:
-            ExtractionError: If download fails or no PDF can be resolved
-        """
-        # Keep volatile signing credentials out of logs and exception context.
-        safe_url = attachment_identity(url)
-
-        # Acquire session with rotation check (serialized, but quick).
-        # Rotation drops the old session reference and creates a new one -- in-flight
-        # requests on the old session keep working because they already hold a local
-        # reference, and the old session is scheduled for close after a grace period.
-        # This avoids the previous deadlock where _in_flight never hit 0 under load.
+    async def _session_for_download(self) -> aiohttp.ClientSession:
+        """Lease a session; retired sessions close after their final request."""
+        close_after_unlock: Optional[aiohttp.ClientSession] = None
         async with self._recycle_lock:
             self._request_count += 1
             if self._request_count >= self._recycle_after:
@@ -222,206 +202,353 @@ class AsyncAnalyzer:
                 self._request_count = 0
                 logger.info("http session rotating", after_requests=self._recycle_after)
                 if old_session and not old_session.closed:
-                    asyncio.create_task(self._drain_and_close_session(old_session))
+                    if self._session_in_flight.get(old_session, 0):
+                        self._retired_sessions.add(old_session)
+                    else:
+                        close_after_unlock = old_session
             session = await self._get_session()
-            self._in_flight += 1
+            self._session_in_flight[session] = (
+                self._session_in_flight.get(session, 0) + 1
+            )
+        if close_after_unlock is not None:
+            await close_after_unlock.close()
+        return session
 
-        # Per-vendor politeness gate: shared with the sync side so processing
-        # downloads pace through the same multi-slot rate limiter rather than
-        # bypassing it via the analyzer's separate aiohttp session.
-        vendor = vendor_for_url(url)
-        await get_rate_limiter().wait_if_needed(vendor)
+    async def _release_download_session(
+        self, session: aiohttp.ClientSession
+    ) -> None:
+        close_after_unlock = False
+        async with self._recycle_lock:
+            remaining = self._session_in_flight.get(session, 0) - 1
+            if remaining > 0:
+                self._session_in_flight[session] = remaining
+            else:
+                self._session_in_flight.pop(session, None)
+                if session in self._retired_sessions:
+                    self._retired_sessions.remove(session)
+                    close_after_unlock = True
+        if close_after_unlock and not session.closed:
+            await session.close()
+            logger.debug("retired http session closed after final request")
 
-        # Actual download happens outside lock (concurrent)
+    async def _sleep_download_retry(self, attempt: int, retry_after: Optional[float]) -> None:
+        delay = min(30.0, retry_after if retry_after is not None else 2.0 ** attempt)
+        await asyncio.sleep(max(0.0, delay))
+
+    @staticmethod
+    def _retry_after_seconds(value: Optional[str]) -> Optional[float]:
+        if not value:
+            return None
         try:
-            async with session.get(url, ssl=False) as resp:  # Disable SSL for Granicus S3
-                if resp.status != 200:
-                    raise DocumentDownloadError(
-                        f"HTTP {resp.status} downloading PDF from {safe_url}",
-                        document_url=safe_url,
-                        status_code=resp.status,
-                    )
+            return max(0.0, min(float(value), 120.0))
+        except (TypeError, ValueError):
+            return None
 
-                content_type = resp.headers.get("Content-Type", "")
-                raw_bytes = await resp.read()
-
-                # Happy path: response is a PDF
-                if raw_bytes[:5] == b"%PDF-" or "application/pdf" in content_type:
-                    logger.debug("pdf downloaded", url=safe_url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
-                    return raw_bytes
-
-                # HTML response -- intermediate attachment page. Parse for PDF links.
-                if _depth >= 1:
-                    # Already followed one redirect; don't chase further.
-                    logger.debug("html attachment page returned non-pdf after resolve, giving up", url=safe_url[:120])
-                    raise DocumentDownloadError(
-                        f"Resolved URL still not a PDF: {safe_url[:120]}",
-                        document_url=safe_url,
-                        retryable=False,
-                    )
-
-                if "text/html" in content_type or raw_bytes[:15].lstrip().lower().startswith((b"<!doctype", b"<html")):
-                    pdf_url = _extract_best_pdf_link(raw_bytes, url)
-                    if pdf_url:
-                        logger.info(
-                            "html attachment page resolved to pdf",
-                            original_url=safe_url[:120],
-                            resolved_url=attachment_identity(pdf_url)[:120],
-                        )
-                        return await self.download_pdf_async(pdf_url, _depth=_depth + 1)
-
-                    # OnBase dual-endpoint: different Hyland deployments serve
-                    # the PDF via different paths. Whittier CA / Santa Barbara
-                    # respond to /Documents/ViewDocument/ and 404 on
-                    # /DownloadFileBytes/; Concord CA / Tampa respond to
-                    # /DownloadFileBytes/ and 404 on /ViewDocument/. The
-                    # adapter picks one; if it's the wrong one for a given
-                    # deployment, swap and retry once.
-                    onbase_alt = None
-                    if "/Documents/ViewDocument/" in url:
-                        onbase_alt = url.replace("/Documents/ViewDocument/", "/Documents/DownloadFileBytes/")
-                    elif "/Documents/DownloadFileBytes/" in url:
-                        onbase_alt = url.replace("/Documents/DownloadFileBytes/", "/Documents/ViewDocument/")
-                    if onbase_alt and onbase_alt != url:
-                        logger.info(
-                            "onbase endpoint returned html, retrying alternate",
-                            original_url=safe_url[:120],
-                            alt_url=attachment_identity(onbase_alt)[:120],
-                        )
-                        return await self.download_pdf_async(onbase_alt, _depth=_depth + 1)
-
-                    logger.debug("html attachment page had no pdf links", url=safe_url[:120])
-                    raise DocumentDownloadError(
-                        f"Attachment page contained no PDF links: {safe_url[:120]}",
-                        document_url=safe_url,
-                        retryable=False,
-                    )
-
-                # Unknown content type -- try using it as-is (could be octet-stream)
-                logger.debug("pdf downloaded", url=safe_url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
-                return raw_bytes
-
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.error("pdf download failed", url=safe_url, error=str(e))
-            raise DocumentDownloadError(
-                f"Failed to download PDF: {e}",
-                document_url=safe_url,
-                original_error=e,
-            ) from e
-        finally:
-            self._in_flight -= 1
-
-    async def extract_pdf_async(self, url: str, banana: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Extract text from PDF asynchronously.
-
-        Downloads PDF with async HTTP, writes to temp file, runs extraction
-        in isolated subprocess. Temp file avoids doubling memory: parent
-        releases PDF bytes before the child starts extracting.
-
-        Args:
-            url: PDF URL
-            banana: Jurisdiction for corpus provenance (document_source.banana);
-                    extraction itself doesn't need it
-
-        Returns:
-            Dict with keys: success, text, page_count, etc.
-
-        Raises:
-            ExtractionError: If extraction fails, times out, or subprocess crashes
-        """
+    async def _download_url_bytes(
+        self,
+        url: str,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+    ) -> DocumentResponse:
+        """Fetch or conditionally validate one URL with bounded retries."""
         safe_url = attachment_identity(url)
-        pdf_bytes = await self.download_pdf_async(url)
+        session = await self._session_for_download()
+        vendor = vendor_for_url(url)
+        attempts = 3
+        conditional_headers = {
+            key: value
+            for key, value in (
+                ("If-None-Match", etag),
+                ("If-Modified-Since", last_modified),
+            )
+            if value
+        }
+        try:
+            for attempt in range(attempts):
+                await get_rate_limiter().wait_if_needed(vendor)
+                try:
+                    request_kwargs: Dict[str, Any] = {
+                        "ssl": verify_tls_for_url(url)
+                    }
+                    if conditional_headers:
+                        request_kwargs["headers"] = conditional_headers
+                    async with session.get(url, **request_kwargs) as resp:
+                        response_url = str(getattr(resp, "url", url))
+                        response_etag = resp.headers.get("ETag")
+                        response_last_modified = resp.headers.get("Last-Modified")
+                        if resp.status == 304 and conditional_headers:
+                            return DocumentResponse(
+                                data=None,
+                                content_type=resp.headers.get("Content-Type", ""),
+                                response_url=response_url,
+                                etag=response_etag or etag,
+                                last_modified=response_last_modified or last_modified,
+                            )
+                        if resp.status == 412 and conditional_headers:
+                            # A validator can become invalid independently of
+                            # the content. Retry once as a normal GET rather
+                            # than treating the cached revision as authoritative.
+                            conditional_headers = {}
+                            logger.info(
+                                "document validator rejected, retrying unconditionally",
+                                url=safe_url[:120],
+                            )
+                            continue
+                        if resp.status != 200:
+                            error = DocumentDownloadError(
+                                f"HTTP {resp.status} downloading document from {safe_url}",
+                                document_url=safe_url,
+                                status_code=resp.status,
+                            )
+                            if error.is_retryable and attempt < attempts - 1:
+                                retry_after = self._retry_after_seconds(
+                                    resp.headers.get("Retry-After")
+                                )
+                                logger.warning(
+                                    "transient document response, retrying",
+                                    url=safe_url[:120],
+                                    status=resp.status,
+                                    attempt=attempt + 1,
+                                )
+                                await self._sleep_download_retry(attempt, retry_after)
+                                continue
+                            raise error
+                        raw_bytes = await resp.read()
+                        content_type = resp.headers.get("Content-Type", "")
+                        return DocumentResponse(
+                            data=raw_bytes,
+                            content_type=content_type,
+                            response_url=response_url,
+                            etag=response_etag,
+                            last_modified=response_last_modified,
+                        )
+                except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError) as e:
+                    raise DocumentDownloadError(
+                        f"TLS verification failed downloading document from {safe_url}",
+                        document_url=safe_url,
+                        retryable=False,
+                        original_error=e,
+                    ) from e
+                except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
+                    if attempt < attempts - 1:
+                        logger.warning(
+                            "transient document download failure, retrying",
+                            url=safe_url[:120],
+                            error_type=type(e).__name__,
+                            attempt=attempt + 1,
+                        )
+                        await self._sleep_download_retry(attempt, None)
+                        continue
+                    raise DocumentDownloadError(
+                        f"Failed to download document from {safe_url}: {type(e).__name__}",
+                        document_url=safe_url,
+                        original_error=e,
+                    ) from e
+                except aiohttp.ClientError as e:
+                    raise DocumentDownloadError(
+                        f"Failed to download document from {safe_url}: {type(e).__name__}",
+                        document_url=safe_url,
+                        retryable=False,
+                        original_error=e,
+                    ) from e
+        finally:
+            await self._release_download_session(session)
+        raise DocumentDownloadError(
+            f"Failed to download document from {safe_url}",
+            document_url=safe_url,
+        )
 
-        # Corpus dedup gate (docs/CORPUS_ARCHITECTURE.md): identity comes from
-        # the bytes themselves. If the corpus already holds text for this exact
-        # content, serve it and skip extraction entirely -- re-summarization,
-        # matter aggregation, and packet-vs-attachment overlaps all stop
-        # re-paying extraction. Hash in a thread: big packets would stall the
-        # loop for hundreds of ms.
+    async def _acquire_document_async(
+        self,
+        requested_url: str,
+        source_url: str,
+        banana: Optional[str],
+        depth: int,
+    ) -> DocumentArtifact:
+        artifact = await self._source_acquirer.acquire(
+            source_url,
+            requested_url=requested_url,
+            banana=banana,
+        )
+
+        if artifact.document_format is not DocumentFormat.HTML or depth >= 2:
+            return artifact
+
+        candidates = extract_document_links(artifact.data, artifact.source_url)
+        onbase_alt = None
+        if "/Documents/ViewDocument/" in source_url:
+            onbase_alt = source_url.replace(
+                "/Documents/ViewDocument/", "/Documents/DownloadFileBytes/"
+            )
+        elif "/Documents/DownloadFileBytes/" in source_url:
+            onbase_alt = source_url.replace(
+                "/Documents/DownloadFileBytes/", "/Documents/ViewDocument/"
+            )
+        if onbase_alt and onbase_alt not in candidates:
+            candidates.append(onbase_alt)
+
+        transient_error: Optional[DocumentDownloadError] = None
+        for candidate in candidates[:3]:
+            try:
+                resolved = await self._acquire_document_async(
+                    requested_url, candidate, banana, depth + 1
+                )
+                if resolved.document_format is not DocumentFormat.HTML:
+                    logger.info(
+                        "html attachment page resolved to document",
+                        original_url=attachment_identity(source_url)[:120],
+                        resolved_url=resolved.source_identity[:120],
+                        document_format=resolved.document_format.value,
+                    )
+                    return resolved
+            except DocumentDownloadError as e:
+                if e.is_retryable:
+                    transient_error = e
+                else:
+                    logger.debug(
+                        "document link was unavailable",
+                        url=attachment_identity(candidate)[:120],
+                        status=e.status_code,
+                    )
+        if transient_error is not None:
+            raise transient_error
+        return artifact
+
+    async def acquire_document_async(
+        self, url: str, banana: Optional[str] = None
+    ) -> DocumentArtifact:
+        """Acquire a typed artifact through the shared source boundary."""
+        return await self._acquire_document_async(url, url, banana, 0)
+
+    async def download_pdf_async(self, url: str, _depth: int = 0) -> bytes:
+        """Compatibility byte download for document-only consumers."""
+        artifact = (
+            await self.acquire_document_async(url)
+            if _depth == 0
+            else await self._acquire_document_async(url, url, None, _depth)
+        )
+        if artifact.document_format is DocumentFormat.HTML:
+            safe_url = attachment_identity(url)
+            raise DocumentDownloadError(
+                f"Attachment page contained no downloadable document: {safe_url[:120]}",
+                document_url=safe_url,
+                retryable=False,
+            )
+        return artifact.data
+
+    async def extract_document_async(
+        self, url: str, banana: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Acquire and extract a supported document or useful HTML fallback."""
+        safe_url = attachment_identity(url)
+        artifact = await self.acquire_document_async(url, banana=banana)
         corpus_store = get_corpus()
-        content_sha256 = None
-        byte_count = len(pdf_bytes)
+
         if corpus_store:
-            content_sha256 = await asyncio.to_thread(sha256_hex, pdf_bytes)
-            cached = await corpus_store.lookup_extraction(content_sha256)
+            cached = await corpus_store.lookup_extraction(artifact.content_sha256)
             if cached:
-                await corpus_store.record_sighting(content_sha256, url, banana)
+                await corpus_store.record_sighting(
+                    artifact.content_sha256, artifact.source_url, banana
+                )
                 logger.info(
                     "extraction served from corpus",
                     url=safe_url[:100],
-                    sha=content_sha256[:16],
+                    sha=artifact.content_sha256[:16],
                     chars=len(cached.get("text") or ""),
                 )
-                cached["content_sha256"] = content_sha256
-                cached["corpus_persisted"] = True
+                cached.update(
+                    content_sha256=artifact.content_sha256,
+                    corpus_persisted=True,
+                    document_format=artifact.document_format.value,
+                    source_url=artifact.source_identity,
+                    from_corpus=True,
+                )
                 return cached
 
-        # Write to temp file and release bytes before subprocess starts.
-        # Without this, parent holds bytes for the full extraction duration
-        # (asyncio.to_thread keeps a reference to all args).
-        fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
-        os.write(fd, pdf_bytes)
-        os.close(fd)
-        del pdf_bytes
+        content_sha256 = artifact.content_sha256
+        document_format = artifact.document_format
+        source_identity = artifact.source_identity
+        temporary_suffix = artifact.suffix
 
-        # Run in subprocess via thread (proc.join is blocking)
-        # Subprocess isolates against PyMuPDF segfaults on malformed PDFs
-        try:
-            # Archive the original first, streaming from the temp file so the
-            # parent never re-holds the bytes. Before extraction on purpose:
-            # a pathological document that times out below still enters the
-            # archive, ready for a better extractor later. Failures inside the
-            # store are logged and swallowed -- the corpus never fails a job.
-            if corpus_store and content_sha256:
-                with open(pdf_path, "rb") as original:
-                    await corpus_store.archive_original(
-                        content_sha256,
-                        byte_count=byte_count,
-                        file_obj=original,
-                        source_url=url,
-                        banana=banana,
-                    )
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _extract_pdf_in_subprocess,
-                    pdf_path,
-                    self.pdf_extractor.ocr_threshold,
-                    self.pdf_extractor.ocr_dpi,
-                    self.pdf_extractor.detect_legislative_formatting,
-                    self.pdf_extractor.max_ocr_workers,
-                ),
-                timeout=620
-            )
-        except asyncio.TimeoutError:
-            logger.error("PDF extraction timed out", url=safe_url[:100])
-            raise ExtractionError(
-                f"PDF extraction timed out: {safe_url[:100]}",
-                document_url=safe_url,
-            )
-        finally:
+        if document_format is DocumentFormat.HTML:
+            html_bytes = artifact.data
+            del artifact
+            text = await asyncio.to_thread(sanitize_html_text, html_bytes)
+            del html_bytes
+            if not text:
+                raise ExtractionError(
+                    f"HTML attachment page contained no usable text: {safe_url[:100]}",
+                    document_url=safe_url,
+                    document_type="html",
+                )
+            result: Dict[str, Any] = {
+                "success": True,
+                "text": text,
+                "method": "html_sanitized",
+                "page_count": 0,
+                "ocr_pages": 0,
+                "extraction_time": 0.0,
+            }
+        else:
+            fd, document_path = tempfile.mkstemp(suffix=temporary_suffix)
             try:
-                os.unlink(pdf_path)
-            except OSError:
-                pass
+                with os.fdopen(fd, "wb") as temporary:
+                    temporary.write(artifact.data)
+                # The guarded child reopens the tempfile. Retaining the immutable
+                # artifact here would keep a second full document copy resident
+                # in the parent for the child's entire (up to 620s) lifetime.
+                del artifact
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _extract_pdf_in_subprocess,
+                        document_path,
+                        self.pdf_extractor.ocr_threshold,
+                        self.pdf_extractor.ocr_dpi,
+                        self.pdf_extractor.detect_legislative_formatting,
+                        self.pdf_extractor.max_ocr_workers,
+                    ),
+                    timeout=620,
+                )
+            except asyncio.TimeoutError:
+                logger.error("document extraction timed out", url=safe_url[:100])
+                raise ExtractionError(
+                    f"Document extraction timed out: {safe_url[:100]}",
+                    document_url=safe_url,
+                    document_type=document_format.value,
+                )
+            finally:
+                try:
+                    os.unlink(document_path)
+                except OSError:
+                    pass
 
         if not result.get("success"):
-            raise ExtractionError(f"PDF extraction failed: {result.get('error', 'Unknown error')}")
+            raise ExtractionError(
+                f"Document extraction failed: {result.get('error', 'Unknown error')}"
+            )
 
-        # Write-once: the freshly manufactured ground truth enters the corpus.
-        # Every future encounter with these bytes is a lookup, not an extraction.
         corpus_persisted = False
-        if corpus_store and content_sha256:
-            corpus_persisted = await corpus_store.persist_extraction(content_sha256, result)
-
-        # Operational ingestion callers need to distinguish "text extracted"
-        # from "text durably entered the corpus". Normal analysis callers can
-        # continue to treat corpus persistence as best-effort.
-        result["content_sha256"] = content_sha256
-        result["corpus_persisted"] = corpus_persisted
-
-        logger.debug("pdf extracted", url=safe_url, pages=result.get("page_count", 0))
+        if corpus_store:
+            corpus_persisted = await corpus_store.persist_extraction(
+                content_sha256, result
+            )
+        result.update(
+            content_sha256=content_sha256,
+            corpus_persisted=corpus_persisted,
+            document_format=document_format.value,
+            source_url=source_identity,
+        )
+        logger.debug(
+            "document extracted",
+            url=safe_url,
+            document_format=document_format.value,
+            pages=result.get("page_count", 0),
+        )
         return result
+
+    async def extract_pdf_async(self, url: str, banana: Optional[str] = None) -> Dict[str, Any]:
+        """Compatibility adapter for callers migrating to typed artifacts."""
+        return await self.extract_document_async(url, banana=banana)
 
     async def process_agenda_with_cache_async(self, meeting_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -500,7 +627,7 @@ class AsyncAnalyzer:
 
         try:
             # Extract PDF text (async download + thread pool extraction)
-            result = await self.extract_pdf_async(url, banana=banana)
+            result = await self.extract_document_async(url, banana=banana)
 
             if result.get("success") and result.get("text"):
                 extracted_text = result["text"]

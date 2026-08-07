@@ -67,7 +67,8 @@ def parse_legislation_attachments(html: str, base_url: str) -> List[Dict[str, An
         return attachments
 
     for link in links:
-        href = link.get('href', '')
+        href_value = link.get('href')
+        href = href_value if isinstance(href_value, str) else ''
         name = link.get_text(strip=True)
 
         if not href or not name:
@@ -135,7 +136,8 @@ def parse_novusagenda_html_agenda(html: str) -> Dict[str, Any]:
 
         for sequence, link in enumerate(coversheet_links, 1):
             # Extract ItemID from href
-            href = link.get('href', '')
+            href_value = link.get('href')
+            href = href_value if isinstance(href_value, str) else ''
             item_id_match = re.search(r'ItemID=(\d+)', href)
             if not item_id_match:
                 continue
@@ -287,7 +289,11 @@ def parse_html_agenda(html: str, meeting_id: str, base_url: str) -> Dict[str, An
 
             # Extract File # and legislation ID (always column 0)
             file_cell = cells[0]
-            file_link = file_cell.find('a', href=lambda x: x and 'LegislationDetail.aspx' in x)
+            file_link = file_cell.find(
+                'a',
+                href=lambda value: isinstance(value, str)
+                and 'LegislationDetail.aspx' in value,
+            )
 
             if not file_link:
                 logger.debug("row has no LegislationDetail link, skipping", parser="legistar", row=sequence)
@@ -296,7 +302,8 @@ def parse_html_agenda(html: str, meeting_id: str, base_url: str) -> Dict[str, An
             file_number = file_link.get_text(strip=True)
 
             # Extract legislation ID from URL (ID=7494673)
-            href = file_link.get('href', '')
+            href_value = file_link.get('href')
+            href = href_value if isinstance(href_value, str) else ''
             legislation_id_match = re.search(r'ID=(\d+)', href)
             legislation_id = legislation_id_match.group(1) if legislation_id_match else None
 
@@ -416,7 +423,12 @@ def parse_aada_html(html: str, meeting_id: str, base_url: str) -> Dict[str, Any]
 
         # Confirm this looks like an item number by checking if it shares a class
         # with known bold/title elements, or if we haven't locked in a bold class yet
-        span_classes = span.get('class', [])
+        class_value = span.get('class')
+        span_classes = (
+            [value for value in class_value if isinstance(value, str)]
+            if isinstance(class_value, list)
+            else []
+        )
         if bold_class is None:
             # First item number found -- lock in its class as the bold class
             bold_class = span_classes[0] if span_classes else None

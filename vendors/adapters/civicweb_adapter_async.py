@@ -27,7 +27,7 @@ Slug is the civicweb subdomain (e.g. 'sonomacity' for sonomacity.civicweb.net).
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin
 
@@ -330,4 +330,3 @@ class AsyncCivicWebAdapter(AsyncBaseAdapter):
                 pass
 
         return None
-

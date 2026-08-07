@@ -598,9 +598,9 @@ class EdgeCaseTests:
     async def test_track_matters_flow_unchanged_attachments(self):
         """Test B: Full transaction flow with unchanged substantive attachments.
         This is the test that would have caught the Fix 1 ordering bug.
-        Simulates: store_meeting -> _track_matters (collects pending_copies) ->
-        store_agenda_items -> execute pending_copies. Asserts the target item
-        row ends up with the copied prior-appearance summary, without FK violation."""
+        Simulates the current post-write authoritative publication boundary and
+        asserts the retained target row receives the prior summary without a
+        redundant matter publication."""
         test_name = "Flow test: unchanged attachments -> copy summary"
         banana = "testsnapeCA"
         try:
@@ -643,33 +643,60 @@ class EdgeCaseTests:
             async with self.db.pool.acquire() as conn:
                 async with conn.transaction():
                     await self.db.meetings.store_meeting(target_meeting, conn=conn)
+                    pre_links = await self.db.items.get_item_matter_links(
+                        target_meeting_id, conn=conn
+                    )
+                    affected_matter_ids = orchestrator._affected_matter_ids(
+                        pre_links, [target_item]
+                    )
                     matters_stats = await orchestrator._track_matters(
-                        target_meeting, items_data, [target_item], conn=conn
+                        target_meeting,
+                        items_data,
+                        [target_item],
+                        affected_matter_ids=affected_matter_ids,
+                        conn=conn,
                     )
                     await self.db.items.store_agenda_items(
                         target_meeting_id, [target_item], conn=conn
                     )
-                    # Fix 1: execute deferred copies after items are stored
-                    for pending in matters_stats.get('pending_copies', []):
-                        await self.db.items.copy_summary_from_prior_appearance(
-                            matter_id=pending['matter_id'],
-                            target_item_id=pending['target_item_id'],
-                            target_meeting_id=pending['target_meeting_id'],
-                            conn=conn,
-                        )
+                    await orchestrator._reconcile_matter_appearances(
+                        target_meeting,
+                        matters_stats.get("appearance_outcomes", {}),
+                        affected_matter_ids=affected_matter_ids,
+                        observed_votes=matters_stats.get("observed_votes", {}),
+                        conn=conn,
+                    )
+                    await orchestrator._publish_authoritative_work(
+                        meeting_id=target_meeting_id,
+                        affected_matter_ids=set(
+                            matters_stats.get("affected_matter_ids", set())
+                        ),
+                        procedural_matter_ids=set(
+                            matters_stats.get("procedural_matter_ids", set())
+                        ),
+                        conn=conn,
+                        publish_meeting=False,
+                    )
+                    matter_publications = await conn.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM pipeline_outbox
+                        WHERE event_type = 'queue.enqueue'
+                          AND payload->>'source_url' = $1
+                        """,
+                        f"matter://{matter_id}",
+                    )
 
             retrieved = await self.db.items.get_agenda_item(target_item_id)
 
             # Assertions:
             # 1. Transaction did not roll back (we got here without exception)
-            # 2. pending_copies was populated (attachments_unchanged path fired)
-            # 3. Target item now carries the prior appearance's summary
-            # 4. No new matter job was enqueued (pending_jobs empty)
+            # 2. Target item now carries the prior appearance's summary
+            # 3. No new matter publication was recorded
             checks = [
-                (len(matters_stats.get('pending_copies', [])) == 1, "pending_copies has 1 entry"),
-                (len(matters_stats.get('pending_jobs', [])) == 0, "pending_jobs empty"),
                 (retrieved is not None, "target item exists"),
                 (retrieved and retrieved.summary == "First-reading frozen snapshot summary", "summary copied from prior"),
+                (matter_publications == 0, "matter publication suppressed"),
             ]
             failed = [msg for ok, msg in checks if not ok]
             if not failed:
@@ -727,25 +754,54 @@ class EdgeCaseTests:
             async with self.db.pool.acquire() as conn:
                 async with conn.transaction():
                     await self.db.meetings.store_meeting(target_meeting, conn=conn)
+                    pre_links = await self.db.items.get_item_matter_links(
+                        target_meeting_id, conn=conn
+                    )
+                    affected_matter_ids = orchestrator._affected_matter_ids(
+                        pre_links, [target_item]
+                    )
                     matters_stats = await orchestrator._track_matters(
-                        target_meeting, items_data, [target_item], conn=conn
+                        target_meeting,
+                        items_data,
+                        [target_item],
+                        affected_matter_ids=affected_matter_ids,
+                        conn=conn,
                     )
                     await self.db.items.store_agenda_items(
                         target_meeting_id, [target_item], conn=conn
                     )
-                    for pending in matters_stats.get('pending_copies', []):
-                        await self.db.items.copy_summary_from_prior_appearance(
-                            matter_id=pending['matter_id'],
-                            target_item_id=pending['target_item_id'],
-                            target_meeting_id=pending['target_meeting_id'],
-                            conn=conn,
-                        )
+                    await orchestrator._reconcile_matter_appearances(
+                        target_meeting,
+                        matters_stats.get("appearance_outcomes", {}),
+                        affected_matter_ids=affected_matter_ids,
+                        observed_votes=matters_stats.get("observed_votes", {}),
+                        conn=conn,
+                    )
+                    await orchestrator._publish_authoritative_work(
+                        meeting_id=target_meeting_id,
+                        affected_matter_ids=set(
+                            matters_stats.get("affected_matter_ids", set())
+                        ),
+                        procedural_matter_ids=set(
+                            matters_stats.get("procedural_matter_ids", set())
+                        ),
+                        conn=conn,
+                        publish_meeting=False,
+                    )
+                    matter_publications = await conn.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM pipeline_outbox
+                        WHERE event_type = 'queue.enqueue'
+                          AND payload->>'source_url' = $1
+                        """,
+                        f"matter://{matter_id}",
+                    )
 
             retrieved = await self.db.items.get_agenda_item(target_item_id)
 
             checks = [
-                (len(matters_stats.get('pending_jobs', [])) == 1, "pending_jobs has 1 entry"),
-                (len(matters_stats.get('pending_copies', [])) == 0, "pending_copies empty"),
+                (matter_publications == 1, "one matter publication recorded"),
                 (retrieved is not None, "target item exists"),
                 (retrieved and retrieved.summary is None, "summary left NULL for matter job to fill"),
             ]
@@ -765,6 +821,9 @@ class EdgeCaseTests:
                 await conn.execute("DELETE FROM meetings WHERE id LIKE 'test_%'")
                 await conn.execute("DELETE FROM jurisdictions WHERE banana LIKE 'test%' OR banana LIKE 'city%'")
                 await conn.execute("DELETE FROM queue WHERE source_url LIKE 'https://test.com%'")
+                await conn.execute(
+                    "DELETE FROM pipeline_outbox WHERE aggregate_id LIKE 'testsnap%'"
+                )
                 await conn.execute("DELETE FROM city_matters WHERE id LIKE 'test_%' OR banana LIKE 'testsnap%'")
             logger.info("cleaned up test data")
         except Exception as e:

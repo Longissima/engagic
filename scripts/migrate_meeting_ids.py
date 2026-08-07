@@ -10,7 +10,7 @@ Old formats varied by vendor:
 - Berkeley/Menlo Park: {vendor}_{YYYYMMDD}
 
 New format: {banana}_{8-char-md5}
-Hash input: {banana}:{vendor_id}:{date_iso}:{title}
+Hash input: {banana}:{vendor_id}:{date_iso_or_undated}:{title}
 
 Usage:
     python scripts/migrate_meeting_ids.py --dry-run  # Preview changes
@@ -24,6 +24,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -39,7 +40,12 @@ logger = logging.getLogger("migrate_meeting_ids")
 DATABASE_URL = "postgresql://engagic:engagic@localhost:5432/engagic"
 
 
-def extract_vendor_id(old_id: str, vendor: str, date: datetime, title: str) -> str:
+def extract_vendor_id(
+    old_id: str,
+    vendor: str,
+    date: Optional[datetime],
+    title: str,
+) -> str:
     """Extract vendor_id from old meeting ID based on vendor type.
 
     For vendors with raw IDs (Legistar, PrimeGov, etc): old_id IS the vendor_id
@@ -176,11 +182,6 @@ async def migrate(dry_run: bool = True):
             title = row["title"] or "Unknown Meeting"
             date = row["date"]
             vendor = row["vendor"]
-
-            if not date:
-                logger.warning(f"Skipping {old_id}: no date")
-                skipped += 1
-                continue
 
             # Extract vendor_id from old format
             vendor_id = extract_vendor_id(old_id, vendor, date, title)

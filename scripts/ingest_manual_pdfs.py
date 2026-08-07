@@ -22,7 +22,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import fitz
 
@@ -30,9 +30,62 @@ from config import Config, get_logger
 from database.db_postgres import Database
 from database.id_generation import generate_item_id, generate_meeting_id
 from database.models import AgendaItem, AttachmentInfo, Meeting
+from pipeline.utils import meeting_work_version
 from vendors.adapters.parsers.agenda_chunker import parse_agenda_pdf, _extract_memo_content
 
 logger = get_logger(__name__).bind(component="manual_ingest")
+
+
+async def _store_and_publish_meeting(
+    db: Database,
+    meeting: Meeting,
+    agenda_items: List[AgendaItem],
+    *,
+    priority: int = 100,
+) -> int:
+    """Commit one authoritative manual snapshot and its outbox intent together."""
+    async with db.pool.acquire() as conn:
+        async with conn.transaction():
+            await db.meetings.store_meeting(meeting, conn=conn)
+            stored = await db.items.store_agenda_items(
+                meeting.id,
+                agenda_items,
+                conn=conn,
+            )
+
+            # Existing summarized items are freeze-on-summary, so the proposed
+            # in-memory packet can differ from what the upsert retained. Re-read
+            # the locked rows and publish exactly the descriptor now in the DB.
+            authoritative_meeting = await db.meetings.get_meeting(
+                meeting.id,
+                conn=conn,
+                lock_for_update=True,
+            )
+            if authoritative_meeting is None:  # pragma: no cover - same UoW insert
+                raise RuntimeError(
+                    f"manual meeting disappeared before publication: {meeting.id}"
+                )
+            authoritative_items = await db.items.get_agenda_items(
+                meeting.id,
+                conn=conn,
+                lock_for_update=True,
+            )
+            work_version = meeting_work_version(
+                authoritative_meeting,
+                authoritative_items,
+            )
+            await db.pipeline_lifecycle.enqueue_queue_job(
+                source_url=f"meeting://{meeting.id}",
+                job_type="meeting",
+                payload={"meeting_id": meeting.id},
+                aggregate_id=meeting.id,
+                meeting_id=meeting.id,
+                banana=authoritative_meeting.banana,
+                priority=priority,
+                work_version=work_version,
+                conn=conn,
+            )
+    return stored
 
 
 def extract_date_from_filename(filename: str) -> Optional[datetime]:
@@ -406,18 +459,10 @@ async def ingest_city(banana: str, pdf_dir: str) -> None:
                 attachments=attachments,
             ))
 
-        # Store
-        await db.meetings.store_meeting(meeting)
-        stored = await db.items.store_agenda_items(meeting_id, agenda_items)
-
-        # Enqueue
-        await db.queue.enqueue_job(
-            source_url=f"meeting://{meeting_id}",
-            job_type="meeting",
-            payload={"meeting_id": meeting_id},
-            meeting_id=meeting_id,
-            banana=banana,
-            priority=100,
+        stored = await _store_and_publish_meeting(
+            db,
+            meeting,
+            agenda_items,
         )
 
         meetings_stored += 1
@@ -447,7 +492,7 @@ def main():
     banana = sys.argv[1]
 
     if not re.match(r'^[a-zA-Z0-9-]+$', banana):
-        print(f"Invalid banana identifier: must be alphanumeric/hyphens only")
+        print("Invalid banana identifier: must be alphanumeric/hyphens only")
         sys.exit(1)
 
     pdf_dir = None

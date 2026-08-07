@@ -4,6 +4,13 @@ from database import migrate as migration_module
 
 
 class FakeConnection:
+    def __init__(self):
+        self.fetch_calls = []
+
+    async def fetch(self, query, *args):
+        self.fetch_calls.append((query, args))
+        return []
+
     async def close(self):
         pass
 
@@ -85,3 +92,26 @@ def test_migration_help_exits_before_any_database_action(monkeypatch, capsys):
     assert exit_info.value.code == 0
     assert "--rollback" in capsys.readouterr().out
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_migration_status_is_read_only(monkeypatch, tmp_path, capsys):
+    connection = FakeConnection()
+    ensure_called = False
+
+    async def fake_connection():
+        return connection
+
+    async def forbidden_ensure(_connection):
+        nonlocal ensure_called
+        ensure_called = True
+
+    monkeypatch.setattr(migration_module, "get_connection", fake_connection)
+    monkeypatch.setattr(migration_module, "ensure_migrations_table", forbidden_ensure)
+    monkeypatch.setattr(migration_module, "MIGRATIONS_DIR", tmp_path)
+
+    await migration_module.status()
+
+    assert ensure_called is False
+    assert all("CREATE" not in query.upper() for query, _ in connection.fetch_calls)
+    assert "Pending Migrations" in capsys.readouterr().out

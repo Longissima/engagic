@@ -35,7 +35,7 @@ Connection Patterns
 
 import asyncpg
 from asyncpg import Connection
-from typing import Any, List, Optional
+from typing import Any, AsyncIterator, List, Optional, cast
 from contextlib import asynccontextmanager
 
 from config import get_logger
@@ -92,7 +92,7 @@ class BaseRepository:
             await conn.executemany(query, args)
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self) -> AsyncIterator[Connection]:
         """Context manager for explicit transactions
 
         Usage:
@@ -107,10 +107,15 @@ class BaseRepository:
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
-                yield conn
+                # asyncpg acquires a transparent PoolConnectionProxy. Its
+                # public operation surface is Connection-compatible, and the
+                # cast keeps repository UoW call sites precisely typed.
+                yield cast(Connection, conn)
 
     @asynccontextmanager
-    async def _ensure_conn(self, conn: Optional[Connection] = None):
+    async def _ensure_conn(
+        self, conn: Optional[Connection] = None
+    ) -> AsyncIterator[Connection]:
         """Use provided connection or create new transaction.
 
         Allows methods to participate in caller's transaction when conn is passed.

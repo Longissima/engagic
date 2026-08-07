@@ -234,6 +234,8 @@ class DeliberationRepository(BaseRepository):
                 """,
                 deliberation_id,
             )
+            if max_row is None:  # pragma: no cover - aggregate always returns a row
+                raise RuntimeError("participant number aggregate returned no row")
             next_number = (max_row["max_num"] or 0) + 1
 
             # Insert new participant
@@ -334,6 +336,8 @@ class DeliberationRepository(BaseRepository):
                     """,
                     deliberation_id,
                 )
+                if max_row is None:  # pragma: no cover - aggregate always yields
+                    raise RuntimeError("participant number aggregate returned no row")
                 participant_number = (max_row["max_num"] or 0) + 1
                 await conn.execute(
                     """
@@ -375,6 +379,9 @@ class DeliberationRepository(BaseRepository):
                     participant_number=participant_number,
                 )
                 return {"error": "duplicate"}
+
+            if row is None:  # pragma: no cover - INSERT RETURNING always yields
+                raise RuntimeError("comment insert returned no row")
 
             logger.info(
                 "created comment",

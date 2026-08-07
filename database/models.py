@@ -90,6 +90,7 @@ class MatterMetadata(BaseModel):
     """
     model_config = ConfigDict(extra="forbid")
     attachment_hash: Optional[str] = None
+    work_version: Optional[str] = None
     disposition: Optional[str] = None
     attempts: int = 0
 
@@ -499,4 +500,3 @@ class AgendaItem:
             del data["matter"]
 
         return data
-

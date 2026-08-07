@@ -25,7 +25,6 @@ import fitz
 import re
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 from difflib import SequenceMatcher
 
 
@@ -217,7 +216,7 @@ def _extract_page_text_with_positions(page):
                 "font_name": dominant["font"],
                 "page": page.number,
             })
-    lines.sort(key=lambda l: (l["y0"], l["x0"]))
+    lines.sort(key=lambda line: (line["y0"], line["x0"]))
     return lines
 
 
@@ -371,7 +370,7 @@ def _is_attachment_url(url):
 
 
 def _extract_meeting_metadata(lines, meta):
-    first_lines = [l["text"] for l in lines[:30]]
+    first_lines = [line["text"] for line in lines[:30]]
     joined = "\n".join(first_lines)
 
     body_patterns = [
@@ -409,9 +408,9 @@ def _extract_meeting_metadata(lines, meta):
             meta.meeting_date = m.group(1).strip()
             break
 
-    for l in lines[:10]:
-        if l["is_bold"] and l["font_size"] >= 14:
-            meta.title = l["text"].strip()
+    for line in lines[:10]:
+        if line["is_bold"] and line["font_size"] >= 14:
+            meta.title = line["text"].strip()
             break
     if not meta.title:
         meta.title = "Agenda"
@@ -596,6 +595,7 @@ def _parse_toc_hierarchical(doc, toc, result):
         item_num, item_title = _parse_toc_item_title(title)
         if not item_num:
             continue
+        assert item_title is not None
 
         section = _infer_section_from_prefix(item_num)
 
@@ -684,7 +684,6 @@ def _parse_toc_flat(doc, toc, result):
             end_page = max(page_0, next_p)
 
             memo = _extract_memo_content(doc, page_0, end_page)
-            memo._toc_title = title
             memos.append(memo)
 
         # Match memos to items by text similarity
@@ -742,6 +741,7 @@ def _build_items_from_toc_entries(doc, toc, toc_entries_beyond, agenda_end, resu
         if item_num is None:
             item_num = ""
             item_title = title.strip()
+        assert item_title is not None
 
         # Find this item's page range: from its page to the next L1's page - 1
         next_l1_page = None
@@ -1092,7 +1092,9 @@ def _find_owning_item_strict(link, item_boundaries):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def parse_agenda(pdf_path: str, force_method: str = None) -> ParsedAgenda:
+def parse_agenda(
+    pdf_path: str, force_method: str | None = None
+) -> ParsedAgenda:
     doc = fitz.open(pdf_path)
     result = ParsedAgenda()
 
@@ -1176,7 +1178,7 @@ if __name__ == "__main__":
                     if memo.recommended_action:
                         print(f"      Rec: {memo.recommended_action[:100]}...")
             if not item.attachments and not item.memos:
-                print(f"  Attachments: none")
+                print("  Attachments: none")
 
         if result.orphan_links:
             print(f"\n{'=' * 60}")

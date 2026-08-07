@@ -13,15 +13,15 @@ Slug should be the city banana (e.g., "sandiegoCA").
 
 import asyncio
 import json
-import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
 
 from bs4 import BeautifulSoup
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
+from vendors.adapters.html_attrs import string_attr
 from vendors.adapters.parsers.granicus_parser import parse_agendaonline_html
 from pipeline.protocols import MetricsCollector
 
@@ -226,8 +226,11 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
         # Method 2: Extract from static HTML links (fallback)
         if not meetings:
             soup = BeautifulSoup(html, "html.parser")
-            for link in soup.find_all("a", href=lambda x: x and "ViewMeeting" in x and "id=" in x):
-                href = link.get("href", "")
+            for link in soup.find_all(
+                "a",
+                href=lambda value: bool(value and "ViewMeeting" in value and "id=" in value),
+            ):
+                href = string_attr(link, "href")
                 title = link.get_text(strip=True)
 
                 if not title:
@@ -375,10 +378,11 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
             if items:
                 items = await self._fetch_item_attachments(items, meeting_id, base_url)
 
+            meeting_date = meeting_data.get("date")
             meeting = {
                 "vendor_id": meeting_id,
                 "title": meeting_data.get("title", ""),
-                "start": meeting_data.get("date").isoformat() if meeting_data.get("date") else "",
+                "start": meeting_date.isoformat() if meeting_date is not None else "",
             }
 
             minutes_href = meeting_data.get("minutes_url")
@@ -480,7 +484,7 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
         domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
         for link in soup.find_all("a", href=True):
-            href = link.get("href", "")
+            href = string_attr(link, "href")
             if "DownloadFile" not in href:
                 continue
 
@@ -526,7 +530,7 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
         # Look for "Agenda Packet" link
         for link in soup.find_all("a", href=True):
             text = link.get_text(strip=True).lower()
-            href = link.get("href", "")
+            href = string_attr(link, "href")
 
             if "packet" in text and (".pdf" in href.lower() or "DownloadFile" in href):
                 if href.startswith("/"):

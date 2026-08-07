@@ -9,20 +9,32 @@ The store's contract under test:
 
 import asyncio
 import io
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from corpus.r2 import R2Error
-from corpus.store import CorpusStore, sha256_hex
+from corpus.store import CorpusOriginal, CorpusStore, sha256_hex
 
 
 class FakeBlobRepo:
     def __init__(self):
         self.blobs = {}
         self.sources = []
+        self.source_state = {}
 
     async def get_blob(self, sha):
         return dict(self.blobs[sha]) if sha in self.blobs else None
+
+    async def get_blob_for_identity(self, source_identity):
+        for sha, identity, _banana in reversed(self.sources):
+            if identity == source_identity:
+                blob = await self.get_blob(sha)
+                if blob:
+                    blob.update(self.source_state[(sha, identity)])
+                return blob
+        return None
 
     async def upsert_blob(self, sha, byte_count, content_type=None):
         self.blobs.setdefault(
@@ -56,8 +68,46 @@ class FakeBlobRepo:
             text_chars=text_chars,
         )
 
-    async def record_source(self, sha, source_identity, banana=None):
+    async def record_source_observation(self, sha, source_identity, banana=None):
         self.sources.append((sha, source_identity, banana))
+        state = self.source_state.setdefault(
+            (sha, source_identity),
+            {
+                "etag": None,
+                "last_modified": None,
+                "last_observed_at": None,
+                "last_validated_at": None,
+                "last_validation_attempt_at": None,
+            },
+        )
+        state["last_observed_at"] = datetime.now()
+
+    async def record_source_validation(
+        self,
+        sha,
+        source_identity,
+        banana=None,
+        *,
+        etag=None,
+        last_modified=None,
+    ):
+        self.sources.append((sha, source_identity, banana))
+        now = datetime.now()
+        self.source_state[(sha, source_identity)] = {
+            "etag": etag,
+            "last_modified": last_modified,
+            "last_observed_at": now,
+            "last_validated_at": now,
+            "last_validation_attempt_at": now,
+        }
+
+    async def record_source_validation_failure(
+        self, sha, source_identity, banana=None
+    ):
+        del banana
+        state = self.source_state[(sha, source_identity)]
+        state["last_observed_at"] = datetime.now()
+        state["last_validation_attempt_at"] = datetime.now()
 
 
 class FakeR2:
@@ -139,6 +189,101 @@ def test_second_archive_skips_upload_but_records_source():
                                source_url="https://b.example/y.pdf"))
     assert store.r2.put_calls == 1
     assert len(repo.sources) == 2
+
+
+def test_original_identity_read_preserves_hash_and_media_type():
+    store, _ = make_store()
+    source_url = "https://a.example/x.pdf?sig=volatile"
+    run(store.archive_original(
+        SHA,
+        byte_count=len(PDF_BYTES),
+        data=PDF_BYTES,
+        source_url=source_url,
+    ))
+
+    original = run(store.get_original_artifact_by_identity(source_url))
+
+    assert original is not None
+    assert original.data == PDF_BYTES
+    assert original.content_sha256 == SHA
+    assert original.content_type == "application/pdf"
+    assert original.last_validated_at is not None
+    assert run(store.get_original_by_identity(source_url)) == PDF_BYTES
+
+
+def test_cache_sighting_does_not_advance_origin_validation():
+    store, repo = make_store()
+    source_url = "https://a.example/x.pdf"
+    run(store.archive_original(
+        SHA,
+        byte_count=len(PDF_BYTES),
+        data=PDF_BYTES,
+        source_url=source_url,
+        etag='"v1"',
+        last_modified="Wed, 01 Jul 2026 12:00:00 GMT",
+    ))
+    state = repo.source_state[(SHA, source_url)]
+    validated_at = state["last_validated_at"]
+
+    run(store.record_sighting(SHA, source_url, "exampleCA"))
+
+    assert state["last_validated_at"] == validated_at
+    assert state["last_observed_at"] >= validated_at
+
+
+def test_corpus_original_freshness_and_failure_backoff():
+    now = datetime(2026, 8, 7, 12, 0, 0)
+    fresh = CorpusOriginal(
+        PDF_BYTES,
+        SHA,
+        "application/pdf",
+        last_validated_at=now - timedelta(hours=2),
+        last_validation_attempt_at=now - timedelta(hours=2),
+    )
+    assert not fresh.needs_revalidation(
+        max_age_seconds=24 * 60 * 60,
+        failure_retry_seconds=60 * 60,
+        now=now,
+    )
+
+    stale_with_recent_failure = CorpusOriginal(
+        PDF_BYTES,
+        SHA,
+        "application/pdf",
+        last_validated_at=now - timedelta(days=2),
+        last_validation_attempt_at=now - timedelta(minutes=10),
+    )
+    assert not stale_with_recent_failure.needs_revalidation(
+        max_age_seconds=24 * 60 * 60,
+        failure_retry_seconds=60 * 60,
+        now=now,
+    )
+    assert stale_with_recent_failure.needs_revalidation(
+        max_age_seconds=24 * 60 * 60,
+        failure_retry_seconds=5 * 60,
+        now=now,
+    )
+
+
+def test_schema_and_migration_define_distinct_source_clocks():
+    root = Path(__file__).resolve().parents[1]
+    schema = (root / "database/schema_postgres.sql").read_text()
+    migration = (
+        root / "database/migrations/034_document_source_freshness.sql"
+    ).read_text()
+    for field in (
+        "last_observed_at",
+        "last_validated_at",
+        "last_validation_attempt_at",
+        "etag",
+        "last_modified",
+    ):
+        assert field in schema
+        assert field in migration
+    assert "last_validated_at DESC NULLS LAST" in schema
+    assert "last_validated_at DESC NULLS LAST" in migration
+    assert "last_observed_at = COALESCE" in migration
+    assert "last_validated_at = COALESCE" not in migration
 
 
 def test_file_obj_archive_streams_and_sniffs():

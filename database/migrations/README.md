@@ -55,6 +55,14 @@ CREATE TABLE schema_migrations (
 |---------|------|-------------|
 | 001 | council_members | Council members + sponsorships tables |
 | 019 | jurisdictions | Rename `cities` -> `jurisdictions`, add `type` column (city/county/transit/utility/etc.), rename `county` -> `county_banana` with self-referencing FK for hierarchical jurisdiction relationships. Full rollback support. |
+| 029 | pipeline_lifecycle | Durable pipeline runs, job attempts, stage events, and transactional outbox. |
+| 030 | batch_lifecycle | Recoverable Batch provider intents, polling clocks, leases, and submission identities. |
+| 031 | jurisdiction_sync_lifecycle | Set-wise sync scheduling inputs and jurisdiction lifecycle state. |
+| 032 | outbox_delivery | FIFO outbox delivery with per-claim UUID fencing, leases, retries, dead letters, and the shared monotonic work-generation sequence. |
+| 033 | queue_claim_ownership | Per-claim queue ownership, stable claim/heartbeat clocks, separate ready-work time, and generation-fenced desired work. |
+| 034 | document_source_freshness | Separate cached observations from successful origin validation; persist HTTP validators and retry-attempt state for bounded conditional revalidation. |
+| 035 | batch_submission_clock | Record provider acceptance separately from durable pre-provider intent creation so provider wait is measured from the correct boundary. |
+| 036 | nullable_appearance_dates | Preserve authoritative appearances for undated meetings by allowing `matter_appearances.appeared_at` to remain NULL. |
 
 ## Guidelines
 

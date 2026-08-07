@@ -6,10 +6,11 @@ Cities using NovusAgenda: Hagerstown MD, Houston TX, and others
 
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 import aiohttp
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
+from vendors.adapters.html_attrs import string_attr
 from vendors.adapters.parsers.novusagenda_parser import parse_html_agenda
 from pipeline.protocols import MetricsCollector
 from bs4 import BeautifulSoup
@@ -120,7 +121,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
 
             if pdf_link:
                 # Extract meeting ID
-                pdf_href = pdf_link.get("href", "")
+                pdf_href = string_attr(pdf_link, "href")
                 meeting_id_match = re.search(r"MeetingID=(\d+)", pdf_href)
                 if meeting_id_match:
                     meeting_id = meeting_id_match.group(1)
@@ -134,7 +135,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                 link_text = link.get_text(strip=True).lower()
                 img = link.find("img")
                 if img:
-                    alt_text = img.get("alt", "").lower()
+                    alt_text = string_attr(img, "alt").lower()
                     link_text = f"{link_text} {alt_text}".strip()
 
                 score = 0
@@ -148,7 +149,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                     best_agenda_link = link
 
             if best_agenda_link:
-                onclick = best_agenda_link.get("onclick", "")
+                onclick = string_attr(best_agenda_link, "onclick")
                 url_match = re.search(r"MeetingView\.aspx\?[^'\"]+", onclick)
                 if url_match:
                     agenda_relative_url = url_match.group(0)
@@ -166,11 +167,17 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
             minutes_url = None
             minutes_pdf_link = row.find("a", href=re.compile(r"DisplayMinutesPDF\.ashx", re.IGNORECASE))
             if minutes_pdf_link:
-                minutes_url = f"{self.base_url}/agendapublic/{minutes_pdf_link.get('href', '')}"
+                minutes_url = (
+                    f"{self.base_url}/agendapublic/"
+                    f"{string_attr(minutes_pdf_link, 'href')}"
+                )
             else:
                 minutes_view_link = row.find("a", onclick=re.compile(r"doctype=Minutes"))
                 if minutes_view_link:
-                    minutes_match = re.search(r"MeetingView\.aspx\?[^'\"]+", minutes_view_link.get("onclick", ""))
+                    minutes_match = re.search(
+                        r"MeetingView\.aspx\?[^'\"]+",
+                        string_attr(minutes_view_link, "onclick"),
+                    )
                     if minutes_match:
                         minutes_url = f"{self.base_url}/agendapublic/{minutes_match.group(0)}"
 
@@ -347,7 +354,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
         seen_ids = set()
 
         for link in soup.find_all("a", href=re.compile(r"AttachmentViewer\.ashx", re.IGNORECASE)):
-            href = link.get("href", "")
+            href = string_attr(link, "href")
             att_id_match = re.search(r"AttachmentID=(\d+)", href)
             if not att_id_match:
                 continue

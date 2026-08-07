@@ -26,13 +26,14 @@ import asyncio
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from urllib.parse import urljoin
 
 import aiohttp
 from bs4 import BeautifulSoup
 
 from config import config, get_logger
+from vendors.adapters.html_attrs import string_list_attr
 from exceptions import VendorHTTPError
 from pipeline.protocols import MetricsCollector
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter
@@ -253,7 +254,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
 
         try:
             resp = await session.request(
-                method, url,
+                cast(Any, method), url,
                 proxies={"https": self._proxy, "http": self._proxy},
                 timeout=300,  # 5 min -- large PDFs (25MB+) through residential proxy
             )
@@ -451,7 +452,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             # Map cells by CSS class prefix
             cell_map: Dict[str, Any] = {}
             for cell in cells:
-                for cls in cell.get("class", []):
+                for cls in string_list_attr(cell, "class"):
                     if cls.startswith("views-field-"):
                         cell_map[cls] = cell
                         break
@@ -652,10 +653,13 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         logger.info("municode meetings retrieved", vendor="municode", slug=self.slug, count=len(meetings))
 
         # Process meetings concurrently (with limit)
-        results = await self._bounded_gather(
-            [self._process_meeting(m) for m in meetings],
-            max_concurrent=5,
-            return_exceptions=False,
+        results = cast(
+            List[Optional[Dict[str, Any]]],
+            await self._bounded_gather(
+                [self._process_meeting(m) for m in meetings],
+                max_concurrent=5,
+                return_exceptions=False,
+            ),
         )
 
         processed = [r for r in results if r is not None]
@@ -826,8 +830,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                 # Find columns by CSS class — order varies across cities
                 cell_map = {}
                 for cell in cells:
-                    classes = cell.get("class", [])
-                    for cls in classes:
+                    for cls in string_list_attr(cell, "class"):
                         if cls in ("meeting", "date", "time", "venue", "agenda", "packet", "minutes"):
                             cell_map[cls] = cell
                             break

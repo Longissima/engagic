@@ -25,7 +25,7 @@ The adapter tries search mode first, falls back to AMID if no results.
 import re
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin
 
@@ -113,9 +113,9 @@ class AsyncCivicEngageAdapter(AsyncBaseAdapter):
         body_categories: Dict[str, List[tuple]] = {}
 
         for option in select.find_all("option"):
-            value = option.get("value", "")
+            value = option.get("value")
             label = option.get_text(strip=True)
-            if not value or not value.isdigit() or value == "0":
+            if not isinstance(value, str) or not value.isdigit() or value == "0":
                 continue
             # Filter: must look like an agenda category, not minutes/audio/video
             if SKIP_CATEGORY_KEYWORDS.search(label):

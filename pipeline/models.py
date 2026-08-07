@@ -6,10 +6,10 @@ Each job type has a specific payload with required fields.
 Runtime validation catches type errors before queue insertion.
 """
 
-from pydantic.dataclasses import dataclass
 from dataclasses import asdict, field
-from typing import Literal, Union, List, Dict, Any, Optional
-import json
+from typing import Any, Dict, List, Literal, Optional, Union
+
+from pydantic.dataclasses import dataclass
 
 
 @dataclass
@@ -42,27 +42,24 @@ class MatterJob:
     5. Fills items.summary for any appearance that has no
        snapshot yet (temporal snapshots already set stay frozen)
 
-    New payloads intentionally do not snapshot appearance item IDs. The
-    item_ids field remains as a processor compatibility shim, but deserialization
-    deliberately discards legacy snapshots so every release queries the
-    authoritative matter appearances.
+    New payloads contain only matter identity and intentionally do not snapshot
+    a representative meeting or appearance item IDs. Both legacy fields remain
+    processor compatibility shims; deserialization accepts the meeting hint but
+    deliberately discards item snapshots so every release queries authoritative
+    matter appearances.
     """
     matter_id: str  # Composite ID: {banana}_{matter_key}
-    meeting_id: str  # Representative meeting where matter appears
+    meeting_id: Optional[str] = None  # Legacy representative-meeting hint
     item_ids: List[str] = field(default_factory=list)  # Legacy payload only
 
     def to_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "matter_id": self.matter_id,
-            "meeting_id": self.meeting_id,
-        }
-        return payload
+        return {"matter_id": self.matter_id}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MatterJob":
         return cls(
             matter_id=data["matter_id"],
-            meeting_id=data["meeting_id"],
+            meeting_id=data.get("meeting_id"),
             item_ids=[],
         )
 
@@ -90,6 +87,11 @@ class QueueJob:
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     work_version: Optional[str] = None
+    last_enqueued_at: Optional[str] = None
+    claim_token: Optional[str] = None
+    claimed_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
+    ready_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary for database storage"""
@@ -103,7 +105,7 @@ class QueueJob:
 
         Database stores:
         - job_type: "meeting" | "matter"
-        - payload: JSON string of payload data
+        - payload: decoded JSON object (asyncpg JSONB codec)
         """
         job_type = row["job_type"]
         payload_data = row["payload"]
@@ -125,16 +127,25 @@ class QueueJob:
             status=row["status"],
             retry_count=row.get("retry_count", 0),
             error_message=row.get("error_message"),
-            created_at=row.get("created_at"),
-            started_at=row.get("started_at"),
-            completed_at=row.get("completed_at"),
+            created_at=_timestamp_string(row.get("created_at")),
+            started_at=_timestamp_string(row.get("started_at")),
+            completed_at=_timestamp_string(row.get("completed_at")),
             work_version=row.get("work_version"),
+            last_enqueued_at=_timestamp_string(row.get("last_enqueued_at")),
+            claim_token=(
+                str(row["claim_token"]) if row.get("claim_token") is not None else None
+            ),
+            claimed_at=_timestamp_string(row.get("claimed_at")),
+            heartbeat_at=_timestamp_string(row.get("heartbeat_at")),
+            ready_at=_timestamp_string(row.get("ready_at")),
         )
 
 
-def serialize_payload(payload: JobPayload) -> str:
-    """Serialize payload to JSON string for database storage"""
-    return json.dumps(payload.to_dict())
+def _timestamp_string(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, str):
+        return value
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if isoformat else str(value)
 
 
 def create_meeting_job(meeting_id: str, banana: str, priority: int = 0) -> Dict[str, Any]:
@@ -142,7 +153,7 @@ def create_meeting_job(meeting_id: str, banana: str, priority: int = 0) -> Dict[
     payload = MeetingJob(meeting_id=meeting_id)
     return {
         "job_type": "meeting",
-        "payload": serialize_payload(payload),
+        "payload": payload.to_dict(),
         "banana": banana,
         "priority": priority
     }
@@ -150,19 +161,24 @@ def create_meeting_job(meeting_id: str, banana: str, priority: int = 0) -> Dict[
 
 def create_matter_job(
     matter_id: str,
-    meeting_id: str,
-    banana: str,
+    meeting_id: Optional[str] = None,
+    banana: Optional[str] = None,
     priority: int = 0,
     work_version: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Helper to create matter job data for enqueueing"""
-    payload = MatterJob(
-        matter_id=matter_id,
-        meeting_id=meeting_id,
-    )
+    """Create an identity-only matter descriptor.
+
+    ``meeting_id`` remains accepted so older callers do not break, but it is no
+    longer serialized: matter processing resolves authoritative appearances by
+    ``matter_id``.
+    """
+    del meeting_id
+    if banana is None:
+        raise ValueError("banana is required")
+    payload = MatterJob(matter_id=matter_id)
     return {
         "job_type": "matter",
-        "payload": serialize_payload(payload),
+        "payload": payload.to_dict(),
         "banana": banana,
         "priority": priority,
         "work_version": work_version,

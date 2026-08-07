@@ -23,6 +23,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from config import get_logger
+from vendors.utils.attachments import classify_attachment_type as _attachment_type
 
 logger = get_logger(__name__).bind(component="vendor")
 
@@ -38,9 +39,6 @@ PROCEDURAL_TITLES = {
     'call to order', 'invocation', 'pledge of allegiance', 'roll call',
     'adjournment', 'adjourn', 'recess', 'reconvene',
 }
-
-
-from vendors.utils.attachments import classify_attachment_type as _attachment_type
 
 
 def _get_item_level(item_div) -> int:
@@ -120,7 +118,8 @@ def parse_civicplus_html(html: str, base_url: str) -> Dict[str, Any]:
         # Extract attachments
         attachments: List[Dict[str, Any]] = []
         for link in item_div.select('.documents a.file'):
-            href = link.get('href', '')
+            href_value = link.get('href')
+            href = href_value if isinstance(href_value, str) else ''
             if not href:
                 continue
             name = link.get_text(strip=True)

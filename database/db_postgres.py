@@ -71,7 +71,12 @@ class Database:
     deliberation: DeliberationRepository
     happening: HappeningRepository
 
-    def __init__(self, pool: asyncpg.Pool):
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        initialize_corpus: bool = True,
+    ):
         self.pool = pool
         self.jurisdictions = JurisdictionRepository(pool)
         self.committees = CommitteeRepository(pool)
@@ -90,9 +95,13 @@ class Database:
         self.feedback = FeedbackRepository(pool)
         self.deliberation = DeliberationRepository(pool)
 
-        # The corpus singleton rides the DB lifecycle: adapters and the
-        # analyzer reach it via corpus.get_corpus() since neither holds a DB.
-        init_corpus(self.document_blobs)
+        # The corpus singleton normally rides the DB lifecycle: adapters and
+        # the analyzer reach it via corpus.get_corpus() since neither holds a
+        # DB. Relational-only inspection callers can opt out without changing
+        # the default runtime boundary.
+        self._manages_corpus_lifecycle = initialize_corpus
+        if initialize_corpus:
+            init_corpus(self.document_blobs)
 
         logger.info("database initialized with repositories", pool_size=f"{pool._minsize}-{pool._maxsize}")
 
@@ -104,8 +113,9 @@ class Database:
         max_size: int = config.POSTGRES_POOL_MAX_SIZE,
         *,
         require_current_schema: bool = True,
+        initialize_corpus: bool = True,
     ) -> "Database":
-        """Create database with connection pool."""
+        """Create a database pool and optionally attach the corpus lifecycle."""
         if dsn is None:
             dsn = config.get_postgres_dsn()
 
@@ -142,7 +152,7 @@ class Database:
                     await pool.close()
                     raise
             logger.info("connection pool created", min_size=min_size, max_size=max_size)
-            return cls(pool)
+            return cls(pool, initialize_corpus=initialize_corpus)
         except (asyncpg.PostgresError, OSError, ConnectionError) as e:
             logger.error("failed to create connection pool", error=str(e))
             raise DatabaseConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
@@ -150,7 +160,9 @@ class Database:
     async def close(self):
         # The corpus store closes first: it holds an aiohttp session, not pool
         # connections, but its repository dies with this pool either way.
-        await close_corpus()
+        # A relational-only instance must not close a singleton it did not own.
+        if self._manages_corpus_lifecycle:
+            await close_corpus()
         # Graceful close waits to reset each connection; one left mid-operation
         # can't be reset and blocks indefinitely. Bound it, then force-terminate.
         try:

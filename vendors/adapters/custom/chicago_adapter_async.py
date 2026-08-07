@@ -619,7 +619,7 @@ class AsyncChicagoAdapter(AsyncBaseAdapter):
         # Build items from matter data
         items = []
         for pdf_item, matter_result in zip(pdf_items, matter_results):
-            if isinstance(matter_result, Exception) or not matter_result:
+            if isinstance(matter_result, BaseException) or not matter_result:
                 logger.debug(
                     "matter fetch failed for record",
                     vendor="chicago",
@@ -788,4 +788,3 @@ class AsyncChicagoAdapter(AsyncBaseAdapter):
             "vote_outcome": vote_outcome,
             "votes": votes,
         }
-

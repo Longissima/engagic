@@ -3,6 +3,8 @@
 from datetime import datetime
 from typing import Optional, List, TYPE_CHECKING
 
+from pipeline.utils import matter_title_identity
+
 if TYPE_CHECKING:
     from database.models import Meeting, AgendaItem, Matter
 
@@ -66,6 +68,8 @@ class MatterEnqueueDecider:
         current_attachment_hash: str,
         has_attachments: bool,
         current_attachment_hash_legacy: Optional[str] = None,
+        current_work_version: Optional[str] = None,
+        current_title: Optional[str] = None,
     ) -> tuple[bool, Optional[str]]:
         if not has_attachments:
             return False, "no_attachments"
@@ -91,6 +95,15 @@ class MatterEnqueueDecider:
         if not unchanged:
             # New or never-hashed content: always worth (re)processing.
             return True, None
+
+        if md and md.work_version and current_work_version:
+            if md.work_version != current_work_version:
+                return True, None
+        elif current_title:
+            if matter_title_identity(existing_matter.title) != matter_title_identity(
+                current_title
+            ):
+                return True, None
 
         if existing_matter.canonical_summary:
             return False, "attachments_unchanged"

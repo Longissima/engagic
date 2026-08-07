@@ -12,7 +12,7 @@ Design:
 - Denormalized sponsorship_count for quick stats queries
 """
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from datetime import datetime
 
 from asyncpg import Connection
@@ -37,6 +37,85 @@ class CouncilMemberRepository(BaseRepository):
     - Retrieve members by city
     - Get sponsorship history
     """
+
+    @staticmethod
+    def _normalize_vote_value(value: object) -> Optional[str]:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        normalized = value.lower().strip()
+        valid_votes = {
+            "yes",
+            "no",
+            "abstain",
+            "absent",
+            "present",
+            "recused",
+            "not_voting",
+        }
+        if normalized in valid_votes:
+            return normalized
+        return {
+            "aye": "yes",
+            "yea": "yes",
+            "nay": "no",
+            "abstained": "abstain",
+            "excused": "absent",
+            "not present": "absent",
+            "recuse": "recused",
+        }.get(normalized, "not_voting")
+
+    @staticmethod
+    async def _lock_attribution_scope(
+        banana: str,
+        conn: Connection,
+    ) -> None:
+        """Serialize exact sponsor/vote projections for one jurisdiction."""
+        await conn.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtextextended('council-attribution:' || $1, 0)
+            )
+            """,
+            banana,
+        )
+
+    @staticmethod
+    async def _recompute_attribution_counts(
+        member_ids: set[str],
+        conn: Connection,
+    ) -> None:
+        """Replace both denormalized counters from retained relationships."""
+        ordered_ids = sorted(member_ids)
+        if not ordered_ids:
+            return
+        await conn.fetch(
+            """
+            SELECT id
+            FROM council_members
+            WHERE id = ANY($1::text[])
+            ORDER BY id
+            FOR UPDATE
+            """,
+            ordered_ids,
+        )
+        await conn.execute(
+            """
+            UPDATE council_members cm
+            SET sponsorship_count = (
+                    SELECT COUNT(*)::int
+                    FROM sponsorships s
+                    WHERE s.council_member_id = cm.id
+                ),
+                vote_count = (
+                    SELECT COUNT(*)::int
+                    FROM votes v
+                    WHERE v.council_member_id = cm.id
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE cm.id = ANY($1::text[])
+            """,
+            ordered_ids,
+        )
 
     async def find_or_create_member(
         self,
@@ -475,6 +554,166 @@ class CouncilMemberRepository(BaseRepository):
 
         return created_count
 
+    async def reconcile_matter_sponsorships(
+        self,
+        *,
+        banana: str,
+        affected_matter_ids: List[str],
+        conn: Connection,
+    ) -> Dict[str, int]:
+        """Make aggregate sponsorships equal retained item sponsor evidence.
+
+        Appearances use the same stable ``meeting_id, sequence, item_id`` order
+        as matter work snapshots. Sponsor list order is preserved within each
+        appearance. The first unique normalized sponsor in that total order is
+        the one aggregate primary;
+        older appearances contribute any additional still-supported sponsors.
+        Thus an A -> B relink removes unsupported A relationships without
+        discarding a sponsor that another retained A appearance still names.
+
+        Exact sponsor and vote reconciliation share one city advisory lock.
+        This keeps overlapping member rows from being acquired in inverse
+        order by concurrent meeting transactions.
+        """
+        matter_ids = sorted(set(affected_matter_ids))
+        if not matter_ids:
+            return {"desired": 0, "deleted": 0, "members_recounted": 0}
+
+        await self._lock_attribution_scope(banana, conn)
+        rows = await conn.fetch(
+            """
+            SELECT i.matter_id, i.meeting_id, i.id AS item_id, i.sequence,
+                   i.sponsors, m.date AS meeting_date
+            FROM items i
+            JOIN meetings m ON m.id = i.meeting_id
+            WHERE i.matter_id = ANY($1::text[])
+            ORDER BY i.matter_id, i.meeting_id, i.sequence, i.id
+            """,
+            matter_ids,
+        )
+        existing_rows = await conn.fetch(
+            """
+            SELECT council_member_id, matter_id
+            FROM sponsorships
+            WHERE matter_id = ANY($1::text[])
+            ORDER BY council_member_id, matter_id
+            FOR UPDATE
+            """,
+            matter_ids,
+        )
+
+        desired_names: Dict[str, str] = {}
+        desired_last_seen: Dict[str, Optional[datetime]] = {}
+        desired_by_matter: Dict[str, List[str]] = {
+            matter_id: [] for matter_id in matter_ids
+        }
+        seen_by_matter: Dict[str, set[str]] = {
+            matter_id: set() for matter_id in matter_ids
+        }
+        for row in rows:
+            matter_id = row["matter_id"]
+            raw_sponsors = row["sponsors"] or []
+            sponsor_names = (
+                [raw_sponsors] if isinstance(raw_sponsors, str) else raw_sponsors
+            )
+            if not isinstance(sponsor_names, list):
+                continue
+            for raw_name in sponsor_names:
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    continue
+                name = raw_name.strip()
+                member_id = generate_council_member_id(banana, name)
+                desired_names.setdefault(member_id, name)
+                appeared_at = row["meeting_date"]
+                prior_seen = desired_last_seen.get(member_id)
+                if appeared_at is not None and (
+                    prior_seen is None or appeared_at > prior_seen
+                ):
+                    desired_last_seen[member_id] = appeared_at
+                else:
+                    desired_last_seen.setdefault(member_id, prior_seen)
+                if member_id not in seen_by_matter[matter_id]:
+                    seen_by_matter[matter_id].add(member_id)
+                    desired_by_matter[matter_id].append(member_id)
+
+        existing_member_ids = {
+            row["council_member_id"] for row in existing_rows
+        }
+        touched_member_ids = existing_member_ids | set(desired_names)
+        for member_id in sorted(desired_names):
+            member = await self.find_or_create_member(
+                banana,
+                desired_names[member_id],
+                desired_last_seen.get(member_id),
+                conn=conn,
+            )
+            if member.id != member_id:  # pragma: no cover - ID helper invariant
+                raise RuntimeError(
+                    "council member identity changed during sponsorship reconcile"
+                )
+
+        desired_records: List[tuple[str, str, bool, int]] = []
+        for matter_id in matter_ids:
+            for order, member_id in enumerate(
+                desired_by_matter[matter_id],
+                start=1,
+            ):
+                desired_records.append(
+                    (member_id, matter_id, order == 1, order)
+                )
+
+        desired_matters = [record[1] for record in desired_records]
+        desired_members = [record[0] for record in desired_records]
+        deleted = await conn.execute(
+            """
+            DELETE FROM sponsorships s
+            WHERE s.matter_id = ANY($1::text[])
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unnest(
+                      $2::text[], $3::text[]
+                  ) AS desired(matter_id, council_member_id)
+                  WHERE desired.matter_id = s.matter_id
+                    AND desired.council_member_id = s.council_member_id
+              )
+            """,
+            matter_ids,
+            desired_matters,
+            desired_members,
+        )
+        if desired_records:
+            await conn.executemany(
+                """
+                INSERT INTO sponsorships (
+                    council_member_id, matter_id, is_primary, sponsor_order
+                )
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (council_member_id, matter_id) DO UPDATE SET
+                    is_primary = EXCLUDED.is_primary,
+                    sponsor_order = EXCLUDED.sponsor_order
+                WHERE sponsorships.is_primary IS DISTINCT FROM
+                          EXCLUDED.is_primary
+                   OR sponsorships.sponsor_order IS DISTINCT FROM
+                          EXCLUDED.sponsor_order
+                """,
+                desired_records,
+            )
+        await self._recompute_attribution_counts(touched_member_ids, conn)
+        deleted_count = self._parse_row_count(deleted)
+        logger.debug(
+            "reconciled matter sponsorships",
+            banana=banana,
+            matters=len(matter_ids),
+            desired=len(desired_records),
+            deleted=deleted_count,
+            members_recounted=len(touched_member_ids),
+        )
+        return {
+            "desired": len(desired_records),
+            "deleted": deleted_count,
+            "members_recounted": len(touched_member_ids),
+        }
+
     # ==================
     # VOTING METHODS
     # ==================
@@ -492,8 +731,10 @@ class CouncilMemberRepository(BaseRepository):
     ) -> bool:
         """Record a single vote for a council member on a matter in a meeting.
 
-        Uses UPSERT with RETURNING - only increments vote_count on actual insert.
-        Returns True if new vote recorded, False if already exists.
+        Existing rows are corrected in place when a later authoritative scrape
+        changes the vote, sequence, date, or metadata. The denormalized count
+        increments only for a genuinely new relationship. Returns True for an
+        insert and False for an update/no-op.
         """
         async with self._ensure_conn(conn) as c:
             # Use RETURNING to detect if insert succeeded (no redundant SELECT)
@@ -514,7 +755,31 @@ class CouncilMemberRepository(BaseRepository):
             )
 
             if not result:
-                # ON CONFLICT triggered - vote already exists
+                await c.execute(
+                    """
+                    UPDATE votes
+                    SET vote = $4,
+                        vote_date = $5,
+                        sequence = $6,
+                        metadata = $7
+                    WHERE council_member_id = $1
+                      AND matter_id = $2
+                      AND meeting_id = $3
+                      AND (
+                            vote IS DISTINCT FROM $4
+                            OR vote_date IS DISTINCT FROM $5
+                            OR sequence IS DISTINCT FROM $6
+                            OR metadata IS DISTINCT FROM $7
+                          )
+                    """,
+                    council_member_id,
+                    matter_id,
+                    meeting_id,
+                    vote,
+                    vote_date,
+                    sequence,
+                    metadata,
+                )
                 return False
 
             # Only increment count when INSERT actually succeeded
@@ -562,21 +827,9 @@ class CouncilMemberRepository(BaseRepository):
             if not name or not vote_value:
                 continue
 
-            # Normalize vote value
-            vote_value = vote_value.lower().strip()
-            valid_votes = {"yes", "no", "abstain", "absent", "present", "recused", "not_voting"}
-            if vote_value not in valid_votes:
-                # Map common variations
-                vote_map = {
-                    "aye": "yes",
-                    "yea": "yes",
-                    "nay": "no",
-                    "abstained": "abstain",
-                    "excused": "absent",
-                    "not present": "absent",
-                    "recuse": "recused",
-                }
-                vote_value = vote_map.get(vote_value, "not_voting")
+            vote_value = self._normalize_vote_value(vote_value)
+            if vote_value is None:
+                continue
 
             # Find or create council member
             member = await self.find_or_create_member(banana, name, vote_date, conn=conn)
@@ -604,6 +857,143 @@ class CouncilMemberRepository(BaseRepository):
             )
 
         return recorded_count
+
+    async def reconcile_meeting_votes(
+        self,
+        *,
+        banana: str,
+        meeting_id: str,
+        affected_matter_ids: List[str],
+        observed_votes: Mapping[str, List[Dict[str, Any]]],
+        vote_date: Optional[datetime],
+        conn: Connection,
+    ) -> Dict[str, int]:
+        """Correct observed votes and remove only provably orphaned rows.
+
+        The vote schema has no item identifier. An omitted member list is
+        therefore not sufficient evidence to delete votes while the matter
+        still has any retained item in this meeting. This boundary safely:
+
+        * upserts every observed current member/value for retained matters;
+        * deletes affected matter votes only when that matter now has zero
+          retained meeting items (the guaranteed A -> B stale-link case); and
+        * recomputes exact counters for the union of old and new members.
+        """
+        matter_ids = sorted(set(affected_matter_ids))
+        if not matter_ids:
+            return {"observed": 0, "deleted": 0, "members_recounted": 0}
+
+        await self._lock_attribution_scope(banana, conn)
+        retained_rows = await conn.fetch(
+            """
+            SELECT DISTINCT matter_id
+            FROM items
+            WHERE meeting_id = $1
+              AND matter_id = ANY($2::text[])
+            ORDER BY matter_id
+            """,
+            meeting_id,
+            matter_ids,
+        )
+        retained_matter_ids = {row["matter_id"] for row in retained_rows}
+        existing_rows = await conn.fetch(
+            """
+            SELECT council_member_id, matter_id
+            FROM votes
+            WHERE meeting_id = $1
+              AND matter_id = ANY($2::text[])
+            ORDER BY council_member_id, matter_id
+            FOR UPDATE
+            """,
+            meeting_id,
+            matter_ids,
+        )
+        touched_member_ids = {
+            row["council_member_id"] for row in existing_rows
+        }
+
+        desired_names: Dict[str, str] = {}
+        desired_votes: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for matter_id in matter_ids:
+            if matter_id not in retained_matter_ids:
+                continue
+            for vote_data in observed_votes.get(matter_id, []):
+                name = vote_data.get("name")
+                vote = self._normalize_vote_value(vote_data.get("vote"))
+                if not isinstance(name, str) or not name.strip() or vote is None:
+                    continue
+                display_name = name.strip()
+                member_id = generate_council_member_id(banana, display_name)
+                key = (matter_id, member_id)
+                if key in desired_votes:
+                    continue
+                desired_names.setdefault(member_id, display_name)
+                desired_votes[key] = {
+                    "vote": vote,
+                    "sequence": vote_data.get("sequence"),
+                    "metadata": vote_data.get("metadata"),
+                }
+
+        touched_member_ids.update(desired_names)
+        for member_id in sorted(desired_names):
+            member = await self.find_or_create_member(
+                banana,
+                desired_names[member_id],
+                vote_date,
+                conn=conn,
+            )
+            if member.id != member_id:  # pragma: no cover - ID helper invariant
+                raise RuntimeError(
+                    "council member identity changed during vote reconcile"
+                )
+
+        for matter_id, member_id in sorted(desired_votes):
+            desired = desired_votes[(matter_id, member_id)]
+            await self.record_vote(
+                council_member_id=member_id,
+                matter_id=matter_id,
+                meeting_id=meeting_id,
+                vote=desired["vote"],
+                vote_date=vote_date,
+                sequence=desired["sequence"],
+                metadata=desired["metadata"],
+                conn=conn,
+            )
+
+        deleted_rows = await conn.fetch(
+            """
+            DELETE FROM votes v
+            WHERE v.meeting_id = $1
+              AND v.matter_id = ANY($2::text[])
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM items i
+                  WHERE i.meeting_id = v.meeting_id
+                    AND i.matter_id = v.matter_id
+              )
+            RETURNING v.council_member_id
+            """,
+            meeting_id,
+            matter_ids,
+        )
+        touched_member_ids.update(
+            row["council_member_id"] for row in deleted_rows
+        )
+        await self._recompute_attribution_counts(touched_member_ids, conn)
+        logger.debug(
+            "reconciled meeting votes",
+            banana=banana,
+            meeting_id=meeting_id,
+            matters=len(matter_ids),
+            observed=len(desired_votes),
+            deleted=len(deleted_rows),
+            members_recounted=len(touched_member_ids),
+        )
+        return {
+            "observed": len(desired_votes),
+            "deleted": len(deleted_rows),
+            "members_recounted": len(touched_member_ids),
+        }
 
     async def get_votes_for_meeting(
         self,

@@ -76,7 +76,7 @@ All vendor adapters inherit from `AsyncBaseAdapter`, which provides:
 - **Error handling** with `VendorHTTPError` (vendor, URL, city context)
 - **Fallback vendor ID generation** (SHA256 hash for vendors without native IDs)
 - **Meeting status detection** (cancelled, postponed, deferred, revised)
-- **Meeting validation** (requires vendor_id, title, start)
+- **Meeting validation** (requires vendor_id and title; validates optional start)
 - **FetchResult contract** - distinguishes "0 meetings" from "adapter failed"
 
 ```python
@@ -531,7 +531,7 @@ async def process_meeting_sponsors(meeting, banana, council_member_repo, meeting
 class MeetingSchema(BaseModel):
     vendor_id: str          # Required, non-empty
     title: str              # Required, non-empty
-    start: str              # ISO format string (NOT datetime object)
+    start: Optional[str]    # ISO format string, or None when undated
     location: Optional[str]
     agenda_url: Optional[str]
     packet_url: Optional[str]

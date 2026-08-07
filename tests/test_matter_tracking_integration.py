@@ -16,20 +16,7 @@ from datetime import datetime
 
 import pytest
 
-from database.db_postgres import PostgresDatabase
 from database.id_generation import generate_matter_id
-from database.services.meeting_ingestion import MeetingIngestionService
-
-
-# Test database setup
-@pytest.fixture
-async def test_db():
-    """Create a temporary test database"""
-    # This would use a test PostgreSQL instance in real implementation
-    # For now, we'll mock the critical parts
-    db = PostgresDatabase(pool=None)  # Mock pool
-    yield db
-    # Cleanup
 
 
 @pytest.fixture
@@ -42,12 +29,6 @@ def test_city():
         "vendor": "primegov",
         "status": "active"
     }
-
-
-@pytest.fixture
-def ingestion_service(test_db):
-    """Create ingestion service for testing"""
-    return MeetingIngestionService(test_db)
 
 
 class TestMatterFileFallbackFlow:

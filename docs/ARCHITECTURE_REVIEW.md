@@ -1,5 +1,11 @@
 # Architecture Review
 
+> Historical snapshot (2026-04-12). Pipeline paths, line numbers, performance
+> findings, and open items below describe the pre-remediation tree. Use
+> [`PIPELINE_REMEDIATION.md`](PIPELINE_REMEDIATION.md) for the settled invariants
+> and [`PIPELINE_PERFORMANCE.md`](PIPELINE_PERFORMANCE.md) for the current map and
+> bounded residuals; do not treat this review as the live pipeline runbook.
+
 **Date:** 2026-04-11 (updated 2026-04-12 with round 2 corrections)
 **Prior review:** 2025-12-02 (140 lines, high-level priorities)
 **Scope:** ~58,000 lines Python backend, ~17K lines vendor adapters
@@ -182,7 +188,8 @@ After reading Legistar, Granicus, CivicPlus, and Berkeley end-to-end, adapters a
 - `_parse_date()` handling 14+ date formats (adapters don't reimplement this)
 - `_chunk_agenda_then_packet()` for 2-pass PDF extraction (agenda URL -> packet TOC)
 - `_resolve_sub_attachments()` for staff report link extraction
-- `_validate_meeting()` enforcing `{vendor_id, title, start}` required fields
+- `_validate_meeting()` enforcing required `{vendor_id, title}` and an optional
+  ISO `start` (authoritative undated meetings remain undated)
 - Session management via `AsyncSessionManager` (per-vendor connection pooling, correct)
 
 **Both agenda chunkers are active by design.** v2 is preferred, v1 is fallback:
@@ -191,7 +198,7 @@ v2 (auto) -> v2 (force toc) -> v2 (force url) -> v1 (fallback)
 ```
 v2 does leaf-to-root (find hyperlinks first, cluster by position). v1 does root-to-leaf (regex item detection per page). Different PDFs need different approaches.
 
-**The real structural problem is the untyped item schema.** Meeting-level dicts are mostly consistent (`vendor_id`, `title`, `start` -- validated by base). But item dicts diverge completely: Legistar items have `matter_id`, `votes`, `sponsors`; Berkeley items have `sponsor`, `recommendation`; PDF-chunked items have `body_text`, `agenda_number`. The orchestrator accesses all of these by convention with no shared contract.
+**The real structural problem is the untyped item schema.** Meeting-level dicts are mostly consistent (`vendor_id`, `title`, optional `start` -- validated by base). But item dicts diverge completely: Legistar items have `matter_id`, `votes`, `sponsors`; Berkeley items have `sponsor`, `recommendation`; PDF-chunked items have `body_text`, `agenda_number`. The orchestrator accesses all of these by convention with no shared contract.
 
 **Error handling varies wildly across adapters:**
 

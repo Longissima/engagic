@@ -16,7 +16,9 @@ uv run scripts/ingest_manual_pdfs.py portolavalleyCA --dir /path/to/pdfs
 - Filename format: `{MMDDYYYY}_{body}_{type}.pdf` (e.g., `03252026_Council_Agenda_Packet.pdf`)
 - Falls back to extracting date/title from PDF content
 - Three parsing strategies attempted in order: Item-TOC (Portola Valley style), standard `parse_agenda_pdf()`, direct text parse
-- Stores meetings and agenda items, enqueues for AI processing (priority=100)
+- Stores the meeting/items and a versioned queue outbox intent in one transaction
+  (priority 100). The script re-reads locked rows before hashing so publication
+  describes the authoritative snapshot actually retained by freeze-on-summary.
 
 ### `probe_vendors.py`
 Detect correct vendor and slug for unconfigured cities by probing vendor URL patterns.
@@ -127,6 +129,36 @@ uv run scripts/generate_tiles.py --upload   # Upload to Cloudflare R2
 ```
 
 ## Operational Tools
+
+### `reconcile_matter_queue.py`
+
+Audit historical matter projections, appearance snapshots, and queue descriptors.
+Dry-run is the default; execution is a separate reviewed operator decision.
+
+```bash
+uv run python scripts/reconcile_matter_queue.py --limit 1000
+uv run python scripts/reconcile_matter_queue.py
+uv run python scripts/reconcile_matter_queue.py --execute  # only after reviewing dry-run
+```
+
+Execution recomputes each plan under matter/item/queue locks and publishes the
+current identity-only matter descriptor. It does not delete data. Re-run the
+default dry-run after execution to record the remaining set.
+
+### `resummarize_items.py`
+
+Invalidate summaries produced before a prompt version and atomically reactivate
+their authoritative meeting version. Past meetings route to the Batch lane.
+
+```bash
+uv run python scripts/resummarize_items.py --below v3 --dry-run
+uv run python scripts/resummarize_items.py --below v3 --limit 200 --yes
+```
+
+The apply path locks the meeting/items, clears only rows still below the requested
+version, computes the current `work_version`, and reactivates that exact queue
+version in the same transaction. It never relies on an unversioned best-effort
+enqueue.
 
 ### `db_viewer.py`
 Interactive database viewer and editor. Browse jurisdictions, meetings, items, queue; add/update jurisdictions with Census data lookup.

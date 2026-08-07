@@ -30,10 +30,34 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 import aiohttp
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from pipeline.protocols import MetricsCollector
+
+
+_COUNCIL_TITLE_RE = re.compile(r"BERKELEY CITY COUNCIL", re.IGNORECASE)
+_FROM_RE = re.compile(r"^From:", re.IGNORECASE)
+_RECOMMENDATION_RE = re.compile(r"^Recommendation:", re.IGNORECASE)
+
+
+def _find_matching_strong(
+    root: BeautifulSoup | Tag,
+    pattern: re.Pattern[str],
+    *,
+    following: bool = False,
+) -> Optional[Tag]:
+    """Find a strong tag whose direct string matches ``pattern``."""
+    candidates = (
+        root.find_all_next("strong") if following else root.find_all("strong")
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, Tag):
+            continue
+        value = candidate.string
+        if isinstance(value, str) and pattern.search(value):
+            return candidate
+    return None
 
 
 class AsyncBerkeleyAdapter(AsyncBaseAdapter):
@@ -79,7 +103,12 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
             if not time_tag:
                 date_text = cells[1].get_text(strip=True)
             else:
-                date_text = time_tag.get('datetime') or time_tag.get_text(strip=True)
+                datetime_value = time_tag.get("datetime")
+                date_text = (
+                    datetime_value
+                    if isinstance(datetime_value, str)
+                    else time_tag.get_text(strip=True)
+                )
 
             if not date_text:
                 continue
@@ -102,7 +131,9 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
             html_cell = cells[2]
             html_a = html_cell.find('a', href=True)
             if html_a:
-                html_link = urljoin(self.base_url, html_a.get('href', ''))
+                html_href = html_a.get("href")
+                if isinstance(html_href, str):
+                    html_link = urljoin(self.base_url, html_href)
 
             # Skip if no HTML agenda (Berkeley should always have one)
             if not html_link:
@@ -118,7 +149,7 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
             time_match = re.search(r'(\d{1,2}:\d{2}\s*[ap]m)', date_text, re.IGNORECASE)
             meeting_time = time_match.group(1) if time_match else None
 
-            meeting_data = {
+            meeting_data: Dict[str, Any] = {
                 'vendor_id': vendor_id,
                 'start': meeting_date.isoformat(),
                 'title': "City Council Meeting",
@@ -136,7 +167,11 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
             if record_cell:
                 record_a = record_cell.find('a', href=True)
                 if record_a:
-                    meeting_data['minutes_url'] = urljoin(self.base_url, record_a.get('href', ''))
+                    record_href = record_a.get("href")
+                    if isinstance(record_href, str):
+                        meeting_data['minutes_url'] = urljoin(
+                            self.base_url, record_href
+                        )
 
             if self._minutes_discovery_only:
                 if meeting_data.get("minutes_url"):
@@ -186,7 +221,7 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
 
         # Extract title from header
         title = None
-        title_tag = soup.find('strong', string=re.compile(r'BERKELEY CITY COUNCIL', re.IGNORECASE))
+        title_tag = _find_matching_strong(soup, _COUNCIL_TITLE_RE)
         if title_tag:
             title = title_tag.get_text(strip=True)
 
@@ -244,6 +279,8 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
         strong_tags = soup.find_all('strong')
 
         for strong in strong_tags:
+            if not isinstance(strong, Tag):
+                continue
             text = strong.get_text(strip=True)
 
             # Match item numbers: "1.", "2.", etc. (not "H1.", "I1." - those are sections)
@@ -254,36 +291,41 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
 
             # Find the link following this number
             next_link = strong.find_next('a', href=True)
-            if not next_link:
+            if not isinstance(next_link, Tag):
                 continue
 
             title = next_link.get_text(strip=True)
             # Remove leading dash if present
             title = title.lstrip('-').strip()
 
-            href = next_link.get('href', '')
+            href_value = next_link.get("href")
+            href = href_value if isinstance(href_value, str) else ""
             attachment_url = urljoin(self.base_url, href) if href else None
 
             # Find "From:" line
-            from_line = strong.find_next('strong', string=re.compile(r'^From:', re.IGNORECASE))
+            from_line = _find_matching_strong(strong, _FROM_RE, following=True)
             sponsor = None
             if from_line:
                 sponsor_text = from_line.get_text(strip=True)
                 sponsor = sponsor_text.replace('From:', '').strip()
 
             # Find "Recommendation:" line
-            rec_line = strong.find_next('strong', string=re.compile(r'^Recommendation:', re.IGNORECASE))
+            rec_line = _find_matching_strong(
+                strong, _RECOMMENDATION_RE, following=True
+            )
             recommendation = None
             if rec_line:
                 # Get text between "Recommendation:" and next <strong> tag
                 rec_text = []
                 current = rec_line.next_sibling
-                while current and current.name != 'strong':
+                while current and not (
+                    isinstance(current, Tag) and current.name == "strong"
+                ):
                     if isinstance(current, str):
                         rec_text.append(current.strip())
-                    elif current.name == 'br':
+                    elif isinstance(current, Tag) and current.name == 'br':
                         break
-                    current = current.next_sibling if hasattr(current, 'next_sibling') else None
+                    current = getattr(current, "next_sibling", None)
                 recommendation = ' '.join(rec_text).strip()
 
             attachments = []

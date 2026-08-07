@@ -313,12 +313,12 @@ async def main():
 
     hits = [r for r in results if r]
     misses = len(results) - len(hits)
-    print(f"\n--- Summary ---")
+    print("\n--- Summary ---")
     print(f"Hits: {len(hits)}/{len(results)}")
     print(f"Misses: {misses}")
 
     if hits:
-        print(f"\n--- SQL updates ---")
+        print("\n--- SQL updates ---")
         for h in hits:
             vendor = h['detected_vendor'].replace("'", "''")
             slug = h['detected_slug'].replace("'", "''")

@@ -6,7 +6,9 @@ Pure async PostgreSQL implementation using 'userland' schema namespace.
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+from asyncpg import Connection
 
 from database.repositories_async.base import BaseRepository
 from userland.database.models import User, Alert, AlertMatch
@@ -264,6 +266,27 @@ class UserlandRepository(BaseRepository):
             for row in rows
         ]
 
+    async def get_city_activation_recipients(
+        self,
+        banana: str,
+        *,
+        conn: Optional[Connection] = None,
+    ) -> List[Dict[str, Any]]:
+        """Load distinct activation recipients in one transaction-scoped read."""
+        async with self._ensure_conn(conn) as connection:
+            rows = await connection.fetch(
+                """
+                SELECT DISTINCT u.id AS user_id, u.email, u.name
+                FROM userland.alerts a
+                JOIN userland.users u ON u.id = a.user_id
+                WHERE a.active = TRUE
+                  AND a.cities @> jsonb_build_array($1::text)
+                ORDER BY u.id
+                """,
+                banana,
+            )
+        return [dict(row) for row in rows]
+
     async def get_demanded_cities(self) -> List[str]:
         """Get all unique cities that users have subscribed to
 
@@ -329,7 +352,9 @@ class UserlandRepository(BaseRepository):
         self,
         banana: str,
         status: str,
-        notes: Optional[str] = None
+        notes: Optional[str] = None,
+        *,
+        conn: Optional[Connection] = None,
     ) -> None:
         """Update city request status
 
@@ -338,8 +363,8 @@ class UserlandRepository(BaseRepository):
             status: New status ('pending', 'added', 'rejected')
             notes: Optional admin notes
         """
-        async with self.transaction() as conn:
-            await conn.execute(
+        async with self._ensure_conn(conn) as connection:
+            await connection.execute(
                 """
                 UPDATE userland.city_requests
                 SET status = $2, notes = $3

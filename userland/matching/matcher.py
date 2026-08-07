@@ -6,14 +6,23 @@ Dual-track matching: string-based (granular) + matter-based (deduplicated)
 """
 
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import Any, Dict, List
 from uuid import uuid4
 
 from config import get_logger
 from database.db_postgres import Database
+from server.utils.meeting_urls import generate_meeting_slug
 from userland.database.models import Alert, AlertMatch
 
 logger = get_logger(__name__)
+
+
+def _serialize_optional_date(value: Any) -> str | None:
+    """Keep missing dates explicit instead of emitting the string ``None``."""
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    return str(isoformat()) if callable(isoformat) else str(value)
 
 
 async def match_alert(
@@ -88,7 +97,7 @@ async def match_alert(
                     summary = summary.split("## Summary", 1)[1].split("##", 1)[0].strip()
 
                 meeting_date = row['date']
-                meeting_slug = f"{meeting_date}-{meeting_id}"
+                meeting_slug = generate_meeting_slug(meeting_id, meeting_date)
                 url = f"https://engagic.org/{row['banana']}/{meeting_slug}?item=item-{item_id}"
 
                 # Create match
@@ -102,7 +111,7 @@ async def match_alert(
                     matched_criteria={
                         "keyword": keyword,
                         "city": f"{row['city_name']}, {row['state']}",
-                        "date": str(row['date']),
+                        "date": _serialize_optional_date(row["date"]),
                         "meeting_title": row['meeting_title'],
                         "item_title": row['title'],
                         "context": summary[:300],
@@ -183,7 +192,7 @@ async def match_matters_for_alert(
             # Build timeline
             timeline = [
                 {
-                    "date": str(app["appeared_at"]),
+                    "date": _serialize_optional_date(app["appeared_at"]),
                     "committee": app["committee"],
                     "action": app["action"],
                     "meeting_title": app["meeting_title"]
@@ -201,7 +210,7 @@ async def match_matters_for_alert(
                 item_id = latest['item_id']
                 meeting_id = latest['meeting_id']
                 meeting_date = latest['appeared_at']
-                meeting_slug = f"{meeting_date}-{meeting_id}"
+                meeting_slug = generate_meeting_slug(meeting_id, meeting_date)
                 url = f"https://engagic.org/{row['banana']}/{meeting_slug}?item=item-{item_id}"
 
             # Create match
@@ -222,8 +231,8 @@ async def match_matters_for_alert(
                     "canonical_summary": row['canonical_summary'],
                     "sponsors": row['sponsors'],
                     "topics": row['canonical_topics'],
-                    "first_seen": str(row['first_seen']),
-                    "last_seen": str(row['last_seen']),
+                    "first_seen": _serialize_optional_date(row["first_seen"]),
+                    "last_seen": _serialize_optional_date(row["last_seen"]),
                     "appearance_count": row['appearance_count'],
                     "timeline": timeline,
                     "url": url

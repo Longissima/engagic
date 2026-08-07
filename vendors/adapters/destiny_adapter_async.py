@@ -29,13 +29,14 @@ Confidence: 8/10 modern, 6/10 legacy - Fort Bend tested; other legacy hosts unve
 import asyncio
 import re
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import timedelta
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
+from vendors.adapters.html_attrs import string_attr
 from pipeline.protocols import MetricsCollector
 
 
@@ -123,7 +124,7 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
                 continue
 
             # Extract seq from link href
-            href = link.get('href', '')
+            href = string_attr(link, "href")
             seq = self._extract_url_param(href, 'seq')
             if not seq:
                 continue
@@ -198,7 +199,9 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         if not pdf_link:
             pdf_link = soup.find('a', title=re.compile(r'PDF\s+Packet', re.I))
         if pdf_link and isinstance(pdf_link, Tag):
-            result['packet_url'] = urljoin(self.base_url, pdf_link.get('href', ''))
+            result['packet_url'] = urljoin(
+                self.base_url, string_attr(pdf_link, "href")
+            )
 
         # Try modern structured parser first (memo links + ai_link items)
         items = self._parse_agenda_items(soup)
@@ -241,7 +244,9 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         current_section_id = ""
         sequence = 0
 
-        for row in soup.find_all('tr', class_=lambda c: c and 'top' in c):
+        for row in soup.find_all(
+            'tr', class_=lambda c: bool(c and 'top' in c)
+        ):
             if not isinstance(row, Tag):
                 continue
             cells = row.find_all('td')
@@ -277,7 +282,7 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
             if not title:
                 continue
 
-            memo_href = item_link.get('href', '')
+            memo_href = string_attr(item_link, "href")
 
             # Collect numbering from cells before the title cell. Cells after it
             # (e.g. Walla Walla's 'Approved' status) are not part of numbering.
@@ -334,7 +339,9 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         dept/section label and whose substantive content lives in lettered children.
         """
         items: List[Dict[str, Any]] = []
-        main = soup.find('table', class_=lambda c: c and 'tableCollapsed' in c)
+        main = soup.find(
+            'table', class_=lambda c: bool(c and 'tableCollapsed' in c)
+        )
         if not main or not isinstance(main, Tag):
             return items
 
@@ -400,7 +407,7 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
                 link = cells[1].find('a', href=True)
                 if not link or not isinstance(link, Tag):
                     continue
-                href = link.get('href', '')
+                href = string_attr(link, "href")
                 if not href:
                     continue
                 name = link.get_text(strip=True)
@@ -471,7 +478,10 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
                         body_parts.append(f"{label}: {value}")
 
         # Extract all bold mediumText sections and their content
-        for td in soup.find_all('td', class_=lambda c: c and 'bold' in c and 'mediumText' in c):
+        for td in soup.find_all(
+            'td',
+            class_=lambda c: bool(c and 'bold' in c and 'mediumText' in c),
+        ):
             section_name = td.get_text(strip=True)
             if section_name == 'Attachments':
                 continue  # attachments handled separately
@@ -490,7 +500,7 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         # Extract attachments from popupAttachments() onclick handlers
         attachments = []
         for link in soup.find_all('a', href='#'):
-            onclick = link.get('onclick', '')
+            onclick = string_attr(link, "onclick")
             if 'popupAttachments' not in onclick:
                 continue
             match = re.search(r"popupAttachments\('([^']+)'", onclick)
@@ -518,8 +528,10 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         """
         viewer_url = None
         for link in row.find_all('a', href=True):
-            href = link.get('href', '')
-            label = f"{link.get('title', '')} {link.get_text(strip=True)}".lower()
+            href = string_attr(link, "href")
+            label = (
+                f"{string_attr(link, 'title')} {link.get_text(strip=True)}"
+            ).lower()
             if 'mindocs/' in href.lower() and 'minute' in label:
                 return urljoin(self.base_url, href)
             if viewer_url is None and re.search(r'[?&]dsp=min(?![a-z])', href):

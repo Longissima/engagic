@@ -1,15 +1,18 @@
 # Ground-Truth Corpus & Pipeline Restaging
 
 **Status:** Proposal (2026-06-29); slices 1-3 SHIPPED (2026-07-02, see
-CHANGELOG "The Corpus Exists", "The Collapse", "One Write Path"). Live now:
+CHANGELOG "The Corpus Exists", "The Collapse", "One Write Path"). Implemented
+in this tree (with migrations 032-035 applied to production on 2026-08-07 as
+recorded in `PIPELINE_REMEDIATION.md`):
 the sha256(bytes) primitive, document_blob/document_source (migration 025;
-source revalidation timestamps in migration 027 and bounded ingest failures in
+source freshness state in migrations 027 and 034 and bounded ingest failures in
 migration 028),
 the engagic-corpus R2 bucket over the S3 data plane, the `corpus/` package,
-the shared subprocess guard (parsing/subprocess_guard.py), and ONE producer
-function (pipeline/ground_truth.py: archive -> guarded chunk -> text persist)
-called by both the sync adapters and the processor's claim-time shape
-manufacturing (_manufacture_items -> attach_items funnel). Sync-side chunking
+the shared typed `DocumentSourceAcquirer`, the shared subprocess guard
+(`parsing/subprocess_guard.py`), and one ground-truth producer function
+(`pipeline/ground_truth.py`: archive -> guarded chunk -> text persist) called by
+both sync adapters and the processor's claim-time shape manufacturing
+(`_manufacture_items` -> `attach_items` funnel). Sync-side chunking
 is legacy behavior behind ENGAGIC_SYNC_CHUNKING (default true); deferred mode
 makes sync pure stage 1 (archive + enqueue) with shape born at claim time
 from corpus bytes. PyMuPDF executes in exactly two guarded child targets
@@ -25,7 +28,7 @@ want to eliminate (licensing + re-work). All four collapse into one architecture
 
 ---
 
-## The law
+## Target law (partially shipped)
 
 > **Extraction writes once. Everything downstream reads.**
 > One stage produces text and is the sole system of record (DB structure + R2
@@ -34,6 +37,12 @@ want to eliminate (licensing + re-work). All four collapse into one architecture
 > exactly one place.
 
 Everything below is the mechanics of that law.
+
+The live pipeline now has shared typed acquisition, content-addressed originals,
+guarded extraction, and one ground-truth write path. `process` can read archived
+artifacts but still manufactures missing shape/text at claim time; `motioncount`
+has not yet become a corpus-only reader. Treat the quoted law as the destination,
+not a claim that every consumer has already crossed over.
 
 ---
 
@@ -79,8 +88,9 @@ Consequences:
 | **2. Produce Ground Truth** | bytes → raw text (+ chunk delineation), per-page OCR fallback; persist text → R2 + DB | CPU/RAM (local OCR) or network (offloaded OCR) | **throttled to RAM budget** | R2 `text/` + DB pointer/provenance |
 | **3. Summarize** | raw text → LLM | LLM API / rate limit | high | DB summaries (already exists) |
 
-Readers of stage 2's output: **`process` summarize** and **`motioncount` reanalyze**.
-Both are pure consumers of the corpus; neither downloads or parses.
+Target readers of stage 2's output are **`process` summarize** and
+**`motioncount` reanalyze**. Process already shares corpus-first acquisition and
+guarded extraction; motioncount conversion remains pending.
 
 ### Why download belongs in stage 1, not stage 2
 
@@ -92,7 +102,7 @@ Two reasons to *not* fold download into "produce text":
    extraction is RAM-bound and must stay throttled. Different knobs → different stages.
 
 The content hash is a twofer: the dedup key *and* the corpus content-address key.
-We don't compute it today — see "new primitive" below.
+The shipped acquisition boundary computes it from observed source bytes.
 
 ### Heterogeneous internals of stage 2 (uniform output)
 
@@ -108,26 +118,65 @@ All three emit the same contract: `{ raw_text, item_delineation?, per_page_metho
 
 ---
 
-## Storage design
+## Storage design (target, with corpus tables shipped)
+
+The content-addressed `document_blob`/`document_source` layer described here is
+live. Direct `content_sha256` references from every meeting/item row remain part
+of the target design; current consumers resolve archived revisions through the
+shared source-identity acquisition boundary.
 
 **R2** (reuse existing plumbing: `scripts/generate_tiles.py:251-310`, wrangler CLI,
 creds `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` in `.llm_secrets`). New bucket(s):
 
 ```
 engagic-corpus/
-  originals/<sha256(bytes)>.pdf      # archived source file (ground-truth artifact)
+  originals/<sha256(bytes)>          # archived source bytes; media type is metadata
   text/<sha256(bytes)>.txt|.md       # extracted raw text (+ markdown if Layout/VLM)
 ```
 
 Content-addressed by **hash of the source bytes** → automatic dedup, immutable,
 re-extraction-safe.
 
+### Source freshness contract
+
+Content identity and source identity answer different questions. The R2 key says
+which immutable bytes we have; `document_source.source_identity` says where those
+bytes were observed. A stable municipal URL can later serve different bytes, so a
+corpus hit is not permission to treat that source as permanently fresh.
+
+Migration 034 gives each `(content_sha256, source_identity)` association
+separate state:
+
+- `last_observed_at`: the pipeline used this archived revision, including a cache hit;
+- `last_validated_at`: the origin confirmed this revision with HTTP 200 or 304;
+- `last_validation_attempt_at`: the last attempted check, used to back off during an
+  origin outage;
+- `etag` and `last_modified`: conditional-request validators when the host provides
+  them.
+
+The acquisition boundary serves a recently validated corpus original without
+network traffic. After `ENGAGIC_CORPUS_REVALIDATE_SECONDS` (24 hours by default),
+it performs a conditional request. HTTP 304 advances validation without downloading
+the body; HTTP 200 is content-hashed and archives a new immutable revision when the
+bytes changed. A failed validation serves the archived revision and waits
+`ENGAGIC_CORPUS_REVALIDATE_FAILURE_SECONDS` (one hour by default) before retrying.
+This fail-open policy keeps civic-host outages from blocking summaries or producing a
+request storm.
+
+Concurrent acquisition of the same signature-stripped source identity is
+single-flight within a process. Content addressing remains the cross-process
+convergence mechanism.
+
+Revalidation is demand-driven: the TTL is evaluated the next time a consumer
+acquires that source. It is not a background expiry scheduler, so a fully
+processed URL that is never requested again is not swept automatically.
+
 **DB** (pointers + provenance; big blobs never inline in hot rows):
 
 ```
 document_blob (
   content_sha256   text primary key,   -- hash of source bytes
-  original_key     text,               -- R2 originals/<hash>.pdf
+  original_key     text,               -- R2 originals/<hash>
   text_key         text,               -- R2 text/<hash>.txt
   extract_method   text,               -- 'pymupdf' | 'pymupdf+layout' | 'vlm:<model>' | mixed
   extract_version  text,               -- bump to force selective re-extraction
@@ -143,18 +192,25 @@ Existing rows (`meetings.{agenda_url,packet_url}`, `items.attachments[]`) gain a
 `extract_version`) is mandatory: a corpus without "how was this produced" rots, and
 we *will* re-extract when the extractor upgrades (Tesseract → VLM, Layout adoption).
 
-### New primitive required
+## Historical 2026-06-29 gap analysis
 
-We hash **metadata** today (`pipeline/utils.py` `hash_attachments_*` = URL+name;
-`id_generation.py` = md5/sha256 over metadata keys) — **never file bytes**. The one
-new primitive is `sha256(downloaded_bytes)`, computed in stage 1. Everything else is
-wiring.
+The next two sections preserve the evidence and sequencing that motivated the
+shipped corpus/acquisition work. Their present-tense statements describe the
+proposal-time system, not the current implementation summarized above.
+
+### Byte-hash primitive (shipped)
+
+At proposal time the pipeline hashed metadata (`pipeline/utils.py`
+`hash_attachments_*` = URL+name; `id_generation.py` = metadata keys), not file
+bytes. The new primitive was `sha256(downloaded_bytes)` in stage 1. It is now
+shipped in the corpus acquisition path; metadata/work hashes remain separate
+desired-work identities.
 
 ---
 
-## The tee point & forced sequencing
+### Original tee-point problem and sequencing
 
-**There is no single seam today** — text is produced in TWO jobs on opposite sides of
+**There was no single seam on 2026-06-29** — text was produced in two jobs on opposite sides of
 the queue, which is the core reason persistence isn't a one-line drop-in:
 - **sync chunker** — `vendors/adapters/parsers/router.py` `chunk_pdf` →
   `agenda_chunker_v2` (downloads + `get_text`s agenda packets for item structure +
@@ -162,22 +218,22 @@ the queue, which is the core reason persistence isn't a one-line drop-in:
 - **process attachment extraction** — `analysis/analyzer_async.py:404-412`
   (download → temp file → subprocess extract → `unlink` at 433). The *guarded* site.
 
-These sometimes touch the SAME bytes (a packet chunked in sync, re-extracted in
-process) and sometimes DIFFERENT bytes (separate per-item attachments). So a naive
+These paths sometimes touched the same bytes (a packet chunked in sync,
+re-extracted in process) and sometimes different bytes (separate per-item
+attachments). So a naive
 `persist_text()` at one site misses the other, and at both sites risks
 double-store/divergence — *unless* the corpus is keyed on `sha256(source_bytes)`, which
-makes identical bytes dedup automatically and divergence impossible. **Stage 2's real
-job is to CREATE the single chokepoint that doesn't exist today**, by collapsing both
-extraction sites into one Produce-Ground-Truth stage. Interim before the collapse: tee
-at BOTH sites, both writing to the byte-hash-keyed corpus (safe precisely because of
-content-addressing).
+makes identical bytes dedup automatically and divergence impossible. The proposal
+identified stage 2 as the missing chokepoint. The current shared acquisition and
+ground-truth owner are the shipped result; the remaining two guarded child targets
+are an implementation detail still scheduled for consolidation.
 
 **Sequencing is forced — do not reorder:**
 
-1. **Guard + offload first.** `process` extraction is *already* hardened: isolated
+1. **Guard + offload first.** Process extraction was already hardened: isolated
    subprocess, 600 s timeout, `RLIMIT_AS=1GB`, `pdf_semaphore=6`
-   (`analyzer_async.py:95-176`). The sync **chunker is not** — that's why it froze on
-   2026-06-29. Before moving any heavy extraction earlier, it must carry those guards,
+   (`analyzer_async.py:95-176`). The sync chunker was not — that's why it froze on
+   2026-06-29. Before moving any heavy extraction earlier, it had to carry those guards,
    and OCR must move off-box (API/GPU). Otherwise you relocate the RAM bomb into the
    seatbelt-less stage and make the freeze the *normal* case.
 2. **Then** move/extend extraction into stage 2 and turn on corpus persistence.
@@ -195,7 +251,7 @@ micro-opt but optimizes a non-bottleneck — skip it until measured.
 
 ---
 
-## Consequences (why all four threads collapse)
+## Target consequences (why all four threads collapse)
 
 - **Throughput:** the RAM bomb (OCR) leaves the 3.8 GB box → stage 3 scales on LLM
   concurrency, not swap. Dominant win is OCR-offload, *not* the stage relabeling
@@ -211,7 +267,8 @@ micro-opt but optimizes a non-bottleneck — skip it until measured.
 PyMuPDF + `pymupdf4llm` = AGPL-or-commercial; `pymupdf-layout` = Polyform-Noncommercial
 -or-commercial (no open-source escape — commercial license mandatory if adopted).
 This architecture confines all PyMuPDF execution to engagic (source-published →
-AGPL-compliant) and makes motioncount a pure reader of unencumbered output text. An
+AGPL-compliant) and is intended to make motioncount a pure reader of unencumbered
+output text. That motioncount conversion remains pending. An
 Artifex commercial license scoped to cover both repos is the belt-and-suspenders move
 and is independently required for Layout.
 
@@ -279,22 +336,18 @@ roughly biggest-first. None are required for the corpus work; all share its shap
    document immune to link rot and SAS expiry forever; the refresh machinery shrinks
    to "only for documents not yet archived." A maintained subsystem mostly evaporates.
 
-2. **Identity-by-bytes makes the pipeline idempotent.** Today we hash *metadata* as a
-   proxy for change/seen — `hash_attachments_fast` (URL+name), `cache.content_hash`
-   (attachment set), `items.attachment_hash`. Those proxies are wrong in *both*
-   directions (a re-signed URL looks changed when it isn't; an edited PDF at the same
-   URL looks unchanged when it is). The byte-hash the corpus needs anyway turns
+2. **Identity-by-bytes makes artifact handling idempotent.** At proposal time the
+   pipeline used metadata as a proxy for artifact change/seen. The shipped corpus
+   now hashes observed bytes, while `sv1`/`mw1` metadata identities separately
+   describe desired summarization work. Byte identity turns
    "processed this exact artifact?" from a guess into a fact → the structural fix for
    the `brief_runs` candidate-row dedup loss *class*, not a patch.
 
-3. **Persist the telemetry stream (closest parallel to the text insight).** structlog
-   already emits rich events — `component`, `vendor`, `duration_ms`, `failure_reason`,
-   the chunker `attempts` audit, the `suggestion_agreed` "passive confusion matrix" —
-   straight into an ephemeral screen buffer. That is *why* OCR-fraction and per-stage
-   timing were unanswerable on 2026-06-29, and why diagnosing the freeze meant `py-spy`
-   archaeology instead of a query. Append the event stream to a table / parquet on R2 →
-   pipeline health, OCR rate, degrading munis, throughput all become `SELECT`s. We
-   discard signal we already pay to generate.
+3. **Persist the telemetry stream (partially shipped).** Durable pipeline runs,
+   attempts, stages, and Batch rows now back last-hour percentiles and 24-hour
+   streaming/Batch series in `engagic-conductor status`. Rich structlog-only vendor,
+   OCR, and chunk-quality details are still not a permanent analytics stream; export
+   them to a durable table/object store before claiming long-term trend coverage.
 
 4. **A frozen corpus turns eval from archaeology into CI.** Eval culture exists
    ("read the pdfs, score the chunker against reality," the quality layer) but runs

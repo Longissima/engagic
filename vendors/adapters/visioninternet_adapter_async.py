@@ -31,8 +31,8 @@ import asyncio
 import os
 import re
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, cast
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -147,7 +147,7 @@ class AsyncVisionInternetAdapter(AsyncBaseAdapter):
         try:
             logger.debug("vendor request (curl_cffi)", vendor=self.vendor, slug=self.slug, method=method, url=url[:100])
             resp = await session.request(
-                method, url,
+                cast(Any, method), url,
                 proxies={"https": self._proxy, "http": self._proxy},
                 timeout=config.VENDOR_HTTP_TIMEOUT,
             )

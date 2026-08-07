@@ -205,7 +205,8 @@ def test_sync_lifecycle_checkpoint_is_written_only_for_completed_status():
         db = _Database([city])
         fetcher = Fetcher(cast(Any, db))
 
-        async def sync_city(city: Jurisdiction):
+        async def sync_city(city: Jurisdiction, *, max_retries: int = 3):
+            del max_retries
             return SyncResult(city_banana=city.banana, status=status)
 
         fetcher._sync_city = sync_city
@@ -231,8 +232,9 @@ def test_sync_checkpoint_failure_fails_closed_without_refetching():
     fetcher = Fetcher(cast(Any, db))
     sync_calls = 0
 
-    async def sync_city(city: Jurisdiction):
+    async def sync_city(city: Jurisdiction, *, max_retries: int = 3):
         nonlocal sync_calls
+        del max_retries
         sync_calls += 1
         return SyncResult(city_banana=city.banana, status=SyncStatus.COMPLETED)
 
@@ -244,6 +246,65 @@ def test_sync_checkpoint_failure_fails_closed_without_refetching():
     assert "checkpoint failed" in result.error_message
     assert sync_calls == 1
     assert db.jurisdictions.mark_calls == ["checkpointCA"]
+
+
+def test_extra_vendor_retry_does_not_replay_successful_primary(monkeypatch):
+    city = _city("multiCA")
+    city.extra_vendors = [{"vendor": "legistar", "slug": "extra"}]
+    fetcher = Fetcher(cast(Any, _Database([city])))
+    calls = []
+
+    async def sync_vendor(city, vendor, slug):
+        del city
+        calls.append((vendor, slug))
+        if vendor == "legistar" and calls.count((vendor, slug)) == 1:
+            return SyncResult(
+                city_banana="multiCA",
+                status=SyncStatus.FAILED,
+                error_message="transient extra failure",
+            )
+        return SyncResult(city_banana="multiCA", status=SyncStatus.COMPLETED)
+
+    async def no_sleep(_seconds):
+        return None
+
+    fetcher._sync_with_vendor = sync_vendor
+    monkeypatch.setattr("pipeline.fetcher.asyncio.sleep", no_sleep)
+
+    result = asyncio.run(fetcher._sync_city(city, max_retries=2))
+
+    assert result.status is SyncStatus.COMPLETED
+    assert calls == [
+        ("primegov", "multiCA-slug"),
+        ("legistar", "extra"),
+        ("legistar", "extra"),
+    ]
+
+
+def test_shutdown_between_vendor_streams_does_not_checkpoint_city():
+    city = _city("multiCA")
+    city.extra_vendors = [{"vendor": "legistar", "slug": "extra"}]
+    db = _Database([city])
+    fetcher = Fetcher(cast(Any, db))
+    calls = []
+
+    async def sync_vendor(city, vendor, slug, *, max_retries=3):
+        del city, max_retries
+        calls.append((vendor, slug))
+        fetcher.is_running = False
+        return SyncResult(
+            city_banana="multiCA", status=SyncStatus.COMPLETED
+        )
+
+    fetcher._sync_vendor_with_retry = sync_vendor
+    result = asyncio.run(fetcher._sync_city_with_retry(city))
+
+    assert result.status is SyncStatus.CANCELLED
+    assert result.error_message == (
+        "Sync interrupted before all vendor streams completed"
+    )
+    assert calls == [("primegov", "multiCA-slug")]
+    assert db.jurisdictions.mark_calls == []
 
 
 class _SchemaAdapter(AsyncBaseAdapter):

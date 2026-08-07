@@ -11,10 +11,19 @@ import structlog
 _project_root = Path(__file__).parent
 _env_file = _project_root / ".env"
 if _env_file.exists():
-    load_dotenv(_env_file)
+    try:
+        load_dotenv(_env_file)
+    except OSError:
+        # Sandboxed tooling may traverse the repository without permission to
+        # read production secrets. Configuration still resolves from the
+        # caller's environment; never make imports depend on secret-file ACLs.
+        pass
 _secrets_file = _project_root / ".llm_secrets"
 if _secrets_file.exists():
-    load_dotenv(_secrets_file, override=True)
+    try:
+        load_dotenv(_secrets_file, override=True)
+    except OSError:
+        pass
 
 logger = logging.getLogger("engagic")
 
@@ -143,6 +152,18 @@ class Config:
         # archived until a multipart path exists.
         self.CORPUS_MAX_ORIGINAL_BYTES = int(
             os.getenv("ENGAGIC_CORPUS_MAX_ORIGINAL_BYTES", str(256 * 1024 * 1024))
+        )
+        # Archived originals are served without origin traffic until this age.
+        # Stale identities use conditional requests; failures serve the archived
+        # revision and wait before another attempt so an origin outage cannot
+        # turn a corpus hit into a request storm.
+        self.CORPUS_REVALIDATE_SECONDS = max(
+            60,
+            int(os.getenv("ENGAGIC_CORPUS_REVALIDATE_SECONDS", str(24 * 60 * 60))),
+        )
+        self.CORPUS_REVALIDATE_FAILURE_SECONDS = max(
+            60,
+            int(os.getenv("ENGAGIC_CORPUS_REVALIDATE_FAILURE_SECONDS", "3600")),
         )
 
         # Morphology classifier suggestions fill the chunker's hint slot for

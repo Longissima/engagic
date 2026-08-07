@@ -149,7 +149,11 @@ class AsyncMenloParkAdapter(AsyncBaseAdapter):
 
         # Cell 1: Agenda packet PDF link
         link = cells[1].find('a', href=True, class_='document')
-        pdf_link = urljoin(self.base_url, link.get('href', '')) if link else None
+        pdf_link = None
+        if link:
+            agenda_href = link.get("href")
+            if isinstance(agenda_href, str):
+                pdf_link = urljoin(self.base_url, agenda_href)
         if not pdf_link:
             return None
 
@@ -158,7 +162,9 @@ class AsyncMenloParkAdapter(AsyncBaseAdapter):
         if len(cells) > 2:
             minutes_link = cells[2].find('a', href=True, class_='document')
             if minutes_link:
-                minutes_url = urljoin(self.base_url, minutes_link.get('href', ''))
+                minutes_href = minutes_link.get("href")
+                if isinstance(minutes_href, str):
+                    minutes_url = urljoin(self.base_url, minutes_href)
 
         url_path = pdf_link.replace(self.base_url, '').strip('/')
         vendor_id = self._generate_fallback_vendor_id(title=url_path, date=meeting_date)

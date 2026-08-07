@@ -7,11 +7,12 @@ Cities using IQM2: Boise ID, Santa Monica CA, Cambridge MA, Buffalo NY, and 40+ 
 import asyncio
 import re
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urljoin
 import aiohttp
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
+from vendors.adapters.html_attrs import string_attr
 from pipeline.protocols import MetricsCollector
 from bs4 import BeautifulSoup
 
@@ -143,7 +144,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
             if not link_elem:
                 continue
 
-            meeting_url = urljoin(self.base_url, link_elem["href"])
+            meeting_url = urljoin(self.base_url, string_attr(link_elem, "href"))
             meeting_id_match = re.search(r"ID=(\d+)", meeting_url)
             if not meeting_id_match:
                 continue
@@ -227,7 +228,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
         packet_url = None
         packet_link = soup.find("a", id=re.compile(r"hlFullAgendaFile"))
         if packet_link and packet_link.get("href"):
-            packet_url = urljoin(self.base_url, packet_link["href"])
+            packet_url = urljoin(self.base_url, string_attr(packet_link, "href"))
 
         meeting_data = {
             "vendor_id": meeting_id,
@@ -294,7 +295,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
             for link in attachment_links:
                 # Extract attachment name and URL
                 attachment_name = link.get_text(strip=True)
-                attachment_url = urljoin(detail_url, link.get("href", ""))
+                attachment_url = urljoin(detail_url, string_attr(link, "href"))
 
                 if attachment_name and attachment_url:
                     # Determine file type from URL or name
@@ -398,7 +399,10 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
                     num_text = num_cell.get_text(strip=True)
 
                     if re.match(r"^[0-9]+\.\s*$", num_text):
-                        title_link = title_cell.find("a", href=lambda x: x and "Detail_LegiFile.aspx" in x)
+                        title_link = title_cell.find(
+                            "a",
+                            href=lambda value: bool(value and "Detail_LegiFile.aspx" in value),
+                        )
 
                         if current_item:
                             items.append(current_item)
@@ -408,7 +412,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
 
                         if title_link:
                             item_title = title_link.get_text(strip=True)
-                            href = title_link.get("href", "")
+                            href = string_attr(title_link, "href")
                             id_match = re.search(r"[?&]ID=(\d+)", href)
                             legifile_id = id_match.group(1) if id_match else None
                         else:
@@ -456,7 +460,10 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
                 if num_cell.get("class") == ["Num"]:
                     num_text = num_cell.get_text(strip=True)
 
-                    title_link = title_cell.find("a", href=lambda x: x and "Detail_LegiFile.aspx" in x)
+                    title_link = title_cell.find(
+                        "a",
+                        href=lambda value: bool(value and "Detail_LegiFile.aspx" in value),
+                    )
 
                     # Letter/number or empty Num with LegiFile link
                     if re.match(r"^[A-Z0-9]+\.\s*$", num_text) or (not num_text and title_link):
@@ -473,7 +480,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
 
                         legifile_id = None
                         if title_link:
-                            href = title_link.get("href", "")
+                            href = string_attr(title_link, "href")
                             id_match = re.search(r"[?&]ID=(\d+)", href)
                             if id_match:
                                 legifile_id = id_match.group(1)
@@ -552,7 +559,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
                     if current_item:
                         pdf_link = title_cell.find("a", href=True)
                         if pdf_link:
-                            pdf_url = urljoin(base_url, pdf_link["href"])
+                            pdf_url = urljoin(base_url, string_attr(pdf_link, "href"))
                             pdf_name = pdf_link.get_text(strip=True)
 
                             file_type = "pdf"

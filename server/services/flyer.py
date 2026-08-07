@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 from importlib.resources import files
 from database.db_postgres import Database
 from database.models import Meeting, AgendaItem
+from server.utils.meeting_urls import generate_meeting_slug
 
 from config import config, get_logger
 
@@ -87,17 +88,6 @@ def _clean_summary_for_flyer(summary: str) -> Tuple[str, str]:
     return f"<p>{summary}</p>", confidence.capitalize()
 
 
-def _generate_meeting_slug(meeting: Meeting) -> str:
-    """Generate meeting slug matching frontend format: {YYYY-MM-DD}-{id}"""
-    # Format date as YYYY-MM-DD (matching frontend utils.ts)
-    date_slug = "undated"
-    if meeting.date:
-        date_slug = meeting.date.strftime("%Y-%m-%d")
-
-    # Format: {date}-{id} (matches frontend generateMeetingSlug)
-    return f"{date_slug}-{meeting.id}"
-
-
 def _generate_item_anchor(item: AgendaItem) -> str:
     """Generate item anchor matching AgendaItem component logic
 
@@ -154,7 +144,7 @@ async def generate_meeting_flyer(
     city_display = f"{city_name}{', ' + state if state else ''}"
 
     # Build meeting URL for QR code (matches frontend routing)
-    meeting_slug = _generate_meeting_slug(meeting)
+    meeting_slug = generate_meeting_slug(meeting.id, meeting.date)
     meeting_url = f"{config.FRONTEND_URL}/{meeting.banana}/{meeting_slug}"
 
     if item:

@@ -75,7 +75,7 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
     banana = city_row["banana"]
     counts = {"fetched": 0, "with_minutes": 0, "would_fill": 0, "filled": 0,
               "already_set": 0,
-              "id_miss": 0, "undated_skipped": 0, "fetch_failed": 0,
+              "id_miss": 0, "fetch_failed": 0,
               "unsupported": 0}
 
     for vendor, slug in vendor_streams(city_row):
@@ -127,11 +127,6 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
             title = md.get("title") or "Meeting"
             meeting_date = parse_date(md)
             if not vendor_id:
-                continue
-            if meeting_date is None:
-                # sync_meeting ids undated meetings with datetime.now() at store
-                # time -- underivable here, so the sweep cannot re-match them.
-                counts["undated_skipped"] += 1
                 continue
 
             meeting_id = generate_meeting_id(

@@ -5,7 +5,7 @@ API-first with HTML fallback. Cities: Seattle WA, NYC, Cambridge MA, and many ot
 """
 
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
 import json
 from json import JSONDecodeError
@@ -13,6 +13,7 @@ import re
 import asyncio
 import xml.etree.ElementTree as ET
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
+from vendors.adapters.html_attrs import string_attr
 from vendors.adapters.parsers.legistar_parser import parse_html_agenda, parse_legislation_attachments, parse_aada_html
 from pipeline.filters import should_skip_meeting, should_skip_processing
 from pipeline.utils import combine_date_time
@@ -1162,17 +1163,20 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
 
             # Look for agenda PDF link if not provided from calendar
             if not packet_url:
-                agenda_links = soup.find_all("a", href=lambda x: x and ".pdf" in x.lower() if x else False)
+                agenda_links = soup.find_all(
+                    "a",
+                    href=lambda x: bool(x and ".pdf" in x.lower()),
+                )
                 for link in agenda_links:
                     link_text = link.get_text(strip=True).lower()
                     if "agenda" in link_text or "packet" in link_text:
-                        packet_url = urljoin(base_url, link["href"])
+                        packet_url = urljoin(base_url, string_attr(link, "href"))
                         break
 
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
             logger.debug("detail page unavailable", slug=self.slug, meeting_id=meeting_id, error=str(e))
 
-        meeting_data = {
+        meeting_data: Dict[str, Any] = {
             "vendor_id": str(meeting_id),
             "title": title,
             "start": meeting_dt.isoformat(),
@@ -1223,7 +1227,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
             logger.debug("AADA page unavailable", slug=self.slug, meeting_id=meeting_id, error=str(e))
 
-        meeting_data = {
+        meeting_data: Dict[str, Any] = {
             "vendor_id": str(meeting_id),
             "title": title,
             "start": meeting_dt.isoformat(),
@@ -1361,7 +1365,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         """Fetch all Bodies (committees) from Legistar API."""
         try:
             url = f"{self.base_url}/Bodies"
-            params = {"$top": 1000}
+            params: Dict[str, Any] = {"$top": 1000}
             if self.api_token:
                 params["token"] = self.api_token
 
@@ -1430,7 +1434,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             from datetime import datetime
             today = datetime.now().strftime("%Y-%m-%d")
 
-            params = {"$top": 1000}
+            params: Dict[str, Any] = {"$top": 1000}
             if current_only:
                 params["$filter"] = f"OfficeRecordEndDate ge datetime'{today}'"
 

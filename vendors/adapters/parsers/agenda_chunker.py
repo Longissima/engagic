@@ -31,6 +31,7 @@ from difflib import SequenceMatcher
 from typing import Dict, Any, List, Optional
 
 from config import get_logger
+from vendors.utils.attachments import classify_attachment_type as _attachment_type
 
 logger = get_logger(__name__).bind(component="vendor")
 
@@ -257,7 +258,7 @@ def _extract_page_text_with_positions(page):
                 "font_name": dominant["font"],
                 "page": page.number,
             })
-    lines.sort(key=lambda l: (l["y0"], l["x0"]))
+    lines.sort(key=lambda line: (line["y0"], line["x0"]))
     return lines
 
 
@@ -456,9 +457,6 @@ def _is_attachment_url(url):
     return False
 
 
-from vendors.utils.attachments import classify_attachment_type as _attachment_type
-
-
 def _extract_matter_file(title: str, body: str) -> Optional[str]:
     """Try to extract a matter file number from title or body text."""
     for text in [title, body[:500] if body else ""]:
@@ -483,7 +481,7 @@ def _text_similarity(a, b):
 
 def _extract_meeting_metadata(lines, meta):
     """Extract meeting metadata from the first ~30 lines."""
-    first_lines = [l["text"] for l in lines[:30]]
+    first_lines = [line["text"] for line in lines[:30]]
     joined = "\n".join(first_lines)
 
     body_patterns = [
@@ -525,9 +523,9 @@ def _extract_meeting_metadata(lines, meta):
             meta.meeting_date = m.group(1).strip()
             break
 
-    for l in lines[:10]:
-        if l["is_bold"] and l["font_size"] >= 14:
-            meta.title = l["text"].strip()
+    for line in lines[:10]:
+        if line["is_bold"] and line["font_size"] >= 14:
+            meta.title = line["text"].strip()
             break
     if not meta.title:
         meta.title = "Agenda"
@@ -1131,7 +1129,7 @@ def _parse_toc_deep_hierarchical(doc, toc, result):
         item = _AgendaItem(
             number=item_num,
             title=item_title_clean or item_title,
-            section=current_section,
+            section=current_section or "",
             body="",
             recommended_action="",
             page_start=page_num,
@@ -1789,7 +1787,7 @@ if __name__ == "__main__":
                     print(f"    - {att['name']}")
                     print(f"      {att['url']}")
             elif not memo_count:
-                print(f"  Attachments: none")
+                print("  Attachments: none")
 
         orphans = result.get("orphan_links", [])
         if orphans:

@@ -38,7 +38,32 @@ def test_terminal_failure_is_not_retried():
     assert outcome.error_type == "ValueError"
 
 
-def test_non_integer_diagnostics_do_not_pollute_counter_stats():
-    outcome = JobOutcome.succeeded({"items_new": 1, "model": "flash", "cached": True})
+def test_abandoned_claim_is_visible_but_not_retried_or_successful():
+    outcome = JobOutcome.abandoned("claim superseded", {"items_new": 1})
 
-    assert outcome.stats == {"items_new": 1, "cached": 1}
+    assert outcome.status is OutcomeStatus.ABANDONED
+    assert not outcome.is_success
+    assert not outcome.should_retry
+    assert outcome.error_type == "ClaimLost"
+
+
+def test_bounded_scalar_diagnostics_survive_without_affecting_classification():
+    outcome = JobOutcome.from_stats(
+        {
+            "items_new": 1,
+            "items_failed": 0,
+            "model": "flash",
+            "cached": True,
+            "provider_wait_ms": 12.5,
+            "nested": {"ignored": True},
+        }
+    )
+
+    assert outcome.is_success
+    assert outcome.stats == {
+        "items_new": 1,
+        "items_failed": 0,
+        "model": "flash",
+        "cached": True,
+        "provider_wait_ms": 12.5,
+    }

@@ -9,8 +9,11 @@ Tests the 3-tier fallback hierarchy for matter identification:
 Also tests edge cases: reading prefixes, generic titles, cross-city collision.
 """
 
+from datetime import datetime
+
 import pytest
 from database.id_generation import (
+    generate_meeting_id,
     generate_matter_id,
     normalize_title_for_matter_id,
     validate_matter_id,
@@ -18,6 +21,28 @@ from database.id_generation import (
     matter_ids_match,
     hash_meeting_id
 )
+
+
+def test_undated_meeting_id_is_stable_and_distinct_from_dated_identity():
+    undated = generate_meeting_id(
+        "exampleCA",
+        "vendor-meeting-1",
+        None,
+        "City Council",
+    )
+
+    assert generate_meeting_id(
+        "exampleCA",
+        "vendor-meeting-1",
+        None,
+        "City Council",
+    ) == undated
+    assert generate_meeting_id(
+        "exampleCA",
+        "vendor-meeting-1",
+        datetime(2026, 8, 7),
+        "City Council",
+    ) != undated
 
 
 class TestMatterFileFallback:
@@ -278,18 +303,22 @@ class TestNormalizeTitleForMatterId:
 
     def test_basic_normalization(self):
         """Basic title normalized to lowercase"""
-        result = normalize_title_for_matter_id("Approval of Budget Amendments")
-        assert result == "approval of budget amendments"
+        result = normalize_title_for_matter_id("Approval of Annual Budget Amendments")
+        assert result == "approval of annual budget amendments"
 
     def test_first_reading_stripped(self):
         """FIRST READING prefix stripped"""
-        result = normalize_title_for_matter_id("FIRST READING: Ordinance 2025-123")
-        assert result == "ordinance 2025-123"
+        result = normalize_title_for_matter_id(
+            "FIRST READING: Ordinance 2025-123 Establishing Water Rates"
+        )
+        assert result == "ordinance 2025-123 establishing water rates"
 
     def test_second_reading_stripped(self):
         """SECOND READING prefix stripped"""
-        result = normalize_title_for_matter_id("SECOND READING: Ordinance 2025-123")
-        assert result == "ordinance 2025-123"
+        result = normalize_title_for_matter_id(
+            "SECOND READING: Ordinance 2025-123 Establishing Water Rates"
+        )
+        assert result == "ordinance 2025-123 establishing water rates"
 
     def test_generic_title_returns_none(self):
         """Generic titles return None"""

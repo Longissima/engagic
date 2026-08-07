@@ -183,7 +183,8 @@ def _extract_attachments(attachment_ul: Tag) -> List[Dict[str, Any]]:
         if not link:
             continue
 
-        href = link.get('href', '')
+        href_value = link.get('href')
+        href = href_value if isinstance(href_value, str) else ''
         name = link.get_text(strip=True)
         if not href or not name:
             continue

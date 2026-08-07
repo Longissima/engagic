@@ -1,5 +1,11 @@
 # Technical Debt Register
 
+> Historical snapshot (2026-04-12). Several pipeline entries below were resolved
+> or replaced by the 2026-08-07 remediation. Current pipeline residuals are
+> maintained in [`PIPELINE_PERFORMANCE.md`](PIPELINE_PERFORMANCE.md); settled
+> correctness and rollout state live in
+> [`PIPELINE_REMEDIATION.md`](PIPELINE_REMEDIATION.md).
+
 Architectural opportunities identified but deferred. Review when modifying related code.
 
 Last audit: 2026-04-12

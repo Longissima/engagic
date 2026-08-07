@@ -28,6 +28,7 @@ import asyncio
 
 from config import get_logger
 from database.db_postgres import Database
+from pipeline.utils import meeting_work_version
 
 logger = get_logger(__name__)
 
@@ -63,30 +64,88 @@ async def find_targets(db: Database, below: str, banana: str | None, limit: int 
         return [dict(r) for r in await conn.fetch(sql, *params)]
 
 
-async def apply(db: Database, targets: list) -> tuple[int, int]:
+async def apply(db: Database, targets: list, below: str) -> tuple[int, int]:
     unfrozen = 0
+    enqueued = 0
     for t in targets:
         async with db.pool.acquire() as conn:
             async with conn.transaction():
+                meeting = await db.meetings.get_meeting(
+                    t["meeting_id"],
+                    conn=conn,
+                    lock_for_update=True,
+                )
+                if meeting is None:
+                    logger.warning(
+                        "skipping missing meeting during resummarization",
+                        meeting_id=t["meeting_id"],
+                    )
+                    continue
+                # Output invalidation preserves mv1 because prompts/summary are
+                # projections. An older open provider row would therefore stay
+                # version-compatible and could refill the just-unfrozen item.
+                # The meeting lock serializes this check with both reservation
+                # and collection; defer the whole meeting until its batch group
+                # is terminal.
+                if await db.batch_jobs.count_open_for_meeting(
+                    t["meeting_id"], conn=conn
+                ):
+                    logger.info(
+                        "deferring resummarization with open batch work",
+                        meeting_id=t["meeting_id"],
+                    )
+                    continue
                 result = await conn.execute(
                     """
                     UPDATE items
                     SET summary = NULL, prompts_version = NULL
                     WHERE id = ANY($1::text[])
+                      AND meeting_id = $2
+                      AND summary IS NOT NULL
+                      AND (prompts_version IS NULL OR prompts_version < $3)
                     """,
                     t["item_ids"],
+                    t["meeting_id"],
+                    below,
                 )
-                unfrozen += int(result.split()[-1])
-        # processing_metadata=None keeps the stored chunk/html audit (COALESCE)
-        await db.queue.enqueue_job(
-            source_url=f"meeting://{t['meeting_id']}",
-            job_type="meeting",
-            payload={"meeting_id": t["meeting_id"]},
-            meeting_id=t["meeting_id"],
-            priority=BACKFILL_PRIORITY,
-            banana=t["banana"],
-        )
-    return unfrozen, len(targets)
+                changed = int(result.split()[-1])
+                if changed == 0:
+                    continue
+                items = await db.items.get_agenda_items(
+                    t["meeting_id"],
+                    conn=conn,
+                    lock_for_update=True,
+                )
+                work_version = meeting_work_version(meeting, items)
+                source_url = f"meeting://{t['meeting_id']}"
+
+                # Output invalidation deliberately preserves the same input
+                # work_version, so its stable outbox event may already be
+                # published. Exact-version reactivation is the explicit retry
+                # authority; keep it in this transaction with the NULL writes.
+                await db.queue.enqueue_job(
+                    source_url=source_url,
+                    job_type="meeting",
+                    payload={"meeting_id": t["meeting_id"]},
+                    meeting_id=t["meeting_id"],
+                    priority=BACKFILL_PRIORITY,
+                    banana=meeting.banana,
+                    work_version=work_version,
+                    conn=conn,
+                )
+                if not await db.queue.reactivate_job_version(
+                    source_url=source_url,
+                    work_version=work_version,
+                    priority=BACKFILL_PRIORITY,
+                    conn=conn,
+                ):
+                    raise RuntimeError(
+                        f"authoritative meeting version was not reactivated: "
+                        f"{t['meeting_id']}"
+                    )
+                unfrozen += changed
+                enqueued += 1
+    return unfrozen, enqueued
 
 
 async def main() -> None:
@@ -117,7 +176,7 @@ async def main() -> None:
             print("\nre-run with --yes to unfreeze these summaries and re-enqueue")
             return
 
-        unfrozen, enqueued = await apply(db, targets)
+        unfrozen, enqueued = await apply(db, targets, args.below)
         print(f"\nunfroze {unfrozen} item summaries, re-enqueued {enqueued} meetings "
               f"at priority {BACKFILL_PRIORITY} (past dates take the batch lane)")
     finally:

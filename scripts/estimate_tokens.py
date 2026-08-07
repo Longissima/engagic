@@ -8,12 +8,9 @@ Usage: uv run scripts/estimate_tokens.py [--sample-size 100]
 
 import argparse
 import asyncio
-import io
 import os
 import random
 import statistics
-import sys
-import time
 
 import asyncpg
 import fitz  # PyMuPDF
@@ -202,7 +199,7 @@ async def main():
     print(f"\n{'='*60}")
     print(f"SAMPLE STATISTICS (n={success_count})")
     print(f"{'='*60}")
-    print(f"  Characters per doc (all):")
+    print("  Characters per doc (all):")
     print(f"    Mean:          {mean_chars:>12,.0f}")
     print(f"    Trimmed mean:  {trimmed_mean:>12,.0f}  (drop top/bottom 5%)")
     print(f"    Winsorized:    {winsorized_mean:>12,.0f}  (cap at P95)")
@@ -229,20 +226,21 @@ async def main():
     total_tokens_trimmed = trimmed_mean * accessible_docs / CHARS_PER_TOKEN
     total_tokens_winsorized = winsorized_mean * accessible_docs / CHARS_PER_TOKEN
     total_tokens_median = median_chars * accessible_docs / CHARS_PER_TOKEN
-    total_tokens_mean = mean_chars * accessible_docs / CHARS_PER_TOKEN
+    total_chars_mean = mean_chars * accessible_docs
+    total_tokens_mean = total_chars_mean / CHARS_PER_TOKEN
 
     print(f"\n{'='*60}")
-    print(f"EXTRAPOLATION TO FULL POPULATION")
+    print("EXTRAPOLATION TO FULL POPULATION")
     print(f"{'='*60}")
     print(f"  Total attachment URLs:        {total_attachments:>14,}")
     print(f"  Estimated accessible (95%):   {accessible_docs:>14,}")
-    print(f"")
+    print()
     print(f"  Estimate (trimmed mean):      {total_tokens_trimmed:>14,.0f} tokens")
     print(f"  Estimate (winsorized mean):   {total_tokens_winsorized:>14,.0f} tokens")
     print(f"  Estimate (median):            {total_tokens_median:>14,.0f} tokens")
     print(f"  Estimate (raw mean):          {total_tokens_mean:>14,.0f} tokens")
     print(f"  95% CI (trimmed):             {ci_low_trim:>14,.0f} - {ci_high_trim:,.0f}")
-    print(f"")
+    print()
 
     # Human-readable
     def human_tokens(n):
@@ -256,11 +254,14 @@ async def main():
 
     print(f"  === {human_tokens(total_tokens_mean)} tokens (mean estimate) ===")
     print(f"  === {human_tokens(total_tokens_median)} tokens (median estimate) ===")
-    print(f"  === 95% CI: {human_tokens(ci_low)} - {human_tokens(ci_high)} ===")
+    print(
+        f"  === 95% CI: {human_tokens(ci_low_trim)} - "
+        f"{human_tokens(ci_high_trim)} ==="
+    )
 
     # Also report stored text for comparison
     print(f"\n{'='*60}")
-    print(f"FOR COMPARISON: STORED SUMMARIES/TEXT")
+    print("FOR COMPARISON: STORED SUMMARIES/TEXT")
     print(f"{'='*60}")
     stored_chars = 59613213 + 61888624 + 35067610 + 6000747  # from earlier queries
     stored_tokens = stored_chars / CHARS_PER_TOKEN

@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS matter_appearances (
     matter_id TEXT NOT NULL,
     meeting_id TEXT NOT NULL,
     item_id TEXT NOT NULL,
-    appeared_at TIMESTAMP NOT NULL,
+    appeared_at TIMESTAMP,  -- Authoritative meeting date; NULL for undated meetings
     committee TEXT,
     action TEXT,
     vote_outcome TEXT CHECK (vote_outcome IS NULL OR vote_outcome IN ('passed', 'failed', 'tabled', 'withdrawn', 'referred', 'amended', 'unknown', 'no_vote')),
@@ -185,6 +185,10 @@ CREATE TABLE IF NOT EXISTS cache (
     last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- One total order for direct desired-work writes and transactional outbox
+-- intents. Opaque work-version hashes say equality; this sequence says newer.
+CREATE SEQUENCE IF NOT EXISTS pipeline_work_generation_seq;
+
 -- Processing queue: Decoupled processing queue (agenda-first, item-level)
 CREATE TABLE IF NOT EXISTS queue (
     id BIGSERIAL PRIMARY KEY,  -- PostgreSQL auto-increment
@@ -205,7 +209,13 @@ CREATE TABLE IF NOT EXISTS queue (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     retry_at TIMESTAMP,
+    ready_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     work_version TEXT,
+    claim_token UUID,
+    claimed_at TIMESTAMP,
+    heartbeat_at TIMESTAMP,
+    desired_generation BIGINT NOT NULL DEFAULT
+        nextval('pipeline_work_generation_seq'),
     FOREIGN KEY (banana) REFERENCES jurisdictions(banana) ON DELETE CASCADE,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
@@ -233,6 +243,7 @@ CREATE TABLE IF NOT EXISTS batch_jobs (
         CHECK (status IN ('submitted', 'collected', 'failed')),
     error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    submitted_at TIMESTAMP,
     last_polled_at TIMESTAMP,
     next_poll_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_error_at TIMESTAMP,
@@ -329,16 +340,35 @@ CREATE TABLE IF NOT EXISTS pipeline_outbox (
     aggregate_id TEXT NOT NULL,
     payload JSONB NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'publishing', 'published', 'failed')),
+        CHECK (status IN (
+            'pending', 'publishing', 'published', 'failed', 'dead_letter'
+        )),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_error TEXT,
+    claimed_at TIMESTAMP,
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMP,
+    claim_token UUID,
+    work_generation BIGINT NOT NULL DEFAULT
+        nextval('pipeline_work_generation_seq'),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     published_at TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_ready
-    ON pipeline_outbox (next_attempt_at, id)
-    WHERE status IN ('pending', 'failed');
+    ON pipeline_outbox (next_attempt_at, work_generation)
+    WHERE status IN ('pending', 'failed', 'publishing');
+CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_aggregate_order
+    ON pipeline_outbox (
+        event_type, aggregate_type, aggregate_id, work_generation
+    )
+    WHERE status NOT IN ('published', 'dead_letter');
+CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_queue_source_generation
+    ON pipeline_outbox ((payload->>'source_url'), work_generation)
+    WHERE event_type = 'queue.enqueue';
+CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_lease_expiry
+    ON pipeline_outbox (lease_expires_at, work_generation)
+    WHERE status = 'publishing';
 
 -- Ground-truth corpus index (see migration 025 / docs/CORPUS_ARCHITECTURE.md).
 -- Original bytes and extracted text live in R2 (engagic-corpus bucket),
@@ -367,11 +397,20 @@ CREATE TABLE IF NOT EXISTS document_source (
     source_identity TEXT NOT NULL,
     banana TEXT,
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, -- deprecated: successful validation clock
+    last_observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_validated_at TIMESTAMP,
+    last_validation_attempt_at TIMESTAMP,
+    etag TEXT,
+    last_modified TEXT,
     PRIMARY KEY (content_sha256, source_identity)
 );
 CREATE INDEX IF NOT EXISTS idx_document_source_identity
-    ON document_source (source_identity, last_seen DESC);
+    ON document_source (
+        source_identity,
+        last_validated_at DESC NULLS LAST,
+        first_seen DESC
+    );
 CREATE INDEX IF NOT EXISTS idx_document_blob_untexted
     ON document_blob (created_at)
     WHERE text_key IS NULL;
@@ -721,11 +760,15 @@ CREATE INDEX IF NOT EXISTS idx_cache_hash ON cache(content_hash);
 -- Queue
 CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
 CREATE INDEX IF NOT EXISTS idx_queue_city ON queue(banana);
--- Composite index for get_next_for_processing() query (covers status, priority, created_at)
-CREATE INDEX IF NOT EXISTS idx_queue_processing ON queue(status, priority DESC, created_at ASC);
+-- Composite index for get_next_for_processing() query.
+CREATE INDEX IF NOT EXISTS idx_queue_processing
+    ON queue(status, priority DESC, last_enqueued_at ASC);
 CREATE INDEX IF NOT EXISTS idx_queue_ready
-    ON queue(status, retry_at, priority DESC, created_at ASC)
+    ON queue(status, retry_at, priority DESC, last_enqueued_at ASC)
     WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_queue_claim_heartbeat
+    ON queue(heartbeat_at)
+    WHERE status = 'processing';
 
 -- Tenant tables
 CREATE INDEX IF NOT EXISTS idx_tenant_coverage_city ON tenant_coverage(banana);
@@ -831,6 +874,7 @@ COMMENT ON TABLE city_matters IS 'Matters-First Architecture: Each legislative m
 COMMENT ON COLUMN city_matters.id IS 'Composite hash including city_banana to prevent cross-city collisions. Generated via fallback hierarchy: matter_file (preferred) → matter_id (vendor UUID) → normalized_title (fallback).';
 
 COMMENT ON TABLE matter_appearances IS 'Timeline tracking: Links matters to meetings via agenda items. Enables legislative timeline view showing matter evolution across meetings.';
+COMMENT ON COLUMN matter_appearances.appeared_at IS 'Authoritative meeting date; NULL when the source meeting is undated';
 
 COMMENT ON TABLE meeting_topics IS 'Normalized from meetings.topics JSON array. Enables efficient topic filtering and indexing.';
 

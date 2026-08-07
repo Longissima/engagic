@@ -58,6 +58,19 @@ class EngagicMetrics:
             buckets=[0.5, 1, 2, 5, 10, 30, 60]
         )
 
+        self.document_acquisitions = Counter(
+            'engagic_document_acquisitions_total',
+            'Document acquisitions by pipeline component, outcome, and observed format',
+            ['component', 'outcome', 'document_type'],
+        )
+
+        self.document_acquisition_duration = Histogram(
+            'engagic_document_acquisition_seconds',
+            'Document acquisition duration by pipeline component and outcome',
+            ['component', 'outcome', 'document_type'],
+            buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 300],
+        )
+
         # LLM metrics
         self.llm_api_calls = Counter(
             'engagic_llm_api_calls_total',
