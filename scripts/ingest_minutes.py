@@ -109,6 +109,8 @@ CLEAR_FAILURE_SQL = """
     WHERE source_identity = $1 AND extract_version = $2
 """
 
+UNBOUNDED_FAILURE_ATTEMPTS = 2_147_483_647
+
 
 Candidate = Tuple[Any, str, str]
 
@@ -180,10 +182,27 @@ def unsupported_minutes_url_reason(url: str) -> str | None:
     return None
 
 
+def failure_attempt_limit(error: Exception, configured_max: int) -> int:
+    """Return the retry cap for a classified ingestion failure."""
+    if isinstance(error, DocumentDownloadError) and error.is_retryable:
+        return UNBOUNDED_FAILURE_ATTEMPTS
+    return configured_max
+
+
+def failure_error_text(error: Exception, source_url: str) -> str:
+    """Format a ledger-safe error without volatile URL credentials."""
+    safe_url = attachment_identity(source_url)
+    message = str(error)
+    if source_url and source_url != safe_url:
+        message = message.replace(source_url, safe_url)
+    return f"{type(error).__name__}: {message}"[:1000]
+
+
 async def record_failure(
     db,
     *,
     identity: str,
+    source_url: str,
     banana: str,
     stage: str,
     error: Exception,
@@ -200,7 +219,7 @@ async def record_failure(
                 EXTRACT_VERSION,
                 banana,
                 stage,
-                str(error)[:1000],
+                failure_error_text(error, source_url),
                 permanent,
                 max_failures,
                 retry_days,
@@ -355,30 +374,30 @@ async def main() -> int:
                     failure = await record_failure(
                         db,
                         identity=identity,
+                        source_url=row["minutes_url"],
                         banana=row["banana"],
                         stage="download",
                         error=e,
-                        # Network/HTTP failures back off but are never made
-                        # permanent. Only an HTML/viewer resolution failure is
-                        # suppressible for the current extractor version.
-                        max_failures=(
-                            args.max_failures if not e.is_retryable else 2_147_483_647
-                        ),
+                        # Transient network/status failures keep backing off;
+                        # deterministic 4xx and resolution failures use the
+                        # configured cap for this extractor version.
+                        max_failures=failure_attempt_limit(e, args.max_failures),
                         retry_days=args.failure_retry_days,
                     )
                     logger.warning(
                         "minutes download failed",
                         banana=row["banana"],
-                        url=row["minutes_url"][:110],
+                        url=identity[:110],
                         attempt=(failure or {}).get("attempt_count"),
                         suppressed=(failure or {}).get("permanent", False),
-                        error=str(e)[:200],
+                        error=failure_error_text(e, row["minutes_url"])[:200],
                     )
                 except ExtractionError as e:
                     counts["failed_extract"] += 1
                     failure = await record_failure(
                         db,
                         identity=identity,
+                        source_url=row["minutes_url"],
                         banana=row["banana"],
                         stage="extract",
                         error=e,
@@ -388,18 +407,18 @@ async def main() -> int:
                     logger.warning(
                         "minutes extraction failed",
                         banana=row["banana"],
-                        url=row["minutes_url"][:110],
+                        url=identity[:110],
                         attempt=(failure or {}).get("attempt_count"),
                         suppressed=(failure or {}).get("permanent", False),
-                        error=str(e)[:200],
+                        error=failure_error_text(e, row["minutes_url"])[:200],
                     )
                 except Exception as e:
                     counts["failed_other"] += 1
                     logger.warning(
                         "minutes ingest failed (will retry)",
                         banana=row["banana"],
-                        url=row["minutes_url"][:110],
-                        error=str(e)[:200],
+                        url=identity[:110],
+                        error=failure_error_text(e, row["minutes_url"])[:200],
                     )
 
         await asyncio.gather(*(ingest_one(candidate) for candidate in todo))

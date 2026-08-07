@@ -3,8 +3,11 @@
 import asyncio
 from datetime import datetime
 
+import pytest
+
 import analysis.analyzer_async as analyzer_module
 from analysis.analyzer_async import AsyncAnalyzer
+from exceptions import DocumentDownloadError, ExtractionError
 import scripts.ingest_minutes as ingest_minutes
 from scripts.ingest_minutes import select_candidates
 import scripts.sweep_minutes as sweep_minutes
@@ -131,6 +134,112 @@ def test_select_candidates_retries_incomplete_and_rechecks_old_sources():
         "permanent_failure": 1,
         "unsupported_url": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(404, False), (410, False), (429, True), (503, True)],
+)
+def test_download_http_status_classification_and_url_redaction(
+    monkeypatch, status, retryable
+):
+    signed_url = (
+        "https://example.test/minutes.pdf?X-Amz-Signature=super-secret"
+        "&X-Amz-Credential=temporary"
+    )
+
+    class Response:
+        headers = {}
+
+        def __init__(self):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        def get(self, url, ssl):
+            assert url == signed_url
+            assert ssl is False
+            return Response()
+
+    class Limiter:
+        async def wait_if_needed(self, vendor):
+            return None
+
+    analyzer = AsyncAnalyzer(enable_llm=False)
+
+    async def get_session():
+        return Session()
+
+    analyzer._get_session = get_session
+    monkeypatch.setattr(analyzer_module, "get_rate_limiter", lambda: Limiter())
+
+    with pytest.raises(DocumentDownloadError) as raised:
+        asyncio.run(analyzer.download_pdf_async(signed_url))
+
+    error = raised.value
+    assert error.status_code == status
+    assert error.is_retryable is retryable
+    assert error.document_url == "https://example.test/minutes.pdf"
+    assert "super-secret" not in str(error)
+    expected_limit = (
+        ingest_minutes.UNBOUNDED_FAILURE_ATTEMPTS if retryable else 3
+    )
+    assert ingest_minutes.failure_attempt_limit(error, 3) == expected_limit
+
+
+def test_record_failure_redacts_signed_url_before_database_write():
+    signed_url = (
+        "https://example.test/minutes.pdf?sig=super-secret&se=tomorrow"
+    )
+    captured = {}
+
+    class Connection:
+        async def fetchrow(self, query, *args):
+            captured["query"] = query
+            captured["args"] = args
+            return {"attempt_count": 1, "permanent": False}
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    class Database:
+        pool = Pool()
+
+    error = ExtractionError(
+        f"could not extract {signed_url}",
+        document_url=signed_url,
+    )
+    result = asyncio.run(
+        ingest_minutes.record_failure(
+            Database(),
+            identity="https://example.test/minutes.pdf",
+            source_url=signed_url,
+            banana="exampleCA",
+            stage="extract",
+            error=error,
+            max_failures=3,
+            retry_days=7,
+        )
+    )
+
+    assert result == {"attempt_count": 1, "permanent": False}
+    assert captured["query"] == ingest_minutes.RECORD_FAILURE_SQL
+    persisted_error = captured["args"][4]
+    assert "super-secret" not in persisted_error
+    assert "https://example.test/minutes.pdf" in persisted_error
 
 
 def test_extraction_only_analyzer_does_not_construct_llm(monkeypatch):

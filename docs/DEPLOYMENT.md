@@ -218,10 +218,11 @@ documents, parses PDFs, or writes to the corpus.
 `scripts/ingest_minutes.py` pulls minutes bytes into the R2 corpus via the
 analyzer's extraction-only path (no LLM client or key); incomplete writes retry
 and completed stable URLs are revalidated every seven days by default so revised
-minutes are captured. Repeated download/extraction failures retry weekly and are
-suppressed after three attempts for the current extractor version; known
-HTML-only viewer URLs are excluded — suggested daily after sync. Sweep before
-ingest.
+minutes are captured. Deterministic download and extraction failures retry
+weekly and are suppressed after three attempts for the current extractor
+version; transient network, rate-limit, and server failures continue with weekly
+backoff. Known HTML-only viewer URLs are excluded — suggested daily after sync.
+Sweep before ingest.
 
 ---
 

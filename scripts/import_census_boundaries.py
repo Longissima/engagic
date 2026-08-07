@@ -18,8 +18,9 @@ Requirements:
 
 import argparse
 import asyncio
-import subprocess
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import asyncpg
@@ -37,6 +38,8 @@ TIGER_BASE_URL = "https://www2.census.gov/geo/tiger/TIGER2023/PLACE"
 # pre-generalized to 1:500k, and one national zip covers every state.
 CARTO_COUNTY_FILENAME = "cb_2023_us_county_500k.zip"
 CARTO_COUNTY_URL = f"https://www2.census.gov/geo/tiger/GENZ2023/shp/{CARTO_COUNTY_FILENAME}"
+COUNTY_IMPORT_TABLE = "census_counties_import"
+MIN_NATIONAL_COUNTY_ROWS = 3_000
 
 # State FIPS codes
 STATE_FIPS = {
@@ -314,14 +317,15 @@ async def match_cities() -> None:
         await conn.close()
 
 
-async def download_county_shapefile() -> None:
+async def download_county_shapefile() -> bool:
     """Download the national cartographic boundary county shapefile."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     dest = DATA_DIR / CARTO_COUNTY_FILENAME
 
-    if dest.exists():
+    if dest.exists() and dest.stat().st_size > 0:
         logger.debug("county shapefile exists, skipping")
-        return
+        return True
+    dest.unlink(missing_ok=True)
 
     logger.info("downloading county boundaries", url=CARTO_COUNTY_URL)
     result = subprocess.run(
@@ -332,20 +336,25 @@ async def download_county_shapefile() -> None:
     if result.returncode != 0:
         logger.error("download failed", stderr=result.stderr)
         dest.unlink(missing_ok=True)
+        return False
+    return True
 
 
-async def import_counties_to_staging() -> None:
-    """Import county shapefile to census_counties staging table."""
+async def import_counties_to_staging() -> bool:
+    """Import and atomically promote a validated county staging table."""
     dsn = config.get_postgres_dsn()
 
     shapefile = DATA_DIR / CARTO_COUNTY_FILENAME
     if not shapefile.exists():
         logger.error("county shapefile not found", path=str(shapefile))
-        return
+        return False
 
+    # Only the disposable import table is removed before ogr2ogr runs. The
+    # currently valid census_counties table remains available until a complete
+    # replacement has passed validation and can be swapped in transactionally.
     conn = await asyncpg.connect(dsn)
     try:
-        await conn.execute("DROP TABLE IF EXISTS census_counties CASCADE")
+        await conn.execute(f"DROP TABLE IF EXISTS {COUNTY_IMPORT_TABLE} CASCADE")
     finally:
         await conn.close()
 
@@ -355,7 +364,7 @@ async def import_counties_to_staging() -> None:
             "-f", "PostgreSQL",
             f"PG:{dsn}",
             f"/vsizip/{shapefile}",
-            "-nln", "census_counties",
+            "-nln", COUNTY_IMPORT_TABLE,
             "-nlt", "MULTIPOLYGON",
             "-t_srs", "EPSG:4326",
             "-overwrite",
@@ -365,16 +374,66 @@ async def import_counties_to_staging() -> None:
     )
     if result.returncode != 0:
         logger.error("ogr2ogr failed", stderr=result.stderr)
-        return
+        return False
 
     conn = await asyncpg.connect(dsn)
     try:
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_census_counties_namelsad
-            ON census_counties (UPPER(namelsad), stusps)
-        """)
-        count = await conn.fetchval("SELECT COUNT(*) FROM census_counties")
+        async with conn.transaction():
+            columns = {
+                row["column_name"]
+                for row in await conn.fetch("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name = $1
+                """, COUNTY_IMPORT_TABLE)
+            }
+            required = {"name", "namelsad", "stusps", "wkb_geometry"}
+            missing = sorted(required - columns)
+            if missing:
+                raise RuntimeError(
+                    f"county import missing required columns: {', '.join(missing)}"
+                )
+
+            stats = await conn.fetchrow(f"""
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE wkb_geometry IS NULL) AS null_geometry,
+                       COUNT(*) FILTER (
+                           WHERE wkb_geometry IS NOT NULL
+                             AND NOT ST_IsValid(wkb_geometry)
+                       ) AS invalid_geometry,
+                       COUNT(*) FILTER (
+                           WHERE wkb_geometry IS NOT NULL
+                             AND ST_SRID(wkb_geometry) <> 4326
+                       ) AS wrong_srid
+                FROM {COUNTY_IMPORT_TABLE}
+            """)
+            if stats["total"] < MIN_NATIONAL_COUNTY_ROWS:
+                raise RuntimeError(
+                    f"county import has only {stats['total']} rows; expected a national file"
+                )
+            if stats["null_geometry"] or stats["invalid_geometry"] or stats["wrong_srid"]:
+                raise RuntimeError(
+                    "county import geometry validation failed: "
+                    f"null={stats['null_geometry']}, "
+                    f"invalid={stats['invalid_geometry']}, "
+                    f"wrong_srid={stats['wrong_srid']}"
+                )
+
+            await conn.execute("DROP TABLE IF EXISTS census_counties")
+            await conn.execute(
+                f"ALTER TABLE {COUNTY_IMPORT_TABLE} RENAME TO census_counties"
+            )
+            await conn.execute("""
+                CREATE INDEX idx_census_counties_namelsad
+                ON census_counties (UPPER(namelsad), stusps)
+            """)
+
+        count = stats["total"]
         logger.info("county import complete", total_counties=count)
+        return True
+    except Exception as e:
+        logger.error("county import validation failed", error=str(e))
+        return False
     finally:
         await conn.close()
 
@@ -396,47 +455,48 @@ async def match_counties() -> None:
     conn = await asyncpg.connect(dsn)
 
     try:
-        counties = await conn.fetch("""
-            SELECT banana, name, state
-            FROM jurisdictions
-            WHERE type = 'county'
-            ORDER BY state, name
-        """)
+        async with conn.transaction():
+            counties = await conn.fetch("""
+                SELECT banana, name, state
+                FROM jurisdictions
+                WHERE type = 'county'
+                ORDER BY state, name
+            """)
 
-        logger.info("matching counties", total=len(counties))
+            logger.info("matching counties", total=len(counties))
 
-        matched = 0
-        unmatched = []
+            matched = 0
+            unmatched = []
 
-        for county in counties:
-            name_upper = county["name"].strip().upper()
-            name_upper = COUNTY_ALIASES.get((name_upper, county["state"]), name_upper)
+            for county in counties:
+                name_upper = county["name"].strip().upper()
+                name_upper = COUNTY_ALIASES.get((name_upper, county["state"]), name_upper)
 
-            # NAMELSAD carries the full legal name ("Oakland County",
-            # "Terrebonne Parish"); NAME is the bare name ("Oakland").
-            row = await conn.fetchrow("""
-                SELECT wkb_geometry
-                FROM census_counties
-                WHERE UPPER(namelsad) = $1 AND stusps = $2
-            """, name_upper, county["state"])
-            if not row:
+                # NAMELSAD carries the full legal name ("Oakland County",
+                # "Terrebonne Parish"); NAME is the bare name ("Oakland").
                 row = await conn.fetchrow("""
                     SELECT wkb_geometry
                     FROM census_counties
-                    WHERE UPPER(name) = $1 AND stusps = $2
+                    WHERE UPPER(namelsad) = $1 AND stusps = $2
                 """, name_upper, county["state"])
+                if not row:
+                    row = await conn.fetchrow("""
+                        SELECT wkb_geometry
+                        FROM census_counties
+                        WHERE UPPER(name) = $1 AND stusps = $2
+                    """, name_upper, county["state"])
 
-            if row:
-                await conn.execute("""
-                    UPDATE jurisdictions SET geom = $1 WHERE banana = $2
-                """, row["wkb_geometry"], county["banana"])
-                matched += 1
-            else:
-                unmatched.append(county)
-                logger.warning(
-                    "no county match",
-                    banana=county["banana"], name=county["name"], state=county["state"],
-                )
+                if row:
+                    await conn.execute("""
+                        UPDATE jurisdictions SET geom = $1 WHERE banana = $2
+                    """, row["wkb_geometry"], county["banana"])
+                    matched += 1
+                else:
+                    unmatched.append(county)
+                    logger.warning(
+                        "no county match",
+                        banana=county["banana"], name=county["name"], state=county["state"],
+                    )
 
         logger.info("county matching complete", matched=matched, unmatched=len(unmatched))
         for county in unmatched:
@@ -444,6 +504,26 @@ async def match_counties() -> None:
 
     finally:
         await conn.close()
+
+
+async def run_county_pipeline() -> bool:
+    """Refresh county staging and match only after every prior step succeeds."""
+    try:
+        if not await download_county_shapefile():
+            logger.error("county pipeline stopped after download failure")
+            return False
+        if not await import_counties_to_staging():
+            logger.error("county pipeline stopped after import failure")
+            return False
+        await match_counties()
+        return True
+    except Exception as e:
+        logger.error(
+            "county pipeline failed",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return False
 
 
 async def report_status() -> None:
@@ -490,7 +570,7 @@ async def report_status() -> None:
         await conn.close()
 
 
-async def main():
+async def main() -> int:
     parser = argparse.ArgumentParser(description="Import Census TIGER boundaries")
     parser.add_argument("--download", action="store_true", help="Download shapefiles")
     parser.add_argument("--import", dest="import_", action="store_true", help="Import to staging")
@@ -510,16 +590,16 @@ async def main():
         await match_cities()
 
     if args.all or args.counties:
-        await download_county_shapefile()
-        await import_counties_to_staging()
-        await match_counties()
+        if not await run_county_pipeline():
+            return 1
 
     if args.status or args.all:
         await report_status()
 
     if not any([args.download, args.import_, args.match, args.counties, args.status, args.all]):
         parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

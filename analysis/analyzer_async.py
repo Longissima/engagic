@@ -38,6 +38,7 @@ from analysis.llm.input_budget import (
     prepare_item_text,
 )
 from pipeline.protocols import MetricsCollector, NullMetrics
+from pipeline.utils import attachment_identity
 from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 
 from config import config, get_logger
@@ -236,6 +237,9 @@ class AsyncAnalyzer:
         Raises:
             ExtractionError: If download fails or no PDF can be resolved
         """
+        # Keep volatile signing credentials out of logs and exception context.
+        safe_url = attachment_identity(url)
+
         # Acquire session with rotation check (serialized, but quick).
         # Rotation drops the old session reference and creates a new one -- in-flight
         # requests on the old session keep working because they already hold a local
@@ -264,8 +268,9 @@ class AsyncAnalyzer:
             async with session.get(url, ssl=False) as resp:  # Disable SSL for Granicus S3
                 if resp.status != 200:
                     raise DocumentDownloadError(
-                        f"HTTP {resp.status} downloading PDF from {url}",
-                        document_url=url,
+                        f"HTTP {resp.status} downloading PDF from {safe_url}",
+                        document_url=safe_url,
+                        status_code=resp.status,
                     )
 
                 content_type = resp.headers.get("Content-Type", "")
@@ -273,16 +278,16 @@ class AsyncAnalyzer:
 
                 # Happy path: response is a PDF
                 if raw_bytes[:5] == b"%PDF-" or "application/pdf" in content_type:
-                    logger.debug("pdf downloaded", url=url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
+                    logger.debug("pdf downloaded", url=safe_url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
                     return raw_bytes
 
                 # HTML response -- intermediate attachment page. Parse for PDF links.
                 if _depth >= 1:
                     # Already followed one redirect; don't chase further.
-                    logger.debug("html attachment page returned non-pdf after resolve, giving up", url=url[:120])
+                    logger.debug("html attachment page returned non-pdf after resolve, giving up", url=safe_url[:120])
                     raise DocumentDownloadError(
-                        f"Resolved URL still not a PDF: {url[:120]}",
-                        document_url=url,
+                        f"Resolved URL still not a PDF: {safe_url[:120]}",
+                        document_url=safe_url,
                         retryable=False,
                     )
 
@@ -291,8 +296,8 @@ class AsyncAnalyzer:
                     if pdf_url:
                         logger.info(
                             "html attachment page resolved to pdf",
-                            original_url=url[:120],
-                            resolved_url=pdf_url[:120],
+                            original_url=safe_url[:120],
+                            resolved_url=attachment_identity(pdf_url)[:120],
                         )
                         return await self.download_pdf_async(pdf_url, _depth=_depth + 1)
 
@@ -311,27 +316,27 @@ class AsyncAnalyzer:
                     if onbase_alt and onbase_alt != url:
                         logger.info(
                             "onbase endpoint returned html, retrying alternate",
-                            original_url=url[:120],
-                            alt_url=onbase_alt[:120],
+                            original_url=safe_url[:120],
+                            alt_url=attachment_identity(onbase_alt)[:120],
                         )
                         return await self.download_pdf_async(onbase_alt, _depth=_depth + 1)
 
-                    logger.debug("html attachment page had no pdf links", url=url[:120])
+                    logger.debug("html attachment page had no pdf links", url=safe_url[:120])
                     raise DocumentDownloadError(
-                        f"Attachment page contained no PDF links: {url[:120]}",
-                        document_url=url,
+                        f"Attachment page contained no PDF links: {safe_url[:120]}",
+                        document_url=safe_url,
                         retryable=False,
                     )
 
                 # Unknown content type -- try using it as-is (could be octet-stream)
-                logger.debug("pdf downloaded", url=url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
+                logger.debug("pdf downloaded", url=safe_url, size_mb=round(len(raw_bytes) / 1024 / 1024, 2))
                 return raw_bytes
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.error("pdf download failed", url=url, error=str(e))
+            logger.error("pdf download failed", url=safe_url, error=str(e))
             raise DocumentDownloadError(
                 f"Failed to download PDF: {e}",
-                document_url=url,
+                document_url=safe_url,
                 original_error=e,
             ) from e
         finally:
@@ -356,6 +361,7 @@ class AsyncAnalyzer:
         Raises:
             ExtractionError: If extraction fails, times out, or subprocess crashes
         """
+        safe_url = attachment_identity(url)
         pdf_bytes = await self.download_pdf_async(url)
 
         # Corpus dedup gate (docs/CORPUS_ARCHITECTURE.md): identity comes from
@@ -374,7 +380,7 @@ class AsyncAnalyzer:
                 await corpus_store.record_sighting(content_sha256, url, banana)
                 logger.info(
                     "extraction served from corpus",
-                    url=url[:100],
+                    url=safe_url[:100],
                     sha=content_sha256[:16],
                     chars=len(cached.get("text") or ""),
                 )
@@ -419,8 +425,11 @@ class AsyncAnalyzer:
                 timeout=620
             )
         except asyncio.TimeoutError:
-            logger.error("PDF extraction timed out", url=url[:100])
-            raise ExtractionError(f"PDF extraction timed out: {url[:100]}")
+            logger.error("PDF extraction timed out", url=safe_url[:100])
+            raise ExtractionError(
+                f"PDF extraction timed out: {safe_url[:100]}",
+                document_url=safe_url,
+            )
         finally:
             try:
                 os.unlink(pdf_path)
@@ -442,7 +451,7 @@ class AsyncAnalyzer:
         result["content_sha256"] = content_sha256
         result["corpus_persisted"] = corpus_persisted
 
-        logger.debug("pdf extracted", url=url, pages=result.get("page_count", 0))
+        logger.debug("pdf extracted", url=safe_url, pages=result.get("page_count", 0))
         return result
 
     async def process_agenda_with_cache_async(self, meeting_data: Dict[str, Any]) -> Dict[str, Any]:

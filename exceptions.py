@@ -277,9 +277,28 @@ class DocumentDownloadError(ExtractionError):
 
     _retryable = True
 
-    def __init__(self, message: str, *, retryable: bool = True, **kwargs):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: Optional[bool] = None,
+        status_code: Optional[int] = None,
+        **kwargs,
+    ):
+        # Network failures have no status and are transient by default. For
+        # HTTP responses, retry only statuses whose semantics are transient;
+        # deterministic 4xx failures use the caller's bounded retry policy.
+        if retryable is None:
+            retryable = (
+                status_code is None
+                or status_code in (408, 425, 429)
+                or 500 <= status_code <= 599
+            )
         self._retryable = retryable
+        self.status_code = status_code
         super().__init__(message, **kwargs)
+        if status_code is not None:
+            self.context["status_code"] = status_code
 
 
 class LLMError(ProcessingError):

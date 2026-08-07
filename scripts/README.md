@@ -90,16 +90,21 @@ Backfill scripts for data completeness:
 ## Geographic & Demographic Data
 
 ### `import_census_boundaries.py`
-Import Census TIGER/Line Place boundaries into `jurisdictions.geom`.
+Import Census TIGER/Line Place and cartographic county boundaries into
+`jurisdictions.geom`.
 
 ```bash
 uv run scripts/import_census_boundaries.py --all       # Full pipeline
 uv run scripts/import_census_boundaries.py --download   # Download shapefiles
 uv run scripts/import_census_boundaries.py --import     # Import to staging
 uv run scripts/import_census_boundaries.py --match      # Match to jurisdictions
+uv run scripts/import_census_boundaries.py --counties   # Validated county refresh + match
 ```
 
 Smart name matching: exact, hyphens, township suffixes, Saint/St variations, abbreviation expansion, fuzzy LIKE fallback.
+County refreshes validate the national row count, required fields, geometry,
+and SRID in a disposable table before atomically replacing the live staging
+table.
 
 ### `import_city_populations.py`
 Import population data from `cities.json` into jurisdictions table.
