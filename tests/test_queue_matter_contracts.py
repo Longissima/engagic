@@ -116,6 +116,16 @@ class _QualityQueueRepository(QueueRepository):
         return self.row
 
 
+class _ProfileQueueRepository(QueueRepository):
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    async def _fetch(self, query, *args):
+        self.calls.append((" ".join(query.split()), args))
+        return self.rows
+
+
 class _ClaimConnection(_FailureConnection):
     def __init__(self, selected, claimed):
         super().__init__()
@@ -124,6 +134,26 @@ class _ClaimConnection(_FailureConnection):
     async def fetchrow(self, query, *args):
         self.fetches.append((" ".join(query.split()), args))
         return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_chunk_profiles_are_fenced_to_the_exact_meeting_work_version():
+    profile = {"page_count": 1, "external_links": 0, "text_chars": 800}
+    repository = _ProfileQueueRepository([{"profile": profile}])
+
+    assert await repository.get_chunk_profiles("meeting-1", "mv1:current") == [
+        profile
+    ]
+
+    query, args = repository.calls[0]
+    assert "job_type = 'meeting'" in query
+    assert "work_version IS NOT DISTINCT FROM $2" in query
+    assert "processing_metadata->'chunk'->>'work_version' = $2" in query
+    assert args == ("meeting-1", "mv1:current")
+
+    # Legacy/unstamped work cannot authorize a semantic decision.
+    assert await repository.get_chunk_profiles("meeting-1", None) == []
+    assert len(repository.calls) == 1
 
 
 @pytest.mark.asyncio

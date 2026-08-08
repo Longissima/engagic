@@ -8,12 +8,15 @@ import pytest
 
 from exceptions import DatabaseError
 from database.models import ParticipationInfo
+from pipeline.document_artifacts import DocumentFormat
 from pipeline.job_runner import TerminalJobError
 from pipeline.models import MeetingJob, QueueJob
 from pipeline.orchestrators.meeting_sync import MeetingSyncOrchestrator
 from pipeline.processor import Processor, _merge_participation_info
 from pipeline.protocols import NullMetrics
 from pipeline.utils import meeting_work_version
+from vendors.adapters.parsers.pdf_profile import PdfProfile
+from vendors.adapters.parsers.router import ChunkResult
 
 
 MEETING_ID = "meeting-cas"
@@ -461,7 +464,7 @@ async def test_itemless_meeting_completes_as_owned_no_content():
     processor.analyzer = cast(Any, object())
 
     async def manufacture(*args, **kwargs):
-        return 0
+        return 0, False
 
     async def update(**kwargs):
         projection.append(kwargs)
@@ -528,6 +531,123 @@ async def test_bare_items_route_to_owned_no_content_finalizer():
 
 
 @pytest.mark.asyncio
+async def test_claim_time_manufacture_keeps_every_bare_agenda_title(monkeypatch):
+    meeting = _meeting()
+    bare_items = [
+        {"title": "Target Area Planning", "body_text": "", "attachments": []},
+        {"title": "Development Trends", "body_text": "", "attachments": []},
+        {"title": "Data Centers", "body_text": "", "attachments": []},
+    ]
+    chunk_result = ChunkResult(
+        items=bare_items,
+        profile=PdfProfile(page_count=1, external_links=0, text_chars=780),
+    )
+    captured = {}
+
+    async def fake_produce_ground_truth(*args, **kwargs):
+        return chunk_result
+
+    monkeypatch.setattr(
+        "pipeline.processor.produce_ground_truth",
+        fake_produce_ground_truth,
+    )
+
+    class Analyzer:
+        async def acquire_document_async(self, url, *, banana):
+            return SimpleNamespace(
+                data=b"%PDF synthetic",
+                document_format=DocumentFormat.PDF,
+                content_sha256="sha256",
+                corpus_persisted=True,
+            )
+
+    class Jurisdictions:
+        async def get_city(self, *, banana):
+            return SimpleNamespace(vendor="civicweb", slug="hillsboro")
+
+    class Orchestrator:
+        async def attach_items(self, stored_meeting, items, **kwargs):
+            captured["meeting"] = stored_meeting
+            captured["items"] = items
+            captured["kwargs"] = kwargs
+            return len(items)
+
+    processor = Processor.__new__(Processor)
+    processor.db = cast(Any, SimpleNamespace(jurisdictions=Jurisdictions()))
+    processor.analyzer = cast(Any, Analyzer())
+    processor._sync_orchestrator_instance = Orchestrator()
+
+    stored, bare = await processor._manufacture_items(
+        cast(Any, meeting),
+        expected_desired_version="mv1:claimed",
+        expected_claim_token=OLD_TOKEN,
+    )
+
+    assert stored == 3
+    assert bare is True
+    assert captured["items"] == bare_items
+    assert captured["kwargs"] == {
+        "expected_desired_version": "mv1:claimed",
+        "expected_claim_token": OLD_TOKEN,
+    }
+
+
+@pytest.mark.asyncio
+async def test_manufactured_bare_shape_is_finalized_before_summarization():
+    meeting = _meeting()
+    bare = _item()
+    bare.body_text = "Roll call of commissioners"
+    initial_version = meeting_work_version(meeting, [])
+    item_reads = 0
+    abandon_calls = []
+
+    class Items:
+        async def get_agenda_items(self, meeting_id):
+            nonlocal item_reads
+            item_reads += 1
+            return [] if item_reads == 1 else [bare]
+
+    processor = Processor.__new__(Processor)
+    processor.db = cast(Any, SimpleNamespace(items=Items()))
+    processor.analyzer = cast(Any, object())
+
+    async def manufacture(*args, **kwargs):
+        return 1, True
+
+    async def abandon(*args, **kwargs):
+        abandon_calls.append((args, kwargs))
+
+    async def forbidden_summarization(*args, **kwargs):
+        raise AssertionError("manufactured bare agenda reached the summarizer")
+
+    cast(Any, processor)._manufacture_items = manufacture
+    cast(Any, processor)._abandon_bare_agenda = abandon
+    cast(Any, processor)._process_meeting_with_items = forbidden_summarization
+
+    result = await processor.process_meeting(
+        cast(Any, meeting),
+        expected_work_version=initial_version,
+        expected_claim_token=OLD_TOKEN,
+    )
+
+    assert result == {
+        "items_processed": 0,
+        "items_new": 0,
+        "items_skipped": 1,
+        "items_failed": 0,
+    }
+    assert len(abandon_calls) == 1
+    args, _kwargs = abandon_calls[0]
+    assert args == (
+        meeting,
+        [bare],
+        meeting_work_version(meeting, [bare]),
+        initial_version,
+        OLD_TOKEN,
+    )
+
+
+@pytest.mark.asyncio
 async def test_packet_completion_requires_summary_and_preserves_participation():
     meeting = _meeting()
     meeting.agenda_url = None
@@ -557,7 +677,7 @@ async def test_packet_completion_requires_summary_and_preserves_participation():
     processor.analyzer = cast(Any, Analyzer())
 
     async def manufacture(*args, **kwargs):
-        return 0
+        return 0, False
 
     async def update(**kwargs):
         projections.append(kwargs)

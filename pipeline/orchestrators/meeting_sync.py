@@ -1082,6 +1082,15 @@ class MeetingSyncOrchestrator:
         priority = self.enqueue_decider.calculate_priority(meeting_date)
 
         work_version = meeting_work_version(stored_meeting, agenda_items)
+        # Chunk diagnostics are retained across re-enqueues as sticky routing
+        # history. Stamp the semantic audit with the exact domain inputs it
+        # measured so processors never apply an old document shape to newer
+        # HTML/API items that arrived without a fresh chunk run.
+        versioned_chunk_audit = (
+            {**chunk_audit, "work_version": work_version}
+            if chunk_audit
+            else None
+        )
         await self.db.pipeline_lifecycle.enqueue_queue_job(
             source_url=f"meeting://{stored_meeting.id}",
             job_type="meeting",
@@ -1092,7 +1101,14 @@ class MeetingSyncOrchestrator:
             banana=stored_meeting.banana,
             work_version=work_version,
             processing_metadata=(
-                {k: v for k, v in (("chunk", chunk_audit), ("html", html_audit)) if v}
+                {
+                    k: v
+                    for k, v in (
+                        ("chunk", versioned_chunk_audit),
+                        ("html", html_audit),
+                    )
+                    if v
+                }
                 or None
             ),
             conn=conn,
