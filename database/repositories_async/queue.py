@@ -583,6 +583,35 @@ class QueueRepository(BaseRepository):
         )
         return row["quality"] if row else None
 
+    async def get_chunk_profiles(self, meeting_id: str) -> List[Dict[str, Any]]:
+        """Measured PDF morphology for every document chunked for a meeting.
+
+        One profile per cascade run (agenda ladder, then packet ladder), each
+        carrying page_count/external_links/text_chars as the chunker measured
+        them. The processor reads these to recognize a document with nothing
+        behind it -- a single page of item labels linking to no staff reports
+        -- and decline to summarize rather than invent.
+        """
+        rows = await self._fetch(
+            """
+            WITH latest AS (
+                SELECT processing_metadata->'chunk'->'runs' AS runs
+                FROM queue
+                WHERE meeting_id = $1
+                  AND jsonb_typeof(processing_metadata->'chunk'->'runs') = 'array'
+                ORDER BY last_enqueued_at DESC NULLS LAST,
+                         updated_at DESC NULLS LAST,
+                         id DESC
+                LIMIT 1
+            )
+            SELECT run->'profile' AS profile
+            FROM latest, jsonb_array_elements(latest.runs) AS run
+            WHERE jsonb_typeof(run->'profile') = 'object'
+            """,
+            meeting_id,
+        )
+        return [row["profile"] for row in rows]
+
     async def heartbeat_job(
         self,
         queue_id: int,

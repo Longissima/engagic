@@ -23,6 +23,7 @@ from pipeline.document_artifacts import DocumentFormat
 from pipeline.ground_truth import archive_bytes, produce_ground_truth
 from pipeline.protocols import MetricsCollector, NullMetrics
 from vendors.adapters.parsers.agenda_chunker import _normalize_link_url
+from vendors.adapters.parsers.morphology import is_bare_document
 from vendors.adapters.parsers.router import (
     ChunkResult,
     DEFERRED,
@@ -632,7 +633,19 @@ class AsyncBaseAdapter:
                 items = await self._resolve_sub_attachments(result.items, vendor_id)
                 if any(it.get("attachments") for it in items):
                     return [it for it in items if it.get("attachments")]
-                text_fallback = [it for it in items if it.get("body_text")]
+                # A bare document keeps its whole listing: the titles are the
+                # only record of what the body met about, and body_text there
+                # is an accident of which item happened to absorb the roll-call
+                # block. Filtering on it deleted the trailing item of every
+                # bare agenda (nothing follows it to slice a body from) and
+                # sometimes all but one. Nothing summarizes these -- the
+                # processor's bare-agenda gate stops before the LLM. Every
+                # other shape keeps the body_text filter, so richer agendas
+                # still fall through to packet chunking and manufacture.
+                if is_bare_document(result.profile):
+                    text_fallback = items
+                else:
+                    text_fallback = [it for it in items if it.get("body_text")]
 
         if packet_url:
             result = await self._chunk_packet_pdf(packet_url, vendor_id, ladder="packet")

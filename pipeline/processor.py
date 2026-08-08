@@ -42,6 +42,7 @@ from parsing.participation import parse_participation_info
 from config import config, get_logger
 from pipeline.protocols import MetricsCollector, NullMetrics
 from pipeline.filters import get_skip_reason, is_public_comment_attachment
+from vendors.adapters.parsers.morphology import is_bare_document
 from vendors.session_manager_async import AsyncSessionManager
 
 logger = get_logger(__name__).bind(component="processor")
@@ -2451,6 +2452,81 @@ class Processor:
             return False
         return bool(quality) and quality.get("seg_smell") == "under_split"
 
+    async def _is_bare_agenda(self, meeting: Meeting) -> bool:
+        """True when every document chunked for this meeting is a bare listing.
+
+        A short single page linking to nothing -- a retreat's discussion
+        topics, a commission's roll-call sheet. There is no record behind it,
+        so item summaries and the monolithic packet summary alike would be
+        written from titles alone, which is how a three-word agenda entry
+        becomes four sentences about financial impacts nobody disclosed. Store
+        the titles, summarize nothing; the page is shorter than its summary
+        would be, and the reader can have the page.
+
+        EVERY run must be bare: a meeting whose thin agenda failed but whose
+        200-page packet chunked is not a bare agenda. Confidence 8/10 -- the
+        failure mode is a meeting whose only real content sat in a document
+        the chunker never profiled, which loses a summary but invents nothing.
+        Meetings with no chunk audit at all fall through untouched.
+        """
+        try:
+            profiles = await self.db.queue.get_chunk_profiles(meeting.id)
+        except Exception as e:
+            logger.debug("chunk profile lookup failed", meeting_id=meeting.id, error=str(e))
+            return False
+        if not profiles:
+            return False
+        return all(is_bare_document(profile) for profile in profiles)
+
+    async def _abandon_bare_agenda(
+        self,
+        meeting: Meeting,
+        agenda_items: List[Any],
+        expected_work_version: Optional[str],
+        expected_desired_version: Optional[str],
+        expected_claim_token: Optional[str],
+    ) -> None:
+        """Mark a bare agenda's items ineligible and close the meeting unsummarized.
+
+        filter_reason is the honest record of why these items have no summary,
+        and it is what lets the meeting satisfy the complete-items invariant
+        without a single LLM call.
+        """
+        filter_writes = [
+            {"item_id": item.id, "filter_reason": "bare_agenda"}
+            for item in agenda_items
+            if not getattr(item, "summary", None)
+            and not getattr(item, "filter_reason", None)
+        ]
+        if filter_writes:
+            await self._persist_meeting_item_results(
+                meeting.id,
+                expected_work_version,
+                filter_writes,
+                expected_desired_version=expected_desired_version,
+                expected_claim_token=expected_claim_token,
+            )
+            # filter_reason participates in the work version; the write we
+            # just made legitimately advanced it under our own claim.
+            current_meeting = await self.db.meetings.get_meeting(meeting.id)
+            current_items = await self.db.items.get_agenda_items(meeting.id)
+            if current_meeting is None:
+                raise TerminalJobError(f"meeting {meeting.id} no longer exists")
+            expected_work_version = meeting_work_version(current_meeting, current_items)
+
+        await self._update_meeting_projection(
+            meeting_id=meeting.id,
+            expected_work_version=expected_work_version,
+            expected_desired_version=expected_desired_version,
+            expected_claim_token=expected_claim_token,
+            require_complete_items=True,
+            summary=None,
+            processing_method="bare_agenda",
+            processing_time=0.0,
+            topics=[],
+            participation=meeting.participation,
+        )
+
     async def _assert_meeting_work_version(
         self, meeting_id: str, expected_work_version: Optional[str]
     ) -> None:
@@ -2660,6 +2736,30 @@ class Processor:
                 )
 
             if agenda_items:
+                # Document shape decides before item content does. A bare
+                # agenda often has exactly one item that absorbed the
+                # roll-call block, which reads as content and would buy a
+                # summary of the one thing on the page that isn't business.
+                if await self._is_bare_agenda(meeting):
+                    logger.info(
+                        "bare agenda, storing titles without summarizing",
+                        item_count=len(agenda_items),
+                        meeting_title=meeting.title,
+                    )
+                    await self._abandon_bare_agenda(
+                        meeting,
+                        agenda_items,
+                        expected_work_version,
+                        expected_desired_version,
+                        expected_claim_token,
+                    )
+                    return {
+                        "items_processed": 0,
+                        "items_new": 0,
+                        "items_skipped": len(agenda_items),
+                        "items_failed": 0,
+                    }
+
                 # Check if any items have processable content (attachments or body text).
                 # Bare HTML titles without content cannot produce summaries -- fall through
                 # to packet processing instead.
