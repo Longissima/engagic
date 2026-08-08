@@ -13,12 +13,13 @@ Domain resolution order:
 4. {slug}.gov / .org
 """
 
+import fcntl
 import json
 import os
 import re
 import asyncio
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse, urljoin, parse_qs
 
@@ -55,6 +56,37 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 pass
         return {}
 
+    def _update_site_config(self, updates: Dict[str, Any]) -> None:
+        """Merge updates into this slug's entry in civicplus_sites.json.
+
+        Locked read-modify-write plus atomic replace so concurrent adapters
+        discovering different slugs cannot clobber each other's entries.
+        A manually maintained file otherwise never learns what the matrix
+        search already paid to find (or already exhausted).
+
+        A "failed" tombstone is permanent until a human removes it (or adds
+        a working "domain") -- _find_agenda_url short-circuits on it before
+        ever reaching the matrix search again, so there is no automatic
+        self-healing path here. This matches how civicplus_sites.json,
+        visioninternet_sites.json, and granicus_view_ids.json already work:
+        machine-discovered or machine-exhausted, human-corrected.
+        """
+        config_file = os.path.join(config.DB_DIR, "civicplus_sites.json")
+        try:
+            with open(config_file, "a+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                f.seek(0)
+                raw = f.read()
+                sites = json.loads(raw) if raw.strip() else {}
+                sites.setdefault(self.slug, {}).update(updates)
+                tmp_path = f"{config_file}.tmp"
+                with open(tmp_path, "w") as tmp:
+                    json.dump(sites, tmp, indent=2, sort_keys=True)
+                os.replace(tmp_path, config_file)
+                self._site_config = sites[self.slug]
+        except Exception:
+            logger.warning("failed to persist civicplus site config", vendor="civicplus", slug=self.slug)
+
     def _get_candidate_base_urls(self) -> List[str]:
         """Extend base candidates with CivicPlus domain."""
         candidates = [f"https://{self.slug}.civicplus.com"]
@@ -65,6 +97,14 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
     async def _find_agenda_url(self) -> Optional[str]:
         """Discover agenda page URL from common CivicPlus patterns across candidate domains."""
+        if self._site_config.get("failed"):
+            logger.warning(
+                "civicplus slug previously exhausted the candidate matrix, skipping search. "
+                "Remove the failed entry (or add a working domain) in data/civicplus_sites.json to retry.",
+                vendor="civicplus", slug=self.slug,
+            )
+            return None
+
         patterns = [
             "/AgendaCenter",
             "/Calendar.aspx",
@@ -91,11 +131,15 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                     ):
                         self.base_url = base_url
                         logger.info("found agenda page", vendor="civicplus", slug=self.slug, base_url=base_url, pattern=pattern)
+                        domain = base_url.removeprefix("https://").removeprefix("http://")
+                        if self._site_config.get("domain") != domain:
+                            self._update_site_config({"domain": domain})
                         return test_url
                 except VendorHTTPError:
                     continue
 
-        logger.warning("could not find agenda page", vendor="civicplus", slug=self.slug)
+        logger.warning("could not find agenda page, tombstoning slug", vendor="civicplus", slug=self.slug)
+        self._update_site_config({"failed": True, "failed_at": datetime.now(timezone.utc).isoformat()})
         return None
 
     async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
