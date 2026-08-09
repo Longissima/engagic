@@ -59,6 +59,41 @@ MATTER_TYPE_FROM_PREFIX = {
     "VAR": "Variance",
 }
 
+# Labelled identifiers carried in the item BODY rather than the title.
+#
+# Cities like Detroit publish boilerplate titles ("Whitfield-Calloway, reso.
+# autho.") and put the durable identity in the agenda text: one contract recurs
+# through committee, formal session, reconsideration and later amendments, and
+# is the same public thing every time. Keying on it collapses those appearances
+# into one matter with one canonical summary.
+#
+# Every pattern is anchored on an explicit label. A wrong key is expensive and
+# not self-correcting -- it permanently merges unrelated items into one
+# city_matters row under one summary -- so these deliberately refuse to guess
+# from bare numbers. The emitted matter_file is namespaced by class ("Contract
+# 6007968", not "6007968") because a contract number and a court case number can
+# collide numerically within one city.
+#
+# Order is priority order: settlements cite both a court case and the city's own
+# law-department file, and the city's file number is the stable handle across
+# both the committee and the formal session.
+# Confidence: 8/10.
+BODY_IDENTIFIER_PATTERNS = [
+    # Contract No. 6007968 / Contract No. 6006718-A1 (AMEND 1)
+    ("Contract", "Contract", r"\bContract\s*(?:No\.?|Number|#)\s*([0-9]{4,10}(?:-[A-Za-z]?[0-9]{0,3})?)\b"),
+    # File No. L25-8029 / File No. L24-01403 (law department settlement file)
+    ("File", "Settlement", r"\bFile\s*(?:No\.?|#)\s*([A-Za-z]{0,2}[0-9]{2}-[0-9]{3,6})\b"),
+    # Case No. 25-011182 / Case #26-041 / Case No. 25-cv-10245
+    ("Case", "Case", r"\bCase\s*(?:No\.?|#)\s*([0-9]{2}-(?:[A-Za-z]{2}-)?[0-9]{3,6})\b"),
+    # Petition No. 1234 (street vacations, encroachments)
+    ("Petition", "Petition", r"\bPetition\s*(?:No\.?|Number|#)\s*([0-9]{3,7}(?:-[A-Za-z0-9]{1,3})?)\b"),
+]
+
+_COMPILED_BODY_IDENTIFIERS = [
+    (label, matter_type, re.compile(pattern, re.IGNORECASE))
+    for label, matter_type, pattern in BODY_IDENTIFIER_PATTERNS
+]
+
 
 class AsyncEscribeAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Escribe meeting management system.
@@ -327,9 +362,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
 
             matter_file = self._extract_matter_file(title)
             attachments = self._extract_item_attachments(container, base_url)
-
-            content_row = container.find("div", class_="AgendaItemContentRow")
-            description = content_row.get_text(strip=True) if content_row else ""
+            body_text = self._extract_item_body_text(container)
 
             item_data = {
                 "vendor_item_id": item_id,  # Raw vendor ID, orchestrator generates final item_id
@@ -337,17 +370,23 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
                 "sequence": item_counter,
                 "agenda_number": item_number,
                 "section": current_section,
-                "description": description,
+                "body_text": body_text,
                 "attachments": attachments,
             }
 
             if matter_file:
                 item_data["matter_file"] = matter_file
-                item_data["matter_id"] = item_id
                 # Derive matter_type from prefix (BOA -> Board of Adjustment, etc.)
                 prefix = matter_file.split("-")[0].upper()
                 if prefix in MATTER_TYPE_FROM_PREFIX:
                     item_data["matter_type"] = MATTER_TYPE_FROM_PREFIX[prefix]
+            else:
+                # No file number in the title: fall back to a labelled identifier
+                # in the agenda text. Deliberately second -- a title prefix is
+                # the instance's own filing scheme and outranks prose.
+                body_identifier = self._extract_body_identifier(title, body_text)
+                if body_identifier:
+                    item_data["matter_file"], item_data["matter_type"] = body_identifier
 
             items.append(item_data)
 
@@ -391,6 +430,42 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
 
         return None
 
+    def _extract_item_body_text(self, container: Tag) -> str:
+        """Extract the item's own agenda text (the substance eScribe publishes inline).
+
+        Layout varies by instance. Items may carry two AgendaItemContentRow divs:
+        a department banner (div.AgendaItemHeader, e.g. "OFFICE OF CONTRACTING AND
+        PROCUREMENT") followed by the real body (div.AgendaItemDescription). Taking
+        the first content row -- what this adapter did before -- captured the banner
+        and dropped the body on roughly a third of Detroit's items.
+
+        The department banner is kept as a prefix when a body exists: with titles
+        like "Whitfield-Calloway, reso. autho." the owning department is real
+        context, not decoration. Confidence: 8/10.
+        """
+        description = container.find("div", class_="AgendaItemDescription")
+        if description is None:
+            for row in container.find_all("div", class_="AgendaItemContentRow"):
+                if row.find("div", class_="AgendaItemHeader"):
+                    continue
+                description = row
+                break
+
+        body = self._clean_text(description.get_text(" ", strip=True)) if description else ""
+        if not body:
+            return ""
+
+        header_div = container.find("div", class_="AgendaItemHeader")
+        header = self._clean_text(header_div.get_text(" ", strip=True)) if header_div else ""
+        if header and header.lower() not in body.lower():
+            return f"{header}\n{body}"
+        return body
+
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        """Collapse eScribe rich-text whitespace, including non-breaking spaces."""
+        return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ")).strip()
+
     def _extract_section_header(self, container: Tag) -> Optional[str]:
         """Extract section header from container if present."""
         title_row = container.find("div", class_="AgendaItemTitleRow")
@@ -426,6 +501,25 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             # Must look like a case/file number (has digits and dashes/letters)
             if re.match(r"^[A-Z0-9]+-[A-Z0-9-]+$", prefix, re.IGNORECASE):
                 return prefix.upper()
+
+        return None
+
+    def _extract_body_identifier(self, *texts: str) -> Optional[tuple[str, str]]:
+        """Find the first labelled durable identifier, as (matter_file, matter_type).
+
+        Returns namespaced values ("Contract 6007968") so identifier classes cannot
+        collide numerically within a city. Amendment suffixes are preserved:
+        6006718-A1 is a distinct council action from 6006718 and merging them would
+        blur an award into its amendment under one canonical summary.
+        """
+        haystack = "\n".join(text for text in texts if text)
+        if not haystack:
+            return None
+
+        for label, matter_type, pattern in _COMPILED_BODY_IDENTIFIERS:
+            match = pattern.search(haystack)
+            if match:
+                return f"{label} {match.group(1).upper()}", matter_type
 
         return None
 

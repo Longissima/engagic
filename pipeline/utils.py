@@ -245,6 +245,26 @@ def hash_substantive_attachments_legacy(attachments: List[Any]) -> str:
     return hash_attachments_fast_legacy(substantive)
 
 
+# Shortest inline agenda text worth treating as summarizable work on its own.
+# An LLM handed less than this invents the rest -- the failure mode the
+# bare-agenda gate exists to prevent. Calibrated against 511 real eScribe items:
+# below 40 chars the bodies are "Recess", "Adjourn", "Staff recommends approval";
+# at 40+ they carry substance ("Xylem Water Solutions; Total exp. $397,698.92").
+# Only decides body-ONLY work -- items with attachments summarize from documents
+# regardless. Confidence: 7/10.
+MIN_SUBSTANTIVE_BODY_TEXT_CHARS = 40
+
+
+def normalize_body_text(value: Optional[str]) -> str:
+    """Collapse agenda body text to its comparable form, or "" if insubstantial."""
+    if not value:
+        return ""
+    collapsed = re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
+    if len(collapsed) < MIN_SUBSTANTIVE_BODY_TEXT_CHARS:
+        return ""
+    return collapsed
+
+
 def aggregate_matter_attachments(appearances: Iterable[Any]) -> List[Any]:
     """Reproduce the processor's authoritative matter attachment set.
 
@@ -289,7 +309,28 @@ class MatterWorkSnapshot:
 
     @property
     def is_summarizable(self) -> bool:
-        return bool(self.substantive_attachments)
+        """Work exists when the aggregate carries documents OR agenda body text.
+
+        Vendors that publish the substance inline (eScribe descriptions, coversheet
+        text) produce matters with no attachments at all. Gating on attachments
+        alone tombstoned those matters as no_substantive_work even though the item
+        path (``_process_single_item``) has always summarized from ``body_text``.
+        Confidence: 9/10.
+        """
+        return bool(self.substantive_attachments) or bool(self.best_body_text)
+
+    @property
+    def best_body_text(self) -> str:
+        """Longest substantive inline text across appearances, "" if none.
+
+        Repeats of one matter carry the same prose, so a shorter copy is a
+        truncated copy, never a better source.
+        """
+        candidates = [
+            normalize_body_text(getattr(item, "body_text", None))
+            for item in self.appearances
+        ]
+        return max(candidates, key=len, default="")
 
     @classmethod
     def from_appearances(cls, appearances: Iterable[Any]) -> "MatterWorkSnapshot":
@@ -326,6 +367,11 @@ class MatterWorkSnapshot:
                 }
             )
         )
+        # Body text is deliberately NOT part of the descriptor. work_version is
+        # compared against every stored matter to decide re-summarization, so
+        # widening the descriptor would invalidate every canonical summary in the
+        # database at once. Body-only matters therefore summarize on first sight
+        # and re-summarize on title or attachment change, not on body edits.
         descriptor = {
             "attachment_version": attachment_version,
             "titles": titles,

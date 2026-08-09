@@ -2113,11 +2113,23 @@ class Processor:
 
         representative_item = items[0]
         representative_item.attachments = all_attachments
+        # Attachments aggregate across appearances; body text must too, or a
+        # matter whose substance is inline summarizes from whichever appearance
+        # sorted first -- which may be the one the vendor published without a
+        # description.
+        if matter_work.best_body_text:
+            representative_item.body_text = matter_work.best_body_text
 
-        logger.info("matter aggregation complete", matter_id=matter_id, appearances=len(items), unique_attachments=len(all_attachments))
+        logger.info(
+            "matter aggregation complete",
+            matter_id=matter_id,
+            appearances=len(items),
+            unique_attachments=len(all_attachments),
+            body_text_chars=len(representative_item.body_text or ""),
+        )
 
         if not matter_work.is_summarizable:
-            logger.debug("matter skipped - no attachments", matter_id=matter_id)
+            logger.debug("matter skipped - no attachments or body text", matter_id=matter_id)
             return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
 
         # sv1 identity is invariant under url_refresh, so the authoritative
