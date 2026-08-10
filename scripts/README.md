@@ -84,6 +84,7 @@ uv run scripts/migrate_meeting_ids.py
 
 ### `backfill_*.py`
 Backfill scripts for data completeness:
+- `backfill_body_identifiers.py` - Set matter_file from identifiers cited in item title/body (dry run by default). Sync derives these on every pass; this covers meetings aged out of the sync window. Run `backfill_matter_ids.py` afterwards
 - `backfill_matter_ids.py` - Create city_matters for orphan items with matter_file but no matter_id
 - `backfill_matter_titles.py` - Fill missing matter titles from items
 - `backfill_vote_outcomes.py` - Compute vote outcomes from vote records

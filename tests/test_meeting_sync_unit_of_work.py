@@ -638,17 +638,27 @@ async def test_meeting_enqueue_uses_deterministic_version_and_uow_connection():
     connection = cast(Connection, object())
     meeting = _meeting()
     items = [_item("item-1", "meeting-1", 1, [])]
+    chunk_audit = {
+        "winning_rung": "text:auto",
+        "runs": [{"profile": {"page_count": 1}}],
+    }
 
     await orchestrator._enqueue_if_needed(
         cast(Any, meeting),
         meeting.date,
         cast(Any, items),
         conn=connection,
+        chunk_audit=chunk_audit,
     )
 
     event = lifecycle.calls[0]
-    assert event["work_version"] == meeting_work_version(meeting, items)
+    expected_version = meeting_work_version(meeting, items)
+    assert event["work_version"] == expected_version
     assert event["work_version"].startswith("mv1:")
+    assert event["processing_metadata"] == {
+        "chunk": {**chunk_audit, "work_version": expected_version}
+    }
+    assert "work_version" not in chunk_audit
     assert event["conn"] is connection
 
 

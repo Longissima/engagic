@@ -53,6 +53,39 @@ def test_nav_chrome_threshold():
     assert morph == m.FLAT_TEXT_AGENDA
 
 
+@pytest.mark.parametrize("profile,expected", [
+    (_profile(page_count=1, external_links=0, text_chars=863), True),   # the retreat agenda
+    (_profile(page_count=1, external_links=1, text_chars=863), False),  # a staff report to read
+    (_profile(page_count=2, external_links=0, text_chars=863), False),  # a second page is content
+    (_profile(page_count=239, external_links=0), False),
+    # One page can still carry a real agenda: per-item recommendations and
+    # fiscal notes. Prose gets summarized; a list of titles does not.
+    (_profile(page_count=1, external_links=0, text_chars=4500), False),
+])
+def test_bare_document_needs_one_short_page_and_no_links(profile, expected):
+    assert m.is_bare_document(profile) is expected
+
+
+def test_bare_document_reads_the_persisted_audit_form():
+    """The processor replays profiles as JSON dicts, not dataclasses."""
+    bare = {"page_count": 1, "external_links": 0, "text_chars": 863}
+    assert m.is_bare_document(bare) is True
+    assert m.is_bare_document({**bare, "external_links": 3}) is False
+    assert m.is_bare_document({**bare, "text_chars": 9000}) is False
+    assert m.is_bare_document({}) is False
+    assert m.is_bare_document({"page_count": 1, "external_links": 0}) is False
+    assert m.is_bare_document({**bare, "text_chars": "863"}) is False
+    assert m.is_bare_document(None) is False
+
+
+def test_bare_document_is_orthogonal_to_classification():
+    """A bare agenda still classifies as whatever structure it has."""
+    bare = _profile(page_count=1, external_links=0, text_chars=863, item_number_lines=7)
+    morph, _ = m.classify(bare)
+    assert morph == m.FLAT_TEXT_AGENDA
+    assert m.is_bare_document(bare) is True
+
+
 @pytest.mark.skipif(not corpus_lib.GOLDENED, reason="no goldens")
 def test_corpus_blast_radius_is_pinned():
     """Suggestions may only change outcomes the goldens have blessed.

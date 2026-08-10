@@ -1438,6 +1438,11 @@ def _parse_agenda_items(all_lines, all_links, result):
                     "page": line["page"],
                     "y0": line["y0"],
                     "line_index": title_end_index,
+                    # Where the item's own header STARTS. line_index is where
+                    # its title ends, which is a different line whenever the
+                    # number and the title render separately ("A." then
+                    # "Target Area Planning..."). Body slicing needs the start.
+                    "start_line_index": i,
                 })
                 continue
 
@@ -1449,10 +1454,19 @@ def _parse_agenda_items(all_lines, all_links, result):
                 result.sections.append(section_name)
             continue
 
-    # Collect body text for each item
+    # Collect body text for each item. An item's body runs from the end of its
+    # own title to the START of the next item's header -- ending at the next
+    # item's line_index (its title end) swallowed that item's number line, so
+    # an agenda with no text under its headings gave every item a body of
+    # exactly the next item's label ("B."), which then read to a summarizer as
+    # this item's content.
     for bi in range(len(item_boundaries)):
         start_li = item_boundaries[bi]["line_index"] + 1
-        end_li = item_boundaries[bi + 1]["line_index"] if bi + 1 < len(item_boundaries) else len(all_lines)
+        end_li = (
+            item_boundaries[bi + 1]["start_line_index"]
+            if bi + 1 < len(item_boundaries)
+            else len(all_lines)
+        )
 
         body_parts = []
         rec_action_parts = []

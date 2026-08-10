@@ -19,7 +19,7 @@ FLAT_TEXT external-link ceiling. Retune against prod audit data, not
 against whichever city broke last week.
 """
 
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple, Union
 
 from vendors.adapters.parsers.pdf_profile import PdfProfile
 
@@ -40,6 +40,9 @@ ANCHORED_MIN_INTERNAL = 3     # mirrors v2's pageref gate
 FLAT_TEXT_MIN_HEADINGS = 3    # mirrors text_chunker.MIN_ITEMS
 FLAT_TEXT_MAX_EXTERNAL = 2    # >=3 links means LINKED_AGENDA owns the doc
 FLAT_TEXT_MAX_PAGES = 20      # mirrors text_chunker.TEXT_AGENDA_MAX_PAGES
+BARE_MAX_PAGES = 1            # one page: there is no packet behind it
+BARE_MAX_EXTERNAL = 0         # one link means one staff report worth reading
+BARE_MAX_TEXT_CHARS = 2000    # above this the page carries prose, not a list
 # ------------------------------------------------------------------------------
 
 # Shape -> the rung most likely to win first try. None = no opinion, let
@@ -88,3 +91,54 @@ def classify(profile: PdfProfile) -> Tuple[str, Optional[str]]:
         morphology = MONOLITH
 
     return morphology, _SUGGESTED_RUNG[morphology]
+
+
+def is_bare_document(
+    profile: Union[PdfProfile, Mapping[str, Any], None],
+) -> bool:
+    """One short page that links nowhere -- a listing of titles, not a record.
+
+    Orthogonal to classify(): that names what structure a document HAS, this
+    answers whether anything is behind it. A retreat agenda listing seven
+    discussion topics is a legitimate FLAT_TEXT_AGENDA whose items are real
+    and whose content does not exist. Callers use it to decline summarizing
+    rather than let a model write paragraphs from a title.
+
+    The text ceiling is what separates a list from a page of prose: 2,086 of
+    the 2,252 one-page link-free meetings in prod carry under 2k chars, where
+    a summary would run as long as the document it summarizes. The 27 that
+    pack >4k onto one page are real single-page agendas with per-item
+    recommendations, and they stay summarizable. Confidence 7/10 on the
+    threshold itself -- retune against the audit, not against one city.
+
+    Accepts the live dataclass (during chunking) or its persisted dict form
+    (replayed later from the chunk audit).
+    """
+    if profile is None:
+        return False
+    if isinstance(profile, PdfProfile):
+        page_count = profile.page_count
+        external_links = profile.external_links
+        text_chars = profile.text_chars
+    else:
+        required = ("page_count", "external_links", "text_chars")
+        if any(key not in profile for key in required):
+            # A partial audit is diagnostics, not evidence that the source
+            # had no substance. Semantic routing must fail closed here.
+            return False
+        page_count = profile["page_count"]
+        external_links = profile["external_links"]
+        text_chars = profile["text_chars"]
+    values = (page_count, external_links, text_chars)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value < 0
+        for value in values
+    ):
+        return False
+    return (
+        page_count <= BARE_MAX_PAGES
+        and external_links <= BARE_MAX_EXTERNAL
+        and text_chars <= BARE_MAX_TEXT_CHARS
+    )

@@ -42,6 +42,7 @@ from parsing.participation import parse_participation_info
 from config import config, get_logger
 from pipeline.protocols import MetricsCollector, NullMetrics
 from pipeline.filters import get_skip_reason, is_public_comment_attachment
+from vendors.adapters.parsers.morphology import is_bare_document
 from vendors.session_manager_async import AsyncSessionManager
 
 logger = get_logger(__name__).bind(component="processor")
@@ -2112,11 +2113,23 @@ class Processor:
 
         representative_item = items[0]
         representative_item.attachments = all_attachments
+        # Attachments aggregate across appearances; body text must too, or a
+        # matter whose substance is inline summarizes from whichever appearance
+        # sorted first -- which may be the one the vendor published without a
+        # description.
+        if matter_work.best_body_text:
+            representative_item.body_text = matter_work.best_body_text
 
-        logger.info("matter aggregation complete", matter_id=matter_id, appearances=len(items), unique_attachments=len(all_attachments))
+        logger.info(
+            "matter aggregation complete",
+            matter_id=matter_id,
+            appearances=len(items),
+            unique_attachments=len(all_attachments),
+            body_text_chars=len(representative_item.body_text or ""),
+        )
 
         if not matter_work.is_summarizable:
-            logger.debug("matter skipped - no attachments", matter_id=matter_id)
+            logger.debug("matter skipped - no attachments or body text", matter_id=matter_id)
             return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
 
         # sv1 identity is invariant under url_refresh, so the authoritative
@@ -2329,7 +2342,7 @@ class Processor:
         *,
         expected_desired_version: Optional[str],
         expected_claim_token: str,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Manufacture item shape at claim time -- the stage-2 call sync used to make.
 
         Mirrors the base adapter's agenda->packet policy: chunk the agenda
@@ -2341,10 +2354,12 @@ class Processor:
         the DB through the same funnel sync uses (attach_items: junk filter,
         matter tracking, snapshot-preserving store), so downstream cannot
         tell where shape was born. Returns stored item count; 0 means no
-        shape and the caller falls through to the monolithic packet path.
+        shape and the caller falls through to the monolithic packet path. The
+        boolean verdict is true when every measured candidate was bare, so the
+        caller can finalize the newly stored titles without summarizing them.
         """
         if not self.analyzer:
-            return 0
+            return 0, False
         city = await self.db.jurisdictions.get_city(banana=meeting.banana)
         vendor = city.vendor if city else ""
         slug = city.slug if city else ""
@@ -2357,6 +2372,7 @@ class Processor:
 
         chosen: Optional[List[Dict[str, Any]]] = None
         text_fallback: List[Dict[str, Any]] = []
+        profiles = []
         for url, ladder in candidates:
             try:
                 artifact = await self.analyzer.acquire_document_async(
@@ -2394,6 +2410,8 @@ class Processor:
             )
             del artifact
             result = await producer
+            if result.profile is not None:
+                profiles.append(result.profile)
             if not result.items:
                 continue
             if ladder == "agenda":
@@ -2401,14 +2419,22 @@ class Processor:
                 if with_attachments:
                     chosen = with_attachments
                     break
-                text_fallback = [it for it in result.items if it.get("body_text")]
+                # Keep the complete title listing for a bare agenda. The
+                # caller uses the returned morphology verdict to finalize it
+                # without an LLM call, matching sync-side chunking behavior.
+                if is_bare_document(result.profile):
+                    text_fallback = result.items
+                else:
+                    text_fallback = [
+                        it for it in result.items if it.get("body_text")
+                    ]
             else:
                 chosen = result.items
                 break
 
         items_data = chosen or text_fallback
         if not items_data:
-            return 0
+            return 0, False
 
         stored = await self._sync_orchestrator.attach_items(
             meeting,
@@ -2422,7 +2448,10 @@ class Processor:
                 meeting_id=meeting.id,
                 items_stored=stored,
             )
-        return stored
+        bare_document_set = bool(profiles) and all(
+            is_bare_document(profile) for profile in profiles
+        )
+        return stored, bare_document_set
 
     @property
     def _sync_orchestrator(self) -> MeetingSyncOrchestrator:
@@ -2450,6 +2479,90 @@ class Processor:
             logger.debug("chunk quality lookup failed", meeting_id=meeting.id, error=str(e))
             return False
         return bool(quality) and quality.get("seg_smell") == "under_split"
+
+    async def _is_bare_agenda(
+        self,
+        meeting: Meeting,
+        expected_work_version: Optional[str],
+    ) -> bool:
+        """True when every document chunked for this meeting is a bare listing.
+
+        A short single page linking to nothing -- a retreat's discussion
+        topics, a commission's roll-call sheet. There is no record behind it,
+        so item summaries and the monolithic packet summary alike would be
+        written from titles alone, which is how a three-word agenda entry
+        becomes four sentences about financial impacts nobody disclosed. Store
+        the titles, summarize nothing; the page is shorter than its summary
+        would be, and the reader can have the page.
+
+        EVERY run must be bare: a meeting whose thin agenda failed but whose
+        200-page packet chunked is not a bare agenda. Confidence 8/10 -- the
+        failure mode is a meeting whose only real content sat in a document
+        the chunker never profiled, which loses a summary but invents nothing.
+        Meetings with no chunk audit at all fall through untouched.
+        """
+        if not expected_work_version:
+            return False
+        try:
+            profiles = await self.db.queue.get_chunk_profiles(
+                meeting.id,
+                expected_work_version,
+            )
+        except Exception as e:
+            logger.debug("chunk profile lookup failed", meeting_id=meeting.id, error=str(e))
+            return False
+        if not profiles:
+            return False
+        return all(is_bare_document(profile) for profile in profiles)
+
+    async def _abandon_bare_agenda(
+        self,
+        meeting: Meeting,
+        agenda_items: List[Any],
+        expected_work_version: Optional[str],
+        expected_desired_version: Optional[str],
+        expected_claim_token: Optional[str],
+    ) -> None:
+        """Mark a bare agenda's items ineligible and close the meeting unsummarized.
+
+        filter_reason is the honest record of why these items have no summary,
+        and it is what lets the meeting satisfy the complete-items invariant
+        without a single LLM call.
+        """
+        filter_writes = [
+            {"item_id": item.id, "filter_reason": "bare_agenda"}
+            for item in agenda_items
+            if not getattr(item, "summary", None)
+            and not getattr(item, "filter_reason", None)
+        ]
+        if filter_writes:
+            await self._persist_meeting_item_results(
+                meeting.id,
+                expected_work_version,
+                filter_writes,
+                expected_desired_version=expected_desired_version,
+                expected_claim_token=expected_claim_token,
+            )
+            # filter_reason participates in the work version; the write we
+            # just made legitimately advanced it under our own claim.
+            current_meeting = await self.db.meetings.get_meeting(meeting.id)
+            current_items = await self.db.items.get_agenda_items(meeting.id)
+            if current_meeting is None:
+                raise TerminalJobError(f"meeting {meeting.id} no longer exists")
+            expected_work_version = meeting_work_version(current_meeting, current_items)
+
+        await self._update_meeting_projection(
+            meeting_id=meeting.id,
+            expected_work_version=expected_work_version,
+            expected_desired_version=expected_desired_version,
+            expected_claim_token=expected_claim_token,
+            require_complete_items=True,
+            summary=None,
+            processing_method="bare_agenda",
+            processing_time=0.0,
+            topics=[],
+            participation=meeting.participation,
+        )
 
     async def _assert_meeting_work_version(
         self, meeting_id: str, expected_work_version: Optional[str]
@@ -2660,6 +2773,30 @@ class Processor:
                 )
 
             if agenda_items:
+                # Document shape decides before item content does. A bare
+                # agenda often has exactly one item that absorbed the
+                # roll-call block, which reads as content and would buy a
+                # summary of the one thing on the page that isn't business.
+                if await self._is_bare_agenda(meeting, expected_desired_version):
+                    logger.info(
+                        "bare agenda, storing titles without summarizing",
+                        item_count=len(agenda_items),
+                        meeting_title=meeting.title,
+                    )
+                    await self._abandon_bare_agenda(
+                        meeting,
+                        agenda_items,
+                        expected_work_version,
+                        expected_desired_version,
+                        expected_claim_token,
+                    )
+                    return {
+                        "items_processed": 0,
+                        "items_new": 0,
+                        "items_skipped": len(agenda_items),
+                        "items_failed": 0,
+                    }
+
                 # Check if any items have processable content (attachments or body text).
                 # Bare HTML titles without content cannot produce summaries -- fall through
                 # to packet processing instead.
@@ -2706,7 +2843,7 @@ class Processor:
             # different-shaped existing set. Falls through to the monolithic
             # packet path when no shape can be manufactured.
             if not agenda_items:
-                manufactured = await self._manufacture_items(
+                manufactured, manufactured_bare = await self._manufacture_items(
                     meeting,
                     expected_desired_version=expected_desired_version,
                     expected_claim_token=expected_claim_token,
@@ -2719,6 +2856,26 @@ class Processor:
                         expected_work_version = meeting_work_version(
                             meeting, agenda_items
                         )
+                        if manufactured_bare:
+                            logger.info(
+                                "bare agenda manufactured at claim time, "
+                                "storing titles without summarizing",
+                                item_count=len(agenda_items),
+                                meeting_title=meeting.title,
+                            )
+                            await self._abandon_bare_agenda(
+                                meeting,
+                                agenda_items,
+                                expected_work_version,
+                                expected_desired_version,
+                                expected_claim_token,
+                            )
+                            return {
+                                "items_processed": 0,
+                                "items_new": 0,
+                                "items_skipped": len(agenda_items),
+                                "items_failed": 0,
+                            }
                         return await self._process_meeting_with_items(
                             meeting,
                             agenda_items,

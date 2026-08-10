@@ -17,6 +17,7 @@ from database.id_generation import (
 from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
+from parsing.identifiers import extract_identifier
 from pipeline.utils import (
     MatterNoWorkReason,
     MatterWorkSnapshot,
@@ -521,6 +522,21 @@ class MeetingSyncOrchestrator:
             item_attachments = deserialize_attachments(item_data.get("attachments"))
             matter_file = item_data.get("matter_file")
             matter_id_vendor = item_data.get("matter_id")
+            matter_type = item_data.get("matter_type")
+
+            # Last resort: read a durable identifier out of the agenda text
+            # itself. Many vendors publish no matter key at all, yet the body
+            # cites a contract or case number that recurs across committee,
+            # council and later amendments. Deriving it here rather than in each
+            # adapter keeps it self-healing -- the items upsert overwrites
+            # matter_file from every sync, so a value that is not re-derived on
+            # each pass would be silently erased.
+            if not matter_file and not matter_id_vendor:
+                derived = extract_identifier(
+                    item_data.get("title"), item_data.get("body_text")
+                )
+                if derived:
+                    matter_file, matter_type = derived
 
             matter_id = None
             if matter_file or matter_id_vendor:
@@ -538,7 +554,7 @@ class MeetingSyncOrchestrator:
                 agenda_number=item_data.get("agenda_number"),
                 matter_file=matter_file,
                 matter_id=matter_id,
-                matter_type=item_data.get("matter_type"),
+                matter_type=matter_type,
                 sponsors=item_data.get("sponsors", []),
                 attachments=item_attachments,
                 body_text=item_data.get("body_text"),
@@ -662,7 +678,11 @@ class MeetingSyncOrchestrator:
 
             raw_item = items_map.get(agenda_item.sequence, {})
             sponsors = raw_item.get("sponsors", [])
-            matter_type = raw_item.get("matter_type")
+            # Generic identifiers are derived into the AgendaItem by the
+            # shared funnel, so adapter input alone is not authoritative here.
+            # Without this fallback a new ``Contract 1234`` aggregate is
+            # created with a null type even though the derived item carries it.
+            matter_type = raw_item.get("matter_type") or agenda_item.matter_type
             raw_vendor_matter_id = raw_item.get("matter_id")
             if "votes" in raw_item:
                 stats["observed_votes"][agenda_item.matter_id] = raw_item.get(
@@ -1082,6 +1102,15 @@ class MeetingSyncOrchestrator:
         priority = self.enqueue_decider.calculate_priority(meeting_date)
 
         work_version = meeting_work_version(stored_meeting, agenda_items)
+        # Chunk diagnostics are retained across re-enqueues as sticky routing
+        # history. Stamp the semantic audit with the exact domain inputs it
+        # measured so processors never apply an old document shape to newer
+        # HTML/API items that arrived without a fresh chunk run.
+        versioned_chunk_audit = (
+            {**chunk_audit, "work_version": work_version}
+            if chunk_audit
+            else None
+        )
         await self.db.pipeline_lifecycle.enqueue_queue_job(
             source_url=f"meeting://{stored_meeting.id}",
             job_type="meeting",
@@ -1092,7 +1121,14 @@ class MeetingSyncOrchestrator:
             banana=stored_meeting.banana,
             work_version=work_version,
             processing_metadata=(
-                {k: v for k, v in (("chunk", chunk_audit), ("html", html_audit)) if v}
+                {
+                    k: v
+                    for k, v in (
+                        ("chunk", versioned_chunk_audit),
+                        ("html", html_audit),
+                    )
+                    if v
+                }
                 or None
             ),
             conn=conn,

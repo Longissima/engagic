@@ -112,6 +112,34 @@ info = parse_participation_info(meeting_text)
 
 Returns `None` if nothing found. Does not raise exceptions.
 
+### identifiers.py - Durable Matter Identifiers
+
+Pulls the identifier a legislative body uses for a thing that recurs across
+meetings — a contract, a case, a law-department file — out of agenda text.
+Called from the sync item funnel for every vendor, so any item whose vendor
+supplies no matter key can still be linked to a matter.
+
+```python
+from parsing.identifiers import extract_identifier
+
+extract_identifier(item.title, item.body_text)
+# Returns: ("Contract 6007968", "Contract") or None
+```
+
+**Why it matters:** without it, one Detroit contract that passes through
+committee, formal session and two amendments is four unrelated items with four
+separately generated summaries. With it, they are one matter with one canonical
+summary and a timeline.
+
+Every pattern is anchored on an explicit label and never guesses from bare
+numbers, because a wrong identifier permanently merges unrelated items into one
+`city_matters` row. Notable guards, all learned from real corpus damage:
+
+- `Master Contract No. X; Procurement Contract No. Y` keys on Y — the master is a
+  vendor-level umbrella and would merge every agreement with that vendor.
+- Amendment suffixes are preserved (`6006718-A1` is not `6006718`).
+- A dangling hyphen or a funding share (`6006718-100%`) is not a suffix.
+
 ## Error Handling
 
 Only `PdfExtractor` raises exceptions — wraps failures in `ExtractionError`:

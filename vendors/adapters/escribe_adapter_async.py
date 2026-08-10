@@ -59,6 +59,31 @@ MATTER_TYPE_FROM_PREFIX = {
     "VAR": "Variance",
 }
 
+# Tags that imply a line break when eScribe rich text is flattened.
+_BLOCK_TAGS = (
+    "p", "div", "br", "li", "tr", "td", "th",
+    "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
+)
+
+# Chrome that must never land in body text: labels, icon rows, attachment lists
+# (whose filenames would otherwise read as content). AgendaItemAttachementsHeader
+# is the vendor's own spelling.
+_BODY_NOISE_CLASSES = (
+    "AgendaItemHeader", "AgendaItemCategory", "AgendaItemSponsors",
+    "AgendaItemIcons", "AgendaItemAttachmentsList", "AgendaItemAttachment",
+    "AgendaItemPublicCommentHeader", "AgendaItemAttachementsHeader",
+    "AgendaItemTitleRow", "ClosedAgendaItemTitleRow", "MotionLabel", "Number",
+)
+
+# Routing badges some instances emit as the entire description (Orlando does this
+# on 84 of 98 items). Whole-string match only -- the same badge legitimately
+# prefixes several KB of real text, and startswith would delete those items.
+_PLACEHOLDER_BODY = re.compile(
+    r"^(?:no agenda items|public comments:?|district\s*:[\s\d,]*(?:all)?|none|n/?a"
+    r"|attachments\s*\|\s*public comments)\.?$",
+    re.IGNORECASE,
+)
+
 
 class AsyncEscribeAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Escribe meeting management system.
@@ -306,7 +331,9 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
 
             item_counter += 1
 
-            counter_elem = container.find("div", class_="AgendaItemCounter")
+            counter_elem = container.find(
+                "div", class_=["AgendaItemCounter", "ClosedAgendaItemCounter"]
+            )
             item_number = counter_elem.get_text(strip=True) if counter_elem else str(item_counter)
 
             # Skip section headers - organizational containers, not substantive items.
@@ -327,9 +354,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
 
             matter_file = self._extract_matter_file(title)
             attachments = self._extract_item_attachments(container, base_url)
-
-            content_row = container.find("div", class_="AgendaItemContentRow")
-            description = content_row.get_text(strip=True) if content_row else ""
+            body_text = self._extract_item_body_text(container)
 
             item_data = {
                 "vendor_item_id": item_id,  # Raw vendor ID, orchestrator generates final item_id
@@ -337,13 +362,15 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
                 "sequence": item_counter,
                 "agenda_number": item_number,
                 "section": current_section,
-                "description": description,
+                "body_text": body_text,
                 "attachments": attachments,
             }
 
+            # Only the instance's own title-prefix filing scheme is vendor
+            # knowledge. Identifiers cited in the agenda text are common to every
+            # vendor and are derived once in the sync item funnel.
             if matter_file:
                 item_data["matter_file"] = matter_file
-                item_data["matter_id"] = item_id
                 # Derive matter_type from prefix (BOA -> Board of Adjustment, etc.)
                 prefix = matter_file.split("-")[0].upper()
                 if prefix in MATTER_TYPE_FROM_PREFIX:
@@ -374,22 +401,125 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             if match:
                 return match.group(1)
 
+        # Closed-session items carry no AgendaItemNNN class and no SelectItem
+        # link, so they were dropped entirely -- along with real content
+        # (liability claimants, labor negotiation parties). Their id survives on
+        # the public-comment list wrapper.
+        closed_list = container.find(
+            "div", class_=re.compile(r"AgendaItemPublicCommentListIndent\d+Closed")
+        )
+        if closed_list:
+            for cls in string_list_attr(closed_list, "class"):
+                match = re.match(r"AgendaItemPublicCommentListIndent(\d+)Closed", cls)
+                if match:
+                    return match.group(1)
+
         return None
 
     def _extract_item_title(self, container: Tag) -> Optional[str]:
         """Extract item title from AgendaItemTitle div or SelectItem link."""
-        title_container = container.find("div", class_="AgendaItemTitle")
-        if title_container:
-            title_link = title_container.find("a")
-            title = title_link.get_text(strip=True) if title_link else title_container.get_text(strip=True)
-            if title:
-                return title
+        for class_name in ("AgendaItemTitle", "ClosedAgendaItemTitle"):
+            title_container = container.find("div", class_=class_name)
+            if title_container:
+                title_link = title_container.find("a")
+                title = (
+                    title_link.get_text(strip=True)
+                    if title_link
+                    else title_container.get_text(strip=True)
+                )
+                if title:
+                    return title
 
         select_link = container.find("a", href=re.compile(r"SelectItem"))
         if select_link:
             return select_link.get_text(strip=True) or None
 
         return None
+
+    def _extract_item_body_text(self, container: Tag) -> str:
+        """Extract the item's own agenda text (the substance eScribe publishes inline).
+
+        Layout varies by instance and the variants are not cosmetic:
+
+        - Two AgendaItemContentRow divs, the first a department banner
+          (div.AgendaItemHeader) and the second the real body. Taking the first
+          row -- what this adapter did before -- returned the banner and dropped
+          the body on a third of Detroit's items.
+        - No AgendaItemDescription at all: Richmond publishes 45 of 48 items as
+          div.MotionText inside ul.AgendaItemMotions.
+        - Routing badges ("District: ALL") emitted as the whole description.
+
+        The department banner is kept as a prefix when a body exists: with titles
+        like "Whitfield-Calloway, reso. autho." the owning department is real
+        context, not decoration. Confidence: 8/10.
+        """
+        parts = [self._block_text(node) for node in self._owned(container, "AgendaItemDescription")]
+
+        if not any(parts):
+            # Fallback: content rows with chrome stripped out. Scoped to this
+            # container so a parent can never absorb a child item's text.
+            parts = []
+            for row in self._owned(container, "AgendaItemContentRow"):
+                fragment = BeautifulSoup(str(row), "html.parser")
+                for class_name in _BODY_NOISE_CLASSES:
+                    for junk in fragment.find_all(class_=class_name):
+                        junk.decompose()
+                for nested in fragment.find_all("div", class_="AgendaItemContainer"):
+                    nested.decompose()
+                parts.append(self._clean_text(fragment.get_text("\n")))
+
+        body = self._clean_text("\n".join(part for part in parts if part))
+        if _PLACEHOLDER_BODY.match(body.replace("\n", " ")):
+            body = ""
+
+        # Staff recommendation. Deduped because the fallback path above may
+        # already have absorbed it.
+        motions = [self._block_text(node) for node in self._owned(container, "MotionText")]
+        for motion in motions:
+            if motion and motion not in body:
+                body = f"{body}\n{motion}".strip()
+
+        if not body:
+            return ""
+
+        headers = self._owned(container, "AgendaItemHeader")
+        header = self._block_text(headers[0]) if headers else ""
+        if header and header.lower() not in body.lower():
+            return f"{header}\n{body}"
+        return body
+
+    @staticmethod
+    def _owned(container: Tag, class_name: str) -> List[Tag]:
+        """Nodes belonging to this container, not to a nested child item."""
+        return [
+            node
+            for node in container.find_all(class_=class_name)
+            if node.find_parent("div", class_="AgendaItemContainer") is container
+        ]
+
+    @classmethod
+    def _block_text(cls, node: Tag) -> str:
+        """Flatten rich text with block boundaries preserved as newlines.
+
+        Measured over 212 real descriptions: get_text(strip=True) fuses 334 word
+        boundaries ("Report:ROI No. 2263"), while get_text(" ", strip=True) fixes
+        those but shreds Word-pasted per-glyph spans into "C o mmi ss i o n e r s".
+        Breaking on block tags only leaves one real fusion in the corpus, and that
+        one is fused in the source text node. Works on a detached copy so the
+        caller's tree is untouched. Confidence: 9/10.
+        """
+        fragment = BeautifulSoup(str(node), "html.parser")
+        for tag in fragment.find_all(_BLOCK_TAGS):
+            tag.insert_after("\n")
+        return cls._clean_text(fragment.get_text())
+
+    @staticmethod
+    def _clean_text(value: str) -> str:
+        """Scrub eScribe whitespace, keeping single newlines as block boundaries."""
+        text = (value or "").replace("\xa0", " ").replace("\u200b", "").replace("\u2009", " ")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\s*\n\s*", "\n", text)
+        return re.sub(r"\n{2,}", "\n", text).strip()
 
     def _extract_section_header(self, container: Tag) -> Optional[str]:
         """Extract section header from container if present."""
