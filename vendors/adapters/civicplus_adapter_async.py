@@ -19,6 +19,7 @@ import os
 import re
 import asyncio
 import hashlib
+import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse, urljoin, parse_qs
@@ -59,33 +60,48 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
     def _update_site_config(self, updates: Dict[str, Any]) -> None:
         """Merge updates into this slug's entry in civicplus_sites.json.
 
-        Locked read-modify-write plus atomic replace so concurrent adapters
-        discovering different slugs cannot clobber each other's entries.
-        A manually maintained file otherwise never learns what the matrix
-        search already paid to find (or already exhausted).
-
-        A "failed" tombstone is permanent until a human removes it (or adds
-        a working "domain") -- _find_agenda_url short-circuits on it before
-        ever reaching the matrix search again, so there is no automatic
-        self-healing path here. This matches how civicplus_sites.json,
-        visioninternet_sites.json, and granicus_view_ids.json already work:
-        machine-discovered or machine-exhausted, human-corrected.
+        The lock lives in a stable sidecar file, rather than the config inode:
+        atomic replacement changes the config inode, which would otherwise let
+        a concurrently opened writer read the old file and clobber a discovery.
+        Each writer also gets its own temporary filename.
         """
         config_file = os.path.join(config.DB_DIR, "civicplus_sites.json")
+        lock_file = f"{config_file}.lock"
+        tmp_path: Optional[str] = None
         try:
-            with open(config_file, "a+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                f.seek(0)
-                raw = f.read()
+            os.makedirs(config.DB_DIR, exist_ok=True)
+            with open(lock_file, "a+", encoding="utf-8") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    with open(config_file, encoding="utf-8") as source:
+                        raw = source.read()
+                except FileNotFoundError:
+                    raw = ""
                 sites = json.loads(raw) if raw.strip() else {}
                 sites.setdefault(self.slug, {}).update(updates)
-                tmp_path = f"{config_file}.tmp"
-                with open(tmp_path, "w") as tmp:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=config.DB_DIR,
+                    prefix=".civicplus_sites.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as tmp:
+                    tmp_path = tmp.name
                     json.dump(sites, tmp, indent=2, sort_keys=True)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
                 os.replace(tmp_path, config_file)
+                tmp_path = None
                 self._site_config = sites[self.slug]
         except Exception:
             logger.warning("failed to persist civicplus site config", vendor="civicplus", slug=self.slug)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except FileNotFoundError:
+                    pass
 
     def _get_candidate_base_urls(self) -> List[str]:
         """Extend base candidates with CivicPlus domain."""
@@ -97,7 +113,10 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
     async def _find_agenda_url(self) -> Optional[str]:
         """Discover agenda page URL from common CivicPlus patterns across candidate domains."""
-        if self._site_config.get("failed"):
+        # A manual domain is an explicit retry authority. It must override a
+        # stale failed marker so operators can repair a slug without editing
+        # two fields or waiting for a code deployment.
+        if self._site_config.get("failed") and not self._site_config.get("domain"):
             logger.warning(
                 "civicplus slug previously exhausted the candidate matrix, skipping search. "
                 "Remove the failed entry (or add a working domain) in data/civicplus_sites.json to retry.",
@@ -119,6 +138,7 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         else:
             candidates = self._get_candidate_base_urls()
 
+        saw_retryable_failure = False
         for base_url in candidates:
             for pattern in patterns:
                 test_url = f"{base_url}{pattern}"
@@ -132,11 +152,25 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                         self.base_url = base_url
                         logger.info("found agenda page", vendor="civicplus", slug=self.slug, base_url=base_url, pattern=pattern)
                         domain = base_url.removeprefix("https://").removeprefix("http://")
-                        if self._site_config.get("domain") != domain:
-                            self._update_site_config({"domain": domain})
+                        if (
+                            self._site_config.get("domain") != domain
+                            or self._site_config.get("failed")
+                        ):
+                            self._update_site_config(
+                                {"domain": domain, "failed": False, "failed_at": None}
+                            )
                         return test_url
-                except VendorHTTPError:
+                except VendorHTTPError as error:
+                    saw_retryable_failure = saw_retryable_failure or error.is_retryable
                     continue
+
+        if saw_retryable_failure:
+            logger.warning(
+                "could not find agenda page because candidate probes failed transiently; will retry next sync",
+                vendor="civicplus",
+                slug=self.slug,
+            )
+            return None
 
         logger.warning("could not find agenda page, tombstoning slug", vendor="civicplus", slug=self.slug)
         self._update_site_config({"failed": True, "failed_at": datetime.now(timezone.utc).isoformat()})

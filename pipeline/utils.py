@@ -29,6 +29,7 @@ ATTACHMENT_HASH_VERSION = "sv1"
 MATTER_WORK_VERSION = "mw1"
 MATTER_NO_WORK_VERSION = "mnw1"
 MEETING_WORK_VERSION = "mv1"
+MATTER_BODY_TEXT_VERSION = "mb1"
 
 MatterNoWorkReason: TypeAlias = Literal[
     "procedural",
@@ -332,6 +333,22 @@ class MatterWorkSnapshot:
         ]
         return max(candidates, key=len, default="")
 
+    @property
+    def body_text_version(self) -> Optional[str]:
+        """Stable digest of the inline text that can affect a summary.
+
+        Keep the body marker separate from attachment identity: a document-free
+        matter has no attachment hash to signal an amended staff description.
+        Omitting the marker when there is no substantive body preserves every
+        existing attachment-only ``mw1`` descriptor, while body-bearing matters
+        are deliberately re-evaluated once under the complete input contract.
+        """
+        body_text = self.best_body_text
+        if not body_text:
+            return None
+        digest = hashlib.sha256(body_text.encode()).hexdigest()
+        return f"{MATTER_BODY_TEXT_VERSION}:{digest}"
+
     @classmethod
     def from_appearances(cls, appearances: Iterable[Any]) -> "MatterWorkSnapshot":
         from pipeline.filters.item_filters import is_public_comment_attachment
@@ -367,15 +384,25 @@ class MatterWorkSnapshot:
                 }
             )
         )
-        # Body text is deliberately NOT part of the descriptor. work_version is
-        # compared against every stored matter to decide re-summarization, so
-        # widening the descriptor would invalidate every canonical summary in the
-        # database at once. Body-only matters therefore summarize on first sight
-        # and re-summarize on title or attachment change, not on body edits.
         descriptor = {
             "attachment_version": attachment_version,
             "titles": titles,
         }
+        body_text = max(
+            (
+                normalize_body_text(getattr(item, "body_text", None))
+                for item in ordered
+            ),
+            key=len,
+            default="",
+        )
+        body_text_version = (
+            f"{MATTER_BODY_TEXT_VERSION}:{hashlib.sha256(body_text.encode()).hexdigest()}"
+            if body_text
+            else None
+        )
+        if body_text_version:
+            descriptor["body_text_version"] = body_text_version
         encoded = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
         work_version = (
             f"{MATTER_WORK_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"

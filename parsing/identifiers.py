@@ -38,7 +38,7 @@ IDENTIFIER_PATTERNS: List[Tuple[str, str, str]] = [
     #     agreement with that vendor into a single matter. The procurement
     #     number in the same sentence is the item's actual identity.
     ("Contract", "Contract",
-     r"(?<!Master )(?<!Master\n)\bContract\s*(?:No\.?|Number|#)\s*"
+     r"\bContract\s*(?:No\.?|Number|#)\s*"
      r"([0-9]{4,10}(?:-(?!\d{1,3}%)[A-Za-z0-9]{1,4})?)\b"),
     # File No. L25-8029 (Detroit law dept) / File #SD25-0033 (Los Altos Hills site
     # development) / File No. CM25-19446 (Tampa) / File No. 15120 (workers' comp).
@@ -79,8 +79,16 @@ def extract_identifier(*texts: Optional[str]) -> Optional[Tuple[str, str]]:
         return None
 
     for label, matter_type, pattern in _COMPILED:
-        match = pattern.search(haystack)
-        if match:
+        for match in pattern.finditer(haystack):
+            # ``Master`` is a descriptor, not a stable action identity. Check
+            # the actual whitespace before each match rather than encoding two
+            # fixed-width lookbehinds: title/body text may contain tabs or
+            # multiple spaces, and a false positive would merge every child
+            # agreement beneath one umbrella matter.
+            if label == "Contract" and re.search(
+                r"master\s+$", haystack[:match.start()], re.IGNORECASE
+            ):
+                continue
             return f"{label} {match.group(1).upper()}", matter_type
 
     return None

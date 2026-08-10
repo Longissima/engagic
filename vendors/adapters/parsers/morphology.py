@@ -121,9 +121,22 @@ def is_bare_document(
         external_links = profile.external_links
         text_chars = profile.text_chars
     else:
-        page_count = profile.get("page_count") or 0
-        external_links = profile.get("external_links") or 0
-        text_chars = profile.get("text_chars") or 0
+        required = ("page_count", "external_links", "text_chars")
+        if any(key not in profile for key in required):
+            # A partial audit is diagnostics, not evidence that the source
+            # had no substance. Semantic routing must fail closed here.
+            return False
+        page_count = profile["page_count"]
+        external_links = profile["external_links"]
+        text_chars = profile["text_chars"]
+    values = (page_count, external_links, text_chars)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or value < 0
+        for value in values
+    ):
+        return False
     return (
         page_count <= BARE_MAX_PAGES
         and external_links <= BARE_MAX_EXTERNAL

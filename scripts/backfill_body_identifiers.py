@@ -36,12 +36,18 @@ BATCH_SIZE = 500
 
 
 async def find_candidates(db: Database, banana: str | None) -> list[dict]:
-    """Unkeyed items whose own text cites a durable identifier."""
+    """Fully unkeyed items whose own text cites a durable identifier.
+
+    Rows with an existing ``matter_id`` may already be attached to a different
+    aggregate. Relinking those is a separate, reviewed migration; this safe
+    backfill only fills the pair of identity fields for genuine orphans.
+    """
     query = """
         SELECT i.id, i.title, i.body_text, m.banana, m.id AS meeting_id
         FROM items i
         JOIN meetings m ON m.id = i.meeting_id
         WHERE i.matter_file IS NULL
+          AND i.matter_id IS NULL
           AND (i.body_text IS NOT NULL OR i.title IS NOT NULL)
     """
     params: list = []
@@ -117,20 +123,26 @@ async def backfill(db: Database, apply: bool, banana: str | None) -> None:
         for start in range(0, len(candidates), BATCH_SIZE):
             batch = candidates[start:start + BATCH_SIZE]
             async with conn.transaction():
-                # matter_file IS NULL is re-checked in the write so a concurrent
-                # sync that already keyed the row wins over this backfill.
-                await conn.executemany(
+                # Both identity fields are re-checked in the write so a
+                # concurrent sync wins rather than leaving a derived
+                # matter_file attached to a pre-existing, different matter_id.
+                rows = await conn.fetch(
                     """
-                    UPDATE items
-                    SET matter_file = $2, matter_type = COALESCE(matter_type, $3)
-                    WHERE id = $1 AND matter_file IS NULL
+                    UPDATE items AS item
+                    SET matter_file = candidate.matter_file,
+                        matter_type = COALESCE(item.matter_type, candidate.matter_type)
+                    FROM unnest($1::text[], $2::text[], $3::text[])
+                        AS candidate(item_id, matter_file, matter_type)
+                    WHERE item.id = candidate.item_id
+                      AND item.matter_file IS NULL
+                      AND item.matter_id IS NULL
+                    RETURNING item.id
                     """,
-                    [
-                        (c["item_id"], c["matter_file"], c["matter_type"])
-                        for c in batch
-                    ],
+                    [c["item_id"] for c in batch],
+                    [c["matter_file"] for c in batch],
+                    [c["matter_type"] for c in batch],
                 )
-            updated += len(batch)
+            updated += len(rows)
             logger.info("batch written", written=updated, total=len(candidates))
 
     logger.info(

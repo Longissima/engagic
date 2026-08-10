@@ -72,7 +72,9 @@ def test_bare_document_reads_the_persisted_audit_form():
     assert m.is_bare_document(bare) is True
     assert m.is_bare_document({**bare, "external_links": 3}) is False
     assert m.is_bare_document({**bare, "text_chars": 9000}) is False
-    assert m.is_bare_document({}) is True  # absent counts read as zero
+    assert m.is_bare_document({}) is False
+    assert m.is_bare_document({"page_count": 1, "external_links": 0}) is False
+    assert m.is_bare_document({**bare, "text_chars": "863"}) is False
     assert m.is_bare_document(None) is False
 
 

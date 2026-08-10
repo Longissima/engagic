@@ -247,6 +247,12 @@ class TestBodyIdentifiers:
         assert both[0] == "Contract 30090"
         assert umbrella_only is None
 
+    @pytest.mark.parametrize("separator", [" ", "  ", "\t", "\n"])
+    def test_master_contract_guard_handles_source_whitespace(self, separator):
+        assert extract_identifier(
+            f"Approve a Master{separator}Contract No. 900174"
+        ) is None
+
     def test_title_is_searched_before_body(self):
         assert extract_identifier(
             "Contract No. 6007968 award",
@@ -319,14 +325,31 @@ class TestMatterWorkGate:
 
         assert work.best_body_text == long
 
-    def test_body_text_does_not_change_work_version(self):
-        """Hashing body text would invalidate every canonical summary in the database."""
-        without = MatterWorkSnapshot.from_appearances([self.Appearance()])
-        with_body = MatterWorkSnapshot.from_appearances(
-            [self.Appearance(body_text="Contract No. 6007968 for body-worn camera systems.")]
+    def test_substantive_body_text_changes_work_version(self):
+        """An amended inline record must not reuse the old canonical summary."""
+        first = MatterWorkSnapshot.from_appearances(
+            [
+                self.Appearance(
+                    body_text="Contract No. 6007968 authorizes body-worn camera systems."
+                )
+            ]
         )
+        amended = MatterWorkSnapshot.from_appearances(
+            [
+                self.Appearance(
+                    body_text=(
+                        "Contract No. 6007968 authorizes body-worn camera systems "
+                        "and increases the spending cap by $2 million."
+                    )
+                )
+            ]
+        )
+        attachment_only = MatterWorkSnapshot.from_appearances([self.Appearance()])
 
-        assert without.work_version == with_body.work_version
+        assert first.work_version != amended.work_version
+        # No marker is added for the legacy attachment-only shape, avoiding a
+        # database-wide reprocess wave for matters whose inputs did not expand.
+        assert attachment_only.body_text_version is None
 
     def test_normalize_body_text_collapses_and_gates(self):
         assert normalize_body_text("  Contract   No.\n6007968 for body-worn camera systems. ") == (

@@ -678,7 +678,11 @@ class MeetingSyncOrchestrator:
 
             raw_item = items_map.get(agenda_item.sequence, {})
             sponsors = raw_item.get("sponsors", [])
-            matter_type = raw_item.get("matter_type")
+            # Generic identifiers are derived into the AgendaItem by the
+            # shared funnel, so adapter input alone is not authoritative here.
+            # Without this fallback a new ``Contract 1234`` aggregate is
+            # created with a null type even though the derived item carries it.
+            matter_type = raw_item.get("matter_type") or agenda_item.matter_type
             raw_vendor_matter_id = raw_item.get("matter_id")
             if "votes" in raw_item:
                 stats["observed_votes"][agenda_item.matter_id] = raw_item.get(
