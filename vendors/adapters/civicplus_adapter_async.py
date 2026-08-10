@@ -161,7 +161,13 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                             )
                         return test_url
                 except VendorHTTPError as error:
-                    saw_retryable_failure = saw_retryable_failure or error.is_retryable
+                    # ``VendorHTTPError`` deliberately classifies most 4xx
+                    # responses as permanent, but 429 means the remote site
+                    # is temporarily rate-limiting us.  Do not turn that
+                    # operational condition into a durable "site absent"
+                    # marker.
+                    is_transient = error.is_retryable or error.status_code == 429
+                    saw_retryable_failure = saw_retryable_failure or is_transient
                     continue
 
         if saw_retryable_failure:

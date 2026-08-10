@@ -58,14 +58,21 @@ async def test_manual_domain_overrides_failed_marker_and_clears_it_on_success(co
 
 
 @pytest.mark.asyncio
-async def test_transient_probe_failures_do_not_create_a_permanent_tombstone(config_dir):
+@pytest.mark.parametrize(
+    ("message", "status_code"),
+    [("timeout", None), ("rate limited", 429)],
+)
+async def test_transient_probe_failures_do_not_create_a_permanent_tombstone(
+    config_dir, message, status_code
+):
     adapter = AsyncCivicPlusAdapter("temporarily-offline")
     adapter._get_candidate_base_urls = lambda: ["https://offline.example.gov"]
 
     async def unavailable(url):
         raise VendorHTTPError(
-            "timeout",
+            message,
             vendor="civicplus",
+            status_code=status_code,
             city_slug="temporarily-offline",
         )
 
