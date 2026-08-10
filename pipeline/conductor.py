@@ -337,14 +337,20 @@ class Conductor:
             metadata={"scope": "all" if city_bananas is None else "targets"},
         )
         run_id = int(run["id"])
-        stage_id = await self.db.pipeline_lifecycle.start_stage(
-            attempt_id=None,
-            run_id=run_id,
-            stage="sync.cycle",
-            metrics={"target_count": len(city_bananas or [])},
-        )
-        heartbeat = asyncio.create_task(self._heartbeat_run(run_id))
+        # From this point every failure path must finish the run, or the row
+        # leaks in 'running' until recover_stale_lifecycle reaps it with a
+        # misleading heartbeat-expiry error — so stage/heartbeat setup happens
+        # inside the try and the handlers tolerate their absence.
+        stage_id: Optional[int] = None
+        heartbeat: Optional[asyncio.Task[None]] = None
         try:
+            stage_id = await self.db.pipeline_lifecycle.start_stage(
+                attempt_id=None,
+                run_id=run_id,
+                stage="sync.cycle",
+                metrics={"target_count": len(city_bananas or [])},
+            )
+            heartbeat = asyncio.create_task(self._heartbeat_run(run_id))
             results = (
                 await self.fetcher.sync_all()
                 if city_bananas is None
@@ -391,31 +397,34 @@ class Conductor:
             )
             return results
         except asyncio.CancelledError:
-            await self.db.pipeline_lifecycle.finish_stage(
-                stage_id,
-                status="failed",
-                error_type="CancelledError",
-                error_message="sync cycle cancelled",
-            )
+            if stage_id is not None:
+                await self.db.pipeline_lifecycle.finish_stage(
+                    stage_id,
+                    status="failed",
+                    error_type="CancelledError",
+                    error_message="sync cycle cancelled",
+                )
             await self.db.pipeline_lifecycle.finish_run(run_id, "cancelled")
             raise
         except Exception as exc:
-            await self.db.pipeline_lifecycle.finish_stage(
-                stage_id,
-                status="failed",
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
+            if stage_id is not None:
+                await self.db.pipeline_lifecycle.finish_stage(
+                    stage_id,
+                    status="failed",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
             await self.db.pipeline_lifecycle.finish_run(
                 run_id, "failed", error_message=f"{type(exc).__name__}: {exc}"
             )
             raise
         finally:
-            heartbeat.cancel()
-            try:
-                await heartbeat
-            except asyncio.CancelledError:
-                pass
+            if heartbeat is not None:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
 
     async def sync_and_process_city(self, city_banana: str) -> Dict[str, Any]:
         """Sync a city and immediately process all its queued jobs

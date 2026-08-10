@@ -780,3 +780,54 @@ async def test_sync_cycle_marks_parent_run_cancelled_for_interrupted_stream():
     assert lifecycle.finished == [
         (41, "cancelled", "1 jurisdiction sync(s) cancelled")
     ]
+
+
+@pytest.mark.asyncio
+async def test_sync_cycle_finishes_run_failed_when_stage_startup_raises():
+    lifecycle = Lifecycle()
+
+    async def start_stage(**kwargs):
+        raise RuntimeError("stage insert lost connection")
+
+    async def finish_stage(stage_id, **kwargs):
+        lifecycle.stage_finished = (stage_id, kwargs)
+
+    lifecycle.start_stage = start_stage
+    lifecycle.finish_stage = finish_stage
+
+    conductor = Conductor.__new__(Conductor)
+    conductor.db = SimpleNamespace(pipeline_lifecycle=lifecycle)
+
+    heartbeats = []
+
+    async def fake_heartbeat(run_id):
+        heartbeats.append(run_id)
+
+    conductor._heartbeat_run = fake_heartbeat
+
+    with pytest.raises(RuntimeError, match="stage insert lost connection"):
+        await conductor.run_sync_cycle(["alphaCA"], command="sync-cli")
+
+    assert not hasattr(lifecycle, "stage_finished")
+    assert lifecycle.finished == [
+        (41, "failed", "RuntimeError: stage insert lost connection")
+    ]
+    assert heartbeats == []
+
+
+@pytest.mark.asyncio
+async def test_sync_cycle_finishes_run_cancelled_when_cancelled_before_stage_exists():
+    lifecycle = Lifecycle()
+
+    async def start_stage(**kwargs):
+        raise asyncio.CancelledError()
+
+    lifecycle.start_stage = start_stage
+
+    conductor = Conductor.__new__(Conductor)
+    conductor.db = SimpleNamespace(pipeline_lifecycle=lifecycle)
+
+    with pytest.raises(asyncio.CancelledError):
+        await conductor.run_sync_cycle(["alphaCA"], command="sync-cli")
+
+    assert lifecycle.finished == [(41, "cancelled", None)]

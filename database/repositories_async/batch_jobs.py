@@ -484,6 +484,38 @@ class BatchJobRepository(BaseRepository):
             )
         return int(row["n"]) if row else 0
 
+    async def count_open_for_matter(
+        self,
+        matter_id: str,
+        *,
+        conn: Optional[Connection] = None,
+    ) -> int:
+        """In-flight chunks owning any appearance snapshot of a matter.
+
+        batch_jobs carries no matter column -- chunks are meeting-scoped and
+        matter linkage exists only through the chunk's owned item_ids joined
+        to items.matter_id. A landing chunk fills owned snapshots at the
+        chunk's submitted prompts_version, so any open owner makes a matter's
+        appearance provenance unstable; callers defer prompt-invalidation
+        work until the owning chunks are terminal.
+        """
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT COUNT(*) AS n
+                FROM batch_jobs b
+                WHERE b.status = 'submitted'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements_text(b.item_ids) AS owned(item_id)
+                      JOIN items i ON i.id = owned.item_id
+                      WHERE i.matter_id = $1
+                  )
+                """,
+                matter_id,
+            )
+        return int(row["n"]) if row else 0
+
     async def count_open_for_cache(self, cache_name: Optional[str]) -> int:
         """Count open chunks that still reference one exact provider cache."""
         if not cache_name:

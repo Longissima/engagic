@@ -477,6 +477,39 @@ class MatterRepository(BaseRepository):
                 work_version,
             )
 
+    async def invalidate_canonical_summary(
+        self,
+        matter_id: str,
+        conn: Optional[Connection] = None,
+    ) -> bool:
+        """Clear the canonical summary so the matter lane must re-summarize.
+
+        Both matter-lane currency gates (the reuse CAS and the
+        skip-summarization path in the processor) require a non-null
+        canonical_summary before trusting the stored metadata versions, so
+        clearing the summary alone forces one full aggregate re-summarization
+        under the current prompt. Metadata versions, canonical_topics, and
+        matter_topics deliberately survive: versions keep scoping outcome
+        attempts to the unchanged appearance inputs, and topics stay visible
+        until the replacement projection lands -- mirroring the item-side
+        unfreeze, which nulls summary provenance but preserves topics.
+        Callers must hold the matter row lock (processor lock order).
+        """
+        async with self._ensure_conn(conn) as c:
+            result = await c.execute(
+                """
+                UPDATE city_matters
+                SET canonical_summary = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                matter_id,
+            )
+        invalidated = self._parse_row_count(result) > 0
+        if invalidated:
+            logger.info("invalidated canonical summary", matter_id=matter_id)
+        return invalidated
+
     async def record_matter_outcome(
         self,
         matter_id: str,

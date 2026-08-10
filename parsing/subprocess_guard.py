@@ -70,6 +70,28 @@ class GuardTaskError(GuardError):
         self.error_type = error_type
 
 
+def _apply_address_space_cap(rlimit_bytes: int) -> None:
+    """Best-effort RLIMIT_AS: requested cap, else the hard limit, else uncapped.
+
+    A raise here happens before the target runs, so a platform that rejects
+    the cap must not turn every guarded call into a startup crash. macOS
+    refuses any finite RLIMIT_AS (EINVAL, surfaced as ValueError) while
+    reporting an infinite hard limit -- there the guard runs uncapped. On
+    Linux the requested cap applies exactly as before.
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (rlimit_bytes, rlimit_bytes))
+        return
+    except (ValueError, OSError):
+        pass
+    _, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard != resource.RLIM_INFINITY:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+        except (ValueError, OSError):
+            pass
+
+
 def _guard_worker(
     result_queue,
     rlimit_bytes: int,
@@ -78,7 +100,7 @@ def _guard_worker(
     kwargs: Dict[str, Any],
 ) -> None:
     """Child-process entrypoint: cap resources, run target, report once."""
-    resource.setrlimit(resource.RLIMIT_AS, (rlimit_bytes, rlimit_bytes))
+    _apply_address_space_cap(rlimit_bytes)
 
     # Mark this child as a preferred OOM victim. The conductor parent sets
     # itself to -500; we override to +500 so under system-wide memory
@@ -178,6 +200,16 @@ def run_guarded(
             raise GuardTaskError(data[0], error_type=data[1])
         return data[0]
     finally:
+        # No escape path may orphan the child: a KeyboardInterrupt (or any
+        # unexpected raise) out of the result wait above, or a wedged child
+        # surviving the timeout path's kill, leaves a live process holding
+        # up to rlimit_bytes of address space. is_alive() is False on a
+        # Process whose start() itself raised, and kill()/join() would raise
+        # on it -- the gate keeps a failed start from masking the original
+        # exception.
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=_JOIN_TIMEOUT_SECONDS)
         # Release the Queue's pipe fds, semaphores, and feeder thread now.
         # Without explicit close each run leaks ~4 fds until non-deterministic
         # GC; over thousands of runs in a long process-cities session that

@@ -21,14 +21,6 @@ from database.models import AttachmentInfo
 import parsing.pdf
 from parsing.pdf import PdfExtractor, _extract_xlsx
 from pipeline.processor import Processor
-import scripts.backfill_v32_summaries as backfill
-from scripts.backfill_v32_summaries import (
-    CORPUS_TEXT_FOR_IDENTITY,
-    LATEST_MATTER_ITEM,
-    STATE_PATH,
-    build_item_text,
-    refresh_canonical_summaries,
-)
 
 
 def test_many_documents_still_obey_strict_budget():
@@ -133,37 +125,6 @@ def test_pdf_markup_annotations_are_redline_evidence():
     assert "[ADDED: add]" in result["text"]
 
 
-def test_v32_backfill_does_not_reuse_v31_state():
-    assert STATE_PATH.name == "backfill_v32_state.jsonl"
-
-
-def test_backfill_state_rejects_records_from_other_prompt_versions(
-    tmp_path, monkeypatch
-):
-    state_path = tmp_path / "state.jsonl"
-    records = [
-        {
-            "prompts_version": "v3.1",
-            "kind": "submitted",
-            "item_ids": ["old-item"],
-            "gemini_job_name": "old-job",
-        },
-        {
-            "prompts_version": backfill.PROMPT_VERSION,
-            "kind": "submitted",
-            "item_ids": ["current-item"],
-            "gemini_job_name": "current-job",
-        },
-    ]
-    state_path.write_text("".join(json.dumps(record) + "\n" for record in records))
-    monkeypatch.setattr(backfill, "STATE_PATH", state_path)
-
-    submitted, _ingested, jobs, _metadata = backfill.load_state()
-
-    assert submitted == {"current-item"}
-    assert [job["gemini_job_name"] for job in jobs] == ["current-job"]
-
-
 def _xlsx_bytes(rows: int, columns: int = 1, cell_chars: int = 8) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
@@ -196,71 +157,6 @@ def test_xlsx_sanity_cap_guards_pathological_workbooks(monkeypatch):
     assert "row-150-" not in text
 
 
-class _Acquire:
-    def __init__(self, conn):
-        self.conn = conn
-
-    async def __aenter__(self):
-        return self.conn
-
-    async def __aexit__(self, *_args):
-        return False
-
-
-class _CorpusConnection:
-    def __init__(self, rows):
-        self.rows = rows
-        self.identities = []
-
-    async def fetchrow(self, query, identity):
-        assert query == CORPUS_TEXT_FOR_IDENTITY
-        self.identities.append(identity)
-        return self.rows.get(identity)
-
-
-class _Pool:
-    def __init__(self, conn):
-        self.conn = conn
-
-    def acquire(self):
-        return _Acquire(self.conn)
-
-
-class _R2:
-    def __init__(self, objects):
-        self.objects = objects
-
-    async def get(self, key):
-        return self.objects.get(key)
-
-
-def test_backfill_preserves_identity_query_parameters_and_spreadsheets():
-    first_url = "https://example.test/View.ashx?ID=1"
-    second_url = "https://example.test/View.ashx?ID=2"
-    conn = _CorpusConnection(
-        {
-            first_url: {"text_key": "one", "page_count": 1},
-            second_url: {"text_key": "two", "page_count": 2},
-        }
-    )
-    attachments = [
-        {"name": "Quote.xlsx", "url": first_url, "type": "spreadsheet"},
-        {"name": "Contract.pdf", "url": second_url, "type": "pdf"},
-    ]
-
-    text, pages = asyncio.run(
-        build_item_text(
-            _Pool(conn),
-            _R2({"one": b"FIRST", "two": b"SECOND"}),
-            attachments,
-        )
-    )
-
-    assert conn.identities == [first_url, second_url]
-    assert "FIRST" in text and "SECOND" in text
-    assert pages == 3
-
-
 def test_processor_routes_spreadsheet_attachments_to_extraction():
     class Analyzer:
         async def extract_document_async(self, url, banana=None):
@@ -286,59 +182,3 @@ def test_processor_routes_spreadsheet_attachments_to_extraction():
 
     assert item_attachments["item-1"] == ["https://example.test/pricing.xlsx"]
     assert cache["https://example.test/pricing.xlsx"]["text"] == "sheet text"
-
-
-class _Transaction:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False
-
-
-class _CanonicalConnection:
-    def __init__(self):
-        self.updated = []
-        self.topic_deletes = []
-        self.topic_inserts = []
-
-    def transaction(self):
-        return _Transaction()
-
-    async def fetchrow(self, query, matter_id):
-        assert query == LATEST_MATTER_ITEM
-        return {"id": f"latest-{matter_id}", "summary": f"latest {matter_id}"}
-
-    async def fetch(self, query, item_id):
-        assert "FROM item_topics" in query
-        return [{"topic": "contracts"}]
-
-    async def execute(self, query, *args):
-        if "UPDATE city_matters" in query:
-            self.updated.append(args)
-            return "UPDATE 1"
-        if "DELETE FROM matter_topics" in query:
-            self.topic_deletes.append(args)
-            return "DELETE 1"
-        raise AssertionError(query)
-
-    async def executemany(self, query, records):
-        assert "INSERT INTO matter_topics" in query
-        self.topic_inserts.extend(records)
-
-
-def test_canonical_refresh_uses_latest_appearance_after_collection():
-    conn = _CanonicalConnection()
-    db = SimpleNamespace(pool=_Pool(conn))
-
-    refreshed = asyncio.run(refresh_canonical_summaries(db, {"matter-b", "matter-a"}))
-
-    assert refreshed == 2
-    assert conn.updated == [
-        ("matter-a", "latest matter-a", ["contracts"]),
-        ("matter-b", "latest matter-b", ["contracts"]),
-    ]
-    assert conn.topic_inserts == [
-        ("matter-a", "contracts"),
-        ("matter-b", "contracts"),
-    ]

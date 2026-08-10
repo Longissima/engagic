@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ import analysis.analyzer_async as analyzer_module
 from analysis.analyzer_async import AsyncAnalyzer
 from database.id_generation import generate_meeting_id
 from exceptions import DocumentDownloadError, ExtractionError
+from pipeline.utils import meeting_work_version
 import scripts.ingest_minutes as ingest_minutes
 from scripts.ingest_minutes import select_candidates
 import scripts.sweep_minutes as sweep_minutes
@@ -513,3 +515,260 @@ def test_sweep_city_reuses_stable_undated_meeting_identity(monkeypatch):
     assert looked_up == [expected_id]
     assert counts["would_fill"] == 1
     assert counts["id_miss"] == 0
+
+
+_SWEEP_CITY = {"banana": "exampleCA", "vendor": "onbase", "slug": "primary"}
+_SWEEP_START = "2026-08-01T18:00:00"
+_SWEEP_MINUTES_URL = "https://example.test/minutes.pdf"
+
+
+def _sweep_meeting_id():
+    return generate_meeting_id(
+        "exampleCA", "vendor-1", datetime.fromisoformat(_SWEEP_START), "Council"
+    )
+
+
+def _patch_single_minutes_adapter(monkeypatch):
+    class Adapter:
+        MINUTES_DISCOVERY_SUPPORTED = True
+        banana = None
+
+        async def fetch_minutes(self, days_back, days_forward):
+            return FetchResult(
+                meetings=[
+                    {
+                        "vendor_id": "vendor-1",
+                        "title": "Council",
+                        "start": _SWEEP_START,
+                        "minutes_url": _SWEEP_MINUTES_URL,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        sweep_minutes, "get_async_adapter", lambda *_args, **_kwargs: Adapter()
+    )
+
+
+def _sweep_meeting(minutes_url):
+    return SimpleNamespace(
+        id=_sweep_meeting_id(),
+        banana="exampleCA",
+        title="Council",
+        date=datetime.fromisoformat(_SWEEP_START),
+        agenda_url="https://example.test/agenda",
+        agenda_sources=None,
+        packet_url=None,
+        minutes_url=minutes_url,
+        participation=None,
+    )
+
+
+def _sweep_items():
+    return [
+        SimpleNamespace(
+            id="item-1",
+            sequence=1,
+            title="Existing item",
+            body_text=None,
+            matter_id=None,
+            matter_file=None,
+            matter_type=None,
+            agenda_number=None,
+            sponsors=None,
+            filter_reason=None,
+            attachments=[],
+            summary="frozen summary",
+        )
+    ]
+
+
+def _fill_path_db(meeting, items, events, enqueue_calls):
+    """Fake db exposing exactly the surfaces the fill transaction touches."""
+
+    class Transaction:
+        async def __aenter__(self):
+            events.append("tx_begin")
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            events.append("tx_rollback" if exc_type else "tx_commit")
+            return False
+
+    class Connection:
+        def transaction(self):
+            return Transaction()
+
+        async def execute(self, query, meeting_id, url):
+            assert query == sweep_minutes.FILL_SQL
+            events.append(("fill", meeting_id, url))
+            return "UPDATE 1"
+
+    connection = Connection()
+
+    class Meetings:
+        async def get_meeting(self, meeting_id, conn=None, lock_for_update=False):
+            assert conn is connection
+            assert lock_for_update is True
+            events.append(("lock", meeting_id))
+            return meeting
+
+    class Items:
+        async def get_agenda_items(self, meeting_id, conn=None):
+            assert conn is connection
+            events.append(("items", meeting_id))
+            return items
+
+    class Queue:
+        async def enqueue_job(self, **kwargs):
+            assert kwargs.pop("conn") is connection
+            events.append("enqueue")
+            enqueue_calls.append(kwargs)
+            return True
+
+    class Acquire:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    return SimpleNamespace(
+        pool=Pool(), meetings=Meetings(), items=Items(), queue=Queue()
+    )
+
+
+def test_sweep_fill_enqueues_new_work_version_in_same_transaction(monkeypatch):
+    _patch_single_minutes_adapter(monkeypatch)
+    events: list = []
+    enqueue_calls: list = []
+    db = _fill_path_db(
+        _sweep_meeting(minutes_url=None), _sweep_items(), events, enqueue_calls
+    )
+
+    counts = asyncio.run(
+        sweep_minutes.sweep_city(
+            db,
+            lambda md: datetime.fromisoformat(md["start"]),
+            dict(_SWEEP_CITY),
+            days_back=60,
+            dry_run=False,
+        )
+    )
+
+    meeting_id = _sweep_meeting_id()
+    # Lock, fill, item load, and enqueue all land between one begin/commit
+    # pair: the mv1 publication is atomic with the write it describes.
+    assert events == [
+        "tx_begin",
+        ("lock", meeting_id),
+        ("fill", meeting_id, _SWEEP_MINUTES_URL),
+        ("items", meeting_id),
+        "enqueue",
+        "tx_commit",
+    ]
+    assert counts["filled"] == 1
+    assert counts["enqueued"] == 1
+
+    (call,) = enqueue_calls
+    assert call["source_url"] == f"meeting://{meeting_id}"
+    assert call["job_type"] == "meeting"
+    assert call["payload"] == {"meeting_id": meeting_id}
+    assert call["meeting_id"] == meeting_id
+    assert call["banana"] == "exampleCA"
+    assert call["priority"] == sweep_minutes.BACKFILL_PRIORITY
+    # The published version hashes the POST-fill minutes_url, not the NULL
+    # the locked row still held when it was read.
+    assert call["work_version"] == meeting_work_version(
+        _sweep_meeting(minutes_url=_SWEEP_MINUTES_URL), _sweep_items()
+    )
+    assert call["work_version"] != meeting_work_version(
+        _sweep_meeting(minutes_url=None), _sweep_items()
+    )
+
+
+@pytest.mark.parametrize("scenario", ["already_set", "id_miss"])
+def test_sweep_fill_miss_writes_and_enqueues_nothing(monkeypatch, scenario):
+    _patch_single_minutes_adapter(monkeypatch)
+    meeting = (
+        _sweep_meeting(minutes_url="https://example.test/prior.pdf")
+        if scenario == "already_set"
+        else None
+    )
+    events: list = []
+    enqueue_calls: list = []
+    db = _fill_path_db(meeting, [], events, enqueue_calls)
+
+    counts = asyncio.run(
+        sweep_minutes.sweep_city(
+            db,
+            lambda md: datetime.fromisoformat(md["start"]),
+            dict(_SWEEP_CITY),
+            days_back=60,
+            dry_run=False,
+        )
+    )
+
+    assert counts[scenario] == 1
+    assert counts["filled"] == 0
+    assert counts["enqueued"] == 0
+    assert enqueue_calls == []
+    # The transaction opens only for the locked diagnostic read; no fill
+    # statement runs, so nothing can commit unpublished.
+    assert events == ["tx_begin", ("lock", _sweep_meeting_id()), "tx_commit"]
+
+
+def test_sweep_dry_run_performs_no_writes(monkeypatch):
+    _patch_single_minutes_adapter(monkeypatch)
+
+    class Connection:
+        async def fetchrow(self, query, meeting_id):
+            assert query == sweep_minutes.MEETING_STATE_SQL
+            assert meeting_id == _sweep_meeting_id()
+            return {"minutes_url": None}
+
+        async def execute(self, *args):
+            raise AssertionError("dry-run must not write")
+
+        def transaction(self):
+            raise AssertionError("dry-run must not open a write transaction")
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    class ForbiddenRepo:
+        def __getattr__(self, name):
+            raise AssertionError(f"dry-run must not touch repositories ({name})")
+
+    db = SimpleNamespace(
+        pool=Pool(),
+        meetings=ForbiddenRepo(),
+        items=ForbiddenRepo(),
+        queue=ForbiddenRepo(),
+    )
+
+    counts = asyncio.run(
+        sweep_minutes.sweep_city(
+            db,
+            lambda md: datetime.fromisoformat(md["start"]),
+            dict(_SWEEP_CITY),
+            days_back=60,
+            dry_run=True,
+        )
+    )
+
+    assert counts["would_fill"] == 1
+    assert counts["filled"] == 0
+    assert counts["enqueued"] == 0

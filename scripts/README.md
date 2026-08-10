@@ -153,12 +153,20 @@ their authoritative meeting version. Past meetings route to the Batch lane.
 ```bash
 uv run python scripts/resummarize_items.py --below v3 --dry-run
 uv run python scripts/resummarize_items.py --below v3 --limit 200 --yes
+uv run python scripts/resummarize_items.py --below v3.2 --attachments-matching '<regex>' --yes
 ```
 
 The apply path locks the meeting/items, clears only rows still below the requested
 version, computes the current `work_version`, and reactivates that exact queue
 version in the same transaction. It never relies on an unversioned best-effort
 enqueue.
+
+This is the single path for prompt-version backfills, including corpus-only
+reconstruction for items whose vendor URLs have expired: document acquisition is
+corpus-first with fail-open, and the queue path enforces the freeze/batch/matter
+invariants. `--attachments-matching <regex>` narrows targeting by attachments
+JSON (case-insensitive), reproducing the retired `backfill_v32_summaries.py`
+transactional-document selection (regex in the module docstring).
 
 ### `db_viewer.py`
 Interactive database viewer and editor. Browse jurisdictions, meetings, items, queue; add/update jurisdictions with Census data lookup.

@@ -3,10 +3,14 @@
 Minutes publish after the meeting -- often approved at the NEXT regular session,
 2-4 weeks later -- while the daemon's resync only looks back ~14 days. This sweep
 re-fetches vendor listings with a wider back-window for cities that have recent
-meetings missing minutes_url, and fills ONLY that column. It deliberately does not
-run the full sync_meeting path: re-storing old meetings and re-tracking matters is
-the daemon's job inside its own window; the sweep is surgical by design and can
-never overwrite anything (UPDATE ... WHERE minutes_url IS NULL).
+meetings missing minutes_url, and fills ONLY that column. It still never
+overwrites an existing value (UPDATE ... WHERE minutes_url IS NULL, under a row
+lock) and still does not run the full sync_meeting path: re-storing old meetings
+and re-tracking matters is the daemon's job inside its own window. But
+minutes_url is an mv1 work-version input, so each fill publishes atomically --
+lock, fill, and enqueue the meeting at its new work_version in one transaction --
+rather than leaving version skew for the daemon to rediscover. Item summaries
+stay frozen, so the enqueued job is cheap version bookkeeping, not an LLM re-run.
 
 Zero LLM calls and no document downloads/parsing/corpus writes. Most adapters
 discover minutes on listing/API responses; ProudCity and CivicPlus may fetch
@@ -30,9 +34,14 @@ from config import config, get_logger
 from database.db_postgres import Database
 from database.id_generation import generate_meeting_id
 from pipeline.orchestrators.meeting_sync import MeetingSyncOrchestrator
+from pipeline.utils import meeting_work_version
 from vendors.factory import get_async_adapter
 
 logger = get_logger(__name__).bind(component="sweep_minutes")
+
+# Swept meetings are past-dated backfill: never outrank fresh meetings
+# (past dates take the batch lane), mirroring resummarize_items.
+BACKFILL_PRIORITY = -10
 
 
 CITIES_SQL = """
@@ -74,7 +83,7 @@ def vendor_streams(city_row) -> list[tuple[str, str]]:
 async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) -> dict:
     banana = city_row["banana"]
     counts = {"fetched": 0, "with_minutes": 0, "would_fill": 0, "filled": 0,
-              "already_set": 0,
+              "enqueued": 0, "already_set": 0,
               "id_miss": 0, "fetch_failed": 0,
               "unsupported": 0}
 
@@ -165,15 +174,54 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                 continue
 
             async with db.pool.acquire() as conn:
-                status = await conn.execute(FILL_SQL, meeting_id, minutes_url)
-                if status == "UPDATE 1":
-                    counts["filled"] += 1
-                else:
-                    existing = await conn.fetchrow(MEETING_STATE_SQL, meeting_id)
-                    if existing is None:
+                async with conn.transaction():
+                    # Lock-first, resummarize-style: the locked read classifies
+                    # id_miss/already_set authoritatively, and guarantees the
+                    # fill and its queue publication commit together or not at
+                    # all. Filling a row we never saw locked could commit an
+                    # mv1 change with no publication.
+                    meeting = await db.meetings.get_meeting(
+                        meeting_id, conn=conn, lock_for_update=True
+                    )
+                    if meeting is None:
                         counts["id_miss"] += 1
-                    elif existing["minutes_url"] is not None:
+                        continue
+                    if meeting.minutes_url is not None:
                         counts["already_set"] += 1
+                        continue
+                    status = await conn.execute(FILL_SQL, meeting_id, minutes_url)
+                    if status != "UPDATE 1":  # unreachable under the row lock
+                        continue
+                    counts["filled"] += 1
+                    # minutes_url is an mv1 input: hash the post-fill value
+                    # (the locked read predates the UPDATE) and publish the new
+                    # version in this same transaction. Item summaries stay
+                    # frozen, so the job is bookkeeping, not an LLM re-run.
+                    items = await db.items.get_agenda_items(meeting_id, conn=conn)
+                    meeting.minutes_url = minutes_url
+                    work_version = meeting_work_version(meeting, items)
+                    # NULL -> value changes the mv1 hash, so plain enqueue at
+                    # the new version already lands runnable; exact-version
+                    # reactivation is only for UNCHANGED versions (see
+                    # resummarize_items).
+                    if await db.queue.enqueue_job(
+                        source_url=f"meeting://{meeting_id}",
+                        job_type="meeting",
+                        payload={"meeting_id": meeting_id},
+                        meeting_id=meeting_id,
+                        priority=BACKFILL_PRIORITY,
+                        banana=meeting.banana,
+                        work_version=work_version,
+                        conn=conn,
+                    ):
+                        counts["enqueued"] += 1
+                    else:
+                        logger.warning(
+                            "fill committed but queue already held this version",
+                            banana=banana,
+                            meeting_id=meeting_id,
+                            work_version=work_version,
+                        )
 
     return counts
 
