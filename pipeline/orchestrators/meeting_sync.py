@@ -17,6 +17,7 @@ from database.id_generation import (
 from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
+from parsing.identifiers import extract_identifier
 from pipeline.utils import (
     MatterNoWorkReason,
     MatterWorkSnapshot,
@@ -521,6 +522,21 @@ class MeetingSyncOrchestrator:
             item_attachments = deserialize_attachments(item_data.get("attachments"))
             matter_file = item_data.get("matter_file")
             matter_id_vendor = item_data.get("matter_id")
+            matter_type = item_data.get("matter_type")
+
+            # Last resort: read a durable identifier out of the agenda text
+            # itself. Many vendors publish no matter key at all, yet the body
+            # cites a contract or case number that recurs across committee,
+            # council and later amendments. Deriving it here rather than in each
+            # adapter keeps it self-healing -- the items upsert overwrites
+            # matter_file from every sync, so a value that is not re-derived on
+            # each pass would be silently erased.
+            if not matter_file and not matter_id_vendor:
+                derived = extract_identifier(
+                    item_data.get("title"), item_data.get("body_text")
+                )
+                if derived:
+                    matter_file, matter_type = derived
 
             matter_id = None
             if matter_file or matter_id_vendor:
@@ -538,7 +554,7 @@ class MeetingSyncOrchestrator:
                 agenda_number=item_data.get("agenda_number"),
                 matter_file=matter_file,
                 matter_id=matter_id,
-                matter_type=item_data.get("matter_type"),
+                matter_type=matter_type,
                 sponsors=item_data.get("sponsors", []),
                 attachments=item_attachments,
                 body_text=item_data.get("body_text"),
