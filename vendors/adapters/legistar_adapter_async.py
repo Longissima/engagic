@@ -48,6 +48,56 @@ def _load_prefer_aada_slugs() -> set:
 _PREFER_AADA_SLUGS = _load_prefer_aada_slugs()
 
 
+# Legistar's MatterStatusName is free text each city configures itself, so the
+# same word can mean opposite things: Milwaukee's "Placed On File" is how an
+# ordinance dies, while Oakland's "Filed" marks one completed. Only terms whose
+# meaning is unambiguous across cities are mapped; everything else returns None
+# and leaves the stored status alone. Guessing here would assert a matter is
+# dead when it is merely waiting, which is worse than saying nothing.
+# Confidence: 8/10 -- derived from live status surveys of milwaukee, denver and
+# oakland. Extend from the "unrecognized vendor matter status" debug log.
+_MATTER_STATUS_MAP = {
+    "passed": "passed",
+    "adopted": "passed",
+    "approved": "passed",
+    "confirmed": "passed",
+    "granted": "passed",
+    "enacted": "enacted",
+    "signed": "enacted",
+    "vetoed": "vetoed",
+    "failed": "failed",
+    "defeated": "failed",
+    "denied": "failed",
+    "dead": "failed",
+    "disallowed": "failed",
+    "placed on file": "failed",
+    "in council-placed on file": "failed",
+    "tabled": "tabled",
+    "held": "tabled",
+    "withdrawn": "withdrawn",
+    "referred": "referred",
+    "in committee": "referred",
+    "in commission": "referred",
+    "in rules committee": "referred",
+    "heard in committee": "referred",
+    "amended": "amended",
+}
+
+# Deliberately unmapped, do not add without checking the city means what you
+# think: "Filed" (completed in Oakland, killed elsewhere), "Settled",
+# "Presentation", "Agenda Ready", "To be Scheduled", "Introduced".
+
+
+def map_matter_status(raw: Optional[str]) -> Optional[str]:
+    """Normalize a vendor status string into engagic's status vocabulary.
+
+    Returns None for anything unrecognized so the caller writes nothing.
+    """
+    if not raw:
+        return None
+    return _MATTER_STATUS_MAP.get(" ".join(raw.split()).lower())
+
+
 class AsyncLegistarAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Legistar platform."""
 
@@ -492,6 +542,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 if isinstance(metadata, dict):
                     if metadata.get("matter_type"):
                         item["matter_type"] = metadata["matter_type"]
+                    if metadata.get("matter_status"):
+                        item["matter_status"] = metadata["matter_status"]
                     if metadata.get("sponsors"):
                         item["sponsors"] = metadata["sponsors"]
 
@@ -513,8 +565,20 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             return None
 
     async def _fetch_matter_metadata_async(self, matter_id: int) -> Dict[str, Any]:
-        """Fetch matter_type and sponsors from API."""
-        metadata = {"matter_type": None, "sponsors": []}
+        """Fetch matter_type, lifecycle status, and sponsors from API.
+
+        MatterStatusName rides along on the /matters/{id} response we already
+        request for the type, so it costs no extra call. It is the vendor's own
+        answer to "is this alive" -- "Placed On File", "Passed", "In Committee".
+        Vote tallies cannot substitute: a motion to place a matter on file
+        passes 15-0 and kills the matter, so a motion-scoped outcome says
+        nothing about the matter's fate.
+        """
+        metadata: Dict[str, Any] = {
+            "matter_type": None,
+            "matter_status": None,
+            "sponsors": [],
+        }
 
         try:
             # Fetch matter details for type
@@ -527,12 +591,18 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 matter_data = await response.json()
                 if matter_data:
                     metadata["matter_type"] = matter_data.get("MatterTypeName")
+                    metadata["matter_status"] = self._map_status(
+                        matter_data.get("MatterStatusName")
+                    )
             else:
                 # XML fallback - NYC returns XML from Legistar API
                 text = await response.text()
                 matter_data = self._parse_xml_matter(text)
                 if matter_data:
                     metadata["matter_type"] = matter_data.get("MatterTypeName")
+                    metadata["matter_status"] = self._map_status(
+                        matter_data.get("MatterStatusName")
+                    )
 
             # Fetch sponsors
             sponsors_url = f"{self.base_url}/matters/{matter_id}/sponsors"
@@ -623,6 +693,17 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             "conflict": "recused",
         }
         return vote_map.get(value_lower, "not_voting")
+
+    def _map_status(self, raw: Optional[str]) -> Optional[str]:
+        """Map a Legistar status to engagic's vocabulary, logging misses."""
+        mapped = map_matter_status(raw)
+        if raw and mapped is None:
+            logger.debug(
+                "unrecognized vendor matter status",
+                slug=self.slug,
+                status=raw,
+            )
+        return mapped
 
     async def _fetch_matter_attachments_async(self, matter_id: int) -> List[Dict[str, Any]]:
         """Fetch attachments for a specific matter from API."""
@@ -772,6 +853,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             matter = {}
             field_map = {
                 'MatterTypeName': 'MatterTypeName',
+                'MatterStatusName': 'MatterStatusName',
                 'MatterName': 'MatterName',
                 'MatterFile': 'MatterFile',
                 'MatterId': 'MatterId',

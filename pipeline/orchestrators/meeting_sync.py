@@ -684,6 +684,10 @@ class MeetingSyncOrchestrator:
             # created with a null type even though the derived item carries it.
             matter_type = raw_item.get("matter_type") or agenda_item.matter_type
             raw_vendor_matter_id = raw_item.get("matter_id")
+            # The vendor's own lifecycle verdict ("Placed On File", "Passed").
+            # None for vendors that publish no status; never written in that
+            # case, so a silent vendor cannot erase a known status.
+            vendor_matter_status = raw_item.get("matter_status")
             if "votes" in raw_item:
                 stats["observed_votes"][agenda_item.matter_id] = raw_item.get(
                     "votes"
@@ -709,6 +713,19 @@ class MeetingSyncOrchestrator:
                 # in the later item UPSERT. The authoritative publication
                 # phase performs the tracking write from retained appearances.
                 stats["duplicate"] += 1
+                # A matter's status changes long after it is first tracked --
+                # the kill vote is usually its last appearance, not its first.
+                # This is the only path that revisits an existing aggregate, so
+                # it is the only place a status transition can be observed.
+                # Guarded rather than always-called: most vendors publish no
+                # status at all, and those syncs should not pay for a write
+                # they cannot inform.
+                if vendor_matter_status:
+                    await self.db.matters.sync_vendor_status(
+                        agenda_item.matter_id,
+                        vendor_matter_status,
+                        conn=conn,
+                    )
                 if (
                     not any(
                         item.meeting_id == meeting.id
@@ -756,6 +773,7 @@ class MeetingSyncOrchestrator:
                     first_seen=meeting.date,
                     last_seen=meeting.date,
                     appearance_count=1,
+                    status=vendor_matter_status or "active",
                 )
 
                 await self.db.matters.store_matter(matter_obj, conn=conn)

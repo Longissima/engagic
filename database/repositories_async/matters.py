@@ -800,6 +800,75 @@ class MatterRepository(BaseRepository):
             outcome=vote_outcome
         )
 
+    # Mirrors the city_matters_status_check constraint. Checked in Python so an
+    # adapter that grows a new mapping cannot abort the whole sync transaction
+    # on a CheckViolationError -- one unknown status must not cost a meeting.
+    ALLOWED_STATUSES = frozenset(
+        {
+            "active",
+            "passed",
+            "failed",
+            "tabled",
+            "withdrawn",
+            "referred",
+            "amended",
+            "vetoed",
+            "enacted",
+        }
+    )
+
+    async def sync_vendor_status(
+        self,
+        matter_id: str,
+        status: Optional[str],
+        conn: Optional[Connection] = None,
+    ) -> bool:
+        """Adopt the vendor's own lifecycle verdict for a matter.
+
+        Distinct from ``update_status``: that one records a terminal
+        disposition we derived and opens its own transaction. This one carries
+        a value the vendor already published and joins the caller's sync
+        transaction instead.
+
+        Writes nothing when the vendor supplied no status -- most vendors do
+        not, and a null must never overwrite a status a Legistar sync
+        established. Writes nothing when unchanged either, so the common
+        re-sync path does not churn ``updated_at`` on every matter it revisits.
+        Returns True only when a row actually changed.
+        """
+        if not status:
+            return False
+
+        if status not in self.ALLOWED_STATUSES:
+            logger.warning(
+                "refusing out-of-vocabulary matter status",
+                matter_id=matter_id,
+                status=status,
+            )
+            return False
+
+        async with self._ensure_conn(conn) as c:
+            result = await c.execute(
+                """
+                UPDATE city_matters
+                SET status = $2,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                  AND status IS DISTINCT FROM $2
+                """,
+                matter_id,
+                status,
+            )
+
+        changed = self._parse_row_count(result) > 0
+        if changed:
+            logger.info(
+                "matter status changed",
+                matter_id=matter_id,
+                status=status,
+            )
+        return changed
+
     async def update_status(
         self,
         matter_id: str,
