@@ -8,9 +8,10 @@ inside one deterministic character budget before prompt-template overhead.
 from typing import Iterable, Sequence
 
 
-# Gemini Flash accepts roughly 1M input tokens. Keep about 10% of the nominal
-# four-million-character approximation for the prompt, schema, and token-ratio
-# variance in non-English/table-heavy documents.
+# This is an assembly/memory bound, not proof that a request fits Gemini.
+# Large completed prompts are checked with the provider tokenizer in
+# GeminiSummarizer before upload; character ratios are too variable for tables,
+# OCR, election returns, and other dense civic records.
 MAX_ITEM_INPUT_CHARS = 3_600_000
 TRIM_FLOOR_CHARS = 50_000
 SHARED_CONTEXT_RESERVE_CHARS = 50_000

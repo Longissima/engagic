@@ -45,6 +45,39 @@ FLASH_LITE_MAX_PAGES = 50  # Or under 50 pages
 BATCH_SDK_CONCURRENCY = 4
 BATCH_SUBMIT_CONCURRENCY = 2
 
+# Gemini 3.1 Flash-Lite accepts 1,048,576 input tokens. Large extracted
+# documents are preflighted with the provider tokenizer and held below the
+# published ceiling so small differences between cached and inline framing do
+# not turn into per-line INVALID_ARGUMENT failures. Smaller requests skip the
+# extra API round trip; even a pessimistic one-token-per-character estimate
+# leaves them comfortably inside the guarded limit.
+GEMINI_INPUT_TOKEN_LIMIT = 1_048_576
+BATCH_INPUT_TOKEN_LIMIT = GEMINI_INPUT_TOKEN_LIMIT - 48_576
+BATCH_TOKEN_PREFLIGHT_CHARS = 500_000
+
+_PERMANENT_PROVIDER_ERROR_CODES = frozenset({3, 5, 7, 9, 11, 12, 16})
+_PERMANENT_PROVIDER_ERROR_STATUSES = frozenset(
+    {
+        "INVALID_ARGUMENT",
+        "NOT_FOUND",
+        "PERMISSION_DENIED",
+        "FAILED_PRECONDITION",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "UNAUTHENTICATED",
+    }
+)
+_SAFETY_FINISH_REASONS = frozenset(
+    {
+        "SAFETY",
+        "BLOCKLIST",
+        "PROHIBITED_CONTENT",
+        "SPII",
+        "IMAGE_SAFETY",
+        "RECITATION",
+    }
+)
+
 
 
 class GeminiSummarizer:
@@ -114,6 +147,117 @@ class GeminiSummarizer:
         """Run one synchronous Batch/Files/Caches SDK call off-loop."""
         async with self._batch_sdk_semaphore:
             return await asyncio.to_thread(call, *args, **kwargs)
+
+    @staticmethod
+    def _provider_error_metadata(error_data: Any) -> Dict[str, Any]:
+        """Normalize one provider error and classify an unchanged retry.
+
+        Batch result files use canonical gRPC codes (for example code 3 for
+        INVALID_ARGUMENT), while SDK exceptions sometimes expose only the
+        symbolic status in their string form. Unknown failures remain
+        retryable; only statuses that cannot improve without changing the
+        request are terminal.
+        """
+        if isinstance(error_data, dict):
+            code = error_data.get("code")
+            status = error_data.get("status")
+            message = error_data.get("message")
+        else:
+            code = getattr(error_data, "code", None)
+            status = getattr(error_data, "status", None)
+            message = getattr(error_data, "message", None)
+
+        try:
+            numeric_code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            numeric_code = None
+
+        error_text = str(error_data)
+        normalized_status = str(status or "").upper()
+        if not normalized_status:
+            normalized_status = next(
+                (
+                    marker
+                    for marker in _PERMANENT_PROVIDER_ERROR_STATUSES
+                    if marker in error_text.upper()
+                ),
+                "",
+            )
+        retryable = not (
+            numeric_code in _PERMANENT_PROVIDER_ERROR_CODES
+            or normalized_status in _PERMANENT_PROVIDER_ERROR_STATUSES
+        )
+        return {
+            "error": error_text,
+            "error_code": numeric_code,
+            "error_status": normalized_status or None,
+            "error_message": str(message) if message is not None else None,
+            "retryable": retryable,
+        }
+
+    @staticmethod
+    def _batch_response_diagnostics(response_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Retain bounded response metadata needed to explain empty output."""
+        candidates = response_data.get("candidates") or []
+        candidate = candidates[0] if candidates else {}
+        finish_reason = candidate.get("finishReason") or candidate.get(
+            "finish_reason"
+        )
+        finish_message = candidate.get("finishMessage") or candidate.get(
+            "finish_message"
+        )
+        prompt_feedback = response_data.get("promptFeedback") or response_data.get(
+            "prompt_feedback"
+        )
+        safety_ratings = candidate.get("safetyRatings") or candidate.get(
+            "safety_ratings"
+        )
+        usage_metadata = response_data.get("usageMetadata") or response_data.get(
+            "usage_metadata"
+        )
+        diagnostics = {
+            "finish_reason": str(finish_reason) if finish_reason else None,
+            "finish_message": str(finish_message)[:1000] if finish_message else None,
+            "prompt_feedback": prompt_feedback,
+            "safety_ratings": safety_ratings,
+            "usage_metadata": usage_metadata,
+        }
+        return {key: value for key, value in diagnostics.items() if value is not None}
+
+    @staticmethod
+    def _empty_response_is_retryable(diagnostics: Dict[str, Any]) -> bool:
+        finish_reason = str(diagnostics.get("finish_reason") or "").upper()
+        if finish_reason in _SAFETY_FINISH_REASONS or finish_reason == "MAX_TOKENS":
+            return False
+        feedback = diagnostics.get("prompt_feedback")
+        if isinstance(feedback, dict):
+            block_reason = feedback.get("blockReason") or feedback.get("block_reason")
+            if block_reason and str(block_reason).upper() not in {
+                "BLOCK_REASON_UNSPECIFIED",
+                "NONE",
+            }:
+                return False
+        return True
+
+    async def _count_batch_input_tokens(
+        self,
+        prompt: str,
+        *,
+        cached_context: Optional[str] = None,
+    ) -> int:
+        """Count a large batch request with Gemini's model tokenizer."""
+        count_input = (
+            f"{cached_context}\n\n{prompt}" if cached_context else prompt
+        )
+        response = await self._run_batch_sdk(
+            self.client.models.count_tokens,
+            model=self.primary_model,
+            contents=count_input,
+        )
+        total_tokens = getattr(response, "total_tokens", None)
+        if total_tokens is None:
+            raise ValueError("Gemini token counter returned no total_tokens")
+        return int(total_tokens)
 
     def _calculate_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
         """Calculate API cost in dollars based on model and token usage
@@ -570,10 +714,9 @@ class GeminiSummarizer:
         max_chunk_items = 30
         max_chunk_est_tokens = 1_200_000
         cached_chars = len(shared_context or "") if cache_name else 0
-        chunks: List[List[Dict[str, Any]]] = []
-        current: List[Dict[str, Any]] = []
-        current_tokens = 0
+        prepared_requests: List[Dict[str, Any]] = []
         for req in item_requests:
+            prepared = dict(req)
             item_title = limit_item_title(req.get("title", ""))
             prepared_text = prepare_item_text(
                 item_title,
@@ -587,7 +730,79 @@ class GeminiSummarizer:
                 title=item_title,
                 text=prepared_text,
             )
-            est_tokens = (len(prompt) + cached_chars) // 4
+            input_chars = len(prompt) + cached_chars
+            input_tokens = max(1, input_chars // 4)
+            prepared["_batch_input_tokens"] = input_tokens
+
+            if input_chars >= BATCH_TOKEN_PREFLIGHT_CHARS:
+                try:
+                    input_tokens = await self._count_batch_input_tokens(
+                        prompt,
+                        cached_context=(shared_context if cache_name else None),
+                    )
+                    prepared["_batch_input_tokens"] = input_tokens
+                    logger.info(
+                        "large batch request token preflight",
+                        item_id=req.get("item_id"),
+                        input_chars=input_chars,
+                        input_tokens=input_tokens,
+                        token_limit=BATCH_INPUT_TOKEN_LIMIT,
+                    )
+                except Exception as exc:
+                    metadata = self._provider_error_metadata(exc)
+                    prepared["_batch_preflight_failure"] = {
+                        **metadata,
+                        "error": f"Gemini token preflight failed: {exc}",
+                        "error_type": "token_preflight_failed",
+                        "stage": "preflight",
+                    }
+
+            if (
+                "_batch_preflight_failure" not in prepared
+                and input_tokens > BATCH_INPUT_TOKEN_LIMIT
+            ):
+                prepared["_batch_preflight_failure"] = {
+                    "error": (
+                        "Batch input requires a lossless representation before "
+                        f"summarization: {input_tokens:,} input tokens exceeds "
+                        f"the guarded {BATCH_INPUT_TOKEN_LIMIT:,}-token limit"
+                    ),
+                    "error_type": "representation_required",
+                    "retryable": False,
+                    "stage": "preflight",
+                    "input_tokens": input_tokens,
+                    "token_limit": BATCH_INPUT_TOKEN_LIMIT,
+                }
+            prepared_requests.append(prepared)
+
+        preflight_failures = [
+            req for req in prepared_requests if req.get("_batch_preflight_failure")
+        ]
+        if preflight_failures:
+            # Keep the meeting submission atomic at the provider boundary. If
+            # one representation is known-invalid, do not create successful
+            # sibling jobs that could race the queue's terminal transition.
+            logger.warning(
+                "batch submission stopped by item preflight",
+                failed_items=len(preflight_failures),
+                total_items=len(prepared_requests),
+            )
+            prepared_requests = preflight_failures
+
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_tokens = 0
+        for req in prepared_requests:
+            # A preflight failure is isolated so successful neighbours can be
+            # submitted and durably collected without ever uploading the
+            # rejected request.
+            if req.get("_batch_preflight_failure"):
+                if current:
+                    chunks.append(current)
+                    current, current_tokens = [], 0
+                chunks.append([req])
+                continue
+            est_tokens = int(req.get("_batch_input_tokens") or 0)
             if current and (
                 len(current) >= max_chunk_items
                 or current_tokens + est_tokens > max_chunk_est_tokens
@@ -743,10 +958,17 @@ class GeminiSummarizer:
             return None
 
         parts = content.get('parts')
-        if not parts or not parts[0]:
+        if not parts:
             return None
 
-        return parts[0].get('text')
+        text_parts = [
+            str(part.get("text"))
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("text")
+            and not part.get("thought")
+        ]
+        return "".join(text_parts) or None
 
     def _extract_text_from_response(self, response) -> Optional[str]:
         """Extract text from live Gemini API response object
@@ -831,7 +1053,8 @@ class GeminiSummarizer:
         # Handle error response
         if 'error' in response_obj:
             error_data = response_obj['error']
-            error_str = str(error_data)
+            error_metadata = self._provider_error_metadata(error_data)
+            error_str = error_metadata["error"]
 
             # Log quota errors but DON'T retry the whole chunk
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
@@ -845,15 +1068,22 @@ class GeminiSummarizer:
             return {
                 "item_id": original_req["item_id"],
                 "success": False,
-                "error": error_str,
+                **error_metadata,
             }
 
         # Handle success response
         if 'response' not in response_obj:
-            return None
+            return {
+                "item_id": original_req["item_id"],
+                "success": False,
+                "error": "Batch result contained neither response nor error",
+                "error_type": "malformed_batch_result",
+                "retryable": True,
+            }
 
         response_data = response_obj['response']
         response_text = None
+        diagnostics = self._batch_response_diagnostics(response_data)
 
         try:
             # Extract text from nested structure
@@ -862,7 +1092,7 @@ class GeminiSummarizer:
             # Check finish_reason
             candidates = response_data.get('candidates')
             if candidates:
-                finish_reason = candidates[0].get('finish_reason')
+                finish_reason = diagnostics.get("finish_reason")
                 if finish_reason and finish_reason != "STOP":
                     logger.warning(
                         "non-normal finish reason",
@@ -883,11 +1113,24 @@ class GeminiSummarizer:
             )
 
             if not response_text:
-                logger.warning("empty response from gemini", key=key)
+                retryable = self._empty_response_is_retryable(diagnostics)
+                logger.warning(
+                    "empty response from gemini",
+                    key=key,
+                    retryable=retryable,
+                    **diagnostics,
+                )
                 return {
                     "item_id": original_req["item_id"],
                     "success": False,
                     "error": "Empty response from Gemini",
+                    "error_type": (
+                        "blocked_or_terminal_empty_response"
+                        if not retryable
+                        else "empty_response"
+                    ),
+                    "retryable": retryable,
+                    "diagnostics": diagnostics,
                 }
 
             # Parse response
@@ -924,6 +1167,9 @@ class GeminiSummarizer:
                 "item_id": original_req["item_id"],
                 "success": False,
                 "error": str(e),
+                "error_type": "response_parse_error",
+                "retryable": self._empty_response_is_retryable(diagnostics),
+                "diagnostics": diagnostics,
             }
 
     async def collect_item_batch(
@@ -999,6 +1245,8 @@ class GeminiSummarizer:
                         "item_id": item_id,
                         "success": False,
                         "error": "Batch response omitted item",
+                        "error_type": "omitted_batch_result",
+                        "retryable": True,
                     }
                 )
 
@@ -1037,6 +1285,28 @@ class GeminiSummarizer:
         max_retries = 4
         retry_delay = 5
         item_ids = [str(req["item_id"]) for req in chunk_requests]
+
+        preflight_failures = [
+            req for req in chunk_requests if req.get("_batch_preflight_failure")
+        ]
+        if preflight_failures:
+            # submit_item_batches isolates these as single-item chunks. Keep a
+            # defensive aggregate here so direct callers still fail closed.
+            failure = dict(preflight_failures[0]["_batch_preflight_failure"])
+            logger.error(
+                "batch chunk rejected by input preflight",
+                chunk_num=chunk_num,
+                item_ids=item_ids,
+                error=failure.get("error"),
+                error_type=failure.get("error_type"),
+                input_tokens=failure.get("input_tokens"),
+            )
+            return {
+                "item_ids": item_ids,
+                "chunk_num": chunk_num,
+                "attempts": 0,
+                **failure,
+            }
 
         for attempt in range(max_retries):
             temp_path = None
@@ -1098,6 +1368,7 @@ class GeminiSummarizer:
                         request_index=i,
                         item_title=item_title[:80],
                         text_length=len(text),
+                        input_tokens=req.get("_batch_input_tokens"),
                         page_count=page_count,
                         prompt_type=prompt_type
                     )
@@ -1177,6 +1448,7 @@ class GeminiSummarizer:
 
             except Exception as e:  # Intentionally broad: retry logic with specific error checks
                 error_str = str(e)
+                error_metadata = self._provider_error_metadata(e)
                 is_quota_error = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
                 is_transient = is_quota_error or any(
                     marker in error_str.upper()
@@ -1216,6 +1488,10 @@ class GeminiSummarizer:
                     "chunk_num": chunk_num,
                     "attempts": attempt + 1,
                     "error": error_str,
+                    "error_code": error_metadata.get("error_code"),
+                    "error_status": error_metadata.get("error_status"),
+                    "retryable": is_transient and error_metadata["retryable"],
+                    "stage": "submit",
                 }
 
             finally:
@@ -1231,6 +1507,8 @@ class GeminiSummarizer:
             "chunk_num": chunk_num,
             "attempts": max_retries,
             "error": "Batch submission retries exhausted",
+            "retryable": True,
+            "stage": "submit",
         }
 
     def _get_prompt(self, category: str, prompt_type: str, **variables) -> str:

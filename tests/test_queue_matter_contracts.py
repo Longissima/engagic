@@ -396,6 +396,56 @@ async def test_reactivation_invalidates_an_active_claim_before_follow_up():
 
 
 @pytest.mark.asyncio
+async def test_provider_retry_preserves_attempt_budget_and_can_dead_letter():
+    connection = _FailureConnection(row={"status": "pending"})
+    repository = QueueRepository(cast(Any, _Pool(connection)))
+
+    status = await repository.retry_job_version(
+        source_url="meeting://meeting-1",
+        work_version="mv1:current",
+        error_message="empty provider response",
+        priority=100,
+    )
+
+    assert status == "pending"
+    query, args = connection.fetches[0]
+    assert "retry_count = retry_count + 1" in query
+    assert "WHEN retry_count >= 2 THEN 'dead_letter'" in query
+    assert "status IN ('completed', 'processing')" in query
+    assert "status IN ('failed', 'dead_letter'" not in query
+    assert args == (
+        "meeting://meeting-1",
+        "mv1:current",
+        100,
+        "empty provider response",
+        30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_provider_failure_cannot_be_retried_unchanged():
+    connection = _FailureConnection(row={"status": "failed"})
+    repository = QueueRepository(cast(Any, _Pool(connection)))
+
+    status = await repository.fail_job_version(
+        source_url="meeting://meeting-1",
+        work_version="mv1:current",
+        error_message="INVALID_ARGUMENT",
+    )
+
+    assert status == "failed"
+    query, args = connection.fetches[0]
+    assert "SET status = 'failed'" in query
+    assert "retry_at = NULL" in query
+    assert "work_version IS NOT DISTINCT FROM $2" in query
+    assert args == (
+        "meeting://meeting-1",
+        "mv1:current",
+        "INVALID_ARGUMENT",
+    )
+
+
+@pytest.mark.asyncio
 async def test_versioned_pending_or_terminal_work_requires_a_distinct_version():
     repository = _CaptureQueueRepository()
 

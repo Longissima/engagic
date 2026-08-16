@@ -741,6 +741,134 @@ class QueueRepository(BaseRepository):
             )
             return active is not None
 
+    async def retry_job_version(
+        self,
+        *,
+        source_url: str,
+        work_version: str,
+        error_message: str,
+        priority: Optional[int] = None,
+        conn: Optional[Connection] = None,
+    ) -> Optional[str]:
+        """Record a provider failure without resetting the attempt budget.
+
+        A completed batch submission has already released its queue claim, so
+        the ordinary claim-scoped failure transition cannot be used by the
+        collector. This exact-version transition gives it the same three-try
+        budget. Concurrent failed sibling chunks observe the already-pending
+        retry instead of charging the meeting multiple attempts.
+        """
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE queue
+                SET status = CASE WHEN retry_count >= 2
+                                  THEN 'dead_letter' ELSE 'pending' END,
+                    priority = COALESCE($3, priority),
+                    retry_count = retry_count + 1,
+                    started_at = NULL,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    completed_at = CASE WHEN retry_count >= 2
+                                        THEN NOW() ELSE NULL END,
+                    failed_at = NOW(),
+                    error_message = $4,
+                    retry_at = CASE WHEN retry_count >= 2 THEN NULL ELSE
+                        NOW() + make_interval(
+                            secs => $5 * CAST(power(2, retry_count) AS INTEGER)
+                        ) END,
+                    ready_at = CASE WHEN retry_count >= 2 THEN ready_at ELSE
+                        NOW() + make_interval(
+                            secs => $5 * CAST(power(2, retry_count) AS INTEGER)
+                        ) END,
+                    last_enqueued_at = NOW(),
+                    updated_at = NOW()
+                WHERE source_url = $1
+                  AND work_version IS NOT DISTINCT FROM $2
+                  AND status IN ('completed', 'processing')
+                RETURNING status
+                """,
+                source_url,
+                work_version,
+                priority,
+                error_message[:2000],
+                self._RETRY_BASE_SECONDS,
+            )
+            if row is not None:
+                status = str(row["status"])
+                logger.warning(
+                    "recorded provider retry",
+                    source_url=source_url,
+                    status=status,
+                    error=error_message,
+                )
+                return status
+            current = await connection.fetchrow(
+                """
+                SELECT status
+                FROM queue
+                WHERE source_url = $1
+                  AND work_version IS NOT DISTINCT FROM $2
+                  AND status IN ('pending', 'processing', 'failed', 'dead_letter')
+                """,
+                source_url,
+                work_version,
+            )
+            return str(current["status"]) if current is not None else None
+
+    async def fail_job_version(
+        self,
+        *,
+        source_url: str,
+        work_version: str,
+        error_message: str,
+        conn: Optional[Connection] = None,
+    ) -> Optional[str]:
+        """Terminally fail one unchanged descriptor after provider rejection."""
+        async with self._ensure_conn(conn) as connection:
+            row = await connection.fetchrow(
+                """
+                UPDATE queue
+                SET status = 'failed',
+                    started_at = NULL,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    completed_at = NOW(),
+                    failed_at = NOW(),
+                    error_message = $3,
+                    retry_at = NULL,
+                    updated_at = NOW()
+                WHERE source_url = $1
+                  AND work_version IS NOT DISTINCT FROM $2
+                  AND status IN ('pending', 'processing', 'completed')
+                RETURNING status
+                """,
+                source_url,
+                work_version,
+                error_message[:2000],
+            )
+            if row is not None:
+                logger.warning(
+                    "terminally failed provider work",
+                    source_url=source_url,
+                    error=error_message,
+                )
+                return str(row["status"])
+            current = await connection.fetchrow(
+                """
+                SELECT status
+                FROM queue
+                WHERE source_url = $1
+                  AND work_version IS NOT DISTINCT FROM $2
+                  AND status IN ('failed', 'dead_letter')
+                """,
+                source_url,
+                work_version,
+            )
+            return str(current["status"]) if current is not None else None
+
     async def release_processing_claim(
         self,
         queue_id: int,

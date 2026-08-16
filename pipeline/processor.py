@@ -76,6 +76,31 @@ def _meeting_items_complete(items: List[Any]) -> bool:
     )
 
 
+def _batch_failure_message(
+    results: List[Dict[str, Any]],
+    failed_count: int,
+) -> str:
+    """Build one bounded, item-addressable error for durable queue state."""
+    details = []
+    for result in results:
+        if result.get("success"):
+            continue
+        item_id = str(result.get("item_id") or "<unknown>")
+        error_type = result.get("error_type") or result.get("error_status")
+        error = str(result.get("error") or "unknown provider failure")
+        diagnostics = result.get("diagnostics") or {}
+        finish_reason = diagnostics.get("finish_reason")
+        label = f"{item_id}: "
+        if error_type:
+            label += f"{error_type}: "
+        label += error
+        if finish_reason:
+            label += f" (finish_reason={finish_reason})"
+        details.append(label)
+    prefix = f"{failed_count} batch item failure(s)"
+    return (prefix + (": " + "; ".join(details) if details else ""))[:2000]
+
+
 def _merge_participation_info(
     stored: Optional[ParticipationInfo],
     observed: Any,
@@ -686,11 +711,18 @@ class Processor:
                 meeting = await self.db.meetings.get_meeting(
                     meeting_id, conn=conn, lock_for_update=True
                 )
+                retry_status = None
                 if meeting is not None:
                     items = await self.db.items.get_agenda_items(
                         meeting_id, conn=conn, lock_for_update=True
                     )
-                    await self._publish_locked_meeting_work(meeting, items, conn)
+                    retry_status = await self._publish_locked_meeting_failure(
+                        meeting,
+                        items,
+                        conn,
+                        error_message=error_message,
+                        retryable=True,
+                    )
 
                 if terminal_status == "collected":
                     closed = await self.db.batch_jobs.mark_collected(
@@ -723,6 +755,7 @@ class Processor:
                 job_id=job_id,
                 meeting_id=meeting_id,
                 terminal_status=terminal_status,
+                retry_status=retry_status,
             )
             return True
         except BatchCollectorLeaseLost:
@@ -774,6 +807,73 @@ class Processor:
             conn=conn,
         ):
             raise RuntimeError("authoritative meeting version was not reactivated")
+
+    async def _publish_locked_meeting_failure(
+        self,
+        meeting: Meeting,
+        items: List[Any],
+        conn: Any,
+        *,
+        error_message: str,
+        retryable: bool,
+    ) -> str:
+        """Record a provider verdict without erasing its retry history."""
+        work_version = meeting_work_version(meeting, items)
+        source_url = f"meeting://{meeting.id}"
+        await self.db.queue.enqueue_job(
+            source_url=source_url,
+            job_type="meeting",
+            payload={"meeting_id": meeting.id},
+            meeting_id=meeting.id,
+            banana=meeting.banana,
+            priority=QUEUE_PRIORITY_BATCH_RETRY,
+            work_version=work_version,
+            conn=conn,
+        )
+        if retryable:
+            status = await self.db.queue.retry_job_version(
+                source_url=source_url,
+                work_version=work_version,
+                priority=QUEUE_PRIORITY_BATCH_RETRY,
+                error_message=error_message,
+                conn=conn,
+            )
+        else:
+            status = await self.db.queue.fail_job_version(
+                source_url=source_url,
+                work_version=work_version,
+                error_message=error_message,
+                conn=conn,
+            )
+        if status is None:
+            raise RuntimeError("authoritative meeting failure was not recorded")
+        await self.db.meetings.update_processing_status(
+            meeting.id,
+            "pending" if status in {"pending", "processing"} else "failed",
+            conn=conn,
+        )
+        return status
+
+    async def _preserve_locked_terminal_meeting(
+        self,
+        meeting: Meeting,
+        work_version: str,
+        conn: Any,
+    ) -> bool:
+        """Keep a sibling collector from reviving terminal same-version work."""
+        desired_state = await self.db.queue.lock_desired_state(
+            f"meeting://{meeting.id}", conn=conn
+        )
+        terminal = bool(
+            desired_state
+            and desired_state.get("work_version") == work_version
+            and desired_state.get("status") in {"failed", "dead_letter"}
+        )
+        if terminal:
+            await self.db.meetings.update_processing_status(
+                meeting.id, "failed", conn=conn
+            )
+        return terminal
 
     async def _collect_one_job(self, job: Dict[str, Any]) -> str:
         """Poll one submitted batch job; ingest, re-enqueue, or leave running.
@@ -833,7 +933,17 @@ class Processor:
         # this meeting's last chunk lands.
         expected_work_version = (job.get("meeting_meta") or {}).get("work_version")
         try:
-            writes, failed = self._prepare_batch_item_results(job, results or [])
+            batch_results = results or []
+            writes, failed = self._prepare_batch_item_results(job, batch_results)
+            terminal_failed = sum(
+                1
+                for result in batch_results
+                if not result.get("success")
+                and result.get("retryable", True) is False
+            )
+            failure_message = (
+                _batch_failure_message(batch_results, failed) if failed else None
+            )
             (
                 applied_item_ids,
                 superseded,
@@ -842,6 +952,8 @@ class Processor:
                 job,
                 writes,
                 failed=failed,
+                terminal_failed=terminal_failed,
+                failure_message=failure_message,
                 expected_work_version=expected_work_version,
             )
         except BatchCollectorLeaseLost:
@@ -985,6 +1097,10 @@ class Processor:
                     "item processing failed",
                     item_id=item_id,
                     error=result.get("error"),
+                    error_type=result.get("error_type")
+                    or result.get("error_status"),
+                    retryable=result.get("retryable", True),
+                    diagnostics=result.get("diagnostics"),
                 )
                 continue
 
@@ -1018,6 +1134,8 @@ class Processor:
         writes: List[Dict[str, Any]],
         *,
         failed: int,
+        terminal_failed: int = 0,
+        failure_message: Optional[str] = None,
         expected_work_version: Optional[str],
     ) -> tuple[List[str], bool, int]:
         """Atomically fence, freeze, and close a collected provider chunk.
@@ -1103,10 +1221,24 @@ class Processor:
                     meeting_id, conn=conn, lock_for_update=True
                 )
 
-            if commit_failed or (
-                last_chunk and not _meeting_items_complete(final_items)
-            ):
-                await self._publish_locked_meeting_work(meeting, items, conn)
+            if commit_failed:
+                await self._publish_locked_meeting_failure(
+                    meeting,
+                    final_items,
+                    conn,
+                    error_message=(
+                        failure_message
+                        or f"{commit_failed} batch item failure(s)"
+                    ),
+                    retryable=terminal_failed == 0,
+                )
+            elif last_chunk and not _meeting_items_complete(final_items):
+                if not await self._preserve_locked_terminal_meeting(
+                    meeting, current_version, conn
+                ):
+                    await self._publish_locked_meeting_work(
+                        meeting, final_items, conn
+                    )
             elif last_chunk:
                 source_url = f"meeting://{meeting_id}"
                 desired_state = await self.db.queue.lock_desired_state(
@@ -1129,11 +1261,20 @@ class Processor:
                         conn,
                     )
 
-            if not await self.db.batch_jobs.mark_collected(
-                job_id,
-                lease_owner=self._batch_collector_id,
-                conn=conn,
-            ):
+            if commit_failed:
+                closed = await self.db.batch_jobs.mark_failed(
+                    job_id,
+                    failure_message or f"{commit_failed} batch item failure(s)",
+                    lease_owner=self._batch_collector_id,
+                    conn=conn,
+                )
+            else:
+                closed = await self.db.batch_jobs.mark_collected(
+                    job_id,
+                    lease_owner=self._batch_collector_id,
+                    conn=conn,
+                )
+            if not closed:
                 raise BatchCollectorLeaseLost(
                     f"batch job {job_id} is no longer owned by this collector"
                 )
@@ -3413,6 +3554,11 @@ class Processor:
             if descriptor.get("gemini_job_name") and not descriptor.get("error")
         ]
         failures = [descriptor for descriptor in descriptors if descriptor.get("error")]
+        terminal_failures = [
+            descriptor
+            for descriptor in failures
+            if descriptor.get("retryable", True) is False
+        ]
         already_reserved = [
             descriptor for descriptor in descriptors if descriptor.get("already_reserved")
         ]
@@ -3429,6 +3575,23 @@ class Processor:
             # Successful siblings are already durable and can collect normally.
             # Raising retries the queue promptly; the next attempt excludes
             # their covered item_ids and submits only the failed chunks.
+            if terminal_failures:
+                terminal_message = "; ".join(
+                    str(descriptor.get("error") or "terminal batch preflight failure")
+                    for descriptor in terminal_failures
+                )[:2000]
+                async with self.db.meetings.transaction() as conn:
+                    await self._lock_current_meeting_work(
+                        meeting.id,
+                        expected_work_version,
+                        conn,
+                        expected_desired_version=expected_desired_version,
+                        expected_claim_token=expected_claim_token,
+                    )
+                    await self.db.meetings.update_processing_status(
+                        meeting.id, "failed", conn=conn
+                    )
+                raise TerminalJobError(terminal_message)
             raise ProcessingError(
                 "one or more batch chunks failed to submit",
                 context={

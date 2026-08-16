@@ -1,6 +1,7 @@
 """Focused failure-injection tests for the Gemini Batch lifecycle."""
 
 import asyncio
+import json
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from analysis.llm.summarizer import (
+    BATCH_INPUT_TOKEN_LIMIT,
     BATCH_SDK_CONCURRENCY,
     BATCH_SUBMIT_CONCURRENCY,
     GeminiSummarizer,
@@ -247,8 +249,118 @@ async def test_collect_reports_provider_omissions_as_item_failures(monkeypatch) 
             "item_id": "item-b",
             "success": False,
             "error": "Batch response omitted item",
+            "error_type": "omitted_batch_result",
+            "retryable": True,
         },
     ]
+
+
+def test_batch_invalid_argument_is_terminal_for_unchanged_request() -> None:
+    summarizer = make_summarizer()
+    result = summarizer._parse_batch_response_line(
+        json.dumps(
+            {
+                "key": "item-1",
+                "error": {
+                    "code": 3,
+                    "message": "Request contains an invalid argument.",
+                },
+            }
+        ),
+        1,
+        {"item-1": {"item_id": "item-1"}},
+    )
+
+    assert result is not None
+    assert result["success"] is False
+    assert result["error_code"] == 3
+    assert result["retryable"] is False
+
+
+def test_batch_empty_safety_response_preserves_diagnostics() -> None:
+    summarizer = make_summarizer()
+    result = summarizer._parse_batch_response_line(
+        json.dumps(
+            {
+                "key": "item-1",
+                "response": {
+                    "candidates": [
+                        {
+                            "finishReason": "SAFETY",
+                            "safetyRatings": [
+                                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT"}
+                            ],
+                        }
+                    ],
+                    "promptFeedback": {"blockReason": "SAFETY"},
+                    "usageMetadata": {"promptTokenCount": 123},
+                },
+            }
+        ),
+        1,
+        {"item-1": {"item_id": "item-1"}},
+    )
+
+    assert result is not None
+    assert result["success"] is False
+    assert result["retryable"] is False
+    assert result["diagnostics"] == {
+        "finish_reason": "SAFETY",
+        "prompt_feedback": {"blockReason": "SAFETY"},
+        "safety_ratings": [
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT"}
+        ],
+        "usage_metadata": {"promptTokenCount": 123},
+    }
+
+
+@pytest.mark.asyncio
+async def test_large_batch_request_is_counted_and_rejected_before_upload(
+    monkeypatch,
+) -> None:
+    summarizer = make_summarizer()
+    uploaded = False
+    failed_descriptors = []
+
+    async def to_thread(call, *args, **kwargs):
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+
+    def forbidden_upload(**_kwargs):
+        nonlocal uploaded
+        uploaded = True
+        raise AssertionError("oversized input must not be uploaded")
+
+    summarizer.client = SimpleNamespace(
+        models=SimpleNamespace(
+            count_tokens=lambda **_kwargs: SimpleNamespace(
+                total_tokens=BATCH_INPUT_TOKEN_LIMIT + 1
+            )
+        ),
+        files=SimpleNamespace(upload=forbidden_upload),
+    )
+
+    async def reserve(_descriptor):
+        return True
+
+    async def fail(descriptor):
+        failed_descriptors.append(descriptor)
+
+    descriptors = await summarizer.submit_item_batches(
+        [{"item_id": "item-huge", "title": "Huge", "text": "x" * 500_000}],
+        submission_scope="meeting-1",
+        reserve_submission=reserve,
+        fail_submission=fail,
+        include_failures=True,
+    )
+
+    assert uploaded is False
+    assert len(descriptors) == 1
+    assert descriptors[0]["error_type"] == "representation_required"
+    assert descriptors[0]["retryable"] is False
+    assert descriptors[0]["attempts"] == 0
+    assert failed_descriptors == descriptors
 
 
 @pytest.mark.asyncio
@@ -468,13 +580,13 @@ def atomic_handoff_processor(*, reactivate_error: bool = False):
             state["queue_active"] = True
             events.append("enqueue")
 
-        async def reactivate_job_version(self, *, conn, **kwargs):
+        async def retry_job_version(self, *, conn, **kwargs):
             assert conn is connection
             assert kwargs["source_url"] == "meeting://meeting-1"
-            events.append("reactivate")
+            events.append("retry")
             if reactivate_error:
-                raise RuntimeError("injected reactivation failure")
-            return True
+                raise RuntimeError("injected retry failure")
+            return "pending"
 
     processor = Processor.__new__(Processor)
     processor.db = SimpleNamespace(
@@ -499,9 +611,9 @@ async def test_atomic_batch_handoff_uses_global_lock_order_and_commits() -> None
     assert publication["banana"] == "currentCA"
     assert events == [
         "begin",
-        "pending",
         "enqueue",
-        "reactivate",
+        "retry",
+        "pending",
         "close",
         "commit",
     ]
@@ -521,7 +633,7 @@ async def test_atomic_batch_handoff_rolls_back_close_when_reactivation_fails() -
 
     assert recovered is False
     assert state == {"batch_status": "submitted", "queue_active": False}
-    assert events == ["begin", "pending", "enqueue", "reactivate", "rollback"]
+    assert events == ["begin", "enqueue", "retry", "rollback"]
 
 
 @pytest.mark.asyncio
@@ -767,6 +879,18 @@ def collector_commit_processor(
                 return True
             return False
 
+        async def mark_failed(
+            self, job_id, error_message, *, lease_owner, conn
+        ):
+            assert error_message
+            assert (lease_owner, conn) == ("collector-1", connection)
+            events.append("close" if lease_owned else "close rejected")
+            if lease_owned and job_id in state["open_jobs"]:
+                state["open_jobs"].remove(job_id)
+                state["batch_status"] = "failed"
+                return True
+            return False
+
     class Meetings:
         async def get_meeting(self, meeting_id, *, conn, lock_for_update):
             assert (meeting_id, conn, lock_for_update) == (
@@ -783,13 +907,11 @@ def collector_commit_processor(
             events.append("finalize meeting")
 
         async def update_processing_status(self, meeting_id, status, *, conn):
-            assert (meeting_id, status, conn) == (
-                "meeting-1",
-                "pending",
-                connection,
-            )
-            state["meeting_status"] = "pending"
-            events.append("meeting pending")
+            assert meeting_id == "meeting-1"
+            assert status in {"pending", "failed"}
+            assert conn is connection
+            state["meeting_status"] = status
+            events.append(f"meeting {status}")
 
     class Items:
         async def get_agenda_items(self, meeting_id, *, conn, lock_for_update):
@@ -822,6 +944,18 @@ def collector_commit_processor(
             assert conn is connection
             events.append("reactivate")
             return True
+
+        async def retry_job_version(self, *, conn, **_kwargs):
+            assert conn is connection
+            state["queue_status"] = "pending"
+            events.append("retry")
+            return "pending"
+
+        async def fail_job_version(self, *, conn, **_kwargs):
+            assert conn is connection
+            state["queue_status"] = "failed"
+            events.append("fail")
+            return "failed"
 
     processor = Processor.__new__(Processor)
     processor.db = SimpleNamespace(
@@ -865,9 +999,9 @@ async def test_collector_lease_loss_rolls_back_item_and_queue_writes() -> None:
         "lock items",
         "write item",
         "lock items",
-        "meeting pending",
         "enqueue",
-        "reactivate",
+        "retry",
+        "meeting pending",
         "close rejected",
         "rollback",
     ]
@@ -990,6 +1124,67 @@ async def test_unversioned_legacy_batch_result_is_requeued_without_domain_write(
     assert state["queue_status"] == "pending"
     assert state["meeting_finalized"] is False
     assert "write item" not in events
+
+
+@pytest.mark.asyncio
+async def test_terminal_item_failure_stops_unchanged_meeting_work() -> None:
+    processor, state, events, work_version = collector_commit_processor(
+        queue_status="completed"
+    )
+
+    result = await processor._commit_batch_item_results(
+        {"id": 1, "meeting_id": "meeting-1", "meeting_meta": {}},
+        [],
+        failed=1,
+        terminal_failed=1,
+        failure_message="item-1: INVALID_ARGUMENT",
+        expected_work_version=work_version,
+    )
+
+    assert result == ([], False, 1)
+    assert state["queue_status"] == "failed"
+    assert state["meeting_status"] == "failed"
+    assert state["batch_status"] == "failed"
+    assert events == [
+        "begin",
+        "lock meeting",
+        "lock items",
+        "enqueue",
+        "fail",
+        "meeting failed",
+        "close",
+        "commit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_sibling_cannot_revive_terminal_incomplete_work() -> None:
+    processor, state, events, work_version = collector_commit_processor(
+        item_ids=("item-1", "item-2"),
+        open_jobs=(2,),
+        queue_status="failed",
+    )
+
+    result = await processor._commit_batch_item_results(
+        {"id": 2, "meeting_id": "meeting-1", "meeting_meta": {}},
+        [
+            {
+                "item_id": "item-2",
+                "summary": "summary for item-2",
+                "topics": [],
+                "prompts_version": "v-test",
+            }
+        ],
+        failed=0,
+        expected_work_version=work_version,
+    )
+
+    assert result == (["item-2"], False, 0)
+    assert state["queue_status"] == "failed"
+    assert state["meeting_status"] == "failed"
+    assert state["meeting_finalized"] is False
+    assert "enqueue" not in events
+    assert "reactivate" not in events
 
 
 @pytest.mark.asyncio
