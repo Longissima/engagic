@@ -243,13 +243,13 @@ class GeminiSummarizer:
                 return False
         return True
 
-    async def _count_batch_input_tokens(
+    async def _count_input_tokens(
         self,
         prompt: str,
         *,
         cached_context: Optional[str] = None,
     ) -> int:
-        """Count a large batch request with Gemini's model tokenizer."""
+        """Count one completed request with Gemini's model tokenizer."""
         count_input = (
             f"{cached_context}\n\n{prompt}" if cached_context else prompt
         )
@@ -262,6 +262,175 @@ class GeminiSummarizer:
         if total_tokens is None:
             raise ValueError("Gemini token counter returned no total_tokens")
         return int(total_tokens)
+
+    # Compatibility for narrow callers/tests that used the former private name.
+    _count_batch_input_tokens = _count_input_tokens
+
+    async def prepare_document_input(
+        self,
+        *,
+        kind: str,
+        text: str,
+        documents: List[Any] | None = None,
+        title: str = "",
+        shared_context: Optional[str] = None,
+        cache_name: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prepare and preflight one document request before transport selection.
+
+        Streaming, cached Batch API, inline Batch API, and packet fallbacks all
+        enter through this boundary.  The returned ``_model_text`` is the exact
+        text that belongs in the prompt; cached shared context is counted but is
+        intentionally absent from that field because the provider attaches it.
+        """
+        if kind not in {"item", "meeting"}:
+            raise ValueError(f"unsupported document input kind: {kind}")
+
+        normalized_documents = list(documents or [])
+        normalized_shared = limit_shared_context(shared_context)
+        item_title = limit_item_title(title)
+        source_text = text or ""
+        self_contained = False
+        adapters: tuple[str, ...] = ()
+        proactive_representation = None
+
+        if needs_proactive_representation(normalized_documents):
+            proactive_representation = build_compact_representation(
+                normalized_documents
+            )
+            if proactive_representation.compacted:
+                source_text = proactive_representation.text
+                self_contained = True
+                adapters = proactive_representation.adapters
+                logger.info(
+                    "provider-compatible public-record representation applied",
+                    request_id=request_id,
+                    kind=kind,
+                    adapters=adapters,
+                    source_chars=proactive_representation.source_chars,
+                    represented_chars=proactive_representation.represented_chars,
+                )
+
+        def assemble_model_text(candidate: str, contained: bool) -> str:
+            if kind == "meeting":
+                return candidate
+            return prepare_item_text(
+                item_title,
+                candidate,
+                None if contained else normalized_shared,
+                inline_shared=not cache_name and not contained,
+            )
+
+        def render_prompt(model_text: str) -> str:
+            if kind == "meeting":
+                return self._get_prompt("meeting", "fallback", text=model_text)
+            return self._get_prompt(
+                "item",
+                self._select_prompt_type(),
+                title=item_title,
+                text=model_text,
+            )
+
+        model_text = assemble_model_text(source_text, self_contained)
+        prompt = render_prompt(model_text)
+        cached_context = (
+            normalized_shared if cache_name and not self_contained else None
+        )
+        input_chars = len(prompt) + len(cached_context or "")
+        input_tokens = max(1, input_chars // 4)
+        failure: Dict[str, Any] | None = None
+
+        if input_chars >= BATCH_TOKEN_PREFLIGHT_CHARS:
+            try:
+                input_tokens = await self._count_input_tokens(
+                    prompt,
+                    cached_context=cached_context,
+                )
+                logger.info(
+                    "large document request token preflight",
+                    request_id=request_id,
+                    kind=kind,
+                    input_chars=input_chars,
+                    input_tokens=input_tokens,
+                    token_limit=BATCH_INPUT_TOKEN_LIMIT,
+                )
+            except Exception as exc:
+                metadata = self._provider_error_metadata(exc)
+                failure = {
+                    **metadata,
+                    "error": f"Gemini token preflight failed: {exc}",
+                    "error_type": "token_preflight_failed",
+                    "stage": "preflight",
+                }
+
+        needs_representation = input_tokens > BATCH_INPUT_TOKEN_LIMIT or (
+            failure is not None and bool(normalized_documents)
+        )
+        if needs_representation:
+            representation = proactive_representation or build_compact_representation(
+                normalized_documents
+            )
+            if representation.compacted:
+                compact_text = representation.text
+                compact_model_text = assemble_model_text(compact_text, True)
+                compact_prompt = render_prompt(compact_model_text)
+                try:
+                    compact_tokens = await self._count_input_tokens(compact_prompt)
+                except Exception as exc:
+                    metadata = self._provider_error_metadata(exc)
+                    failure = {
+                        **metadata,
+                        "error": (
+                            "Gemini compact-representation token preflight "
+                            f"failed: {exc}"
+                        ),
+                        "error_type": "token_preflight_failed",
+                        "stage": "representation_preflight",
+                    }
+                else:
+                    failure = None
+                    source_text = compact_text
+                    model_text = compact_model_text
+                    self_contained = True
+                    adapters = representation.adapters
+                    input_tokens = compact_tokens
+                    logger.info(
+                        "oversized request represented deterministically",
+                        request_id=request_id,
+                        kind=kind,
+                        adapters=adapters,
+                        source_chars=representation.source_chars,
+                        represented_chars=representation.represented_chars,
+                        represented_input_tokens=compact_tokens,
+                    )
+
+            if failure is None and input_tokens > BATCH_INPUT_TOKEN_LIMIT:
+                attempted = f" after adapters {adapters}" if adapters else ""
+                failure = {
+                    "error": (
+                        "Input has no compatible representation that fits: "
+                        f"{input_tokens:,} input tokens exceeds the guarded "
+                        f"{BATCH_INPUT_TOKEN_LIMIT:,}-token limit{attempted}"
+                    ),
+                    "error_type": "representation_required",
+                    "retryable": False,
+                    "stage": "preflight",
+                    "input_tokens": input_tokens,
+                    "token_limit": BATCH_INPUT_TOKEN_LIMIT,
+                }
+
+        prepared: Dict[str, Any] = {
+            "text": source_text,
+            "_model_text": model_text,
+            "_batch_input_tokens": input_tokens,
+            "_representation_self_contained": self_contained,
+        }
+        if adapters:
+            prepared["_representation_adapters"] = adapters
+        if failure is not None:
+            prepared["_batch_preflight_failure"] = failure
+        return prepared
 
     def _calculate_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
         """Calculate API cost in dollars based on model and token usage
@@ -717,137 +886,20 @@ class GeminiSummarizer:
         # text. Flash Lite 4M TPM; cap a chunk at ~1.2M estimated tokens.
         max_chunk_items = 30
         max_chunk_est_tokens = 1_200_000
-        cached_chars = len(shared_context or "") if cache_name else 0
         prepared_requests: List[Dict[str, Any]] = []
         for req in item_requests:
             prepared = dict(req)
-            item_title = limit_item_title(req.get("title", ""))
-            if needs_proactive_representation(req.get("documents") or []):
-                proactive = build_compact_representation(req.get("documents") or [])
-                if proactive.compacted:
-                    prepared["text"] = proactive.text
-                    prepared["_representation_self_contained"] = True
-                    prepared["_representation_adapters"] = proactive.adapters
-                    logger.info(
-                        "provider-compatible public-record representation applied",
-                        item_id=req.get("item_id"),
-                        adapters=proactive.adapters,
-                        source_chars=proactive.source_chars,
-                        represented_chars=proactive.represented_chars,
-                    )
-            prepared_text = prepare_item_text(
-                item_title,
-                prepared.get("text", ""),
-                None
-                if prepared.get("_representation_self_contained")
-                else shared_context,
-                inline_shared=(
-                    not cache_name
-                    and not prepared.get("_representation_self_contained")
-                ),
-            )
-            prompt = self._get_prompt(
-                "item",
-                self._select_prompt_type(),
-                title=item_title,
-                text=prepared_text,
-            )
-            input_chars = len(prompt) + (
-                0
-                if prepared.get("_representation_self_contained")
-                else cached_chars
-            )
-            input_tokens = max(1, input_chars // 4)
-            prepared["_batch_input_tokens"] = input_tokens
-
-            if input_chars >= BATCH_TOKEN_PREFLIGHT_CHARS:
-                try:
-                    input_tokens = await self._count_batch_input_tokens(
-                        prompt,
-                        cached_context=(shared_context if cache_name else None),
-                    )
-                    prepared["_batch_input_tokens"] = input_tokens
-                    logger.info(
-                        "large batch request token preflight",
-                        item_id=req.get("item_id"),
-                        input_chars=input_chars,
-                        input_tokens=input_tokens,
-                        token_limit=BATCH_INPUT_TOKEN_LIMIT,
-                    )
-                except Exception as exc:
-                    metadata = self._provider_error_metadata(exc)
-                    prepared["_batch_preflight_failure"] = {
-                        **metadata,
-                        "error": f"Gemini token preflight failed: {exc}",
-                        "error_type": "token_preflight_failed",
-                        "stage": "preflight",
-                    }
-
-            needs_representation = (
-                input_tokens > BATCH_INPUT_TOKEN_LIMIT
-                or (
-                    "_batch_preflight_failure" in prepared
-                    and bool(req.get("documents"))
+            prepared.update(
+                await self.prepare_document_input(
+                    kind="item",
+                    title=req.get("title", ""),
+                    text=req.get("text", ""),
+                    documents=req.get("documents") or [],
+                    shared_context=shared_context,
+                    cache_name=cache_name,
+                    request_id=str(req.get("item_id") or ""),
                 )
             )
-            if needs_representation:
-                representation = build_compact_representation(
-                    req.get("documents") or []
-                )
-                if representation.compacted:
-                    compact_prompt = self._get_prompt(
-                        "item",
-                        self._select_prompt_type(),
-                        title=item_title,
-                        text=representation.text,
-                    )
-                    try:
-                        compact_tokens = await self._count_batch_input_tokens(
-                            compact_prompt
-                        )
-                    except Exception as exc:
-                        metadata = self._provider_error_metadata(exc)
-                        prepared["_batch_preflight_failure"] = {
-                            **metadata,
-                            "error": f"Gemini compact-representation token preflight failed: {exc}",
-                            "error_type": "token_preflight_failed",
-                            "stage": "representation_preflight",
-                        }
-                    else:
-                        prepared.pop("_batch_preflight_failure", None)
-                        logger.info(
-                            "oversized request represented deterministically",
-                            item_id=req.get("item_id"),
-                            adapters=representation.adapters,
-                            source_chars=representation.source_chars,
-                            represented_chars=representation.represented_chars,
-                            original_input_tokens=input_tokens,
-                            represented_input_tokens=compact_tokens,
-                        )
-                        prepared["text"] = representation.text
-                        prepared["_representation_self_contained"] = True
-                        prepared["_representation_adapters"] = representation.adapters
-                        prepared["_batch_input_tokens"] = compact_tokens
-                        input_tokens = compact_tokens
-
-                if (
-                    "_batch_preflight_failure" not in prepared
-                    and input_tokens > BATCH_INPUT_TOKEN_LIMIT
-                ):
-                    adapters = prepared.get("_representation_adapters") or ()
-                    attempted = f" after adapters {adapters}" if adapters else ""
-                    prepared["_batch_preflight_failure"] = {
-                        "error": (
-                            "Batch input has no compatible representation that fits: "
-                            f"{input_tokens:,} input tokens exceeds the guarded "
-                            f"{BATCH_INPUT_TOKEN_LIMIT:,}-token limit{attempted}"
-                        ),
-                        "error_type": "representation_required",
-                        "retryable": False,
-                        "stage": "preflight",
-                        "input_tokens": input_tokens,
-                        "token_limit": BATCH_INPUT_TOKEN_LIMIT,
-                    }
             prepared_requests.append(prepared)
 
         preflight_failures = [
@@ -1399,12 +1451,18 @@ class GeminiSummarizer:
                     self_contained = bool(
                         req.get("_representation_self_contained")
                     )
-                    text = prepare_item_text(
-                        item_title,
-                        req["text"],
-                        None if self_contained else shared_context,
-                        inline_shared=not cache_name and not self_contained,
-                    )
+                    text = req.get("_model_text")
+                    if text is None:
+                        # Defensive compatibility for direct private-method
+                        # callers. Normal submissions are prepared once by
+                        # prepare_document_input and use its exact preflighted
+                        # model text here.
+                        text = prepare_item_text(
+                            item_title,
+                            req["text"],
+                            None if self_contained else shared_context,
+                            inline_shared=not cache_name and not self_contained,
+                        )
 
                     # Use actual page count if available, otherwise estimate
                     page_count = req.get("page_count")

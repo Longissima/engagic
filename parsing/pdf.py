@@ -635,7 +635,7 @@ class PdfExtractor:
             logger.error("failed to render page", page_num=page.number + 1, error=str(e))
             return None
 
-    def _ocr_from_bytes(self, png_bytes: bytes, page_num: int) -> str:
+    def _ocr_from_bytes(self, png_bytes: bytes, page_num: int) -> Optional[str]:
         """Run OCR on pre-rendered PNG bytes (thread-safe)
 
         Args:
@@ -643,7 +643,8 @@ class PdfExtractor:
             page_num: Page number (1-indexed, for logging)
 
         Returns:
-            Extracted text from OCR, or empty string on failure
+            Extracted text from OCR. ``None`` means OCR failed; an empty string
+            is a successful read of a genuinely blank page.
         """
         try:
             img = Image.open(io.BytesIO(png_bytes)).convert('L')  # Grayscale
@@ -658,17 +659,17 @@ class PdfExtractor:
             return text
         except (Image.DecompressionBombError, Image.DecompressionBombWarning):
             logger.warning("page image too large for OCR", page_num=page_num)
-            return ""
+            return None
         except RuntimeError as e:
             # pytesseract raises RuntimeError on timeout
             if "Tesseract process timeout" in str(e):
                 logger.warning("OCR timeout on page", page_num=page_num)
             else:
                 logger.error("OCR runtime error", page_num=page_num, error=str(e))
-            return ""
+            return None
         except (OSError, pytesseract.TesseractError) as e:
             logger.error("OCR failed", page_num=page_num, error=str(e), error_type=type(e).__name__)
-            return ""
+            return None
 
     def _ocr_page(self, page) -> str:
         """Extract text from page using OCR (sequential fallback)
@@ -683,21 +684,27 @@ class PdfExtractor:
         if rendered is None:
             return ""
         png_bytes, _, _ = rendered
-        return self._ocr_from_bytes(png_bytes, page.number + 1)
+        return self._ocr_from_bytes(png_bytes, page.number + 1) or ""
 
-    def _ocr_pages_parallel(self, ocr_tasks: List[Tuple[int, bytes, str]]) -> Dict[int, str]:
+    def _ocr_pages_parallel(
+        self,
+        ocr_tasks: List[Tuple[int, bytes, str, bool]],
+    ) -> Tuple[Dict[int, str], set[int]]:
         """Run OCR on multiple pages in parallel
 
         Args:
-            ocr_tasks: List of (page_num, png_bytes, original_text) tuples
+            ocr_tasks: ``(page_num, png_bytes, original_text, repair_required)``
+                tuples. ``repair_required`` distinguishes corrupt/suspicious
+                layers from ordinary short pages that merely benefit from OCR.
 
         Returns:
-            Dict mapping page_num to OCR result text
+            A page-text mapping and the page numbers whose OCR execution failed.
         """
         if not ocr_tasks:
-            return {}
+            return {}, set()
 
         results = {}
+        failed_pages: set[int] = set()
         workers = min(self.max_ocr_workers, len(ocr_tasks))
 
         logger.info(
@@ -716,7 +723,7 @@ class PdfExtractor:
             # Submit all OCR jobs
             future_to_page = {
                 executor.submit(self._ocr_from_bytes, png_bytes, page_num): (page_num, original_text)
-                for page_num, png_bytes, original_text in ocr_tasks
+                for page_num, png_bytes, original_text, _ in ocr_tasks
             }
 
             # Collect results as they complete (with total timeout)
@@ -728,6 +735,10 @@ class PdfExtractor:
                     try:
                         # Per-page timeout as secondary safeguard
                         ocr_result = future.result(timeout=120)
+                        if ocr_result is None:
+                            failed_pages.add(page_num)
+                            results[page_num] = original_text
+                            continue
 
                         # Decide whether to use OCR or keep original
                         if self._is_ocr_better(original_text, ocr_result, page_num):
@@ -737,9 +748,11 @@ class PdfExtractor:
 
                     except TimeoutError:
                         logger.warning("OCR timeout on page", page_num=page_num)
+                        failed_pages.add(page_num)
                         results[page_num] = original_text
                     except Exception as e:  # Intentionally broad: catch any thread exception
                         logger.error("parallel OCR failed", page_num=page_num, error=str(e) or type(e).__name__)
+                        failed_pages.add(page_num)
                         results[page_num] = original_text
 
             except TimeoutError:
@@ -748,6 +761,7 @@ class PdfExtractor:
                 for future, (page_num, original_text) in future_to_page.items():
                     if future not in completed_futures:
                         future.cancel()
+                        failed_pages.add(page_num)
                         results[page_num] = original_text
                         timed_out_pages.append(page_num)
                 logger.warning(
@@ -764,7 +778,7 @@ class PdfExtractor:
             avg_per_page=round(ocr_time / len(ocr_tasks), 2) if ocr_tasks else 0
         )
 
-        return results
+        return results, failed_pages
 
     def _is_ocr_better(self, original: str, ocr_result: str, page_num: int) -> bool:
         """Determine if OCR result is better than original text
@@ -837,7 +851,7 @@ class PdfExtractor:
         """
         page_texts = {}  # page_num -> text
         all_links = []
-        ocr_tasks = []  # List of (page_num, png_bytes, original_text)
+        ocr_tasks = []  # (page_num, png_bytes, original_text, repair_required)
         ocr_pending = 0  # below-threshold pages skipped because ocr_enabled=False
 
         # Activation is deterministic and auditable: a textual legend OR
@@ -898,10 +912,12 @@ class PdfExtractor:
             # Sparse pages and pages with a strongly garbled embedded text
             # layer both belong to OCR. A long broken CMap is not better than
             # an absent text layer merely because it exceeds the char floor.
+            garbled_text_layer = is_garbled_text_layer(page_text)
+            repair_required = suspicious_text_volume or garbled_text_layer
             needs_ocr = (
                 suspicious_text_volume
                 or initial_char_count < self.ocr_threshold
-                or is_garbled_text_layer(page_text)
+                or garbled_text_layer
             )
             if needs_ocr:
                 if not self.ocr_enabled:
@@ -915,19 +931,20 @@ class PdfExtractor:
                         page_num=page_num + 1,
                         char_count=initial_char_count,
                         threshold=self.ocr_threshold,
-                        garbled_text_layer=is_garbled_text_layer(page_text),
+                        garbled_text_layer=garbled_text_layer,
                     )
                     # Render page to PNG (main thread, PyMuPDF not thread-safe)
                     rendered = self._render_page_for_ocr(page)
                     if rendered:
                         png_bytes, _, _ = rendered
-                        ocr_tasks.append((page_num + 1, png_bytes, page_text))
+                        ocr_tasks.append(
+                            (page_num + 1, png_bytes, page_text, repair_required)
+                        )
                     else:
-                        # Rendering failed, keep original but make a broken
-                        # text layer explicitly retryable instead of silently
-                        # stamping the extraction complete.
-                        if suspicious_text_volume or is_garbled_text_layer(page_text):
-                            ocr_pending += 1
+                        # Rendering failure means the OCR-owning path could not
+                        # establish completeness, even when the retained layer
+                        # is merely short rather than demonstrably corrupt.
+                        ocr_pending += 1
                         page_texts[page_num + 1] = page_text
             else:
                 page_texts[page_num + 1] = page_text
@@ -946,22 +963,25 @@ class PdfExtractor:
         page_count = len(doc)
 
         # Pass 2: Run OCR in parallel (outside doc context, PNG bytes already captured)
+        failed_ocr_pages: set[int] = set()
         if ocr_tasks:
-            ocr_results = self._ocr_pages_parallel(ocr_tasks)
+            ocr_results, failed_ocr_pages = self._ocr_pages_parallel(ocr_tasks)
             page_texts.update(ocr_results)
+            ocr_pending += len(failed_ocr_pages)
 
         # Count OCR pages (pages where OCR was actually used, not just attempted)
         ocr_pages = sum(
-            1 for page_num, _, original in ocr_tasks
+            1 for page_num, _, original, _ in ocr_tasks
             if page_num in page_texts and page_texts[page_num] != original
         )
-        unrepaired_garbled_pages = sum(
+        unrepaired_required_pages = sum(
             1
-            for page_num, _, original in ocr_tasks
-            if is_garbled_text_layer(original)
-            and is_garbled_text_layer(page_texts.get(page_num, original))
+            for page_num, _, original, repair_required in ocr_tasks
+            if repair_required
+            and page_num not in failed_ocr_pages
+            and page_texts.get(page_num, original) == original
         )
-        ocr_pending += unrepaired_garbled_pages
+        ocr_pending += unrepaired_required_pages
 
         # Assemble final text in page order
         text_parts = [

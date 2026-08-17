@@ -9,6 +9,7 @@ from typing import Any, cast
 import fitz
 from openpyxl import Workbook
 
+from analysis.analyzer_async import AsyncAnalyzer
 from analysis.llm.input_budget import (
     prepare_item_text,
 )
@@ -32,6 +33,102 @@ def test_shared_and_item_text_are_not_truncated_before_token_preflight():
     assert "i" * 100_000 in prepared
     assert "SHARED CONTEXT" in prepared
     assert "AGENDA ITEM: Large item" in prepared
+
+
+def _representation_boundary_summarizer():
+    summarizer = object.__new__(GeminiSummarizer)
+    summarizer.primary_model = "gemini-test"
+    summarizer._get_prompt = lambda *args, **kwargs: kwargs.get("text", "")
+    return summarizer
+
+
+def test_streaming_items_use_the_same_representation_boundary_as_batch(monkeypatch):
+    explicit_exhibit = "rating review massage provider details\n" * 400
+    captured = {}
+    summarizer = _representation_boundary_summarizer()
+
+    async def inline(call, *args, **kwargs):
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", inline)
+
+    def summarize_item(title, text, page_count):
+        captured.update(title=title, text=text, page_count=page_count)
+        return "represented summary", ["other"]
+
+    summarizer.summarize_item = summarize_item
+    analyzer = object.__new__(AsyncAnalyzer)
+    analyzer.summarizer = summarizer
+    request = {
+        "item_id": "item-evidence",
+        "title": "License review",
+        "text": explicit_exhibit,
+        "page_count": 78,
+        "documents": [
+            {
+                "name": "Regarding Application_RubmapsReviews",
+                "text": explicit_exhibit,
+            },
+            {"name": "Shared agenda", "text": "shared meeting context"},
+        ],
+    }
+
+    async def collect():
+        return [
+            chunk
+            async for chunk in analyzer.process_batch_items_async(
+                [request], shared_context="shared meeting context"
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert chunks[0][0]["success"] is True
+    assert "text_sha256=" in captured["text"]
+    assert "shared meeting context" in captured["text"]
+    assert "rating review massage provider details" not in captured["text"]
+
+
+def test_packet_fallback_uses_the_shared_representation_boundary(monkeypatch):
+    explicit_exhibit = "rating review massage provider details\n" * 400
+    captured = {}
+    summarizer = _representation_boundary_summarizer()
+
+    async def inline(call, *args, **kwargs):
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", inline)
+
+    def summarize_meeting(text):
+        captured["text"] = text
+        return "represented meeting summary"
+
+    summarizer.summarize_meeting = summarize_meeting
+    analyzer = object.__new__(AsyncAnalyzer)
+    analyzer.summarizer = summarizer
+
+    async def extract(url, banana=None):
+        return {
+            "success": True,
+            "text": explicit_exhibit,
+            "method": "pymupdf",
+            "page_count": 78,
+            "content_sha256": "b" * 64,
+            "source_url": "https://example.test/RubmapsReviews.pdf",
+            "document_format": "pdf",
+        }
+
+    analyzer.extract_document_async = extract
+
+    summary, _method, _participation = asyncio.run(
+        analyzer.process_agenda_async(
+            "https://example.test/RubmapsReviews.pdf", banana="testCA"
+        )
+    )
+
+    assert summary == "represented meeting summary"
+    assert "text_sha256=" in captured["text"]
+    assert "rating review massage provider details" not in captured["text"]
 
 
 def test_rendered_prompt_is_status_aware():

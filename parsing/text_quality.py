@@ -28,10 +28,15 @@ def is_garbled_text_layer(text: str) -> bool:
     all_letters = sum(char.isalpha() for char in sample)
     nonspace = sum(not char.isspace() for char in sample)
 
-    # A multilingual page still tends to be made of letters. Broken CMaps are
-    # instead mostly symbols, with too few readable letters or digits to be a
-    # plausible prose or numeric-table layer.
+    # A multilingual page still tends to be made of Unicode letters. Broken
+    # CMaps are instead mostly symbols, with only a few extended glyphs that
+    # happen to satisfy ``isalpha``. Keep script-neutral letter density as an
+    # independent guard before using the ASCII-oriented corruption signal.
     readable_ratio = (ascii_letters + ascii_digits) / max(1, nonspace)
+    letter_or_digit_ratio = (all_letters + ascii_digits) / max(1, nonspace)
     extended_letter_ratio = (all_letters - ascii_letters) / max(1, all_letters)
-    return readable_ratio < 0.20 and extended_letter_ratio >= 0.35
-
+    return (
+        readable_ratio < 0.20
+        and letter_or_digit_ratio < 0.35
+        and extended_letter_ratio >= 0.35
+    )

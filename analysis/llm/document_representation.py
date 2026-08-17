@@ -28,6 +28,7 @@ _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _TOKEN_RE = re.compile(r"\S+")
 _PAGE_SPLIT_RE = re.compile(r"(?m)^--- PAGE (\d+) ---\n?")
 _NUMBER_CELL_RE = re.compile(r"(?:[$+\-]?[\d,.]+%?|N/?A|-)\Z", re.IGNORECASE)
+_NEGATIVE_SCIENTIFIC_EXPONENT_RE = re.compile(r"(?<=\d)E-0([1-9])")
 _AERMOD_RECORD_RE = re.compile(
     r"^(LOCATION|SRCPARAM|SRCGROUP|DISCCART|EVALCART|AREAVERT|BUILDHGT|"
     r"BUILDWID|BUILDLEN|XBADJ|YBADJ|HOUREMIS|EMISFACT)\b",
@@ -329,8 +330,78 @@ def _split_source_pages(text: str) -> list[tuple[int, str]]:
     ]
 
 
+def _render_reversible_table_stream(
+    text: str,
+    *,
+    adapter: str,
+    strip_cell_tags: bool,
+) -> str:
+    """Render table/layout text through the shared reversible token stream."""
+    lines, repeated_coordinates, abbreviated_exponents = (
+        _compact_numeric_table_notation(
+            _compact_table_lines(
+                text,
+                strip_cell_tags=strip_cell_tags,
+                pack_election_rows=False,
+            )
+        )
+    )
+    lines = _rle_repeated_lines(lines)
+    encoded, definitions = _dictionary_encode(lines)
+    preamble = [
+        f"[REPRESENTATION {REPRESENTATION_VERSION}; adapter={adapter}]",
+        "@page N = source page; tabs = source fixed-width field boundaries; VALUE*N = N adjacent identical tokens, cells, or rows.",
+    ]
+    if strip_cell_tags:
+        preamble.append(
+            "@cells..@endcells = line-isolated table cells in source order; one line is one cell; @empty is an empty cell."
+        )
+    if repeated_coordinates:
+        preamble.append(
+            "@xy within a row repeats that row's second and third fields exactly as 'X, Y'."
+        )
+    if abbreviated_exponents:
+        preamble.append(
+            "In numeric table fields, a lowercase eN suffix expands to E-0N (for example 1.2e6 = 1.2E-06)."
+        )
+    if definitions:
+        preamble.append("~ aliases expand to these exact repeated source lines:")
+        preamble.extend(f"{alias}\t{line}" for alias, line in definitions)
+        preamble.append("@endaliases")
+    preamble.append("[/REPRESENTATION]")
+    return "\n".join([*preamble, *encoded])
+
+
+def _compact_numeric_table_notation(
+    lines: Sequence[str],
+) -> tuple[list[str], int, int]:
+    """Remove repeated numeric notation while retaining every table value.
+
+    Large modeled-risk grids repeat each row's X/Y fields later in the same
+    row and spell every small value with a token-heavy ``E-0N`` suffix.  Both
+    transforms are deterministic and declared in the representation preamble;
+    no row, column, precision digit, sign, or exponent is discarded.
+    """
+    output: list[str] = []
+    repeated_coordinates = 0
+    abbreviated_exponents = 0
+    for source_line in lines:
+        line = source_line
+        fields = line.split("\t")
+        if len(fields) >= 4:
+            repeated_xy = f"{fields[1]}, {fields[2]}"
+            if repeated_xy in line:
+                line = line.replace(repeated_xy, "@xy", 1)
+                repeated_coordinates += 1
+
+        line, substitutions = _NEGATIVE_SCIENTIFIC_EXPONENT_RE.subn(r"e\1", line)
+        abbreviated_exponents += substitutions
+        output.append(line)
+    return output, repeated_coordinates, abbreviated_exponents
+
+
 def _render_aermod_receipt(document: SourceDocument) -> str:
-    """Keep the authored report verbatim; receipt the raw model appendix."""
+    """Keep authored findings; compact tables and receipt the model appendix."""
     pages = _split_source_pages(document.text)
     first_model_index = next(
         (
@@ -354,6 +425,14 @@ def _render_aermod_receipt(document: SourceDocument) -> str:
         f"--- PAGE {page_num} ---\n{body.rstrip()}"
         for page_num, body in authored_pages
     )
+    authored_table_adapter = None
+    if _fixed_width_table_shape(authored_text):
+        authored_table_adapter = "aermod-authored-fixed-width-v1"
+        authored_text = _render_reversible_table_stream(
+            authored_text,
+            adapter=authored_table_adapter,
+            strip_cell_tags=_tagged_table_shape(authored_text),
+        )
     appendix_text = "\n\n".join(
         f"--- PAGE {page_num} ---\n{body.rstrip()}"
         for page_num, body in model_pages
@@ -392,7 +471,13 @@ def _render_aermod_receipt(document: SourceDocument) -> str:
 
     receipt = [
         f"[REPRESENTATION {REPRESENTATION_VERSION}; adapter=aermod-report-receipt-v1]",
-        "The authored air-quality report above is verbatim. The appended AERMOD/AERMET machine dump is represented by a deterministic audit receipt; its complete extraction remains in the corpus source named in PROVENANCE.",
+        (
+            "The authored air-quality report above retains every row and field in the shared reversible fixed-width representation. "
+            if authored_table_adapter
+            else "The authored air-quality report above is verbatim. "
+        )
+        + "The appended AERMOD/AERMET machine dump is represented by a deterministic audit receipt; its complete extraction remains in the corpus source named in PROVENANCE.",
+        f"authored_adapter={authored_table_adapter or 'raw-verbatim'}",
         f"appendix_pages={model_pages[0][0]}-{model_pages[-1][0]}",
         f"appendix_page_count={len(model_pages)}",
         f"appendix_chars={len(appendix_text)}",
@@ -431,21 +516,23 @@ def _render_contract_catalog_receipt(document: SourceDocument) -> str:
     header = _CONTRACT_CATALOG_HEADER.lstrip()
     rows: list[str] = []
     parsed: list[tuple[str, Decimal, str]] = []
+    noncatalog_lines: list[tuple[int, str]] = []
     price_re = re.compile(
         r"\s(?P<sin>(?:\d{4,9}[A-Z]*|ANCILLARY|OLM))\s+"
         r"(?P<point>[A-Z]{2})\s+(?P<price>\d[\d,]*[.]\d{2})\s*$"
     )
-    for raw_line in catalog_text.splitlines():
+    for source_line, raw_line in enumerate(catalog_text.splitlines(), start=1):
         line = raw_line.rstrip()
         stripped = line.strip()
-        if (
-            not stripped
-            or stripped == header
-            or _PAGE_RE.fullmatch(stripped)
-        ):
+        if not stripped or stripped == header or _PAGE_RE.fullmatch(stripped):
             continue
         price_match = price_re.search(line)
         if price_match is None:
+            # Catalogs can contain amendments, clauses, explanatory prose, and
+            # wrapped rows after the first repeated header. Those lines are
+            # primary evidence, not catalog furniture: retain them verbatim
+            # with their source line so the row receipt never hides a decision.
+            noncatalog_lines.append((source_line, line))
             continue
         price = Decimal(price_match.group("price").replace(",", ""))
         rows.append(stripped)
@@ -461,10 +548,10 @@ def _render_contract_catalog_receipt(document: SourceDocument) -> str:
     ordered = sorted(parsed, key=lambda row: (row[1], row[2]))
     receipt = [
         f"[REPRESENTATION {REPRESENTATION_VERSION}; adapter=contract-catalog-receipt-v1]",
-        "The contract terms above are verbatim. The item-level GSA price schedule is represented by a deterministic catalog receipt; every SKU row remains in the corpus source named in PROVENANCE.",
+        "Contract text outside parsed SKU rows is retained verbatim above or in @noncatalog_lines below. The item-level GSA price schedule is represented by a deterministic catalog receipt; every SKU row remains in the corpus source named in PROVENANCE.",
         "schema=MFGPART|MFGNAME|PRODNAME|ISSCODE|SIN|PPOINT|GSAPRICE",
         f"catalog_rows={len(parsed)}",
-        f"unparsed_nonblank_lines={max(0, sum(bool(line.strip()) for line in catalog_text.splitlines()) - len(parsed) - document.text.count(_CONTRACT_CATALOG_HEADER))}",
+        f"unparsed_nonblank_lines={len(noncatalog_lines)}",
         f"catalog_rows_sha256={hashlib.sha256(chr(10).join(rows).encode()).hexdigest()}",
         f"price_range_usd={ordered[0][1]}..{ordered[-1][1]}",
         "manufacturer_field=retained_in_corpus_rows_but_not_aggregated_because_the_PDF_fixed_width_column_overlaps_long_part_numbers",
@@ -478,6 +565,13 @@ def _render_contract_catalog_receipt(document: SourceDocument) -> str:
     receipt.extend(row[2] for row in ordered[:25])
     receipt.append("@highest_price_rows exact source rows")
     receipt.extend(row[2] for row in ordered[-25:])
+    if noncatalog_lines:
+        receipt.append("@noncatalog_lines source_line\tverbatim source text")
+        receipt.extend(
+            f"{source_line}\t{line}"
+            for source_line, line in noncatalog_lines
+        )
+        receipt.append("@end_noncatalog_lines")
     receipt.append("[/REPRESENTATION]")
     return prefix + "\n\n" + "\n".join(receipt)
 
@@ -685,28 +779,14 @@ def _render_compact_document(document: SourceDocument) -> tuple[str, str]:
         return document.text, "raw"
 
     adapter = "tagged-table-v1" if strip_cell_tags else "fixed-width-report-v1"
-    lines = _rle_repeated_lines(
-        _compact_table_lines(
+    return (
+        _render_reversible_table_stream(
             document.text,
+            adapter=adapter,
             strip_cell_tags=strip_cell_tags,
-            pack_election_rows=False,
-        )
+        ),
+        adapter,
     )
-    encoded, definitions = _dictionary_encode(lines)
-    preamble = [
-        f"[REPRESENTATION {REPRESENTATION_VERSION}; adapter={adapter}]",
-        "@page N = source page; tabs = source fixed-width field boundaries; VALUE*N = N adjacent identical tokens, cells, or rows.",
-    ]
-    if strip_cell_tags:
-        preamble.append(
-            "@cells..@endcells = line-isolated table cells in source order; one line is one cell; @empty is an empty cell."
-        )
-    if definitions:
-        preamble.append("~ aliases expand to these exact repeated source lines:")
-        preamble.extend(f"{alias}\t{line}" for alias, line in definitions)
-        preamble.append("@endaliases")
-    preamble.append("[/REPRESENTATION]")
-    return "\n".join([*preamble, *encoded]), adapter
 
 
 def render_documents(documents: Iterable[SourceDocument | Mapping[str, Any]]) -> str:

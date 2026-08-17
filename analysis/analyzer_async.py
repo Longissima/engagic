@@ -16,6 +16,7 @@ Rate limiting is handled by the summarizer via Gemini's retry instructions.
 """
 
 import asyncio
+import math
 import os
 import tempfile
 import time
@@ -32,7 +33,6 @@ from analysis.llm.summarizer import GeminiSummarizer
 from analysis.llm.input_budget import (
     limit_item_title,
     limit_shared_context,
-    prepare_item_text,
 )
 from pipeline.protocols import MetricsCollector, NullMetrics
 from pipeline.document_acquisition import DocumentResponse, DocumentSourceAcquirer
@@ -49,6 +49,9 @@ from vendors.rate_limiter_async import get_rate_limiter, vendor_for_url
 from config import config, get_logger
 
 logger = get_logger(__name__).bind(component="pipeline")
+
+DOCUMENT_EXTRACTION_TIMEOUT_SECONDS = 600
+DOCUMENT_EXTRACTION_OUTER_GRACE_SECONDS = 20
 
 
 def _extract_best_pdf_link(html_bytes: bytes, base_url: str) -> Optional[str]:
@@ -85,11 +88,12 @@ def _extract_pdf_in_subprocess(document_path, ocr_threshold, ocr_dpi,
         detect_legislative_formatting,
         max_ocr_workers,
     )
+    started = time.monotonic()
     try:
         return run_guarded(
             extract_document_file,
             args,
-            timeout=600,
+            timeout=DOCUMENT_EXTRACTION_TIMEOUT_SECONDS,
             rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
         )
     except GuardTimeout:
@@ -99,10 +103,18 @@ def _extract_pdf_in_subprocess(document_path, ocr_threshold, ocr_dpi,
         # this path. Some otherwise readable, graphics-heavy PDFs crash there
         # while plain text extraction succeeds. Retry once in a fresh guarded
         # child without redline geometry; never retry a crash in-process.
-        if detect_legislative_formatting:
+        if detect_legislative_formatting and document_path.lower().endswith(".pdf"):
+            remaining_timeout = max(
+                1,
+                math.ceil(
+                    DOCUMENT_EXTRACTION_TIMEOUT_SECONDS
+                    - (time.monotonic() - started)
+                ),
+            )
             logger.warning(
                 "guarded PDF extraction crashed; retrying without legislative geometry",
                 exit_code=e.exitcode,
+                remaining_timeout=remaining_timeout,
             )
             try:
                 return run_guarded(
@@ -114,12 +126,12 @@ def _extract_pdf_in_subprocess(document_path, ocr_threshold, ocr_dpi,
                         False,
                         max_ocr_workers,
                     ),
-                    timeout=600,
+                    timeout=remaining_timeout,
                     rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
                 )
             except GuardTimeout:
                 raise ExtractionError(
-                    "Document extraction fallback timed out after 600s"
+                    "Document extraction fallback exhausted the shared 600s budget"
                 )
             except GuardCrashed as fallback_error:
                 raise ExtractionError(
@@ -550,7 +562,10 @@ class AsyncAnalyzer:
                         self.pdf_extractor.detect_legislative_formatting,
                         self.pdf_extractor.max_ocr_workers,
                     ),
-                    timeout=620,
+                    timeout=(
+                        DOCUMENT_EXTRACTION_TIMEOUT_SECONDS
+                        + DOCUMENT_EXTRACTION_OUTER_GRACE_SECONDS
+                    ),
                 )
             except asyncio.TimeoutError:
                 logger.error("document extraction timed out", url=safe_url[:100])
@@ -574,6 +589,21 @@ class AsyncAnalyzer:
         if corpus_store:
             corpus_persisted = await corpus_store.persist_extraction(
                 content_sha256, result
+            )
+        ocr_pending = int(result.get("ocr_pending") or 0)
+        extraction_method = str(result.get("method") or "")
+        if ocr_pending > 0 or extraction_method.endswith("-partial"):
+            logger.warning(
+                "document extraction incomplete; refusing downstream analysis",
+                url=safe_url[:100],
+                method=extraction_method,
+                ocr_pending=ocr_pending,
+                corpus_persisted=corpus_persisted,
+            )
+            raise ExtractionError(
+                f"Document extraction incomplete: {ocr_pending} page(s) require OCR retry",
+                document_url=safe_url,
+                document_type=document_format.value,
             )
         result.update(
             content_sha256=content_sha256,
@@ -680,6 +710,30 @@ class AsyncAnalyzer:
                 if participation:
                     logger.debug("extracted participation info", fields=list(participation.model_dump(exclude_none=True).keys()))
 
+                prepared = await summarizer.prepare_document_input(
+                    kind="meeting",
+                    text=extracted_text,
+                    documents=[
+                        {
+                            "name": result.get("source_url") or url,
+                            "text": extracted_text,
+                            "content_sha256": result.get("content_sha256"),
+                            "source_url": result.get("source_url") or url,
+                            "page_count": result.get("page_count"),
+                            "document_format": result.get("document_format"),
+                        }
+                    ],
+                    request_id=url,
+                )
+                preflight_failure = prepared.get("_batch_preflight_failure")
+                if preflight_failure:
+                    raise LLMError(
+                        str(preflight_failure.get("error") or "Document input preflight failed"),
+                        model=summarizer.primary_model,
+                        prompt_type="meeting_fallback",
+                    )
+                model_text = prepared["_model_text"]
+
                 # Summarize meeting (Gemini SDK is sync, run in thread pool)
                 # Rate limiting handled reactively by summarizer via Gemini's retry instructions
                 # 5 min timeout - summarizer has internal 3 min retry budget
@@ -687,7 +741,7 @@ class AsyncAnalyzer:
                     summary = await asyncio.wait_for(
                         asyncio.to_thread(
                             summarizer.summarize_meeting,
-                            extracted_text
+                            model_text,
                         ),
                         timeout=300
                     )
@@ -766,20 +820,25 @@ class AsyncAnalyzer:
         async def process_item(item: Dict[str, Any]) -> Dict[str, Any]:
             """Process single item with timeout."""
             try:
-                text = item.get("text", "")
                 title = limit_item_title(item.get("title", ""))
                 page_count = item.get("page_count")
 
-                # Mirror the batch lane's shared-context inlining
-                # (_submit_one_chunk); without it, items whose only documents
-                # are shared reach the model as "[Item: title]" with no
-                # document text.
-                text = prepare_item_text(
-                    title,
-                    text,
-                    shared_context,
-                    inline_shared=True,
+                prepared = await summarizer.prepare_document_input(
+                    kind="item",
+                    title=title,
+                    text=item.get("text", ""),
+                    documents=item.get("documents") or [],
+                    shared_context=shared_context,
+                    request_id=str(item.get("item_id") or ""),
                 )
+                preflight_failure = prepared.get("_batch_preflight_failure")
+                if preflight_failure:
+                    raise LLMError(
+                        str(preflight_failure.get("error") or "Document input preflight failed"),
+                        model=summarizer.primary_model,
+                        prompt_type="item_unified",
+                    )
+                text = prepared["_model_text"]
 
                 # Summarize item (Gemini SDK is sync, run in thread pool).
                 # SDK now has its own 300s http timeout matching this wait_for,

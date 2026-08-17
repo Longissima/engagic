@@ -1,3 +1,5 @@
+import time
+
 from analysis.llm.document_representation import (
     SourceDocument,
     build_compact_representation,
@@ -59,6 +61,22 @@ def test_fixed_width_adapter_makes_columns_explicit_and_rle_encodes_cells():
     assert represented.represented_chars < represented.source_chars
 
 
+def test_fixed_width_adapter_compacts_repeated_numeric_notation_without_values_lost():
+    row = (
+        "1          480435.9          3746848.36          "
+        "0.03658 480435.9, 3746848.36          1.2E-06"
+    )
+    source = "\n".join([row] * 600)
+
+    represented = build_compact_representation([SourceDocument("Risk grid", source)])
+
+    assert represented.adapters == ("fixed-width-report-v1",)
+    assert "1\t480435.9\t3746848.36\t0.03658 @xy\t1.2e6" in represented.text
+    assert "@xy within a row repeats that row's second and third fields" in represented.text
+    assert "1.2e6 = 1.2E-06" in represented.text
+    assert "VALUE*N" in represented.text
+
+
 def test_unsupported_prose_remains_raw():
     prose = "The council considered a short agreement. " * 20
     represented = build_compact_representation([SourceDocument("Memo", prose)])
@@ -81,6 +99,16 @@ def test_normal_prose_and_numeric_tables_are_not_garbled():
         "This is ordinary public-record prose with names, dates, and decisions. " * 10
     )
     assert not is_garbled_text_layer("100 200 300 400 500\n" * 50)
+
+
+def test_non_latin_public_record_prose_is_not_garbled():
+    samples = [
+        "市议会审议了公共交通预算和社区服务合同。" * 30,
+        "ناقش مجلس المدينة ميزانية النقل العام وعقد خدمات المجتمع. " * 20,
+        "Городской совет рассмотрел бюджет транспорта и договор услуг. " * 20,
+    ]
+
+    assert all(not is_garbled_text_layer(sample) for sample in samples)
 
 
 def test_shorter_readable_ocr_replaces_a_long_garbled_text_layer():
@@ -132,6 +160,43 @@ def test_suspiciously_large_page_text_is_never_sliced_before_ocr():
     assert result["method"] == "pymupdf-partial"
 
 
+def test_failed_ocr_candidate_is_marked_partial():
+    source = "complete embedded source layer " * 8_000
+
+    class Page:
+        number = 0
+
+        def get_text(self, *, sort=True):
+            return source
+
+    class Document:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, page_num):
+            assert page_num == 0
+            return Page()
+
+    class FailedOcrExtractor(PdfExtractor):
+        def _render_page_for_ocr(self, page):
+            return b"png", 1, 1
+
+        def _ocr_pages_parallel(self, tasks):
+            return (
+                {page_num: original for page_num, _, original, _ in tasks},
+                {page_num for page_num, _, _, _ in tasks},
+            )
+
+    extractor = FailedOcrExtractor(
+        detect_legislative_formatting=False,
+        max_ocr_workers=1,
+    )
+    result = extractor._extract_from_document(Document(), False, time.time())
+
+    assert result["ocr_pending"] == 1
+    assert result["method"] == "pymupdf-partial"
+
+
 def test_contract_catalog_receipt_keeps_terms_and_audits_sku_rows():
     header = (
         "    MFGPART           MFGNAME               PRODNAME           "
@@ -150,6 +215,7 @@ def test_contract_catalog_receipt_keeps_terms_and_audits_sku_rows():
         "Contract number: GS-TEST\nPrompt payment terms: Net 30 Days\n"
         "--- PAGE 2 ---\n"
         + "\n".join(rows)
+        + "\nAMENDMENT 7: increase the contract ceiling to $9 million.\n"
     )
 
     represented = build_compact_representation([SourceDocument("GSA schedule", source)])
@@ -159,6 +225,7 @@ def test_contract_catalog_receipt_keeps_terms_and_audits_sku_rows():
     assert "catalog_rows=1100" in represented.text
     assert "catalog_rows_sha256=" in represented.text
     assert "PART-500" not in represented.text
+    assert "AMENDMENT 7: increase the contract ceiling to $9 million." in represented.text
 
 
 def test_aermod_receipt_keeps_authored_report_and_receipts_model_dump():
@@ -184,6 +251,36 @@ def test_aermod_receipt_keeps_authored_report_and_receipts_model_dump():
     assert "LOCATION\t600" in represented.text
     assert "appendix_sha256=" in represented.text
     assert "LOCATION L0000500" not in represented.text
+
+
+def test_aermod_receipt_reversibly_compacts_authored_fixed_width_tables():
+    authored_rows = "\n".join(
+        f"Finding {index:<8}      Receptor {index:<8}      {index}.000"
+        for index in range(500)
+    )
+    headers = "\n".join(
+        "*** AERMOD - VERSION 22112 ***" for _ in range(25)
+    )
+    records = "\n".join(
+        f"LOCATION L{index:07d} VOLUME {index}.0 3750000.0 500.0"
+        for index in range(600)
+    )
+    source = (
+        "--- PAGE 1 ---\nAuthored findings table\n"
+        + authored_rows
+        + "\n--- PAGE 2 ---\nSO STARTING\n"
+        + headers
+        + "\n"
+        + records
+    )
+
+    represented = build_compact_representation([SourceDocument("Air report", source)])
+
+    assert represented.adapters == ("aermod-report-receipt-v1",)
+    assert "adapter=aermod-authored-fixed-width-v1" in represented.text
+    assert "Finding 0\tReceptor 0\t0.000" in represented.text
+    assert "Finding 499\tReceptor 499\t499.000" in represented.text
+    assert "authored_adapter=aermod-authored-fixed-width-v1" in represented.text
 
 
 def test_election_receipt_keeps_countywide_and_audit_sections():
