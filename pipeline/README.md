@@ -231,14 +231,15 @@ items, and orchestrates guarded extraction and LLM analysis.
 - Acquire and extract PDF/HTML/Office/RTF artifacts through
   `AsyncAnalyzer.extract_document_async()` and the shared
   `DocumentSourceAcquirer`
-- Multi-tier filtering (procedural items, public comments, EIRs, boilerplate)
+- Item eligibility filtering for procedural/ceremonial agenda entries
 - Document-level caching (deduplication within meeting)
-- Document version filtering (keep latest version only)
+- Complete attachment/revision retention with content-addressed provenance
 - Batch item processing
 - Topic normalization and aggregation
 - Participation info extraction and merging
 - Incremental saving (per-chunk)
-- Public comment compilation detection (page count, OCR ratio, signature patterns)
+- Provider-token preflight and deterministic document representations for
+  recognized oversized tables/reports
 
 #### Processing Lanes (urgency-routed)
 
@@ -294,13 +295,14 @@ Meeting has agenda_items
   ├─ Filter already-processed items (reuse canonical summaries from matters)
   ├─ Filter procedural items (minutes, roll call, etc.)
   ├─ Build document cache (meeting-level, shared URLs)
-  │   ├─ Filter document versions (keep latest Ver2 over Ver1)
-  │   ├─ Filter low-value attachments (public comments, EIRs, boilerplate)
+  │   ├─ Retain every listed attachment and revision
   │   ├─ Acquire each unique supported document once (single-flight)
   │   ├─ Dispatch by observed media type under extraction resource limits
-  │   └─ Detect public comment compilations (page count, OCR ratio, signatures)
+  │   └─ Preserve source URL, content hash, page count, and format provenance
   ├─ Separate shared vs item-specific documents
   ├─ Build batch requests (item-specific text, shared context separate)
+  ├─ Count oversized requests with the provider tokenizer
+  ├─ Apply high-confidence table/report receipts only when required
   ├─ Extract participation info from first/last items
   ├─ Process via AsyncAnalyzer.process_batch_items_async()
   │   └─ Generator yields chunks as they complete
@@ -379,14 +381,14 @@ CEREMONIAL_PATTERNS = ["proclamation", "commendation", "recognition", ...]
 ADMINISTRATIVE_PATTERNS = ["appointment", "liquor license", "signboard permit", ...]
 ```
 
-**Attachment level - skip low-value documents:**
+**Attachment level - preserve public documents:**
 
 ```python
-# Public comments: "public comment", "correspondence received", ...
-# Parcel tables: "parcel table", "property list", "assessor", ...
-# Boilerplate contracts: "omnia partners", "sourcewell", "master agreement", ...
-# SF procedural: "ceqa det", "myr memo", "hearing notice", ...
-# Environmental reports: "feir", "deir", "environmental impact report", ...
+# No attachment-title/content skip list is applied during item assembly.
+# Full extracted text remains in the corpus. If the complete prompt exceeds
+# Gemini's input limit, only recognized formats (contract catalogs, election
+# canvasses, AERMOD appendices, dense tables) receive deterministic receipts.
+# Unsupported prose fails preflight rather than being silently excerpted.
 ```
 
 **Matter type level - skip administrative matters:**
@@ -395,15 +397,12 @@ ADMINISTRATIVE_PATTERNS = ["appointment", "liquor license", "signboard permit", 
 SKIP_MATTER_TYPES = ["Minutes", "IRC", "Information Item", "Information Only", ...]
 ```
 
-#### Public Comment Compilation Detection
+#### Corpus and representation boundary
 
-Runtime detection of bulk scanned compilations:
-
-```python
-# Excessive page count (>1000 pages)
-# High OCR ratio on large docs (>50 pages, >30% OCR)
-# Repetitive signatures (>20 "sincerely," in text)
-```
+Original bytes and full extracted text are corpus truth. Model-input receipts
+carry source hashes and exact counts/ranges so a compacted result is auditable;
+they never replace or delete the corpus object. Garbled legacy PDF text layers
+are repaired lazily with OCR, and partial OCR extractions remain retryable.
 
 #### Incremental Saving
 

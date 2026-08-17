@@ -30,6 +30,7 @@ from PIL import Image
 
 from config import get_logger
 from exceptions import ExtractionError
+from parsing.text_quality import is_garbled_text_layer
 
 logger = get_logger(__name__).bind(component="parser")
 
@@ -58,11 +59,12 @@ _RTF_MAGIC = b'{\\rtf'
 _PDF_ANNOT_UNDERLINE = cast(int, getattr(fitz, "PDF_ANNOT_UNDERLINE", 9))
 _PDF_ANNOT_STRIKE_OUT = cast(int, getattr(fitz, "PDF_ANNOT_STRIKE_OUT", 11))
 
-# Sanity bound against pathological workbooks (dimension bombs, formula
-# spew), not an editorial cap: extraction is otherwise lossless and any
-# fitting to the model budget happens at prompt assembly, where it is
-# logged and disclosed to the model.
-XLSX_SANITY_MAX_CHARS = 20_000_000
+# Large, mostly scanned/corrupt-text PDFs can legitimately need several
+# minutes of OCR.  The old five-minute aggregate deadline was just short
+# enough to strand the tail of a 497-page contract while still waiting for
+# its worker threads to exit.  Keep the finite guard, but give the bounded
+# four-worker pool enough time to finish this rare recovery path.
+OCR_TOTAL_TIMEOUT_SECONDS = 540
 
 
 def detect_document_format(data: bytes) -> str:
@@ -189,17 +191,16 @@ def _extract_xlsx(data: bytes) -> Optional[str]:
 
     Fee schedules and budget detail live in spreadsheets; without this, 800+
     attachments were invisible to summarization. Extraction is lossless --
-    every sheet, row, and cell -- so the corpus archives the full text and
-    any trimming happens once, at prompt assembly, where it is logged and
-    disclosed to the model. Empty rows and trailing empty cells carry no
-    text and are skipped.
+    every sheet, row, and cell -- so the corpus archives the full text. Model
+    input sizing is handled later by provider token preflight and compatible
+    deterministic representations. Empty rows and trailing empty cells carry
+    no text and are skipped.
     """
     wb = None
     try:
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         parts = []
-        total_chars = 0
         for ws in wb.worksheets:
             wrote_header = False
             for row in ws.iter_rows(values_only=True):
@@ -210,19 +211,9 @@ def _extract_xlsx(data: bytes) -> Optional[str]:
                     continue
                 if not wrote_header:
                     parts.append(f"## Sheet: {ws.title}")
-                    total_chars += len(parts[-1]) + 1
                     wrote_header = True
                 line = "| " + " | ".join(cells) + " |"
                 parts.append(line)
-                total_chars += len(line) + 1
-                if total_chars > XLSX_SANITY_MAX_CHARS:
-                    logger.warning(
-                        "xlsx sanity cap hit", sheet=ws.title, chars=total_chars
-                    )
-                    parts.append(
-                        "[remaining workbook content omitted: extraction sanity cap]"
-                    )
-                    return "\n".join(parts)
         text = "\n".join(parts)
         return text if text.strip() else None
     except Exception as e:
@@ -717,9 +708,9 @@ class PdfExtractor:
 
         ocr_start = time.time()
 
-        # Total OCR budget: 5 minutes for all pages combined
+        # Total OCR budget for all pages combined.
         # Prevents infinite hangs if Tesseract locks up on any page
-        ocr_total_timeout = 300
+        ocr_total_timeout = OCR_TOTAL_TIMEOUT_SECONDS
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all OCR jobs
@@ -809,8 +800,18 @@ class PdfExtractor:
         empty_original_ocr_usable = orig_chars == 0 and ocr_chars >= 100 and ocr_letter_ratio > 0.15
         significantly_more = ocr_chars >= (orig_chars * 2) and ocr_letter_ratio > 0.4
         high_quality_improvement = ocr_chars > orig_chars and ocr_letter_ratio > 0.7
+        garbled_text_repair = (
+            is_garbled_text_layer(original)
+            and ocr_chars >= 100
+            and not is_garbled_text_layer(ocr_result)
+        )
 
-        if empty_original_ocr_usable or significantly_more or high_quality_improvement:
+        if (
+            empty_original_ocr_usable
+            or significantly_more
+            or high_quality_improvement
+            or garbled_text_repair
+        ):
             logger.info(
                 f"[PyMuPDF] Page {page_num}: Using OCR "
                 f"({ocr_chars} chars, {ocr_words} words, {ocr_letter_ratio:.1%} letters > original {orig_chars} chars)"
@@ -867,12 +868,10 @@ class PdfExtractor:
                     threshold=REDLINE_ACTIVATION_STRUCK_SPANS,
                 )
 
-        # Per-page sanity cap. A single PDF page should never yield more than
-        # a few KB of real text. When PyMuPDF sees a broken font CMap or a
-        # mis-tagged content stream, get_text() can return megabytes of
-        # gibberish for one page and the total exceeds the 1GB RLIMIT_AS
-        # child budget or blows up multiprocessing pickle. Truncate early so
-        # the rest of the document still extracts.
+        # A single PDF page should rarely yield more than a few KB of real
+        # text. A very large layer is therefore an OCR signal, but never a
+        # license to slice the source: if OCR cannot produce a better layer,
+        # retain all embedded text and mark the extraction partial/retryable.
         _MAX_PAGE_CHARS = 200_000
 
         # Pass 1: Extract text from all pages, collect OCR tasks
@@ -885,19 +884,26 @@ class PdfExtractor:
             else:
                 page_text = cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
 
-            if len(page_text) > _MAX_PAGE_CHARS:
+            suspicious_text_volume = len(page_text) > _MAX_PAGE_CHARS
+            if suspicious_text_volume:
                 logger.warning(
-                    "[PyMuPDF] Page yielded suspicious text volume, truncating",
+                    "[PyMuPDF] Page yielded suspicious text volume; preserving and queuing OCR",
                     page_num=page_num + 1,
                     chars=len(page_text),
-                    limit=_MAX_PAGE_CHARS,
+                    threshold=_MAX_PAGE_CHARS,
                 )
-                page_text = page_text[:_MAX_PAGE_CHARS]
 
             initial_char_count = len(page_text.strip())
 
-            # If page has minimal text, queue for OCR
-            if initial_char_count < self.ocr_threshold:
+            # Sparse pages and pages with a strongly garbled embedded text
+            # layer both belong to OCR. A long broken CMap is not better than
+            # an absent text layer merely because it exceeds the char floor.
+            needs_ocr = (
+                suspicious_text_volume
+                or initial_char_count < self.ocr_threshold
+                or is_garbled_text_layer(page_text)
+            )
+            if needs_ocr:
                 if not self.ocr_enabled:
                     # Ground-truth mode: count instead of OCR. The caller uses
                     # ocr_pending to decide whether this text is complete.
@@ -908,7 +914,8 @@ class PdfExtractor:
                         "page queued for OCR",
                         page_num=page_num + 1,
                         char_count=initial_char_count,
-                        threshold=self.ocr_threshold
+                        threshold=self.ocr_threshold,
+                        garbled_text_layer=is_garbled_text_layer(page_text),
                     )
                     # Render page to PNG (main thread, PyMuPDF not thread-safe)
                     rendered = self._render_page_for_ocr(page)
@@ -916,7 +923,11 @@ class PdfExtractor:
                         png_bytes, _, _ = rendered
                         ocr_tasks.append((page_num + 1, png_bytes, page_text))
                     else:
-                        # Rendering failed, keep original
+                        # Rendering failed, keep original but make a broken
+                        # text layer explicitly retryable instead of silently
+                        # stamping the extraction complete.
+                        if suspicious_text_volume or is_garbled_text_layer(page_text):
+                            ocr_pending += 1
                         page_texts[page_num + 1] = page_text
             else:
                 page_texts[page_num + 1] = page_text
@@ -944,6 +955,13 @@ class PdfExtractor:
             1 for page_num, _, original in ocr_tasks
             if page_num in page_texts and page_texts[page_num] != original
         )
+        unrepaired_garbled_pages = sum(
+            1
+            for page_num, _, original in ocr_tasks
+            if is_garbled_text_layer(original)
+            and is_garbled_text_layer(page_texts.get(page_num, original))
+        )
+        ocr_pending += unrepaired_garbled_pages
 
         # Assemble final text in page order
         text_parts = [
@@ -956,10 +974,14 @@ class PdfExtractor:
 
         # Determine extraction method
         method = "pymupdf+ocr" if ocr_pages > 0 else "pymupdf"
+        if ocr_pending > 0:
+            method += "-partial"
 
         log_msg = f"[PyMuPDF] Extracted {page_count} pages, {len(full_text)} chars"
         if ocr_pages > 0:
             log_msg += f" (OCR: {ocr_pages} pages)"
+        if ocr_pending > 0:
+            log_msg += f" (OCR pending: {ocr_pending} pages)"
         if extract_links:
             log_msg += f", {len(all_links)} links"
         log_msg += f" in {extraction_time:.2f}s"

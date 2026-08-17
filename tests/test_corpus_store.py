@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from corpus.r2 import R2Error
-from corpus.store import CorpusOriginal, CorpusStore, sha256_hex
+from corpus.store import CorpusOriginal, CorpusStore, EXTRACT_VERSION, sha256_hex
 
 
 class FakeBlobRepo:
@@ -309,6 +309,58 @@ def test_lookup_misses():
                                        "page_count": 1, "ocr_pages": 0}))
     repo.blobs[SHA]["extract_version"] = "0"
     assert run(store.lookup_extraction(SHA)) is None
+
+
+def test_clean_v1_extraction_remains_compatible_but_garbled_v1_repairs_lazily():
+    store, repo = make_store()
+    run(store.archive_original(SHA, byte_count=len(PDF_BYTES), data=PDF_BYTES))
+    run(
+        store.persist_extraction(
+            SHA,
+            {
+                "success": True,
+                "text": "Readable council contract text. " * 20,
+                "method": "pymupdf",
+                "page_count": 1,
+                "ocr_pages": 0,
+            },
+        )
+    )
+    repo.blobs[SHA]["extract_version"] = "1"
+    assert run(store.lookup_extraction(SHA)) is not None
+
+    store.r2.objects["text/" + SHA + ".txt"] = (
+        "\x9c:w3¬:9 Ö9R\x9c:8¬wÔÖ\x8e\x9cÖR\x8b9S " * 80
+    ).encode()
+    assert run(store.lookup_extraction(SHA)) is None
+    assert EXTRACT_VERSION == "2"
+
+
+def test_partial_ocr_extraction_is_retryable_and_can_be_replaced():
+    store, repo = make_store()
+    run(store.archive_original(SHA, byte_count=len(PDF_BYTES), data=PDF_BYTES))
+    partial = {
+        "success": True,
+        "text": "Readable prefix plus an unrepaired page",
+        "method": "pymupdf+ocr-partial",
+        "page_count": 497,
+        "ocr_pages": 439,
+    }
+    assert run(store.persist_extraction(SHA, partial))
+    assert run(store.lookup_extraction(SHA)) is None
+
+    complete = {
+        "success": True,
+        "text": "Complete readable extraction",
+        "method": "pymupdf+ocr",
+        "page_count": 497,
+        "ocr_pages": 468,
+    }
+    assert run(store.persist_extraction(SHA, complete))
+    served = run(store.lookup_extraction(SHA))
+    assert served is not None
+    assert served["text"] == "Complete readable extraction"
+    assert repo.blobs[SHA]["extract_method"] == "pymupdf+ocr"
 
 
 def test_failed_extraction_not_persisted():

@@ -10,40 +10,26 @@ import fitz
 from openpyxl import Workbook
 
 from analysis.llm.input_budget import (
-    MAX_ITEM_INPUT_CHARS,
-    MAX_SHARED_CONTEXT_CHARS,
-    fit_parts_to_budget,
     prepare_item_text,
-    render_document_parts,
 )
 from analysis.llm.summarizer import GeminiSummarizer
 from database.models import AttachmentInfo
-import parsing.pdf
 from parsing.pdf import PdfExtractor, _extract_xlsx
 from pipeline.processor import Processor
 
 
-def test_many_documents_still_obey_strict_budget():
-    parts = [(str(i), "x" * 50_001) for i in range(73)]
-
-    fitted, notes = fit_parts_to_budget(parts, MAX_ITEM_INPUT_CHARS)
-    rendered, render_notes = render_document_parts(parts, MAX_ITEM_INPUT_CHARS)
-
-    assert sum(len(text) for _, text in fitted) == MAX_ITEM_INPUT_CHARS
-    assert len(rendered) <= MAX_ITEM_INPUT_CHARS
-    assert notes
-    assert render_notes
-
-
-def test_shared_and_item_text_share_one_budget():
+def test_shared_and_item_text_are_not_truncated_before_token_preflight():
+    shared = "s" * 3_800_000
     prepared = prepare_item_text(
         "Large item",
         "i" * 100_000,
-        "s" * MAX_SHARED_CONTEXT_CHARS,
+        shared,
         inline_shared=True,
     )
 
-    assert len(prepared) == MAX_ITEM_INPUT_CHARS
+    assert len(prepared) > 3_800_000
+    assert shared in prepared
+    assert "i" * 100_000 in prepared
     assert "SHARED CONTEXT" in prepared
     assert "AGENDA ITEM: Large item" in prepared
 
@@ -148,15 +134,6 @@ def test_xlsx_extraction_is_lossless():
     assert "omitted" not in text
 
 
-def test_xlsx_sanity_cap_guards_pathological_workbooks(monkeypatch):
-    monkeypatch.setattr(parsing.pdf, "XLSX_SANITY_MAX_CHARS", 200)
-    text = _extract_xlsx(_xlsx_bytes(150))
-
-    assert text is not None
-    assert "extraction sanity cap" in text
-    assert "row-150-" not in text
-
-
 def test_processor_routes_spreadsheet_attachments_to_extraction():
     class Analyzer:
         async def extract_document_async(self, url, banana=None):
@@ -182,3 +159,47 @@ def test_processor_routes_spreadsheet_attachments_to_extraction():
 
     assert item_attachments["item-1"] == ["https://example.test/pricing.xlsx"]
     assert cache["https://example.test/pricing.xlsx"]["text"] == "sheet text"
+
+
+def test_processor_keeps_full_public_comment_and_every_named_revision():
+    full_comment = "public testimony\n" * 2_000
+
+    class Analyzer:
+        async def extract_document_async(self, url, banana=None):
+            text = full_comment if "comment" in url else f"contents of {url}"
+            return {
+                "success": True,
+                "text": text,
+                "page_count": 10,
+                "content_sha256": url[-1] * 64,
+                "source_url": url,
+                "document_format": "pdf",
+            }
+
+    processor = object.__new__(Processor)
+    processor.analyzer = cast(Any, Analyzer())
+    processor._pdf_semaphore = asyncio.Semaphore(2)
+    urls = [
+        "https://example.test/contract-Ver1.pdf",
+        "https://example.test/contract-Ver2.pdf",
+        "https://example.test/comment.pdf",
+    ]
+    item = SimpleNamespace(
+        id="item-1",
+        attachments=[
+            AttachmentInfo(
+                name=("Public Comments" if "comment" in url else url.rsplit("/", 1)[-1]),
+                url=url,
+                type="pdf",
+            )
+            for url in urls
+        ],
+    )
+
+    cache, item_attachments, _shared = asyncio.run(
+        processor._build_document_cache([item], banana="testCA")
+    )
+
+    assert item_attachments["item-1"] == urls
+    assert cache[urls[-1]]["text"] == full_comment
+    assert "excerpt" not in cache[urls[-1]]["text"]

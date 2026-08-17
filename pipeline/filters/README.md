@@ -8,7 +8,9 @@ and honest metrics.
 
 ## The Three Logical Stages
 
-Despite having 6 distinct filter checkpoints, they map to 3 questions:
+The active item path has 4 filter checkpoints. Attachment-name helpers remain
+for legacy matter change detection, but they do not remove documents from
+meeting item assembly. These checkpoints still map to 3 questions:
 
 1. **Should we store this?** (ingestion — only test/demo meetings are dropped)
 2. **Should we process this?** (queuing)
@@ -30,8 +32,6 @@ Vendor API response
     │
     ├─ 4. Processor item filter ─ skip procedural/ceremonial/admin items
     │                              (saved with filter_reason, not summarized)
-    ├─ 5. Attachment filter ───── skip low-value attachments by name
-    ├─ 6. Document heuristics ─── skip bulk docs by content analysis (post-extraction)
     │
     │  ── sent to LLM ──
     ▼
@@ -80,10 +80,11 @@ Vendor API response
 **Rationale:** These have search value but no policy substance worth summarizing.
 The `filter_reason` column enables auditing what % of items are filtered and why.
 
-### 5. Attachment Name Level — `is_public_comment_attachment(name)`
+### Legacy matter identity — `is_public_comment_attachment(name)`
 
-**Stage:** Extraction
-**Impact:** Attachment skipped before PDF extraction
+**Stage:** Matter change detection only
+**Impact:** Excludes low-signal attachments from the legacy substantive hash;
+does not filter the current meeting item document cache or model input
 **Pattern groups:**
 - `PUBLIC_COMMENT_PATTERNS` — public comments, letters, correspondence (20+ patterns)
 - `PARCEL_TABLE_PATTERNS` — property lists, assessor data
@@ -91,23 +92,10 @@ The `filter_reason` column enables auditing what % of items are filtered and why
 - `SF_PROCEDURAL_PATTERNS` — SF-specific routing forms (city-specific!)
 - `EIR_PATTERNS` — environmental impact reports
 
-**Called in:** `processor.py`
-**Also:** `filter_version_attachments()` in `vendors/utils/attachments.py` deduplicates
-versioned attachments (keeps highest version only).
-
-### 6. Document Content Heuristics — `is_likely_public_comment_compilation()`
-
-**Stage:** Extraction (post-PDF-extraction, pre-LLM)
-**Impact:** Extracted text discarded before LLM
-**Thresholds:**
-- \>1000 pages → skip (massive compilation)
-- 50-1000 pages + >30% OCR → skip (bulk scanned letters)
-- \>5000 chars + >20 "Sincerely," → skip (comment letter compilation)
-
-**Called in:** `processor.py`
-**Rationale:** Last-resort catch for documents that looked legitimate by name but are
-actually bulk compilations. Runs after we've already paid the extraction cost, so
-this is about saving LLM tokens specifically.
+**Called in:** `pipeline/utils.py` compatibility hashing. The current processor
+retains all listed revisions and public-comment attachments. Oversized inputs
+fail provider preflight unless a high-confidence deterministic representation
+exists; no bulk-document content heuristic discards extracted text.
 
 ## Files
 
@@ -116,8 +104,8 @@ this is about saving LLM tokens specifically.
 | `item_filters.py` | All pattern constants + filter functions (meeting, processor, matter, attachment) |
 | `orchestrators/matter_filter.py` | Thin class wrapper around `should_skip_matter()` |
 | `orchestrators/enqueue_decider.py` | Queue enrollment logic + priority scoring |
-| `processor.py` | Heuristic thresholds + `is_likely_public_comment_compilation()` |
-| `vendors/utils/attachments.py` | Attachment version deduplication |
+| `processor.py` | Complete meeting item document assembly |
+| `analysis/llm/document_representation.py` | Auditable model-input receipts |
 
 ## Known Issues and Debt
 

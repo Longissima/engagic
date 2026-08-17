@@ -730,6 +730,7 @@ CREATE INDEX IF NOT EXISTS idx_items_meeting_id ON items(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_items_matter_meeting ON items(matter_id, meeting_id) WHERE matter_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_items_meeting_summarized ON items(meeting_id) WHERE summary IS NOT NULL;  -- For stats query: meetings with summarized items
 CREATE INDEX IF NOT EXISTS idx_items_filter_reason ON items(filter_reason) WHERE filter_reason IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_items_summary_updated_id ON items(summary_updated_at, id);  -- Stable cursor for Motioncount incremental summary discovery
 
 -- Item topics (new normalized table)
 CREATE INDEX IF NOT EXISTS idx_item_topics_topic ON item_topics(topic);

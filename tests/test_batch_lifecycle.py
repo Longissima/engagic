@@ -364,6 +364,107 @@ async def test_large_batch_request_is_counted_and_rejected_before_upload(
 
 
 @pytest.mark.asyncio
+async def test_oversized_tabular_request_is_compacted_and_recounted(
+    monkeypatch,
+) -> None:
+    summarizer = make_summarizer()
+    counted = []
+    submitted = []
+
+    async def to_thread(call, *args, **kwargs):
+        return call(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+
+    def count_tokens(**kwargs):
+        contents = kwargs["contents"]
+        counted.append(contents)
+        total = (
+            BATCH_INPUT_TOKEN_LIMIT + 1
+            if "[ADDED:" in contents
+            else BATCH_INPUT_TOKEN_LIMIT - 1
+        )
+        return SimpleNamespace(total_tokens=total)
+
+    summarizer.client = SimpleNamespace(
+        models=SimpleNamespace(count_tokens=count_tokens)
+    )
+
+    async def submit_one(chunk, chunk_num, *_args, **_kwargs):
+        submitted.extend(chunk)
+        return {
+            "gemini_job_name": "jobs/represented",
+            "item_ids": [request["item_id"] for request in chunk],
+            "chunk_num": chunk_num,
+            "attempts": 1,
+        }
+
+    summarizer._submit_one_chunk = submit_one
+    source = "\n".join(
+        f"[ADDED: Candidate {index}]\n[ADDED: {index}]\n[ADDED: 0]"
+        for index in range(15_000)
+    )
+    request = {
+        "item_id": "item-table",
+        "title": "Canvass",
+        "text": source,
+        "documents": [{"name": "Canvass", "text": source}],
+    }
+
+    descriptors = await summarizer.submit_item_batches(
+        [request], submission_scope="meeting-1", include_failures=True
+    )
+
+    assert len(counted) == 2
+    assert descriptors[0]["gemini_job_name"] == "jobs/represented"
+    assert submitted[0]["_representation_self_contained"] is True
+    assert "[REPRESENTATION civic-document-v2" in submitted[0]["text"]
+    assert "[ADDED:" not in submitted[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_provider_blocked_evidence_is_represented_before_size_preflight() -> None:
+    summarizer = make_summarizer()
+    submitted = []
+
+    async def submit_one(chunk, chunk_num, *_args, **_kwargs):
+        submitted.extend(chunk)
+        return {
+            "gemini_job_name": "jobs/provider-compatible",
+            "item_ids": [request["item_id"] for request in chunk],
+            "chunk_num": chunk_num,
+            "attempts": 1,
+        }
+
+    summarizer._submit_one_chunk = submit_one
+    explicit_exhibit = "rating review massage provider details\n" * 400
+    request = {
+        "item_id": "item-evidence",
+        "title": "Massage establishment license",
+        "text": explicit_exhibit,
+        "documents": [
+            {
+                "name": "Regarding Application_RubmapsReviews",
+                "text": explicit_exhibit,
+                "content_sha256": "b" * 64,
+            }
+        ],
+    }
+
+    descriptors = await summarizer.submit_item_batches(
+        [request], submission_scope="meeting-1", include_failures=True
+    )
+
+    assert descriptors[0]["gemini_job_name"] == "jobs/provider-compatible"
+    assert submitted[0]["_representation_self_contained"] is True
+    assert submitted[0]["_representation_adapters"] == (
+        "public-record-evidence-receipt-v1",
+    )
+    assert "text_sha256=" in submitted[0]["text"]
+    assert "rating review massage provider details" not in submitted[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_poll_failure_is_persisted_and_lease_released_for_retry() -> None:
     marked: list[tuple[int, str]] = []
 

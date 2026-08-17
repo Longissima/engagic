@@ -20,7 +20,6 @@ from pipeline.outbox_dispatch import dispatch_outbox_event
 from pipeline.outcomes import JobOutcome, OutcomeStatus
 from pipeline.orchestrators.meeting_sync import MeetingSyncOrchestrator
 from pipeline.utils import (
-    filter_document_version_urls,
     MatterWorkSnapshot,
     matter_title_identity,
     meeting_work_version,
@@ -31,17 +30,13 @@ from analysis.analyzer_async import AsyncAnalyzer
 from analysis.llm.summarizer import GeminiSummarizer
 from analysis.llm.input_budget import (
     DOCUMENT_ATTACHMENT_TYPES,
-    MAX_ITEM_INPUT_CHARS,
-    MAX_SHARED_CONTEXT_CHARS,
-    PUBLIC_COMMENT_EXCERPT_CHARS,
-    render_document_parts,
-    truncate_text_to_budget,
 )
+from analysis.llm.document_representation import render_documents
 from analysis.topics.normalizer import get_normalizer
 from parsing.participation import parse_participation_info
 from config import config, get_logger
 from pipeline.protocols import MetricsCollector, NullMetrics
-from pipeline.filters import get_skip_reason, is_public_comment_attachment
+from pipeline.filters import get_skip_reason
 from vendors.adapters.parsers.morphology import is_bare_document
 from vendors.session_manager_async import AsyncSessionManager
 
@@ -120,8 +115,6 @@ def _merge_participation_info(
 STALE_SWEEP_INTERVAL = 300
 STALE_SWEEP_MINUTES = 15
 
-PUBLIC_COMMENT_SIGNATURE_THRESHOLD = 20
-
 # Cache libc handle for malloc_trim. glibc retains freed heap arenas by default;
 # malloc_trim(0) forces release back to the kernel after large transient allocations.
 # None on non-glibc platforms (macOS dev, musl) -- feature is a no-op there.
@@ -157,28 +150,6 @@ def filter_participation_for_city(
     if not city_has_participation:
         return parsed
     return {k: v for k, v in parsed.items() if k in MEETING_SPECIFIC_PARTICIPATION_KEYS}
-
-
-def is_likely_public_comment_compilation(
-    extraction_result: Dict[str, Any],
-    url_path: str
-) -> bool:
-    """Detect public comment compilations via signature patterns.
-
-    Pre-extraction filtering by attachment name is handled by is_public_comment_attachment().
-    This is a post-extraction fallback for documents that slipped past the name filter.
-    Page count and OCR ratio are not reliable signals -- legitimate contracts and bid
-    documents routinely have hundreds of pages and scanned attachments.
-    """
-    text = extraction_result.get("text", "")
-
-    if len(text) > 5000:
-        sincerely_count = text.lower().count("sincerely,")
-        if sincerely_count > PUBLIC_COMMENT_SIGNATURE_THRESHOLD:
-            logger.info("skipping likely comment compilation - repetitive signatures", url_path=url_path, signature_count=sincerely_count)
-            return True
-
-    return False
 
 
 class Processor:
@@ -1455,10 +1426,6 @@ class Processor:
         """Backward-compatible thin adapter for the finite batch supervisor."""
         return await self.run_batch_supervisor(bananas)
 
-    def _filter_document_versions(self, urls: List[str]) -> List[str]:
-        """Keep only latest versions (Ver2 > Ver1, etc.)."""
-        return filter_document_version_urls(urls)
-
     async def _execute_streaming_job(self, job: QueueJob) -> JobOutcome | Dict[str, Any]:
         """Load authoritative state and execute one streaming-lane descriptor."""
         if isinstance(job.payload, MatterJob):
@@ -1927,11 +1894,7 @@ class Processor:
         for att in item.attachments:
             att_url, att_type, att_name = att.url, att.type, att.name
 
-            if att_type not in ("pdf", "doc", "document", "unknown") or not att_url:
-                continue
-
-            if att_name and is_public_comment_attachment(att_name):
-                logger.info("skipping low-value attachment", name=att_name)
+            if att_type not in DOCUMENT_ATTACHMENT_TYPES or not att_url:
                 continue
 
             attachments_to_extract.append((att_url, att_name))
@@ -1944,9 +1907,6 @@ class Processor:
                 try:
                     result = await analyzer.extract_document_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
-                        if is_likely_public_comment_compilation(result, att_name or att_url):
-                            logger.info("skipping public comment compilation", name=att_name or att_url)
-                            return None
                         logger.debug("extracted attachment text", attachment=att_name or att_url, pages=result.get('page_count', 0), chars=len(result['text']))
                         return (att_name or att_url, result["text"], result.get("page_count", 0))
                     return None
@@ -3181,7 +3141,7 @@ class Processor:
         return already_processed, need_processing, filter_writes
 
     async def _build_document_cache(self, need_processing: List, banana: Optional[str] = None) -> tuple[Dict, Dict, set]:
-        """Build meeting-level document cache with version filtering and deduplication.
+        """Build a meeting cache retaining every distinct attachment URL.
 
         banana is corpus provenance only, from the meeting row (DB truth)."""
         logger.info("building meeting-level document cache")
@@ -3199,10 +3159,13 @@ class Processor:
                     if att.name and att.url not in url_to_name:
                         url_to_name[att.url] = att.name
 
-            filtered_item_urls = self._filter_document_versions(item_urls)
-            item_attachments[item.id] = filtered_item_urls
+            # Every listed revision is evidence. The corpus keeps historical
+            # bytes, and prompt assembly must not silently select only the
+            # newest filename-level "VerN" attachment.
+            retained_item_urls = list(dict.fromkeys(item_urls))
+            item_attachments[item.id] = retained_item_urls
 
-            for url in filtered_item_urls:
+            for url in retained_item_urls:
                 all_urls.add(url)
                 url_to_items.setdefault(url, []).append(item.id)
 
@@ -3213,14 +3176,9 @@ class Processor:
             return {}, item_attachments, all_urls
         analyzer = self.analyzer
 
-        # Public-comment attachments are extracted but excerpted below, never
-        # silently dropped: the public's position is part of the record.
         urls_to_extract = []
-        comment_urls = set()
         for att_url in all_urls:
             att_name = url_to_name.get(att_url, "")
-            if att_name and is_public_comment_attachment(att_name):
-                comment_urls.add(att_url)
             urls_to_extract.append((att_url, att_name))
 
         # Concurrent PDF extraction (global semaphore caps total across all meetings)
@@ -3233,18 +3191,14 @@ class Processor:
                     if result.get("success") and result.get("text"):
                         text = result["text"]
                         page_count = result.get("page_count", 0)
-                        is_comment = att_url in comment_urls or is_likely_public_comment_compilation(
-                            result, att_name or att_url
-                        )
-                        if is_comment and len(text) > PUBLIC_COMMENT_EXCERPT_CHARS:
-                            logger.info("excerpting public comment document", attachment=att_name or att_url, pages=page_count, chars=len(text))
-                            text = (
-                                text[:PUBLIC_COMMENT_EXCERPT_CHARS]
-                                + "\n\n[PIPELINE NOTE: this attachment appears to be a public-comment"
-                                f" document ({page_count} pages, {len(result['text']):,} characters);"
-                                " only the excerpt above is included]"
-                            )
-                        return att_url, {"text": text, "page_count": page_count, "name": att_name or att_url}
+                        return att_url, {
+                            "text": text,
+                            "page_count": page_count,
+                            "name": att_name or att_url,
+                            "content_sha256": result.get("content_sha256"),
+                            "source_url": result.get("source_url") or att_url,
+                            "document_format": result.get("document_format"),
+                        }
                     return att_url, None
                 except (ExtractionError, OSError, IOError) as e:
                     logger.warning("failed to extract document", attachment=att_name or att_url, error=str(e))
@@ -3289,14 +3243,11 @@ class Processor:
         batch_requests = []
         item_map = {}
         failed_items = []
-        # The shared documents count toward every item's context window whether
-        # they are inline or held in Gemini cached content.
-        item_text_budget = max(0, MAX_ITEM_INPUT_CHARS - shared_context_chars - 1_000)
-
         for item in need_processing:
             try:
                 doc_parts = []
                 unreadable = []
+                source_documents = []
                 total_page_count = 0
                 has_shared_attachments = False
                 url_names = {
@@ -3306,6 +3257,8 @@ class Processor:
                 }
 
                 for att_url in item_attachments.get(item.id, []):
+                    if att_url in document_cache:
+                        source_documents.append(document_cache[att_url])
                     if att_url in shared_urls:
                         has_shared_attachments = True
                         continue
@@ -3325,17 +3278,37 @@ class Processor:
                         "[PIPELINE NOTE: the following attachments exist for this"
                         " item but could not be read: " + "; ".join(unreadable) + "]"
                     )
+                    source_documents.append(
+                        {
+                            "name": "Attachment extraction status",
+                            "text": unreadable_note,
+                            "document_format": "text",
+                        }
+                    )
+
+                body_text = item.body_text or ""
+                if body_text:
+                    source_documents.append(
+                        {
+                            "name": "Agenda item body text",
+                            "text": body_text,
+                            "source_url": None,
+                            "content_sha256": None,
+                            "page_count": None,
+                            "document_format": "text",
+                        }
+                    )
 
                 # Items with only shared attachments can still be processed
                 # using shared context + item metadata
                 if doc_parts:
-                    note_chars = len(unreadable_note) + 2 if unreadable_note else 0
-                    combined_text, trim_notes = render_document_parts(
-                        doc_parts,
-                        max(0, item_text_budget - note_chars),
+                    combined_text = render_documents(
+                        {"name": name, "text": text} for name, text in doc_parts
                     )
-                    if trim_notes:
-                        logger.warning("item input trimmed to budget", title=item.title[:50], notes=trim_notes)
+                    if body_text:
+                        combined_text += (
+                            "\n\n=== Agenda item body text ===\n" + body_text
+                        )
                     if unreadable_note:
                         combined_text += "\n\n" + unreadable_note
                 elif has_shared_attachments:
@@ -3343,11 +3316,8 @@ class Processor:
                     desc = getattr(item, 'description', '') or ''
                     combined_text = f"[Item: {item.title}]\n{desc}".strip() if desc else f"[Item: {item.title}]"
                     logger.debug("item uses shared attachments only", title=item.title[:50])
-                elif item.body_text:
-                    combined_text = truncate_text_to_budget(
-                        item.body_text,
-                        max(0, item_text_budget - len(unreadable_note) - 2),
-                    )
+                elif body_text:
+                    combined_text = body_text
                     if unreadable_note:
                         combined_text += "\n\n" + unreadable_note
                     logger.debug("using coversheet body text", title=item.title[:50], chars=len(combined_text))
@@ -3355,10 +3325,6 @@ class Processor:
                     logger.warning("no text extracted for item", title=item.title[:50])
                     failed_items.append(item.title)
                     continue
-
-                # Notes and coversheet fallbacks are assembled after document
-                # fitting, so enforce the absolute item share one final time.
-                combined_text = truncate_text_to_budget(combined_text, item_text_budget)
 
                 if item.sequence in (first_sequence, last_sequence):
                     item_participation = parse_participation_info(combined_text)
@@ -3373,6 +3339,7 @@ class Processor:
                     "text": combined_text,
                     "sequence": item.sequence,
                     "page_count": total_page_count if total_page_count > 0 else None,
+                    "documents": source_documents,
                 })
                 item_map[item.id] = item
                 logger.debug("prepared item for batch processing", title=item.title[:50], chars=len(combined_text))
@@ -3721,18 +3688,10 @@ class Processor:
             shared_context = None
             if shared_urls:
                 shared_parts = [
-                    (document_cache[url]["name"], document_cache[url]["text"])
+                    document_cache[url]
                     for url in sorted(shared_urls)
                 ]
-                shared_context, shared_trim_notes = render_document_parts(
-                    shared_parts,
-                    MAX_SHARED_CONTEXT_CHARS,
-                )
-                if shared_trim_notes:
-                    logger.warning(
-                        "shared context trimmed to budget",
-                        notes=shared_trim_notes,
-                    )
+                shared_context = render_documents(shared_parts)
                 logger.info("built meeting-level shared context", chars=len(shared_context), shared_document_count=len(shared_urls))
 
             batch_requests, item_map, failed_items = self._build_batch_requests(

@@ -63,6 +63,7 @@ CREATE TABLE schema_migrations (
 | 034 | document_source_freshness | Separate cached observations from successful origin validation; persist HTTP validators and retry-attempt state for bounded conditional revalidation. |
 | 035 | batch_submission_clock | Record provider acceptance separately from durable pre-provider intent creation so provider wait is measured from the correct boundary. |
 | 036 | nullable_appearance_dates | Preserve authoritative appearances for undated meetings by allowing `matter_appearances.appeared_at` to remain NULL. |
+| 037 | items_summary_updated_cursor | Add the `(summary_updated_at, id)` item index used by Motioncount incremental summary discovery. |
 
 ## Guidelines
 

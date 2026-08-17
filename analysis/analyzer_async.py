@@ -78,16 +78,59 @@ def _extract_pdf_in_subprocess(document_path, ocr_threshold, ocr_dpi,
     The child imports parsing.pdf (the guard target's module), not this
     module -- spawns no longer pay for the analyzer's HTTP/LLM import stack.
     """
+    args = (
+        document_path,
+        ocr_threshold,
+        ocr_dpi,
+        detect_legislative_formatting,
+        max_ocr_workers,
+    )
     try:
         return run_guarded(
             extract_document_file,
-            (document_path, ocr_threshold, ocr_dpi, detect_legislative_formatting, max_ocr_workers),
+            args,
             timeout=600,
             rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
         )
     except GuardTimeout:
         raise ExtractionError("Document extraction subprocess timed out after 600s")
     except GuardCrashed as e:
+        # Drawing inspection is the highest-risk native MuPDF operation in
+        # this path. Some otherwise readable, graphics-heavy PDFs crash there
+        # while plain text extraction succeeds. Retry once in a fresh guarded
+        # child without redline geometry; never retry a crash in-process.
+        if detect_legislative_formatting:
+            logger.warning(
+                "guarded PDF extraction crashed; retrying without legislative geometry",
+                exit_code=e.exitcode,
+            )
+            try:
+                return run_guarded(
+                    extract_document_file,
+                    (
+                        document_path,
+                        ocr_threshold,
+                        ocr_dpi,
+                        False,
+                        max_ocr_workers,
+                    ),
+                    timeout=600,
+                    rlimit_bytes=int(1.5 * 1024 * 1024 * 1024),
+                )
+            except GuardTimeout:
+                raise ExtractionError(
+                    "Document extraction fallback timed out after 600s"
+                )
+            except GuardCrashed as fallback_error:
+                raise ExtractionError(
+                    "Document extraction subprocess crashed twice "
+                    f"(exit codes {e.exitcode}, {fallback_error.exitcode})"
+                )
+            except GuardTaskError as fallback_error:
+                raise ExtractionError(
+                    "Document extraction fallback failed: "
+                    f"{fallback_error} ({fallback_error.error_type})"
+                )
         raise ExtractionError(
             f"Document extraction subprocess crashed (exit code {e.exitcode})"
         )

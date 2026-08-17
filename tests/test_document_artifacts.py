@@ -14,6 +14,7 @@ import analysis.analyzer_async as analyzer_module
 from analysis.analyzer_async import AsyncAnalyzer
 from corpus.store import CorpusOriginal, sha256_hex
 from parsing.pdf import PdfExtractor
+from parsing.subprocess_guard import GuardCrashed
 from pipeline.document_artifacts import (
     DocumentArtifact,
     DocumentFormat,
@@ -575,6 +576,33 @@ def test_extraction_releases_artifact_before_guarded_child(monkeypatch):
 
     assert result["text"] == "released"
     assert result["content_sha256"] == content_sha
+
+
+def test_guarded_pdf_crash_retries_without_legislative_geometry(monkeypatch):
+    calls = []
+
+    def guarded(call, args, **kwargs):
+        calls.append((call, args, kwargs))
+        if len(calls) == 1:
+            raise GuardCrashed("native crash", exitcode=-11)
+        return {
+            "success": True,
+            "text": "complete fallback extraction",
+            "method": "pymupdf",
+            "page_count": 28,
+            "ocr_pages": 0,
+            "ocr_pending": 0,
+        }
+
+    monkeypatch.setattr(analyzer_module, "run_guarded", guarded)
+
+    result = analyzer_module._extract_pdf_in_subprocess(
+        "/tmp/problem.pdf", 100, 150, True, 3
+    )
+
+    assert result["text"] == "complete fallback extraction"
+    assert [entry[1][3] for entry in calls] == [True, False]
+    assert all(entry[2]["timeout"] == 600 for entry in calls)
 
 
 def test_session_rotation_waits_for_each_sessions_final_request(monkeypatch):

@@ -28,6 +28,7 @@ from config import config, get_logger
 from corpus.r2 import R2Client
 from database.repositories_async.document_blobs import DocumentBlobRepository
 from pipeline.utils import attachment_identity
+from parsing.text_quality import is_garbled_text_layer
 
 logger = get_logger(__name__).bind(component="corpus")
 
@@ -35,7 +36,8 @@ logger = get_logger(__name__).bind(component="corpus")
 # extractor materially changes (Tesseract -> VLM OCR, Layout adoption):
 # lookup_extraction treats rows from other versions as misses, so re-extraction
 # happens lazily exactly where documents are touched again.
-EXTRACT_VERSION = "1"
+EXTRACT_VERSION = "2"
+_COMPATIBLE_EXTRACT_VERSIONS = frozenset({"1", EXTRACT_VERSION})
 
 _ORIGINAL_PREFIX = "originals/"
 _TEXT_PREFIX = "text/"
@@ -235,6 +237,7 @@ class CorpusStore:
                 existing
                 and existing.get("text_key")
                 and existing.get("extract_version") == EXTRACT_VERSION
+                and not str(existing.get("extract_method") or "").endswith("-partial")
             ):
                 return True
 
@@ -278,8 +281,16 @@ class CorpusStore:
             blob = await self.blobs.get_blob(content_sha256)
             if not blob or not blob.get("text_key"):
                 return None
-            if blob.get("extract_version") != EXTRACT_VERSION:
+            extract_version = blob.get("extract_version")
+            if extract_version not in _COMPATIBLE_EXTRACT_VERSIONS:
                 return None  # older extractor produced this; re-extract fresh
+            if str(blob.get("extract_method") or "").endswith("-partial"):
+                logger.info(
+                    "partial corpus extraction requires OCR retry",
+                    sha=content_sha256[:16],
+                    extract_method=blob.get("extract_method"),
+                )
+                return None
 
             text_bytes = await self.r2.get(blob["text_key"])
             if text_bytes is None:
@@ -290,9 +301,21 @@ class CorpusStore:
                 )
                 return None
 
+            text = text_bytes.decode("utf-8", errors="replace")
+            # Version 2 adds broken-font/CMap repair. Keep serving every clean
+            # v1 extraction so this targeted upgrade does not force a corpus-
+            # wide re-extraction; only demonstrably garbled legacy text misses.
+            if extract_version != EXTRACT_VERSION and is_garbled_text_layer(text):
+                logger.info(
+                    "legacy corpus extraction requires garbled-text repair",
+                    sha=content_sha256[:16],
+                    extract_version=extract_version,
+                )
+                return None
+
             return {
                 "success": True,
-                "text": text_bytes.decode("utf-8", errors="replace"),
+                "text": text,
                 "method": blob.get("extract_method"),
                 "page_count": blob.get("page_count") or 0,
                 "ocr_pages": blob.get("ocr_page_count") or 0,
