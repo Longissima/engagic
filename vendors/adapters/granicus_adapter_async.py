@@ -18,6 +18,8 @@ import os
 import re
 import asyncio
 import tempfile
+from copy import deepcopy
+from difflib import SequenceMatcher
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urljoin, urlparse, unquote, parse_qs
@@ -47,6 +49,212 @@ def _ensure_attachment_portal_urls(items: List[Dict[str, Any]]) -> List[Dict[str
             if url and not att.get("portal_url"):
                 att["portal_url"] = url
     return items
+
+
+def _normalized_item_text(value: Any) -> str:
+    """Normalize human labels for conservative cross-document matching."""
+    folded = str(value or "").casefold()
+    return " ".join(
+        "".join(character if character.isalnum() else " " for character in folded).split()
+    )
+
+
+def _item_section(item: Dict[str, Any]) -> str:
+    metadata = item.get("metadata") or {}
+    return _normalized_item_text(
+        item.get("section")
+        or metadata.get("section")
+        or metadata.get("section_path")
+    )
+
+
+def _item_number_keys(item: Dict[str, Any]) -> set[str]:
+    """Return only explicit/leading agenda identifiers, never arbitrary numbers."""
+    keys: set[str] = set()
+    for raw in (item.get("vendor_item_id"), item.get("agenda_number")):
+        normalized = re.sub(r"[^a-z0-9]+", "", str(raw or "").casefold())
+        if normalized:
+            keys.add(normalized)
+
+    title = str(item.get("title") or "").strip()
+    leading = re.match(
+        r"^(?:item\s+)?((?:[a-z]\d*|\d+)(?:[.\-][a-z0-9]+)*)(?:\s*[-.:)]|\s+)",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if leading:
+        normalized = re.sub(r"[^a-z0-9]+", "", leading.group(1).casefold())
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+def _packet_match_index(
+    packet_item: Dict[str, Any],
+    agenda_items: List[Dict[str, Any]],
+    agenda_key_counts: Dict[str, int],
+) -> Optional[int]:
+    """Find one unambiguous agenda owner for a packet-derived evidence entry.
+
+    Packet TOCs frequently contain several entries per real agenda item.  This
+    deliberately permits many packet entries to enrich one agenda item, while
+    refusing to manufacture agenda shape from ambiguous section-local labels.
+    """
+    packet_title = _normalized_item_text(packet_item.get("title"))
+    packet_section = _item_section(packet_item)
+    packet_keys = _item_number_keys(packet_item)
+
+    exact_title = [
+        idx
+        for idx, agenda_item in enumerate(agenda_items)
+        if packet_title
+        and packet_title == _normalized_item_text(agenda_item.get("title"))
+    ]
+    if len(exact_title) == 1:
+        return exact_title[0]
+
+    keyed = [
+        idx
+        for idx, agenda_item in enumerate(agenda_items)
+        if packet_keys & _item_number_keys(agenda_item)
+    ]
+    if len(keyed) == 1:
+        # A key is safe only when it is unique in the authoritative agenda.
+        shared = packet_keys & _item_number_keys(agenda_items[keyed[0]])
+        if any(agenda_key_counts.get(key) == 1 for key in shared):
+            return keyed[0]
+
+    if len(keyed) > 1 and packet_section:
+        section_matches = [
+            idx for idx in keyed if _item_section(agenda_items[idx]) == packet_section
+        ]
+        if len(section_matches) == 1:
+            return section_matches[0]
+        if section_matches:
+            keyed = section_matches
+
+    # Titles can bridge agendas whose item number is missing from one PDF, but
+    # only at a high threshold with a clear winner.  Short generic headings are
+    # intentionally excluded.
+    if len(packet_title) < 18:
+        return None
+    candidates = keyed or list(range(len(agenda_items)))
+    scored = sorted(
+        (
+            SequenceMatcher(
+                None,
+                packet_title,
+                _normalized_item_text(agenda_items[idx].get("title")),
+                autojunk=False,
+            ).ratio(),
+            idx,
+        )
+        for idx in candidates
+    )
+    if not scored:
+        return None
+    best_score, best_idx = scored[-1]
+    runner_up = scored[-2][0] if len(scored) > 1 else 0.0
+    if best_score >= 0.92 and best_score - runner_up >= 0.06:
+        return best_idx
+    return None
+
+
+def _attachment_identity(attachment: Dict[str, Any]) -> tuple[str, ...]:
+    document_identity = (
+        str(attachment.get("url") or "").strip(),
+        str(attachment.get("portal_url") or "").strip(),
+        str(attachment.get("history_id") or "").strip(),
+        str(attachment.get("meta_id") or "").strip(),
+    )
+    if any(document_identity):
+        return ("document", *document_identity)
+    return ("label", _normalized_item_text(attachment.get("name")))
+
+
+def _merge_packet_evidence(
+    agenda_items: List[Dict[str, Any]],
+    packet_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep agenda-defined shape and merge confidently matched packet evidence.
+
+    An empty agenda has no authoritative shape, so the packet remains the
+    fallback.  Otherwise unmatched packet TOC entries (exhibits, clauses,
+    cover pages) never become standalone agenda items.
+    """
+    if not agenda_items:
+        return deepcopy(packet_items)
+    if not packet_items:
+        return deepcopy(agenda_items)
+
+    merged = deepcopy(agenda_items)
+    agenda_key_counts: Dict[str, int] = {}
+    for agenda_item in agenda_items:
+        for key in _item_number_keys(agenda_item):
+            agenda_key_counts[key] = agenda_key_counts.get(key, 0) + 1
+
+    for packet_item in packet_items:
+        match_idx = _packet_match_index(
+            packet_item, agenda_items, agenda_key_counts
+        )
+        if match_idx is None:
+            continue
+
+        target = merged[match_idx]
+        existing_attachments = target.get("attachments")
+        if not isinstance(existing_attachments, list):
+            existing_attachments = []
+            target["attachments"] = existing_attachments
+        seen_attachments = {
+            _attachment_identity(attachment)
+            for attachment in existing_attachments
+        }
+        for attachment in packet_item.get("attachments") or []:
+            # Empty URLs are packet-internal page markers, not downloadable
+            # attachments.  The meeting-level packet_url remains the durable
+            # link to those pages.
+            if not str(attachment.get("url") or "").strip():
+                continue
+            identity = _attachment_identity(attachment)
+            if identity in seen_attachments:
+                continue
+            existing_attachments.append(deepcopy(attachment))
+            seen_attachments.add(identity)
+
+        packet_body = str(packet_item.get("body_text") or "").strip()
+        agenda_body = str(target.get("body_text") or "").strip()
+        if packet_body:
+            normalized_packet = _normalized_item_text(packet_body)
+            normalized_agenda = _normalized_item_text(agenda_body)
+            if not agenda_body:
+                target["body_text"] = packet_body
+            elif normalized_packet and normalized_packet not in normalized_agenda:
+                target["body_text"] = (
+                    f"{agenda_body}\n\n[Packet evidence]\n{packet_body}"
+                )
+
+        for field in ("matter_id", "matter_file", "matter_type"):
+            if not target.get(field) and packet_item.get(field):
+                target[field] = packet_item[field]
+
+        packet_metadata = packet_item.get("metadata") or {}
+        metadata = target.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            target["metadata"] = metadata
+        if packet_metadata.get("page_start") is not None:
+            metadata.setdefault("packet_page_start", packet_metadata["page_start"])
+        if packet_metadata.get("page_end") is not None:
+            metadata.setdefault("packet_page_end", packet_metadata["page_end"])
+        if packet_metadata.get("parse_method"):
+            metadata.setdefault(
+                "packet_parse_method", packet_metadata["parse_method"]
+            )
+        metadata["packet_evidence_items"] = (
+            int(metadata.get("packet_evidence_items") or 0) + 1
+        )
+
+    return merged
 
 
 def _translate_downloadfile_to_viewdocument(url: str) -> str:
@@ -310,7 +518,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 )
                 pdf_items = await self._parse_pdf_response(response, event_id, force_method="url")
                 resolved_packet_url = final_url
-                # Thin-agenda fallback: if the agenda PDF produced nothing
+                # Thin-agenda enrichment: if the agenda PDF produced nothing
                 # useful -- either zero items or items with no attachments
                 # (motion-boilerplate body_text doesn't count; Winder GA's
                 # "Consideration of a Motion to accept..." items have 400-char
@@ -325,7 +533,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                     listing_packet = meeting_data.get("packet_url")
                     if listing_packet and listing_packet != final_url:
                         logger.info(
-                            "agenda pdf hollow, falling back to listing packet",
+                            "agenda pdf hollow, enriching from listing packet",
                             vendor="granicus",
                             slug=self.slug,
                             event_id=event_id,
@@ -336,7 +544,9 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                             listing_packet, event_id, force_method="toc"
                         )
                         if packet_items:
-                            pdf_items = packet_items
+                            pdf_items = _merge_packet_evidence(
+                                pdf_items or [], packet_items
+                            )
                             resolved_packet_url = listing_packet
                 if pdf_items:
                     pdf_items = _ensure_attachment_portal_urls(pdf_items)
@@ -363,7 +573,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                     )
                     pdf_items = await self._parse_packet_pdf(real_pdf_url, event_id, force_method="url")
                     resolved_packet_url = real_pdf_url
-                    # Same thin-agenda fallback as the direct-PDF branch:
+                    # Same thin-agenda enrichment as the direct-PDF branch:
                     # NPR's gview-wrapped agenda PDFs are 2-page thin front
                     # matter. The real meaty packet is a separate cloudfront
                     # URL captured from ViewPublisher and has a clean TOC
@@ -376,7 +586,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                         listing_packet = meeting_data.get("packet_url")
                         if listing_packet and listing_packet != real_pdf_url:
                             logger.info(
-                                "gview agenda hollow, falling back to listing packet",
+                                "gview agenda hollow, enriching from listing packet",
                                 vendor="granicus",
                                 slug=self.slug,
                                 event_id=event_id,
@@ -387,7 +597,9 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                                 listing_packet, event_id, force_method="toc"
                             )
                             if packet_items:
-                                pdf_items = packet_items
+                                pdf_items = _merge_packet_evidence(
+                                    pdf_items or [], packet_items
+                                )
                                 resolved_packet_url = listing_packet
                     if pdf_items:
                         pdf_items = _ensure_attachment_portal_urls(pdf_items)

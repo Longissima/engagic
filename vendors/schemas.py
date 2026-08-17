@@ -7,7 +7,19 @@ Catches type errors early instead of failing at SQLite INSERT time.
 
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+)
+
+from config import get_logger
+
+
+logger = get_logger(__name__).bind(component="vendor_schema")
 
 
 class AttachmentSchema(BaseModel):
@@ -82,10 +94,51 @@ class AgendaItemSchema(BaseModel):
 
     @field_validator("attachments", mode="before")
     @classmethod
-    def normalize_attachments(cls, v: Any) -> Any:
+    def normalize_attachments(cls, v: Any, info: ValidationInfo) -> Any:
         # A few vendor APIs distinguish a missing collection with null. The
         # pipeline has always treated that identically to an empty collection.
-        return [] if v is None else v
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            # Preserve the contract: a malformed collection itself remains an
+            # item-level validation error.  Only malformed optional entries in
+            # an otherwise valid list are isolated below.
+            return v
+
+        attachments: List[AttachmentSchema] = []
+        for index, attachment in enumerate(v):
+            try:
+                attachments.append(AttachmentSchema.model_validate(attachment))
+            except (ValidationError, TypeError, ValueError) as exc:
+                if isinstance(exc, ValidationError):
+                    reasons = [
+                        {
+                            "field": ".".join(str(part) for part in error["loc"]),
+                            "message": error["msg"],
+                        }
+                        for error in exc.errors(
+                            include_url=False,
+                            include_input=False,
+                        )
+                    ]
+                else:
+                    reasons = [{"field": "attachment", "message": str(exc)}]
+                raw_name = (
+                    attachment.get("name")
+                    if isinstance(attachment, dict)
+                    else None
+                )
+                logger.warning(
+                    "filtered invalid optional attachment",
+                    item_title=str(info.data.get("title", ""))[:100],
+                    vendor_item_id=info.data.get("vendor_item_id"),
+                    attachment_index=index,
+                    attachment_name=(
+                        str(raw_name)[:100] if raw_name is not None else None
+                    ),
+                    reasons=reasons,
+                )
+        return attachments
 
     @field_validator("title")
     @classmethod

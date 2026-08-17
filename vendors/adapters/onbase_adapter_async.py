@@ -15,7 +15,7 @@ import asyncio
 import json
 import re
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, cast
 from urllib.parse import urljoin, urlparse, parse_qs, unquote
 
 from bs4 import BeautifulSoup
@@ -24,6 +24,7 @@ from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from vendors.adapters.html_attrs import string_attr
 from vendors.adapters.parsers.granicus_parser import parse_agendaonline_html
 from pipeline.protocols import MetricsCollector
+from exceptions import VendorHTTPError
 
 
 ONBASE_CONFIG_FILE = "data/onbase_sites.json"
@@ -64,6 +65,14 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
     """Async adapter for direct OnBase Agenda Online instances."""
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    # OnBase item-detail endpoints are substantially more fragile than their
+    # meeting listings.  The shared vendor rate limiter controls cadence, but
+    # it deliberately has multiple slots and therefore does not bound a single
+    # tenant's fan-out.  Keep tenant work small enough that one slow deployment
+    # cannot occupy every global OnBase slot.
+    _MEETING_DETAIL_CONCURRENCY = 3
+    _ITEM_DETAIL_CONCURRENCY = 3
+    _ITEM_DETAIL_FAILURE_BUDGET = 3
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="onbase", metrics=metrics)
@@ -77,6 +86,12 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
             )
 
         self.site_urls = [f"https://{path.rstrip('/')}/" for path in config[self.slug]]
+        # Shared by all meetings and configured sites handled by this adapter
+        # instance.  A per-call semaphore would multiply concurrency whenever
+        # several meetings fetch their attachments at the same time.
+        self._item_detail_semaphore = asyncio.Semaphore(
+            self._ITEM_DETAIL_CONCURRENCY
+        )
         logger.info(
             "initialized async adapter",
             component="vendor",
@@ -172,7 +187,11 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
             for meeting in meetings_in_range
         ]
 
-        results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+        results = await self._bounded_gather(
+            detail_tasks,
+            max_concurrent=self._MEETING_DETAIL_CONCURRENCY,
+            return_exceptions=True,
+        )
 
         meetings = []
         for i, result in enumerate(results):
@@ -440,10 +459,47 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
         Relies on ASP.NET session cookies established by _fetch_meeting_detail.
         """
         xhr_headers = {"X-Requested-With": "XMLHttpRequest"}
+        failure_count = 0
+        in_flight = 0
+        skipped_count = 0
+        circuit_condition = asyncio.Condition()
+
+        async def reserve_request() -> bool:
+            """Reserve failure-budget capacity before starting an HTTP call.
+
+            Counting in-flight requests against the budget prevents a wave of
+            concurrent timeouts from overshooting it.  Successful and
+            permanent-failure requests release their capacity; retryable
+            failures consume it for the remainder of this meeting.
+            """
+            nonlocal in_flight, skipped_count
+            async with circuit_condition:
+                while (
+                    failure_count < self._ITEM_DETAIL_FAILURE_BUDGET
+                    and failure_count + in_flight
+                    >= self._ITEM_DETAIL_FAILURE_BUDGET
+                ):
+                    await circuit_condition.wait()
+                if failure_count >= self._ITEM_DETAIL_FAILURE_BUDGET:
+                    skipped_count += 1
+                    return False
+                in_flight += 1
+                return True
+
+        async def finish_request(*, retryable_failure: bool) -> None:
+            nonlocal failure_count, in_flight
+            async with circuit_condition:
+                in_flight -= 1
+                if retryable_failure:
+                    failure_count += 1
+                circuit_condition.notify_all()
 
         async def fetch_item(item: Dict[str, Any]) -> Dict[str, Any]:
             item_id = item.get("vendor_item_id")
             if not item_id:
+                return item
+
+            if not await reserve_request():
                 return item
 
             detail_url = (
@@ -451,24 +507,56 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
                 f"?meetingId={meeting_id}&itemId={item_id}&isSection=false&type=agenda"
             )
 
-            try:
-                response = await self._get(detail_url, headers=xhr_headers)
-                html = await response.text()
-                attachments = self._parse_attachments(html, base_url)
-                if attachments:
-                    item["attachments"] = attachments
-            except Exception as e:
-                logger.debug(
-                    "failed to fetch item attachments",
-                    vendor="onbase",
-                    slug=self.slug,
-                    item_id=item_id,
-                    error=str(e)
-                )
+            async with self._item_detail_semaphore:
+                try:
+                    response = await self._get(detail_url, headers=xhr_headers)
+                    html = await response.text()
+                    attachments = self._parse_attachments(html, base_url)
+                    if attachments:
+                        item["attachments"] = attachments
+                except Exception as e:
+                    retryable = (
+                        isinstance(e, asyncio.TimeoutError)
+                        or (
+                            isinstance(e, VendorHTTPError)
+                            and e.is_retryable
+                        )
+                    )
+                    await finish_request(retryable_failure=retryable)
+                    logger.debug(
+                        "failed to fetch item attachments",
+                        vendor="onbase",
+                        slug=self.slug,
+                        meeting_id=meeting_id,
+                        item_id=item_id,
+                        retryable=retryable,
+                        error=str(e)
+                    )
+                    return item
+
+            await finish_request(retryable_failure=False)
 
             return item
 
-        return list(await asyncio.gather(*[fetch_item(item) for item in items]))
+        results = list(
+            await self._bounded_gather(
+                (fetch_item(item) for item in items),
+                max_concurrent=self._ITEM_DETAIL_CONCURRENCY,
+                return_exceptions=False,
+            )
+        )
+        if skipped_count:
+            logger.warning(
+                "onbase item attachment failure budget exhausted",
+                vendor="onbase",
+                slug=self.slug,
+                meeting_id=meeting_id,
+                retryable_failures=failure_count,
+                failure_budget=self._ITEM_DETAIL_FAILURE_BUDGET,
+                skipped_items=skipped_count,
+                retained_items=len(results),
+            )
+        return cast(List[Dict[str, Any]], results)
 
     def _parse_attachments(self, html: str, base_url: str) -> List[Dict[str, Any]]:
         """Parse attachment links from item detail page.

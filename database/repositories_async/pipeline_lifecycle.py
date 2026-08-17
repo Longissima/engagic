@@ -899,3 +899,31 @@ class PipelineLifecycleRepository(BaseRepository):
             event_key,
         )
         return row is not None
+
+    async def record_meeting_ingest_audit(
+        self,
+        *,
+        meeting_id: str,
+        banana: str,
+        vendor: Optional[str],
+        slug: Optional[str],
+        audit: Dict[str, Any],
+        conn: Optional[Connection] = None,
+    ) -> None:
+        async with self._ensure_conn(conn) as connection:
+            await connection.execute(
+                """
+                INSERT INTO meeting_ingest_audits (
+                    meeting_id, banana, vendor, slug, source_path,
+                    item_count, attachment_count, audit
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                """,
+                meeting_id,
+                banana,
+                vendor,
+                slug,
+                audit["source_path"],
+                audit["item_count"],
+                audit["attachment_count"],
+                audit,
+            )

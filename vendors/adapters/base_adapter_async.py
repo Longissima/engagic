@@ -734,7 +734,10 @@ class AsyncBaseAdapter:
         """Accumulate cascade audits per meeting; fetch_meetings() stamps them
         onto outgoing meeting dicts so they reach queue.processing_metadata."""
         if vendor_id:
-            self._chunk_audits.setdefault(str(vendor_id), []).append(result.audit())
+            self._chunk_audits.setdefault(str(vendor_id), []).append({
+                **result.audit(),
+                "observed_at": datetime.now().isoformat(),
+            })
 
     def _record_html_audit(
         self,
@@ -747,6 +750,8 @@ class AsyncBaseAdapter:
         queue.processing_metadata — dialect drift becomes queryable."""
         if vendor_id:
             self._html_audits[str(vendor_id)] = {
+                "audit_version": "ha1",
+                "observed_at": datetime.now().isoformat(),
                 "pattern": pattern,
                 "item_count": len(items),
                 "attachment_count": sum(
@@ -1078,6 +1083,28 @@ class AsyncBaseAdapter:
                 valid.append(validated.model_dump(exclude_none=True))
             if len(valid) < len(meetings):
                 logger.warning("filtered invalid meetings", vendor=self.vendor, slug=self.slug, total=len(meetings), valid=len(valid))
+
+            # A genuinely empty vendor result is a successful no-op. Raw work
+            # that was fetched but entirely rejected at the schema boundary is
+            # different: reporting success would mark the city synced while
+            # silently discarding every candidate.
+            if meetings and not valid:
+                error = (
+                    f"All {len(meetings)} fetched meeting candidate(s) failed "
+                    "schema validation"
+                )
+                logger.error(
+                    "all fetched meetings failed schema validation",
+                    vendor=self.vendor,
+                    slug=self.slug,
+                    total=len(meetings),
+                )
+                return FetchResult(
+                    meetings=[],
+                    success=False,
+                    error=error,
+                    error_type="SchemaValidationError",
+                )
 
             # Attach extraction audits to their meetings (by vendor_id)
             for m in valid:

@@ -8,6 +8,8 @@ import asyncio
 import re
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+from urllib.parse import urljoin
+
 import aiohttp
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from vendors.adapters.html_attrs import string_attr
@@ -27,7 +29,8 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
     MINUTES_DISCOVERY_SUPPORTED = True
 
     _DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
-    _TIME_RE = re.compile(r"^\d{1,2}:\d{2}")
+    _TIME_RE = re.compile(r"^\d{1,2}:\d{2}", re.IGNORECASE)
+    _MEETING_GRID_RE = re.compile(r"radGridMeetings", re.IGNORECASE)
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="novusagenda", metrics=metrics)
@@ -53,6 +56,91 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                 return layout
         return None
 
+    @staticmethod
+    def _row_classes(row) -> set[str]:
+        classes = row.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        return {str(value) for value in classes}
+
+    def _meeting_rows_from_table(self, table) -> List[Any]:
+        return [
+            row
+            for row in table.find_all("tr")
+            if self._row_classes(row) & {"rgRow", "rgAltRow"}
+        ]
+
+    def _find_meeting_rows(self, soup: BeautifulSoup) -> List[Any]:
+        """Return meeting-grid rows without swallowing the item-search grid.
+
+        NovusAgenda can render sibling meeting and item Telerik grids in the
+        same document. Both use ``rgRow``/``rgAltRow`` data-row classes, so a
+        document-wide row search turns agenda items into phantom meetings.
+        """
+        grid = soup.find("table", id=self._MEETING_GRID_RE)
+        if grid is not None:
+            return self._meeting_rows_from_table(grid)
+
+        # Older/customized portals may rename the control while preserving its
+        # canonical column headings.
+        for table in soup.find_all("table"):
+            headings = {
+                " ".join(cell.get_text(" ", strip=True).lower().split())
+                for cell in table.find_all("th")
+            }
+            if "meeting date" in headings and "meeting type" in headings:
+                return self._meeting_rows_from_table(table)
+
+        # Preserve the generic selector used by legacy/custom portals that do
+        # not expose either identifying signal above.
+        return soup.find_all("tr", class_=["rgRow", "rgAltRow"])
+
+    @classmethod
+    def _parse_date(cls, date_str: str) -> datetime:
+        for date_format in ("%m/%d/%y", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(date_str, date_format)
+            except ValueError:
+                continue
+        raise ValueError(f"unsupported NovusAgenda date: {date_str}")
+
+    @staticmethod
+    def _iso_start(meeting_date: datetime, time_field: str) -> str:
+        time_match = re.match(
+            r"^(\d{1,2}:\d{2})\s*(AM|PM)?\b",
+            time_field.strip(),
+            re.IGNORECASE,
+        )
+        if not time_match:
+            return meeting_date.date().isoformat()
+
+        time_text = time_match.group(1)
+        meridiem = time_match.group(2)
+        time_format = "%I:%M %p" if meridiem else "%H:%M"
+        parsed_time = datetime.strptime(
+            f"{time_text} {meridiem}" if meridiem else time_text,
+            time_format,
+        ).time()
+        return datetime.combine(meeting_date.date(), parsed_time).isoformat(
+            timespec="minutes"
+        )
+
+    @staticmethod
+    def _meeting_id_from_row(row) -> Optional[str]:
+        """Extract the vendor meeting id from any meeting-level row link."""
+        for link in row.find_all("a"):
+            link_value = (
+                f"{string_attr(link, 'href')} {string_attr(link, 'onclick')}"
+            )
+            meeting_id_match = re.search(
+                r"(?:[?&]|&amp;)MeetingID=(\d+)",
+                link_value,
+                re.IGNORECASE,
+            )
+            if meeting_id_match:
+                return meeting_id_match.group(1)
+        return None
+
     async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
         """Scrape meetings from NovusAgenda /agendapublic page."""
         response = await self._get(f"{self.base_url}/agendapublic")
@@ -61,7 +149,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
 
         start_date, end_date = self._date_range(days_back, days_forward)
 
-        meeting_rows = soup.find_all("tr", class_=["rgRow", "rgAltRow"])
+        meeting_rows = self._find_meeting_rows(soup)
         logger.info("found meeting rows", vendor="novusagenda", slug=self.slug, count=len(meeting_rows))
 
         meetings = []
@@ -99,7 +187,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
             meeting_type = cells[layout["type"]].get_text(strip=True) if layout["type"] < len(cells) else ""
 
             try:
-                meeting_date = datetime.strptime(date_str, "%m/%d/%y")
+                meeting_date = self._parse_date(date_str)
                 if meeting_date < start_date or meeting_date > end_date:
                     logger.debug("skipping meeting outside date range", vendor="novusagenda", slug=self.slug, meeting_type=meeting_type, date=date_str)
                     continue
@@ -108,16 +196,25 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                 continue
 
             time_idx = layout.get("time")
-            time_field = cells[time_idx].get_text(strip=True) if time_idx and time_idx < len(cells) else ""
+            time_field = (
+                cells[time_idx].get_text(strip=True)
+                if time_idx is not None and time_idx < len(cells)
+                else ""
+            )
+            start = self._iso_start(meeting_date, time_field)
             meeting_status = self._parse_meeting_status(meeting_type, time_field)
 
             # Find PDF link and HTML agenda link
-            pdf_link = row.find("a", href=re.compile(r"DisplayAgendaPDF\.ashx"))
-            all_agenda_links = row.find_all("a", onclick=re.compile(r"MeetingView\.aspx"))
+            pdf_link = row.find(
+                "a", href=re.compile(r"DisplayAgendaPDF\.ashx", re.IGNORECASE)
+            )
+            all_agenda_links = row.find_all(
+                "a", onclick=re.compile(r"MeetingView\.aspx", re.IGNORECASE)
+            )
 
             packet_url = None
             agenda_url = None
-            meeting_id = None
+            meeting_id = self._meeting_id_from_row(row)
 
             if pdf_link:
                 # Extract meeting ID
@@ -125,7 +222,9 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                 meeting_id_match = re.search(r"MeetingID=(\d+)", pdf_href)
                 if meeting_id_match:
                     meeting_id = meeting_id_match.group(1)
-                    packet_url = f"{self.base_url}/agendapublic/{pdf_href}"
+                    packet_url = urljoin(
+                        f"{self.base_url}/agendapublic/", pdf_href
+                    )
 
             # Prioritize parsable HTML agendas over summaries
             best_agenda_link = None
@@ -150,10 +249,14 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
 
             if best_agenda_link:
                 onclick = string_attr(best_agenda_link, "onclick")
-                url_match = re.search(r"MeetingView\.aspx\?[^'\"]+", onclick)
+                url_match = re.search(
+                    r"MeetingView\.aspx\?[^'\"]+", onclick, re.IGNORECASE
+                )
                 if url_match:
                     agenda_relative_url = url_match.group(0)
-                    agenda_url = f"{self.base_url}/agendapublic/{agenda_relative_url}"
+                    agenda_url = urljoin(
+                        f"{self.base_url}/agendapublic/", agenda_relative_url
+                    )
 
                     if not meeting_id:
                         meeting_id_match = re.search(r"MeetingID=(\d+)", agenda_relative_url)
@@ -167,19 +270,25 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
             minutes_url = None
             minutes_pdf_link = row.find("a", href=re.compile(r"DisplayMinutesPDF\.ashx", re.IGNORECASE))
             if minutes_pdf_link:
-                minutes_url = (
-                    f"{self.base_url}/agendapublic/"
-                    f"{string_attr(minutes_pdf_link, 'href')}"
+                minutes_url = urljoin(
+                    f"{self.base_url}/agendapublic/",
+                    string_attr(minutes_pdf_link, "href"),
                 )
             else:
-                minutes_view_link = row.find("a", onclick=re.compile(r"doctype=Minutes"))
+                minutes_view_link = row.find(
+                    "a", onclick=re.compile(r"doctype=Minutes", re.IGNORECASE)
+                )
                 if minutes_view_link:
                     minutes_match = re.search(
                         r"MeetingView\.aspx\?[^'\"]+",
                         string_attr(minutes_view_link, "onclick"),
+                        re.IGNORECASE,
                     )
                     if minutes_match:
-                        minutes_url = f"{self.base_url}/agendapublic/{minutes_match.group(0)}"
+                        minutes_url = urljoin(
+                            f"{self.base_url}/agendapublic/",
+                            minutes_match.group(0),
+                        )
 
             if not meeting_id:
                 meeting_id = self._generate_fallback_vendor_id(
@@ -192,7 +301,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                     result = {
                         "vendor_id": meeting_id,
                         "title": meeting_type,
-                        "start": date_str,
+                        "start": start,
                         "minutes_url": minutes_url,
                     }
                     if meeting_status:
@@ -249,7 +358,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
             result = {
                 "vendor_id": meeting_id,
                 "title": meeting_type,
-                "start": date_str,
+                "start": start,
                 "packet_url": packet_url,
             }
 

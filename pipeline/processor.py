@@ -14,7 +14,12 @@ from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
 from pipeline.ground_truth import produce_ground_truth
 from pipeline.document_artifacts import DocumentFormat
-from pipeline.job_runner import JobExecutionPolicy, JobRunner, TerminalJobError
+from pipeline.job_runner import (
+    JobExecutionPolicy,
+    JobRunner,
+    SupersededWorkError,
+    TerminalJobError,
+)
 from pipeline.models import MatterJob, MeetingJob, QueueJob
 from pipeline.outbox_dispatch import dispatch_outbox_event
 from pipeline.outcomes import JobOutcome, OutcomeStatus
@@ -36,7 +41,12 @@ from analysis.topics.normalizer import get_normalizer
 from parsing.participation import parse_participation_info
 from config import config, get_logger
 from pipeline.protocols import MetricsCollector, NullMetrics
-from pipeline.filters import get_skip_reason
+from pipeline.filters import (
+    ITEM_FILTER_VERSION,
+    FilterDecision,
+    get_filter_decision,
+    system_filter_decision,
+)
 from vendors.adapters.parsers.morphology import is_bare_document
 from vendors.session_manager_async import AsyncSessionManager
 
@@ -1978,7 +1988,7 @@ class Processor:
             work.legacy_attachment_version,
         }
         if expected_work_version and expected_work_version not in compatible_versions:
-            raise TerminalJobError(
+            raise SupersededWorkError(
                 f"matter {matter_id} work was superseded "
                 f"({expected_work_version} -> {work_version})"
             )
@@ -2005,7 +2015,7 @@ class Processor:
         items = list(work.appearances)
         work_version = work.work_version
         if work_version != expected_work_version:
-            raise TerminalJobError(
+            raise SupersededWorkError(
                 f"matter {matter_id} work was superseded "
                 f"({expected_work_version} -> {work_version})"
             )
@@ -2017,7 +2027,7 @@ class Processor:
             desired_state.get("work_version") if desired_state is not None else None
         )
         if desired_version != expected_desired_version:
-            raise TerminalJobError(
+            raise SupersededWorkError(
                 f"matter {matter_id} desired work was superseded "
                 f"({expected_desired_version} -> {desired_version})"
             )
@@ -2030,7 +2040,7 @@ class Processor:
             or desired_claim_token is None
             or str(desired_claim_token) != expected_claim_token
         ):
-            raise TerminalJobError(
+            raise SupersededWorkError(
                 f"matter {matter_id} queue claim was superseded"
             )
         return locked_matter, items, work_version, work.attachment_version
@@ -2112,7 +2122,7 @@ class Processor:
         disposition: Optional[str] = None,
         increment_attempts: bool = False,
         filter_item_id: Optional[str] = None,
-        filter_reason: Optional[str] = None,
+        filter_decision: Optional[FilterDecision] = None,
     ) -> None:
         """Persist every non-success verdict under the aggregate CAS lock."""
         async with self.db.matters.transaction() as conn:
@@ -2123,9 +2133,14 @@ class Processor:
                 expected_desired_version,
                 expected_claim_token,
             )
-            if filter_item_id and filter_reason:
+            if filter_item_id and filter_decision:
                 await self.db.items.update_filter_reason(
-                    filter_item_id, filter_reason, conn=conn
+                    filter_item_id,
+                    filter_decision.reason,
+                    rule_id=filter_decision.rule_id,
+                    filter_version=filter_decision.version,
+                    source="matter_processor",
+                    conn=conn,
                 )
             await self.db.matters.record_matter_outcome(
                 matter_id,
@@ -2155,7 +2170,7 @@ class Processor:
             if not matter.canonical_summary or not self._matter_projection_is_current(
                 matter, items, work_version, attachment_version
             ):
-                raise TerminalJobError(
+                raise SupersededWorkError(
                     f"matter {matter_id} canonical projection changed before reuse"
                 )
             await self.db.matters.update_attachment_hash(
@@ -2310,21 +2325,21 @@ class Processor:
         # every sync and burns a queue cycle forever (observed: 142 such
         # matters in one city). The disposition is scoped to this attachment
         # set -- changed attachments re-open the matter.
-        skip_reason = get_skip_reason(representative_item.title)
-        if skip_reason:
+        filter_decision = get_filter_decision(representative_item.title)
+        if filter_decision:
             await self._record_matter_outcome_cas(
                 matter_id,
                 expected_work_version,
                 expected_desired_version=expected_desired_version,
                 expected_claim_token=expected_claim_token,
-                disposition=f"filtered_{skip_reason}",
+                disposition=f"filtered_{filter_decision.reason}",
                 filter_item_id=representative_item.id,
-                filter_reason=skip_reason,
+                filter_decision=filter_decision,
             )
             logger.info(
                 "matter filtered, disposition recorded",
                 matter_id=matter_id,
-                reason=skip_reason,
+                reason=filter_decision.reason,
             )
             return {"items_processed": len(items), "items_new": 0, "items_skipped": len(items), "items_failed": 0}
 
@@ -2348,7 +2363,7 @@ class Processor:
                 expected_claim_token=expected_claim_token,
                 increment_attempts=True,
             )
-            return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
+            return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items), "failure_reason": "processing_error", "failure_error_type": type(e).__name__}
 
         if not result:
             await self._record_matter_outcome_cas(
@@ -2358,7 +2373,7 @@ class Processor:
                 expected_claim_token=expected_claim_token,
                 increment_attempts=True,
             )
-            return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
+            return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items), "failure_reason": "no_result"}
 
         summary = result.get("summary")
         topics = result.get("topics", [])
@@ -2372,7 +2387,7 @@ class Processor:
                 expected_claim_token=expected_claim_token,
                 increment_attempts=True,
             )
-            return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items)}
+            return {"items_processed": len(items), "items_new": 0, "items_skipped": 0, "items_failed": len(items), "failure_reason": "empty_summary"}
 
         # Re-read after extraction/LLM latency. A sync may have published a
         # newer desired version while this worker was busy; stale workers may
@@ -2631,7 +2646,13 @@ class Processor:
         without a single LLM call.
         """
         filter_writes = [
-            {"item_id": item.id, "filter_reason": "bare_agenda"}
+            {
+                "item_id": item.id,
+                "filter_reason": "bare_agenda",
+                "filter_rule_id": "system:bare_agenda",
+                "filter_version": ITEM_FILTER_VERSION,
+                "filter_source": "meeting_processor",
+            }
             for item in agenda_items
             if not getattr(item, "summary", None)
             and not getattr(item, "filter_reason", None)
@@ -2676,7 +2697,7 @@ class Processor:
         items = await self.db.items.get_agenda_items(meeting_id)
         version = meeting_work_version(meeting, items)
         if expected_work_version and version != expected_work_version:
-            raise TerminalJobError(
+            raise SupersededWorkError(
                 f"meeting {meeting_id} work was superseded "
                 f"({expected_work_version} -> {version})"
             )
@@ -2707,7 +2728,7 @@ class Processor:
         )
         version = meeting_work_version(meeting, items)
         if expected_work_version and version != expected_work_version:
-            raise TerminalJobError(
+            raise SupersededWorkError(
                 f"meeting {meeting_id} work was superseded "
                 f"({expected_work_version} -> {version})"
             )
@@ -2723,7 +2744,7 @@ class Processor:
                 else None
             )
             if desired_version != expected_desired_version:
-                raise TerminalJobError(
+                raise SupersededWorkError(
                     f"meeting {meeting_id} desired work was superseded "
                     f"({expected_desired_version} -> {desired_version})"
                 )
@@ -2738,7 +2759,7 @@ class Processor:
                 or desired_claim_token is None
                 or str(desired_claim_token) != expected_claim_token
             ):
-                raise TerminalJobError(
+                raise SupersededWorkError(
                     f"meeting {meeting_id} queue claim was superseded"
                 )
         return meeting, items
@@ -2811,6 +2832,11 @@ class Processor:
                     await self.db.items.update_filter_reason(
                         item_id,
                         write["filter_reason"],
+                        rule_id=write.get("filter_rule_id"),
+                        filter_version=write.get(
+                            "filter_version", ITEM_FILTER_VERSION
+                        ),
+                        source=write.get("filter_source", "meeting_processor"),
                         conn=conn,
                     )
                     applied.add(item_id)
@@ -2868,7 +2894,7 @@ class Processor:
             agenda_items = await self.db.items.get_agenda_items(meeting.id)
             current_version = meeting_work_version(meeting, agenda_items)
             if expected_work_version and current_version != expected_work_version:
-                raise TerminalJobError(
+                raise SupersededWorkError(
                     f"meeting {meeting.id} work was superseded "
                     f"({expected_work_version} -> {current_version})"
                 )
@@ -3023,6 +3049,7 @@ class Processor:
                             "items_new": 0,
                             "items_skipped": 0,
                             "items_failed": 1,
+                            "failure_reason": "empty_summary",
                         }
                     processing_time = result.get("processing_time") or 0.0
                     await self._assert_meeting_work_version(
@@ -3046,7 +3073,7 @@ class Processor:
                     return {"items_processed": 1, "items_new": 1, "items_skipped": 0, "items_failed": 0}
                 else:
                     logger.error("failed to process packet", packet_url=meeting.packet_url, error=result.get('error'))
-                    return {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 1}
+                    return {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 1, "failure_reason": str(result.get("error_type") or result.get("error_status") or "analyzer_failure")}
 
             await self._update_meeting_projection(
                 meeting_id=meeting.id,
@@ -3068,7 +3095,7 @@ class Processor:
                 # Batch submit failures must reach the queue runner so retry
                 # state changes instead of being misclassified as completed.
                 raise
-            return {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 1}
+            return {"items_processed": 0, "items_new": 0, "items_skipped": 0, "items_failed": 1, "failure_reason": type(e).__name__}
 
     async def _extract_participation_info(
         self, meeting: Meeting, city_has_participation: bool = False
@@ -3117,20 +3144,46 @@ class Processor:
         filter_writes: List[Dict[str, Any]] = []
 
         for item in agenda_items:
-            skip_reason = get_skip_reason(item.title)
-            if skip_reason:
-                logger.debug("skipping item", title=item.title[:50], reason=skip_reason)
+            decision = get_filter_decision(item.title)
+            if decision:
+                logger.debug(
+                    "skipping item", title=item.title[:50], reason=decision.reason
+                )
                 filter_writes.append(
-                    {"item_id": item.id, "filter_reason": skip_reason}
+                    {
+                        "item_id": item.id,
+                        "filter_reason": decision.reason,
+                        "filter_rule_id": decision.rule_id,
+                        "filter_version": decision.version,
+                        "filter_source": "meeting_processor",
+                    }
                 )
                 continue
 
             if not item.attachments and not item.body_text:
+                decision = system_filter_decision("no_content")
                 logger.debug("skipping item without attachments or body text", title=item.title[:50])
                 filter_writes.append(
-                    {"item_id": item.id, "filter_reason": "no_content"}
+                    {
+                        "item_id": item.id,
+                        "filter_reason": decision.reason,
+                        "filter_rule_id": decision.rule_id,
+                        "filter_version": decision.version,
+                        "filter_source": "meeting_processor",
+                    }
                 )
                 continue
+
+            if item.filter_reason:
+                filter_writes.append(
+                    {
+                        "item_id": item.id,
+                        "filter_reason": None,
+                        "filter_rule_id": None,
+                        "filter_version": ITEM_FILTER_VERSION,
+                        "filter_source": "meeting_processor",
+                    }
+                )
 
             if item.summary:
                 logger.debug("item already processed", title=item.title[:50])
@@ -3732,6 +3785,9 @@ class Processor:
                     "items_skipped": len(already_processed),
                     "items_failed": len(failed_items),
                     "items_submitted": len(batch_requests) if submitted_chunks else 0,
+                    "failure_reason": (
+                        "document_assembly_failure" if failed_items else ""
+                    ),
                 }
 
             if batch_requests:
@@ -3813,6 +3869,9 @@ class Processor:
                 "items_new": new_count,
                 "items_skipped": skipped_count,
                 "items_failed": len(failed_items),
+                "failure_reason": (
+                    "item_processing_failure" if failed_items else ""
+                ),
             }
 
         logger.warning("no items could be processed")
@@ -3821,6 +3880,7 @@ class Processor:
             "items_new": 0,
             "items_skipped": len(already_processed),
             "items_failed": len(failed_items),
+            "failure_reason": "item_processing_failure",
         }
 
     async def close(self):

@@ -119,7 +119,7 @@ def _processor_with_state(desired_state, *, summary=None, items=None):
             assert fields["summary"] == "first summary"
             events.append("update item")
 
-        async def update_filter_reason(self, item_id, reason, *, conn):
+        async def update_filter_reason(self, item_id, reason, *, conn, **_metadata):
             assert (item_id, reason, conn) == (item.id, "procedural", connection)
             events.append("update filter")
 
@@ -371,6 +371,7 @@ async def test_mixed_streaming_result_reports_persisted_success_while_pending():
         "items_new": 1,
         "items_skipped": 0,
         "items_failed": 1,
+        "failure_reason": "item_processing_failure",
     }
     assert projection[0]["require_complete_items"] is True
 
@@ -425,7 +426,13 @@ async def test_bare_item_gets_explicit_no_content_disposition():
     assert processed == []
     assert pending == []
     assert filter_writes == [
-        {"item_id": "item-cas", "filter_reason": "no_content"}
+        {
+            "item_id": "item-cas",
+            "filter_reason": "no_content",
+            "filter_rule_id": "system:no_content",
+            "filter_version": "ifv1",
+            "filter_source": "meeting_processor",
+        }
     ]
 
 

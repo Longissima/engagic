@@ -225,6 +225,14 @@ class CorpusStore:
         try:
             text = result.get("text") or ""
             if not result.get("success") or not text:
+                await self.blobs.record_extraction_failure(
+                    content_sha256,
+                    error_type=str(result.get("error_type") or "ExtractionFailed"),
+                    error_message=str(
+                        result.get("error")
+                        or ("extraction returned empty text" if not text else "extraction failed")
+                    ),
+                )
                 return False
 
             # Write-once means first-writer-wins per extractor version: sync
@@ -252,6 +260,12 @@ class CorpusStore:
                 page_count=result.get("page_count"),
                 ocr_page_count=result.get("ocr_pages"),
                 text_chars=len(text),
+                extraction_status=(
+                    "partial"
+                    if str(result.get("method") or "").endswith("-partial")
+                    or int(result.get("ocr_pending") or 0) > 0
+                    else "succeeded"
+                ),
             )
             logger.info(
                 "persisted extraction to corpus",
@@ -262,6 +276,14 @@ class CorpusStore:
             )
             return True
         except Exception as e:
+            try:
+                await self.blobs.record_extraction_failure(
+                    content_sha256,
+                    error_type=type(e).__name__,
+                    error_message=str(e),
+                )
+            except Exception:
+                pass
             logger.warning(
                 "corpus text persist failed, pipeline continues",
                 sha=content_sha256[:16],

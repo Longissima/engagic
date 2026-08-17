@@ -1,11 +1,17 @@
 """Pipeline Filters - Item and matter filtering logic"""
 
 from pipeline.filters.item_filters import (
+    ATTACHMENT_FILTER_VERSION,
+    ITEM_FILTER_VERSION,
+    FilterDecision,
+    get_attachment_filter_decision,
+    get_filter_decision,
     should_skip_meeting,
     should_skip_processing,
     get_skip_reason,
     should_skip_matter,
     is_public_comment_attachment,
+    system_filter_decision,
     MEETING_SKIP_PATTERNS,
     PROCEDURAL_PATTERNS,
     CEREMONIAL_PATTERNS,
@@ -17,11 +23,17 @@ from pipeline.filters.item_filters import (
 )
 
 __all__ = [
+    "ATTACHMENT_FILTER_VERSION",
+    "ITEM_FILTER_VERSION",
+    "FilterDecision",
+    "get_attachment_filter_decision",
+    "get_filter_decision",
     "should_skip_meeting",
     "should_skip_processing",
     "get_skip_reason",
     "should_skip_matter",
     "is_public_comment_attachment",
+    "system_filter_decision",
     "MEETING_SKIP_PATTERNS",
     "PROCEDURAL_PATTERNS",
     "CEREMONIAL_PATTERNS",

@@ -64,7 +64,13 @@ Coverage grows at the speed of the failure pool, not your evenings:
    JOIN meetings m ON m.id = q.meeting_id
    JOIN jurisdictions j USING (banana)
    WHERE q.processing_metadata->'chunk'->>'failure_reason' IS NOT NULL
-      OR q.processing_metadata->'chunk'->'quality'->>'seg_smell' IS NOT NULL
+      OR EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(
+             COALESCE(q.processing_metadata->'chunk'->'runs', '[]'::jsonb)
+           ) AS run
+           WHERE run->'quality'->>'seg_smell' IS NOT NULL
+         )
    ORDER BY q.created_at DESC;
    ```
 2. **Fetch** — `uv run python tests/chunker/fetch_fixtures.py`

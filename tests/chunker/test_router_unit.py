@@ -84,12 +84,18 @@ class TestSummarizeRuns:
     def test_single_winning_run(self):
         runs = [{"ladder": "packet", "winning_rung": "v2:toc",
                  "parse_method": "v2_toc", "item_count": 9,
-                 "failure_reason": None, "attempts": []}]
+                 "failure_reason": None, "attempts": [],
+                 "quality": {"seg_smell": "under_split"},
+                 "morphology": "toc_packet",
+                 "profile": {"page_count": 10}}]
         s = router.summarize_runs(runs)
         assert s["winning_rung"] == "v2:toc"
         assert s["winning_ladder"] == "packet"
         assert s["item_count"] == 9
         assert s["failure_reason"] is None
+        assert s["quality"] == {"seg_smell": "under_split"}
+        assert s["morphology"] == "toc_packet"
+        assert s["profile"] == {"page_count": 10}
 
     def test_last_winner_wins_across_runs(self):
         runs = [

@@ -131,6 +131,17 @@ uv run scripts/generate_tiles.py --upload   # Upload to Cloudflare R2
 
 ## Operational Tools
 
+### `recompute_item_filters.py`
+
+Re-evaluate stored item filters against the current rules. Dry-run is the
+default; execution versions every changed decision and requeues meetings whose
+items become eligible.
+
+```bash
+uv run python scripts/recompute_item_filters.py
+uv run python scripts/recompute_item_filters.py --execute
+```
+
 ### `reconcile_matter_queue.py`
 
 Audit historical matter projections, appearance snapshots, and queue descriptors.

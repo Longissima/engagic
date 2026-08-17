@@ -7,6 +7,7 @@ Contains utilities used across pipeline modules for matters-first processing.
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 import requests
@@ -307,6 +308,7 @@ class MatterWorkSnapshot:
     work_version: str
     legacy_attachment_version: str
     normalized_titles: tuple[str, ...]
+    attachment_filter_audit: Dict[str, Any]
 
     @property
     def is_summarizable(self) -> bool:
@@ -351,7 +353,10 @@ class MatterWorkSnapshot:
 
     @classmethod
     def from_appearances(cls, appearances: Iterable[Any]) -> "MatterWorkSnapshot":
-        from pipeline.filters.item_filters import is_public_comment_attachment
+        from pipeline.filters.item_filters import (
+            ATTACHMENT_FILTER_VERSION,
+            get_attachment_filter_decision,
+        )
 
         ordered = tuple(
             sorted(
@@ -364,13 +369,33 @@ class MatterWorkSnapshot:
             )
         )
         attachments = tuple(aggregate_matter_attachments(ordered))
+        attachment_decisions = [
+            (
+                attachment,
+                get_attachment_filter_decision(
+                    str(getattr(attachment, "name", "") or "")
+                ),
+            )
+            for attachment in attachments
+        ]
         substantive = tuple(
             attachment
-            for attachment in attachments
-            if not is_public_comment_attachment(
-                str(getattr(attachment, "name", "") or "")
-            )
+            for attachment, decision in attachment_decisions
+            if decision is None
         )
+        excluded = [
+            decision
+            for _attachment, decision in attachment_decisions
+            if decision is not None
+        ]
+        attachment_filter_audit = {
+            "version": ATTACHMENT_FILTER_VERSION,
+            "total": len(attachments),
+            "substantive": len(substantive),
+            "excluded": len(excluded),
+            "reason_counts": dict(Counter(d.reason for d in excluded)),
+            "rule_counts": dict(Counter(d.rule_id for d in excluded)),
+        }
         attachment_version = hash_attachments(list(substantive))
         legacy_attachment_version = hash_attachments_fast_legacy(list(substantive))
         titles = tuple(
@@ -415,6 +440,7 @@ class MatterWorkSnapshot:
             work_version=work_version,
             legacy_attachment_version=legacy_attachment_version,
             normalized_titles=titles,
+            attachment_filter_audit=attachment_filter_audit,
         )
 
 

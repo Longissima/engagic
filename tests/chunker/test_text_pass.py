@@ -6,7 +6,13 @@ import fitz
 import pytest
 
 from parsing.subprocess_guard import run_guarded
-from vendors.adapters.parsers.router import chunk_pdf
+from vendors.adapters.parsers.router import (
+    OCR_REQUIRED,
+    Attempt,
+    ChunkResult,
+    _apply_ocr_shape_policy,
+    chunk_pdf,
+)
 
 
 AGENDA_LINES = [
@@ -95,6 +101,62 @@ def test_mixed_pdf_reports_ocr_pending(text_pdf):
         result = chunk_pdf(tmp.name, "auto")
         assert result.extraction is not None
         assert result.extraction["ocr_pending"] == 2
+        assert result.extraction["ocr_pending_pages"] == [3, 4]
+
+
+def test_structural_shape_survives_incomplete_ocr_with_disclosure():
+    result = ChunkResult(
+        items=[
+            {
+                "title": "Approve the project",
+                "sequence": 1,
+                "body_text": "Useful embedded text",
+                "attachments": [],
+                "metadata": {"page_start": 4, "page_end": 5},
+            }
+        ],
+        metadata={"parse_method": "v2_toc"},
+        winning_rung="v2:toc",
+        attempts=[Attempt(rung="v2:toc", item_count=1, parse_method="v2_toc")],
+        extraction={"ocr_pending": 1, "ocr_pending_pages": [5]},
+    )
+
+    _apply_ocr_shape_policy(result)
+
+    assert result.failure_reason is None
+    assert result.winning_rung == "v2:toc"
+    assert len(result.items) == 1
+    item = result.items[0]
+    assert item["metadata"]["ocr_pending_pages"] == [5]
+    assert item["metadata"]["shape_basis"] == "structural"
+    assert item["body_text"].startswith("[SOURCE EXTRACTION INCOMPLETE:")
+    assert item["body_text"].endswith("Useful embedded text")
+
+
+def test_text_derived_shape_is_rejected_when_its_page_needs_ocr():
+    result = ChunkResult(
+        items=[
+            {
+                "title": "Possibly broken heading",
+                "sequence": 1,
+                "attachments": [],
+                "metadata": {"page_start": 2, "page_end": 2},
+            }
+        ],
+        metadata={"parse_method": "text_items"},
+        winning_rung="text:auto",
+        attempts=[Attempt(
+            rung="text:auto", item_count=1, parse_method="text_items"
+        )],
+        extraction={"ocr_pending": 1, "ocr_pending_pages": [2]},
+    )
+
+    _apply_ocr_shape_policy(result)
+
+    assert result.items == []
+    assert result.winning_rung is None
+    assert result.failure_reason == OCR_REQUIRED
+    assert result.attempts[0].failure_reason == OCR_REQUIRED
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import pytest
 
 from config import config
 from corpus.store import CorpusOriginal, sha256_hex
+from parsing.subprocess_guard import GuardCrashed
 from pipeline.ground_truth import produce_ground_truth
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter
 from vendors.adapters.parsers.router import ChunkResult, DEFERRED, TOO_SMALL
@@ -56,6 +57,55 @@ def test_produce_ground_truth_too_small():
     ))
     assert result.failure_reason == TOO_SMALL
     assert result.extraction is None
+
+
+def test_guard_crash_uses_reduced_recovery_and_links_incomplete_pages(monkeypatch):
+    import pipeline.ground_truth as ground_truth
+
+    calls = []
+
+    def fake_guard(target, args, **kwargs):
+        calls.append((target, args, kwargs))
+        if len(calls) == 1:
+            raise GuardCrashed("native parser crash", exitcode=255)
+        return ChunkResult(
+            items=[{
+                "title": "Recovered structural item",
+                "sequence": 1,
+                "body_text": "[SOURCE EXTRACTION INCOMPLETE: verify source.]",
+                "attachments": [],
+                "metadata": {
+                    "page_start": 7,
+                    "page_end": 8,
+                    "extraction_incomplete": True,
+                    "ocr_pending_pages": [7, 8],
+                    "shape_basis": "structural",
+                },
+            }],
+            metadata={"parse_method": "v2_toc"},
+            winning_rung="v2:toc",
+            extraction={"ocr_pending": 2, "ocr_pending_pages": [7, 8]},
+        )
+
+    monkeypatch.setattr(ground_truth, "run_guarded", fake_guard)
+
+    result, recovery = ground_truth._run_chunk_with_recovery(
+        "/tmp/not-read-by-fake-guard.pdf", "auto", None
+    )
+    result.quality["guard_recovery"] = recovery
+    ground_truth._attach_incomplete_source_links(
+        result, "https://example.gov/agenda.pdf?rev=2#old"
+    )
+
+    assert calls[0][0] is ground_truth.chunk_pdf
+    assert calls[1][0] is ground_truth.recover_pdf_text
+    assert calls[1][2]["timeout"] <= config.CHUNKER_TIMEOUT_SECONDS
+    assert recovery["exitcode"] == 255
+    assert result.items[0]["attachments"] == [{
+        "name": "Source page 7-8 (OCR incomplete)",
+        "url": "https://example.gov/agenda.pdf?rev=2#page=7",
+        "type": "source_link",
+    }]
 
 
 def test_sync_deferral_archives_and_defers(monkeypatch):

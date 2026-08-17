@@ -58,7 +58,8 @@ class FakeBlobRepo:
             self.blobs[sha]["original_key"] = key
 
     async def set_extraction(self, sha, text_key, extract_method, extract_version,
-                             page_count, ocr_page_count, text_chars):
+                             page_count, ocr_page_count, text_chars,
+                             extraction_status="succeeded"):
         self.blobs[sha].update(
             text_key=text_key,
             extract_method=extract_method,
@@ -66,6 +67,14 @@ class FakeBlobRepo:
             page_count=page_count,
             ocr_page_count=ocr_page_count,
             text_chars=text_chars,
+            extraction_status=extraction_status,
+        )
+
+    async def record_extraction_failure(self, sha, *, error_type, error_message):
+        self.blobs[sha].update(
+            extraction_status="failed",
+            extraction_error_type=error_type,
+            extraction_error_message=error_message,
         )
 
     async def record_source_observation(self, sha, source_identity, banana=None):

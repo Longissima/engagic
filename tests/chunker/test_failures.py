@@ -24,6 +24,7 @@ TAXONOMY = {
     router.NO_TEXT_LAYER,
     router.NO_ITEMS,
     router.ENGINE_ERROR,
+    router.OCR_REQUIRED,
 }
 
 

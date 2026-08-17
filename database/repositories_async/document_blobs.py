@@ -65,6 +65,7 @@ class DocumentBlobRepository(BaseRepository):
         page_count: Optional[int],
         ocr_page_count: Optional[int],
         text_chars: int,
+        extraction_status: str = "succeeded",
     ) -> None:
         """Record extracted text and its provenance for a blob."""
         await self._execute(
@@ -76,7 +77,11 @@ class DocumentBlobRepository(BaseRepository):
                 page_count = $5,
                 ocr_page_count = $6,
                 text_chars = $7,
-                text_extracted_at = CURRENT_TIMESTAMP
+                text_extracted_at = CURRENT_TIMESTAMP,
+                extraction_status = $8,
+                extraction_attempted_at = CURRENT_TIMESTAMP,
+                extraction_error_type = NULL,
+                extraction_error_message = NULL
             WHERE content_sha256 = $1
             """,
             content_sha256,
@@ -86,6 +91,28 @@ class DocumentBlobRepository(BaseRepository):
             page_count,
             ocr_page_count,
             text_chars,
+            extraction_status,
+        )
+
+    async def record_extraction_failure(
+        self,
+        content_sha256: str,
+        *,
+        error_type: str,
+        error_message: str,
+    ) -> None:
+        await self._execute(
+            """
+            UPDATE document_blob
+            SET extraction_status = 'failed',
+                extraction_attempted_at = CURRENT_TIMESTAMP,
+                extraction_error_type = $2,
+                extraction_error_message = LEFT($3, 2000)
+            WHERE content_sha256 = $1
+            """,
+            content_sha256,
+            error_type,
+            error_message,
         )
 
     async def record_source_observation(

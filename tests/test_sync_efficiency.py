@@ -370,6 +370,7 @@ def test_adapter_boundary_normalizes_valid_output_and_filters_schema_failures():
     assert [meeting["vendor_id"] for meeting in result.meetings] == [
         "123",
         "optional-fields",
+        "invalid-attachment",
     ]
     meeting = result.meetings[0]
     assert meeting["title"] == "Council Meeting"
@@ -391,6 +392,50 @@ def test_adapter_boundary_normalizes_valid_output_and_filters_schema_failures():
     ]
     assert "items" not in result.meetings[1]
     assert "packet_url" not in result.meetings[1]
+    # A malformed optional attachment is isolated; it no longer discards the
+    # otherwise valid item or its parent meeting.
+    assert result.meetings[2]["items"][0]["attachments"] == []
+
+
+class _AllInvalidSchemaAdapter(AsyncBaseAdapter):
+    def __init__(self):
+        super().__init__("test-city", "test-vendor")
+
+    async def _fetch_meetings_impl(self, days_back, days_forward):
+        return [
+            {
+                "vendor_id": "bad-date",
+                "title": "Fetched but invalid",
+                "start": "08/19/26",
+            }
+        ]
+
+
+class _EmptySchemaAdapter(AsyncBaseAdapter):
+    def __init__(self):
+        super().__init__("test-city", "test-vendor")
+
+    async def _fetch_meetings_impl(self, days_back, days_forward):
+        return []
+
+
+def test_adapter_boundary_reports_failure_when_all_fetched_work_is_invalid():
+    result = asyncio.run(_AllInvalidSchemaAdapter().fetch_meetings())
+
+    assert result.success is False
+    assert result.meetings == []
+    assert result.error_type == "SchemaValidationError"
+    assert result.error == (
+        "All 1 fetched meeting candidate(s) failed schema validation"
+    )
+
+
+def test_adapter_boundary_preserves_success_for_legitimate_empty_result():
+    result = asyncio.run(_EmptySchemaAdapter().fetch_meetings())
+
+    assert result.success is True
+    assert result.meetings == []
+    assert result.error is None
 
 
 class _Connection:

@@ -852,7 +852,12 @@ class PdfExtractor:
         page_texts = {}  # page_num -> text
         all_links = []
         ocr_tasks = []  # (page_num, png_bytes, original_text, repair_required)
-        ocr_pending = 0  # below-threshold pages skipped because ocr_enabled=False
+        # Exact page provenance matters downstream: a structural item whose
+        # bookmark/link boundary is sound may still be usable when one of its
+        # pages needs OCR, while a text-derived boundary on that same page is
+        # not authoritative.  Keep the count for the public contract, but
+        # derive it from a set so a failed repair is never double-counted.
+        ocr_pending_pages: set[int] = set()
 
         # Activation is deterministic and auditable: a textual legend OR
         # geometric strike evidence (spans crossed mid-height by strike
@@ -923,7 +928,7 @@ class PdfExtractor:
                 if not self.ocr_enabled:
                     # Ground-truth mode: count instead of OCR. The caller uses
                     # ocr_pending to decide whether this text is complete.
-                    ocr_pending += 1
+                    ocr_pending_pages.add(page_num + 1)
                     page_texts[page_num + 1] = page_text
                 else:
                     logger.debug(
@@ -944,7 +949,7 @@ class PdfExtractor:
                         # Rendering failure means the OCR-owning path could not
                         # establish completeness, even when the retained layer
                         # is merely short rather than demonstrably corrupt.
-                        ocr_pending += 1
+                        ocr_pending_pages.add(page_num + 1)
                         page_texts[page_num + 1] = page_text
             else:
                 page_texts[page_num + 1] = page_text
@@ -967,21 +972,22 @@ class PdfExtractor:
         if ocr_tasks:
             ocr_results, failed_ocr_pages = self._ocr_pages_parallel(ocr_tasks)
             page_texts.update(ocr_results)
-            ocr_pending += len(failed_ocr_pages)
+            ocr_pending_pages.update(failed_ocr_pages)
 
         # Count OCR pages (pages where OCR was actually used, not just attempted)
         ocr_pages = sum(
             1 for page_num, _, original, _ in ocr_tasks
             if page_num in page_texts and page_texts[page_num] != original
         )
-        unrepaired_required_pages = sum(
-            1
+        unrepaired_required_pages = {
+            page_num
             for page_num, _, original, repair_required in ocr_tasks
             if repair_required
             and page_num not in failed_ocr_pages
             and page_texts.get(page_num, original) == original
-        )
-        ocr_pending += unrepaired_required_pages
+        }
+        ocr_pending_pages.update(unrepaired_required_pages)
+        ocr_pending = len(ocr_pending_pages)
 
         # Assemble final text in page order
         text_parts = [
@@ -1015,6 +1021,7 @@ class PdfExtractor:
             "extraction_time": extraction_time,
             "ocr_pages": ocr_pages,
             "ocr_pending": ocr_pending,
+            "ocr_pending_pages": sorted(ocr_pending_pages),
         }
 
         if extract_links:

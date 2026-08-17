@@ -394,15 +394,44 @@ class ItemRepository(BaseRepository):
     async def update_filter_reason(
         self,
         item_id: str,
-        reason: str,
+        reason: Optional[str],
+        *,
+        rule_id: Optional[str] = None,
+        filter_version: str = "legacy",
+        source: str = "processor",
         conn: Optional[Connection] = None,
     ) -> None:
-        """Update the filter_reason for an item."""
+        """Replace the current verdict and append an audit when it changes."""
         async with self._ensure_conn(conn) as connection:
             await connection.execute(
-                "UPDATE items SET filter_reason = $1 WHERE id = $2",
-                reason,
+                """
+                WITH prior AS MATERIALIZED (
+                    SELECT filter_reason, filter_rule_id, filter_version
+                    FROM items WHERE id = $1 FOR UPDATE
+                ), updated AS (
+                    UPDATE items
+                    SET filter_reason = $2,
+                        filter_rule_id = $3,
+                        filter_version = $4,
+                        filter_evaluated_at = CURRENT_TIMESTAMP
+                    WHERE id = $1
+                    RETURNING id
+                )
+                INSERT INTO item_filter_audits (
+                    item_id, old_reason, new_reason, rule_id,
+                    filter_version, source
+                )
+                SELECT updated.id, prior.filter_reason, $2, $3, $4, $5
+                FROM prior, updated
+                WHERE prior.filter_reason IS DISTINCT FROM $2
+                   OR prior.filter_rule_id IS DISTINCT FROM $3
+                   OR prior.filter_version IS DISTINCT FROM $4
+                """,
                 item_id,
+                reason,
+                rule_id,
+                filter_version,
+                source,
             )
 
     async def get_all_items_for_matter(

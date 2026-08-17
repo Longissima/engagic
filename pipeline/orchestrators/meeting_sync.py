@@ -1,5 +1,7 @@
 """Meeting Sync Orchestrator - Coordinates meeting storage workflow."""
 
+import hashlib
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, TypedDict
@@ -27,9 +29,136 @@ from pipeline.utils import (
 from pipeline.orchestrators.matter_filter import MatterFilter
 from pipeline.orchestrators.enqueue_decider import EnqueueDecider, MatterEnqueueDecider
 from pipeline.orchestrators.vote_processor import VoteProcessor
+from pipeline.filters import (
+    ATTACHMENT_FILTER_VERSION,
+    get_attachment_filter_decision,
+)
 from vendors.adapters.parsers.quality import classify_title
 
 logger = get_logger(__name__).bind(component="meeting_sync")
+
+
+def _source_audit(meeting_dict: Mapping[str, Any]) -> Dict[str, Any]:
+    items = meeting_dict.get("items") or []
+    chunk = meeting_dict.get("chunk_audit")
+    html = meeting_dict.get("html_audit")
+    if chunk:
+        source_path = "chunked_pdf"
+        parser = chunk.get("parse_method") or chunk.get("winning_rung")
+    elif html:
+        source_path = "html"
+        parser = html.get("pattern")
+    elif items:
+        source_path = "adapter_items"
+        parser = None
+    elif meeting_dict.get("packet_url") or meeting_dict.get("agenda_url"):
+        source_path = "monolith_document"
+        parser = None
+    else:
+        source_path = "metadata_only"
+        parser = None
+
+    attachments = [
+        attachment
+        for item in items
+        for attachment in (item.get("attachments") or [])
+        if isinstance(attachment, Mapping)
+    ]
+    decisions = [
+        decision
+        for attachment in attachments
+        if (
+            decision := get_attachment_filter_decision(
+                str(attachment.get("name") or "")
+            )
+        )
+    ]
+    return {
+        "version": "sp1",
+        "source_path": source_path,
+        "parser": parser,
+        "item_count": len(items),
+        "attachment_count": len(attachments),
+        "attachment_filter": {
+            "version": ATTACHMENT_FILTER_VERSION,
+            "excluded": len(decisions),
+            "reason_counts": dict(Counter(d.reason for d in decisions)),
+            "rule_counts": dict(Counter(d.rule_id for d in decisions)),
+        },
+    }
+
+
+def _normalize_item_identity_text(value: Any) -> str:
+    """Normalize semantic item labels without depending on agenda position."""
+    folded = str(value or "").casefold()
+    return " ".join(
+        "".join(character if character.isalnum() else " " for character in folded).split()
+    )
+
+
+def _item_identity_section(item: Mapping[str, Any]) -> str:
+    metadata = item.get("metadata") or {}
+    return _normalize_item_identity_text(
+        item.get("section")
+        or metadata.get("section")
+        or metadata.get("section_path")
+        or metadata.get("parent_section")
+    )
+
+
+def _item_identity_core(item: Mapping[str, Any]) -> str:
+    """Stable semantic identity for section-local vendor identifiers."""
+    return "\x1f".join(
+        (
+            _item_identity_section(item),
+            _normalize_item_identity_text(item.get("agenda_number")),
+            _normalize_item_identity_text(item.get("title")),
+            _normalize_item_identity_text(item.get("matter_file")),
+            _normalize_item_identity_text(item.get("matter_id")),
+        )
+    )
+
+
+def _stable_item_id_plan(
+    meeting_id: str,
+    items: List[Mapping[str, Any]],
+) -> List[Optional[str]]:
+    """Plan deterministic IDs, hashing semantics only for colliding base IDs.
+
+    Unique vendor identifiers retain their historical IDs.  When a vendor
+    reuses a section-local label (``A``, ``1``) or resets sequence numbering,
+    every member of that collision group receives a semantic suffix.  Exact
+    duplicate records collapse to one item instead of gaining order-dependent
+    ``_dupN`` suffixes.
+    """
+    bases = [
+        generate_item_id(
+            meeting_id,
+            int(item.get("sequence") or (idx + 1)),
+            item.get("vendor_item_id"),
+        )
+        for idx, item in enumerate(items)
+    ]
+    groups: Dict[str, List[int]] = {}
+    for idx, base in enumerate(bases):
+        groups.setdefault(base, []).append(idx)
+
+    planned: List[Optional[str]] = list(bases)
+    for base, indexes in groups.items():
+        if len(indexes) == 1:
+            continue
+
+        seen_semantics: set[str] = set()
+        for idx in indexes:
+            semantic = _item_identity_core(items[idx])
+            if semantic in seen_semantics:
+                planned[idx] = None
+                continue
+            seen_semantics.add(semantic)
+            digest = hashlib.sha256(semantic.encode("utf-8")).hexdigest()[:16]
+            planned[idx] = f"{base}_local_{digest}"
+
+    return planned
 
 
 class MeetingStoreStats(TypedDict, total=False):
@@ -150,6 +279,7 @@ class MeetingSyncOrchestrator:
                 agenda_items = self.db.items.dedupe_items_by_matter(agenda_items)
 
             matters_stats: Dict[str, Any] = {}
+            source_audit = _source_audit(meeting_dict)
             async with self.db.pool.acquire() as conn:
                 async with conn.transaction():
                     is_first_meeting = False
@@ -160,6 +290,20 @@ class MeetingSyncOrchestrator:
                         )
                         stats["activation_checked"] = True
                     await self.db.meetings.store_meeting(meeting_obj, conn=conn)
+                    record_ingest = getattr(
+                        getattr(self.db, "pipeline_lifecycle", None),
+                        "record_meeting_ingest_audit",
+                        None,
+                    )
+                    if record_ingest:
+                        await record_ingest(
+                            meeting_id=meeting_obj.id,
+                            banana=meeting_obj.banana,
+                            vendor=getattr(city, "vendor", None),
+                            slug=getattr(city, "slug", None),
+                            audit=source_audit,
+                            conn=conn,
+                        )
 
                     if agenda_items:
                         # store_meeting owns the meeting row lock. Discover old
@@ -240,6 +384,7 @@ class MeetingSyncOrchestrator:
                         publish_meeting=True,
                         chunk_audit=meeting_dict.get("chunk_audit"),
                         html_audit=meeting_dict.get("html_audit"),
+                        source_audit=source_audit,
                     )
 
             return meeting_obj, stats
@@ -483,8 +628,8 @@ class MeetingSyncOrchestrator:
         existing_items_map = {item.id: item for item in existing_items}
 
         agenda_items = []
-        seen_item_ids: set[str] = set()
         filtered_garbage = 0
+        candidates: List[tuple[int, Dict[str, Any]]] = []
         for idx, item_data in enumerate(items_data):
             # Junk-title guard. Financial/tabular content (check registers, GL-code
             # tables, rate sheets) explodes into one item per row, and it can arrive
@@ -495,29 +640,66 @@ class MeetingSyncOrchestrator:
             if classify_title(item_data.get("title")):
                 filtered_garbage += 1
                 continue
+            candidates.append((idx, item_data))
+
+        identity_candidates: List[Mapping[str, Any]] = []
+        for source_idx, item_data in candidates:
+            if item_data.get("sequence"):
+                identity_candidates.append(item_data)
+            else:
+                with_sequence = dict(item_data)
+                with_sequence["sequence"] = source_idx + 1
+                identity_candidates.append(with_sequence)
+        planned_ids = _stable_item_id_plan(
+            stored_meeting.id,
+            identity_candidates,
+        )
+        exact_duplicates = sum(item_id is None for item_id in planned_ids)
+        collision_items = 0
+
+        # A compatibility bridge for IDs previously persisted as
+        # encounter-order ``_dupN`` values. Exact title/agenda-number matches
+        # preserve the row itself (and therefore its frozen snapshot) during
+        # migration; ambiguous matches are never guessed.
+        existing_by_semantic: Dict[tuple[str, str], List[AgendaItem]] = {}
+        for existing_item in existing_items:
+            semantic_key = (
+                _normalize_item_identity_text(existing_item.title),
+                _normalize_item_identity_text(existing_item.agenda_number),
+            )
+            existing_by_semantic.setdefault(semantic_key, []).append(existing_item)
+
+        claimed_existing_ids: set[str] = set()
+        for (source_idx, item_data), item_id in zip(candidates, planned_ids):
+            if item_id is None:
+                continue
             # Centralized item ID generation - all adapters return vendor_item_id
             # Use 'or' to handle both missing key AND explicit 0/None from vendors
-            sequence = item_data.get("sequence") or (idx + 1)
+            sequence = item_data.get("sequence") or (source_idx + 1)
             vendor_item_id = item_data.get("vendor_item_id")
-            item_id = generate_item_id(stored_meeting.id, sequence, vendor_item_id)
-            if item_id in seen_item_ids:
-                # Section-scoped vendor numbering ("1." in consent AND regular
-                # business) duplicates ids, which the items upsert's ON CONFLICT
-                # would collapse into one row. Suffix by agenda order — as
-                # stable as the sequence fallback.
-                base_id = item_id
-                n = 2
-                while item_id in seen_item_ids:
-                    item_id = f"{base_id}_dup{n}"
-                    n += 1
-                logger.warning(
-                    "duplicate item id within meeting, disambiguated",
-                    meeting_id=stored_meeting.id,
-                    vendor_item_id=vendor_item_id,
-                    item_id=item_id,
-                    title=(item_data.get("title") or "")[:80],
-                )
-            seen_item_ids.add(item_id)
+            base_id = generate_item_id(
+                stored_meeting.id, int(sequence), vendor_item_id
+            )
+            # Preserve an unambiguous legacy ID itself, not merely the summary
+            # stored under it.  Otherwise the semantic-ID migration would
+            # insert a second row while the old encounter-order ``_dupN`` row
+            # remained attached to the meeting.  Claim each existing row at
+            # most once so two genuinely distinct current items with the same
+            # title cannot collapse onto it.
+            semantic_key = (
+                _normalize_item_identity_text(item_data.get("title")),
+                _normalize_item_identity_text(item_data.get("agenda_number")),
+            )
+            legacy_matches = existing_by_semantic.get(semantic_key, [])
+            if (
+                len(legacy_matches) == 1
+                and legacy_matches[0].id not in claimed_existing_ids
+            ):
+                item_id = legacy_matches[0].id
+            claimed_existing_ids.add(item_id)
+            is_collision = item_id != base_id
+            if is_collision:
+                collision_items += 1
 
             item_attachments = deserialize_attachments(item_data.get("attachments"))
             matter_file = item_data.get("matter_file")
@@ -573,6 +755,14 @@ class MeetingSyncOrchestrator:
                     agenda_item.attachments = existing_item.attachments
 
             agenda_items.append(agenda_item)
+
+        if collision_items or exact_duplicates:
+            logger.warning(
+                "section-local item ids resolved deterministically",
+                meeting_id=stored_meeting.id,
+                collision_items=collision_items,
+                exact_duplicates_removed=exact_duplicates,
+            )
 
         if filtered_garbage:
             logger.info(
@@ -862,6 +1052,7 @@ class MeetingSyncOrchestrator:
         publish_meeting: bool,
         chunk_audit: Optional[Dict[str, Any]] = None,
         html_audit: Optional[Dict[str, Any]] = None,
+        source_audit: Optional[Dict[str, Any]] = None,
     ) -> Meeting:
         """Derive desired work from locked rows retained by the database.
 
@@ -1011,6 +1202,9 @@ class MeetingSyncOrchestrator:
                         "work_version": matter_work.work_version,
                         "banana": authoritative_meeting.banana,
                         "meeting_date": authoritative_meeting.date,
+                        "attachment_filter_audit": (
+                            matter_work.attachment_filter_audit
+                        ),
                     }
                 )
             elif matter_id in procedural_matter_ids or not matter_work.is_summarizable:
@@ -1068,6 +1262,9 @@ class MeetingSyncOrchestrator:
                     work_version=publication["work_version"],
                     banana=publication["banana"],
                     meeting_date=publication["meeting_date"],
+                    attachment_filter_audit=publication[
+                        "attachment_filter_audit"
+                    ],
                     conn=conn,
                 )
             else:
@@ -1092,6 +1289,7 @@ class MeetingSyncOrchestrator:
                 conn=conn,
                 chunk_audit=chunk_audit,
                 html_audit=html_audit,
+                source_audit=source_audit,
             )
 
         return authoritative_meeting
@@ -1104,10 +1302,11 @@ class MeetingSyncOrchestrator:
         conn: Connection,
         chunk_audit: Optional[Dict[str, Any]] = None,
         html_audit: Optional[Dict[str, Any]] = None,
+        source_audit: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Enqueue meeting for LLM processing if criteria are met."""
         should_enqueue, skip_reason = self.enqueue_decider.should_enqueue(
-            stored_meeting, agenda_items, bool(agenda_items)
+            stored_meeting, agenda_items, bool(agenda_items), chunk_audit
         )
 
         if not should_enqueue:
@@ -1144,6 +1343,7 @@ class MeetingSyncOrchestrator:
                     for k, v in (
                         ("chunk", versioned_chunk_audit),
                         ("html", html_audit),
+                        ("source", source_audit),
                     )
                     if v
                 }
@@ -1165,6 +1365,7 @@ class MeetingSyncOrchestrator:
         banana: str,
         meeting_date: Optional[datetime],
         conn: Connection,
+        attachment_filter_audit: Optional[Dict[str, Any]] = None,
     ) -> None:
         priority = self.matter_enqueue_decider.calculate_priority(meeting_date)
 
@@ -1177,6 +1378,11 @@ class MeetingSyncOrchestrator:
             banana=banana,
             priority=priority,
             work_version=work_version,
+            processing_metadata=(
+                {"attachment_filter": attachment_filter_audit}
+                if attachment_filter_audit
+                else None
+            ),
             conn=conn,
         )
 

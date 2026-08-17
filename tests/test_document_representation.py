@@ -157,6 +157,7 @@ def test_suspiciously_large_page_text_is_never_sliced_before_ocr():
     assert source in result["text"]
     assert result["text"].endswith("END-OF-SOURCE")
     assert result["ocr_pending"] == 1
+    assert result["ocr_pending_pages"] == [1]
     assert result["method"] == "pymupdf-partial"
 
 
@@ -194,6 +195,7 @@ def test_failed_ocr_candidate_is_marked_partial():
     result = extractor._extract_from_document(Document(), False, time.time())
 
     assert result["ocr_pending"] == 1
+    assert result["ocr_pending_pages"] == [1]
     assert result["method"] == "pymupdf-partial"
 
 

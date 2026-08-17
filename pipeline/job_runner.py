@@ -18,6 +18,10 @@ class TerminalJobError(RuntimeError):
     """The claimed descriptor cannot succeed without different desired work."""
 
 
+class SupersededWorkError(TerminalJobError):
+    """The attempt is obsolete because newer desired work owns the aggregate."""
+
+
 class _QueueClaimLost(RuntimeError):
     """The worker no longer owns the queue descriptor it was executing."""
 
@@ -134,6 +138,8 @@ class JobRunner:
                 outcome = JobOutcome.retryable_failure(
                     f"job exceeded {policy.timeout_seconds:g}s wall-clock timeout"
                 )
+            except SupersededWorkError as exc:
+                outcome = JobOutcome.abandoned(exc)
             except TerminalJobError as exc:
                 outcome = JobOutcome.terminal_failure(exc)
             except (ProcessingError, LLMError, ExtractionError) as exc:

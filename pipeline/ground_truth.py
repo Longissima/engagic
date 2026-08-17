@@ -16,11 +16,13 @@ provenance. Corpus failures never propagate -- the store swallows its own.
 import asyncio
 import os
 import tempfile
+import time
 from typing import Any, Dict, Optional
+from urllib.parse import urldefrag
 
 from config import config, get_logger
 from corpus.store import get_corpus, sha256_hex
-from parsing.subprocess_guard import GuardTimeout, run_guarded
+from parsing.subprocess_guard import GuardCrashed, GuardTimeout, run_guarded
 from vendors.adapters.parsers.router import (
     ChunkResult,
     ENGINE_ERROR,
@@ -30,6 +32,7 @@ from vendors.adapters.parsers.router import (
     Attempt,
     chunk_pdf,
     get_city_hint,
+    recover_pdf_text,
     set_city_hint,
 )
 
@@ -54,6 +57,48 @@ def _chunk_guard_semaphore() -> asyncio.Semaphore:
         sem = asyncio.Semaphore(config.CHUNKER_SUBPROCESS_CONCURRENCY)
         _chunk_guard_sems[loop] = sem
     return sem
+
+
+def _run_chunk_with_recovery(
+    tmp_path: str,
+    ladder: str,
+    hint: Optional[str],
+) -> tuple[ChunkResult, Optional[Dict[str, Any]]]:
+    """Run the normal guard and its one reduced retry in the same worker.
+
+    Keeping both blocking guard calls inside one ``to_thread`` job also
+    avoids depending on executor rescheduling after an exception.
+    """
+    guard_started = time.monotonic()
+    try:
+        return run_guarded(
+            chunk_pdf,
+            (tmp_path, ladder, hint),
+            timeout=config.CHUNKER_TIMEOUT_SECONDS,
+            rlimit_bytes=_CHUNK_RLIMIT_BYTES,
+        ), None
+    except GuardCrashed as first_crash:
+        remaining = config.CHUNKER_TIMEOUT_SECONDS - (
+            time.monotonic() - guard_started
+        )
+        if remaining < 1.0:
+            raise
+        logger.warning(
+            "chunker child crashed; trying guarded text-only recovery",
+            exitcode=first_crash.exitcode,
+            remaining_seconds=round(remaining, 1),
+        )
+        result = run_guarded(
+            recover_pdf_text,
+            (tmp_path, ladder),
+            timeout=remaining,
+            rlimit_bytes=_CHUNK_RLIMIT_BYTES,
+        )
+        return result, {
+            "trigger": "crash",
+            "exitcode": first_crash.exitcode,
+            "path": "text_only",
+        }
 
 
 async def archive_bytes(
@@ -123,13 +168,14 @@ async def produce_ground_truth(
         # child. A pathological page wedges one child for at most the
         # timeout, never the pipeline (the 2026-06-29 freeze class).
         async with _chunk_guard_semaphore():
-            result = await asyncio.to_thread(
-                run_guarded,
-                chunk_pdf,
-                (tmp_path, ladder, hint),
-                timeout=config.CHUNKER_TIMEOUT_SECONDS,
-                rlimit_bytes=_CHUNK_RLIMIT_BYTES,
+            result, guard_recovery = await asyncio.to_thread(
+                _run_chunk_with_recovery,
+                tmp_path,
+                ladder,
+                hint,
             )
+            if guard_recovery:
+                result.quality["guard_recovery"] = guard_recovery
 
     except GuardTimeout as e:
         # Distinct from ENGINE_ERROR: timeouts are the freeze telemetry.
@@ -155,6 +201,9 @@ async def produce_ground_truth(
     if result.winning_rung:
         set_city_hint(vendor, slug, ladder, result.winning_rung)
 
+    if source_url:
+        _attach_incomplete_source_links(result, source_url)
+
     # Stage-2 write-once: persist the child's ground-truth text when it is
     # provably complete. Process extraction then serves these bytes from the
     # corpus instead of re-extracting.
@@ -168,3 +217,36 @@ async def produce_ground_truth(
         await corpus_store.persist_extraction(content_sha256, result.extraction)
 
     return result
+
+
+def _attach_incomplete_source_links(result: ChunkResult, source_url: str) -> None:
+    """Expose OCR-incomplete structural pages without reprocessing the URL."""
+    base_url, _fragment = urldefrag(source_url)
+    for item in result.items:
+        metadata = item.get("metadata") or {}
+        if not metadata.get("extraction_incomplete"):
+            continue
+        pages = metadata.get("ocr_pending_pages") or []
+        if not pages:
+            try:
+                pages = [int(metadata["page_start"])]
+            except (KeyError, TypeError, ValueError):
+                pages = []
+        first_page = pages[0] if pages else None
+        if not pages:
+            page_label = "document"
+        elif len(pages) == 1:
+            page_label = str(first_page)
+        elif pages == list(range(pages[0], pages[-1] + 1)):
+            page_label = f"{pages[0]}-{pages[-1]}"
+        else:
+            page_label = f"{first_page} and {len(pages) - 1} other page(s)"
+        url = f"{base_url}#page={first_page}" if first_page else base_url
+        attachments = item.setdefault("attachments", [])
+        if any(att.get("url") == url for att in attachments):
+            continue
+        attachments.append({
+            "name": f"Source page {page_label} (OCR incomplete)",
+            "url": url,
+            "type": "source_link",
+        })

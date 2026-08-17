@@ -139,6 +139,9 @@ CREATE TABLE IF NOT EXISTS items (
     quality_score REAL,    -- Denormalized from ratings for efficient queries
     rating_count INTEGER DEFAULT 0,
     filter_reason TEXT,    -- Why item was skipped: 'procedural', 'ceremonial', 'administrative', or NULL
+    filter_rule_id TEXT,
+    filter_version TEXT,
+    filter_evaluated_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
     FOREIGN KEY (matter_id) REFERENCES city_matters(id) ON DELETE SET NULL
@@ -332,6 +335,40 @@ CREATE INDEX IF NOT EXISTS idx_pipeline_stage_attempt
 CREATE INDEX IF NOT EXISTS idx_pipeline_stage_run
     ON pipeline_stage_events (run_id, stage, started_at);
 
+CREATE TABLE IF NOT EXISTS item_filter_audits (
+    id BIGSERIAL PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    old_reason TEXT,
+    new_reason TEXT,
+    rule_id TEXT,
+    filter_version TEXT NOT NULL,
+    source TEXT NOT NULL,
+    evaluated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_item_filter_audits_item
+    ON item_filter_audits (item_id, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_item_filter_audits_version
+    ON item_filter_audits (filter_version, evaluated_at DESC);
+
+CREATE TABLE IF NOT EXISTS meeting_ingest_audits (
+    id BIGSERIAL PRIMARY KEY,
+    meeting_id TEXT NOT NULL,
+    banana TEXT NOT NULL,
+    vendor TEXT,
+    slug TEXT,
+    source_path TEXT NOT NULL,
+    item_count INTEGER NOT NULL DEFAULT 0,
+    attachment_count INTEGER NOT NULL DEFAULT 0,
+    audit JSONB NOT NULL DEFAULT '{}'::jsonb,
+    observed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_meeting_ingest_audits_meeting
+    ON meeting_ingest_audits (meeting_id, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_meeting_ingest_audits_path
+    ON meeting_ingest_audits (source_path, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_meeting_ingest_audits_vendor
+    ON meeting_ingest_audits (vendor, observed_at DESC);
+
 CREATE TABLE IF NOT EXISTS pipeline_outbox (
     id BIGSERIAL PRIMARY KEY,
     event_key TEXT NOT NULL UNIQUE,
@@ -386,6 +423,14 @@ CREATE TABLE IF NOT EXISTS document_blob (
     page_count INTEGER,
     ocr_page_count INTEGER,
     text_chars BIGINT,
+    extraction_status TEXT CHECK (
+        extraction_status IS NULL OR extraction_status IN (
+            'succeeded', 'partial', 'failed'
+        )
+    ),
+    extraction_attempted_at TIMESTAMP,
+    extraction_error_type TEXT,
+    extraction_error_message TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     text_extracted_at TIMESTAMP
 );

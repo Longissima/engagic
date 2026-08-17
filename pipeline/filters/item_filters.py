@@ -1,7 +1,50 @@
 """Item filtering - store everything, filter at processing time"""
 
+import hashlib
 import re
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
+
+
+ITEM_FILTER_VERSION = "ifv1"
+ATTACHMENT_FILTER_VERSION = "afv1"
+
+
+@dataclass(frozen=True, slots=True)
+class FilterDecision:
+    reason: str
+    rule_id: str
+    version: str
+
+
+def _rule_id(namespace: str, pattern: str) -> str:
+    digest = hashlib.sha256(pattern.encode("utf-8")).hexdigest()[:16]
+    return f"{namespace}:{digest}"
+
+
+def _match_decision(
+    value: str,
+    reason: str,
+    patterns: Sequence[str],
+    *,
+    version: str,
+) -> Optional[FilterDecision]:
+    for pattern in patterns:
+        if re.search(pattern, value, re.IGNORECASE):
+            return FilterDecision(
+                reason=reason,
+                rule_id=_rule_id(reason, pattern),
+                version=version,
+            )
+    return None
+
+
+def system_filter_decision(reason: str) -> FilterDecision:
+    return FilterDecision(
+        reason=reason,
+        rule_id=f"system:{reason}",
+        version=ITEM_FILTER_VERSION,
+    )
 
 # Meeting level: test/demo meetings to skip entirely
 MEETING_SKIP_PATTERNS = [
@@ -185,19 +228,33 @@ def should_skip_meeting(title: str) -> bool:
     return any(re.search(p, title, re.IGNORECASE) for p in MEETING_SKIP_PATTERNS)
 
 
+def get_filter_decision(
+    title: str, item_type: str = ""
+) -> Optional[FilterDecision]:
+    combined = f"{title} {item_type}".lower()
+    for reason, patterns in (
+        ("procedural", PROCEDURAL_PATTERNS),
+        ("ceremonial", CEREMONIAL_PATTERNS),
+        ("administrative", ADMINISTRATIVE_PATTERNS),
+    ):
+        decision = _match_decision(
+            combined,
+            reason,
+            patterns,
+            version=ITEM_FILTER_VERSION,
+        )
+        if decision:
+            return decision
+    return None
+
+
 def get_skip_reason(title: str, item_type: str = "") -> Optional[str]:
     """Get the skip reason category for an item, or None if it should be processed.
 
     Returns: "procedural", "ceremonial", "administrative", or None.
     """
-    combined = f"{title} {item_type}".lower()
-    if any(re.search(p, combined, re.IGNORECASE) for p in PROCEDURAL_PATTERNS):
-        return "procedural"
-    if any(re.search(p, combined, re.IGNORECASE) for p in CEREMONIAL_PATTERNS):
-        return "ceremonial"
-    if any(re.search(p, combined, re.IGNORECASE) for p in ADMINISTRATIVE_PATTERNS):
-        return "administrative"
-    return None
+    decision = get_filter_decision(title, item_type)
+    return decision.reason if decision else None
 
 
 def should_skip_processing(title: str, item_type: str = "") -> bool:
@@ -213,14 +270,26 @@ def should_skip_matter(matter_type: str) -> bool:
     return any(skip.lower() in matter_lower for skip in SKIP_MATTER_TYPES)
 
 
-def is_public_comment_attachment(name: str) -> bool:
-    """Is attachment low-value for summarization (public comments, parcel tables, boilerplate, procedural, EIRs)?"""
+def get_attachment_filter_decision(name: str) -> Optional[FilterDecision]:
     name_lower = name.lower()
-    all_patterns = (
-        PUBLIC_COMMENT_PATTERNS +
-        PARCEL_TABLE_PATTERNS +
-        BOILERPLATE_CONTRACT_PATTERNS +
-        SF_PROCEDURAL_PATTERNS +
-        EIR_PATTERNS
-    )
-    return any(re.search(p, name_lower, re.IGNORECASE) for p in all_patterns)
+    for reason, patterns in (
+        ("public_comment", PUBLIC_COMMENT_PATTERNS),
+        ("parcel_table", PARCEL_TABLE_PATTERNS),
+        ("boilerplate_contract", BOILERPLATE_CONTRACT_PATTERNS),
+        ("sf_procedural", SF_PROCEDURAL_PATTERNS),
+        ("environmental_report", EIR_PATTERNS),
+    ):
+        decision = _match_decision(
+            name_lower,
+            reason,
+            patterns,
+            version=ATTACHMENT_FILTER_VERSION,
+        )
+        if decision:
+            return decision
+    return None
+
+
+def is_public_comment_attachment(name: str) -> bool:
+    """Whether an attachment is excluded from summary-input change detection."""
+    return get_attachment_filter_decision(name) is not None

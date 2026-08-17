@@ -104,14 +104,20 @@ class JobOutcome:
             normalized, "items_skipped"
         )
         processed = _counter(normalized, "items_processed")
+        reason = str(normalized.get("failure_reason") or "unit_failure")
+        message = f"{failed} processing unit(s) failed: {reason}"
         if handled > 0 or processed > failed:
             return cls(
                 OutcomeStatus.PARTIAL,
                 normalized,
-                error=f"{failed} processing unit(s) failed",
+                error=message,
+                error_type="UnitFailure",
             )
-        return cls.retryable_failure(
-            f"{failed} processing unit(s) failed", normalized
+        return cls(
+            OutcomeStatus.RETRYABLE_FAILURE,
+            normalized,
+            error=message,
+            error_type="UnitFailure",
         )
 
 

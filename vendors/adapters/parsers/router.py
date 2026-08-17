@@ -48,6 +48,7 @@ NO_ITEMS = "no_items"              # parsed fine, no item structure found
 ENGINE_ERROR = "engine_error"      # chunker raised
 TIMEOUT = "timeout"                # guard killed a wedged/runaway chunk (set by dispatch)
 DEFERRED = "deferred_to_processing"  # sync archived the bytes; the processor manufactures shape
+OCR_REQUIRED = "ocr_required"       # text-derived item boundaries intersect incomplete OCR pages
 
 MIN_PDF_BYTES = 500
 
@@ -62,6 +63,24 @@ _VALID_METHODS = {
     "v2": {"toc", "url", "pageref", "auto"},
     "text": {"auto"},
 }
+
+# These methods derive item boundaries from document-authored structure,
+# rather than from the embedded text that may itself require OCR.  The body
+# text can be partial while the boundary remains authoritative.  text_items
+# is intentionally absent: when its heading page needs OCR, the shape itself
+# is upstream-broken and must be rebuilt in the OCR-owning process lane.
+_STRUCTURAL_PARSE_METHODS = frozenset({
+    "url",
+    "v2_url",
+    "v2_pageref",
+    "v2_toc",
+    "toc_hierarchical",
+    "toc_document_bundle",
+    "toc_deep_hierarchical",
+    "toc_flat",
+})
+
+_INCOMPLETE_TEXT_MARKER = "[SOURCE EXTRACTION INCOMPLETE:"
 
 # Every ladder ends on text:auto — the flat-text extractor for short
 # agendas whose only structure is numbered heading lines (no links, no
@@ -157,6 +176,9 @@ def summarize_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "winning_ladder": winner.get("ladder") if winner else None,
         "parse_method": winner.get("parse_method", "") if winner else "",
         "item_count": winner.get("item_count", 0) if winner else 0,
+        "quality": winner.get("quality") if winner else None,
+        "morphology": winner.get("morphology") if winner else None,
+        "profile": winner.get("profile") if winner else None,
         "failure_reason": None if winner else runs[-1].get("failure_reason"),
         "runs": runs,
     }
@@ -185,6 +207,9 @@ class ChunkResult:
     morphology: Optional[str] = None  # classifier's named shape
     suggested_rung: Optional[str] = None  # classifier's pick (None = no opinion)
     suggestion_used: bool = False  # suggestion actually filled the hint slot
+    hint_source: str = "ladder_default"
+    hint_rung: Optional[str] = None
+    declared_first_rung: Optional[str] = None
     quality: Dict[str, Any] = field(default_factory=dict)  # extraction vs chunking layer signals
     # Ground-truth text manufactured alongside chunking (stage 2 of
     # docs/CORPUS_ARCHITECTURE.md): the full PdfExtractor result dict
@@ -202,11 +227,15 @@ class ChunkResult:
     def audit(self) -> Dict[str, Any]:
         """Compact JSON-safe trail for logs / queue.processing_metadata."""
         return {
+            "audit_version": "ca2",
             "ladder": self.ladder,
             "profile": self.profile.to_dict() if self.profile else None,
             "morphology": self.morphology,
             "suggested_rung": self.suggested_rung,
             "suggestion_used": self.suggestion_used,
+            "hint_source": self.hint_source,
+            "hint_rung": self.hint_rung,
+            "declared_first_rung": self.declared_first_rung,
             # the passive confusion matrix: did the classifier call it?
             "suggestion_agreed": (
                 self.suggested_rung == self.winning_rung
@@ -264,6 +293,184 @@ def _attach_ground_truth(result: ChunkResult, pdf_path: str) -> None:
         logger.debug("ground-truth text pass failed", error=str(e), error_type=type(e).__name__)
 
 
+def _page_range(item: Dict[str, Any]) -> Optional[range]:
+    """Return an item's inclusive 1-indexed source-page range, if known."""
+    metadata = item.get("metadata") or {}
+    raw_start = metadata.get("page_start")
+    if raw_start is None:
+        return None
+    try:
+        start = int(str(raw_start))
+        end = int(str(metadata.get("page_end") or start))
+    except (TypeError, ValueError):
+        return None
+    if start < 1 or end < start:
+        return None
+    return range(start, end + 1)
+
+
+def _format_pages(pages: Sequence[int]) -> str:
+    if not pages:
+        return "unknown"
+    runs: List[str] = []
+    start = previous = pages[0]
+    for page in pages[1:]:
+        if page == previous + 1:
+            previous = page
+            continue
+        runs.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = page
+    runs.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(runs)
+
+
+def _apply_ocr_shape_policy(result: ChunkResult) -> None:
+    """Separate authoritative shape from incomplete page text.
+
+    OCR-disabled ground truth is allowed to carry structurally delineated
+    items, but never to bless text-derived boundaries that intersect a page
+    still requiring OCR.  Retained items get an explicit model-visible note
+    and per-item page provenance; produce_ground_truth later turns that
+    provenance into a source-page link once it has the source URL.
+    """
+    if not result.items:
+        return
+
+    extraction = result.extraction or {}
+    pending_count = int(extraction.get("ocr_pending") or 0)
+    pending_values = extraction.get("ocr_pending_pages")
+    pending_pages: Optional[set[int]]
+    if pending_values is not None:
+        pending_pages = {
+            int(str(page)) for page in pending_values
+            if isinstance(page, int) or str(page).isdigit()
+        }
+    else:
+        pending_pages = None
+
+    # A fully scanned document deliberately skips the full text pass.  TOC
+    # and link shapes can still be valid, but every item is conservatively
+    # marked incomplete because exact OCR pages are not known here.
+    if not result.extraction and result.profile and not result.profile.has_text_layer:
+        pending_count = result.profile.page_count
+        pending_pages = None
+
+    if pending_count <= 0:
+        return
+
+    affected: List[tuple[Dict[str, Any], List[int]]] = []
+    for item in result.items:
+        item_range = _page_range(item)
+        if pending_pages is None:
+            pages = list(item_range) if item_range is not None else []
+            affected.append((item, pages))
+            continue
+        if item_range is None:
+            affected.append((item, sorted(pending_pages)))
+            continue
+        pages = sorted(pending_pages.intersection(item_range))
+        if pages:
+            affected.append((item, pages))
+
+    if not affected:
+        return
+
+    if result.parse_method not in _STRUCTURAL_PARSE_METHODS:
+        result.items = []
+        result.raw = {}
+        result.failure_reason = OCR_REQUIRED
+        winning_rung = result.winning_rung
+        result.winning_rung = None
+        for attempt in reversed(result.attempts):
+            if attempt.rung == winning_rung and attempt.failure_reason is None:
+                attempt.item_count = 0
+                attempt.failure_reason = OCR_REQUIRED
+                attempt.error = (
+                    f"{len(affected)} text-derived item boundaries intersect "
+                    "pages requiring OCR"
+                )
+                break
+        return
+
+    for item, pages in affected:
+        metadata = dict(item.get("metadata") or {})
+        metadata.update({
+            "extraction_incomplete": True,
+            "ocr_pending_pages": pages,
+            "shape_basis": "structural",
+        })
+        item["metadata"] = metadata
+        note = (
+            f"{_INCOMPLETE_TEXT_MARKER} OCR is still required on source "
+            f"page(s) {_format_pages(pages)}. The item boundary comes from "
+            "the document's links/bookmarks; verify the retained text "
+            "against the linked source page.]"
+        )
+        body_text = str(item.get("body_text") or "").strip()
+        if not body_text.startswith(_INCOMPLETE_TEXT_MARKER):
+            item["body_text"] = f"{note}\n\n{body_text}".rstrip()
+
+
+def recover_pdf_text(pdf_path: str, ladder: str = "auto") -> ChunkResult:
+    """Reduced text-only recovery after a native cascade child crash.
+
+    This deliberately avoids PDF profiling, link traversal, TOC parsing, and
+    both full agenda engines.  It can therefore salvage complete corpus text
+    (and simple numbered items) when a malformed structure crashes the normal
+    cascade.  It remains subprocess-guarded by the caller.
+    """
+    result = ChunkResult(ladder=ladder)
+    try:
+        result.extraction = PdfExtractor(ocr_enabled=False).extract_from_path(pdf_path)
+    except Exception as e:
+        result.failure_reason = ENGINE_ERROR
+        result.attempts.append(Attempt(
+            rung="recovery:text",
+            failure_reason=ENGINE_ERROR,
+            error=f"{type(e).__name__}: {e}",
+        ))
+        return result
+
+    t0 = time.monotonic()
+    try:
+        parsed = parse_agenda_pdf_text(pdf_path)
+    except Exception as e:
+        result.failure_reason = ENGINE_ERROR
+        result.attempts.append(Attempt(
+            rung="recovery:text",
+            failure_reason=ENGINE_ERROR,
+            error=f"{type(e).__name__}: {e}",
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        ))
+        return result
+
+    items = parsed.get("items") or []
+    parse_method = (parsed.get("metadata") or {}).get("parse_method", "")
+    result.attempts.append(Attempt(
+        rung="text:auto",
+        item_count=len(items),
+        parse_method=parse_method,
+        failure_reason=None if items else NO_ITEMS,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+    ))
+    if items:
+        result.items = items
+        result.metadata = parsed.get("metadata") or {}
+        result.raw = parsed
+        result.winning_rung = "text:auto"
+        result.quality = {
+            "recovery": "text_only_after_guard_crash",
+            "garbage_titles": len(garbage_titles(items)),
+            "repaired_titles": 0,
+            "matter_files": extract_matter_files(items),
+        }
+        _apply_ocr_shape_policy(result)
+    else:
+        text = str(result.extraction.get("text") or "").strip()
+        result.failure_reason = NO_ITEMS if text else NO_TEXT_LAYER
+    return result
+
+
 def _classify_empty(
     pdf_path: str,
     attempts: List[Attempt],
@@ -299,6 +506,13 @@ def chunk_pdf(
     morphology classifier's suggestion fills the slot. See resolve_rungs.
     """
     result = ChunkResult(ladder=ladder if isinstance(ladder, str) else None)
+    declared_rungs = (
+        LADDERS[ladder] if isinstance(ladder, str) else list(ladder)
+    )
+    result.declared_first_rung = declared_rungs[0] if declared_rungs else None
+    if hint is not None:
+        result.hint_source = "sticky"
+        result.hint_rung = hint
 
     try:
         doc = fitz.open(pdf_path)
@@ -329,6 +543,8 @@ def chunk_pdf(
         if hint is None and result.suggested_rung and config.CHUNKER_CLASSIFIER_HINTS:
             hint = result.suggested_rung
             used_suggestion = True
+            result.hint_source = "classifier"
+            result.hint_rung = hint
 
     rungs = resolve_rungs(ladder, hint)
     # "used" means it could actually influence routing — a suggestion outside
@@ -385,6 +601,7 @@ def chunk_pdf(
                 ),
             }
             _attach_ground_truth(result, pdf_path)
+            _apply_ocr_shape_policy(result)
             return result
 
     result.failure_reason = _classify_empty(pdf_path, result.attempts, result.profile)

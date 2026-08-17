@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Optional, List, TYPE_CHECKING
 
 from pipeline.utils import matter_title_identity
+from pipeline.filters import get_filter_decision
+from vendors.adapters.parsers.morphology import is_bare_document
 
 if TYPE_CHECKING:
     from database.models import Meeting, AgendaItem, Matter
@@ -18,16 +20,37 @@ class EnqueueDecider:
         self,
         meeting: "Meeting",
         agenda_items: List["AgendaItem"],
-        has_items: bool
+        has_items: bool,
+        chunk_audit: Optional[dict] = None,
     ) -> tuple[bool, Optional[str]]:
         """Determine if meeting should be enqueued for processing
 
         Returns (should_enqueue, skip_reason) tuple.
         """
         # Check for item-level summaries (golden path)
-        # Items with filter_reason are intentionally skipped and will never get summaries
+        def filter_still_applies(item: "AgendaItem") -> bool:
+            reason = getattr(item, "filter_reason", None)
+            if not reason:
+                return False
+            decision = get_filter_decision(item.title)
+            if decision and decision.reason == reason:
+                return True
+            if reason == "no_content":
+                return not item.attachments and not item.body_text
+            if reason == "bare_agenda" and chunk_audit:
+                profiles = [
+                    run.get("profile")
+                    for run in chunk_audit.get("runs", [])
+                    if isinstance(run.get("profile"), dict)
+                ]
+                return bool(profiles) and all(is_bare_document(p) for p in profiles)
+            return False
+
         if has_items and agenda_items:
-            items_done = [item for item in agenda_items if item.summary or item.filter_reason]
+            items_done = [
+                item for item in agenda_items
+                if item.summary or filter_still_applies(item)
+            ]
             if items_done and len(items_done) == len(agenda_items):
                 return False, f"all {len(agenda_items)} items already processed"
 
