@@ -1050,11 +1050,12 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             # Parse in thread to avoid blocking
             parsed = await asyncio.to_thread(parse_html_agenda, html)
 
-            # Stamp portal_url on attachments so users get a stable link
-            for item in parsed.get("items", []):
-                for att in item.get("attachments", []):
-                    if not att.get("portal_url"):
-                        att["portal_url"] = html_url
+            # Deliberately no portal_url stamp. Municode has no per-attachment
+            # viewer page -- adaHtmlDocument is the meeting's whole agenda, the
+            # same URL for every attachment on every item, so stamping it made N
+            # distinct documents collapse into one downstream. The blob URLs it
+            # links are unsigned and durable, so `url` is already the stable link;
+            # the agenda belongs on meeting["agenda_url"], where it already is.
 
             # Fallback: discover city code from attachment URLs
             if not self._discovered_city_code:
