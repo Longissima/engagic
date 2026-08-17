@@ -6,8 +6,10 @@ the "packet" ladder, agenda URLs through "agenda". Results are cached per
 process so the three test modules don't re-chunk the same PDF.
 """
 
+import hashlib
 import json
 import re
+import warnings
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -22,6 +24,19 @@ GOLDEN_DIR = HERE / "golden"
 KIND_LADDER = {"packet": "packet", "agenda": "agenda"}
 
 
+STALE_FIXTURES: list[str] = []
+
+
+def _matches_manifest(path: Path, entry: Dict[str, Any]) -> bool:
+    if path.stat().st_size != entry.get("size"):
+        return False
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest() == entry.get("sha256")
+
+
 def _load_entries() -> list:
     if not MANIFEST_PATH.exists():
         return []
@@ -30,7 +45,11 @@ def _load_entries() -> list:
     for e in manifest["fixtures"]:
         if e.get("fetch_status") != "ok":
             continue
-        if not (FIXTURES_DIR / e["filename"]).exists():
+        path = FIXTURES_DIR / e["filename"]
+        if not path.exists():
+            continue
+        if not _matches_manifest(path, e):
+            STALE_FIXTURES.append(e["filename"])
             continue
         out.append(e)
     return out
@@ -38,6 +57,12 @@ def _load_entries() -> list:
 
 FETCHED = _load_entries()
 GOLDENED = [e for e in FETCHED if (GOLDEN_DIR / f"{e['meeting_id']}.json").exists()]
+if STALE_FIXTURES:
+    warnings.warn(
+        f"ignored {len(STALE_FIXTURES)} fixture(s) that do not match manifest: "
+        + ", ".join(STALE_FIXTURES),
+        stacklevel=2,
+    )
 
 _cache: Dict[str, ChunkResult] = {}
 

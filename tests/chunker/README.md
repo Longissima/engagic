@@ -79,4 +79,5 @@ Coverage grows at the speed of the failure pool, not your evenings:
    pins recall/precision at measured values — pennies per document)
 4. **Review** — the truth-file diff is a draft of reality; spot-check
    titles against the fixture before trusting a pin
-5. **Ratchet** — `uv run pytest tests/chunker -q` enforces the pins forever
+5. **Ratchet** — `uv run pytest tests/chunker -vv --durations=20` enforces the
+   pins with per-fixture progress and slow-test visibility

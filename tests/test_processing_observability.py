@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from pipeline.filters import (
     ATTACHMENT_FILTER_VERSION,
     ITEM_FILTER_VERSION,
@@ -8,6 +10,7 @@ from pipeline.filters import (
 )
 from pipeline.orchestrators.meeting_sync import _source_audit
 from pipeline.outcomes import JobOutcome, OutcomeStatus
+from pipeline.processor import Processor
 from pipeline.utils import MatterWorkSnapshot
 from scripts.recompute_item_filters import desired_filter
 
@@ -20,6 +23,17 @@ def test_item_filter_decision_is_versioned_and_rule_specific():
     assert first.reason == "procedural"
     assert first.version == ITEM_FILTER_VERSION
     assert first.rule_id.startswith("procedural:")
+
+
+def test_item_filter_handles_dated_minutes_and_exact_sections():
+    minutes = get_filter_decision(
+        "Approval of March 30, 2026 Work Session Meeting minutes."
+    )
+    communications = get_filter_decision("COMMUNICATIONS")
+    award = get_filter_decision("Presentation of Officer of the Quarter")
+    assert minutes is not None and minutes.reason == "procedural"
+    assert communications is not None and communications.reason == "procedural"
+    assert award is not None and award.reason == "ceremonial"
 
 
 def test_attachment_filter_audit_records_counts_without_dropping_attachments():
@@ -71,3 +85,22 @@ def test_unit_failure_has_structured_type_and_reason():
     assert outcome.status is OutcomeStatus.RETRYABLE_FAILURE
     assert outcome.error_type == "UnitFailure"
     assert outcome.error == "1 processing unit(s) failed: empty_summary"
+
+
+@pytest.mark.asyncio
+async def test_packet_diversion_requires_unsafe_chunk_slices():
+    quality = {"seg_smell": "over_split", "item_count": 100, "garbage_titles": 4}
+
+    async def get_chunk_quality(_meeting_id):
+        return quality
+
+    processor = Processor.__new__(Processor)
+    processor.db = SimpleNamespace(
+        queue=SimpleNamespace(get_chunk_quality=get_chunk_quality)
+    )
+    meeting = SimpleNamespace(id="m1", packet_url="https://example.test/packet.pdf")
+    assert not await processor._diverts_to_packet(meeting)
+    quality["garbage_titles"] = 25
+    assert await processor._diverts_to_packet(meeting)
+    quality.update(seg_smell="under_split", garbage_titles=0)
+    assert await processor._diverts_to_packet(meeting)

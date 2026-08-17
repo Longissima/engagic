@@ -3,6 +3,7 @@ Chunker health audit -- run on demand to spot-check item quality.
 
 Usage:
     uv run scripts/audit_chunker.py                  # summary stats
+    uv run scripts/audit_chunker.py --telemetry      # persisted path/filter/corpus audit
     uv run scripts/audit_chunker.py --sample 5       # pull 5 random meetings, show items
     uv run scripts/audit_chunker.py --method v2_toc  # filter to specific parse method
     uv run scripts/audit_chunker.py --flags          # show meetings with quality flags
@@ -10,18 +11,21 @@ Usage:
 
 import argparse
 import asyncio
+import json
+
 import asyncpg
 
-DB_URL = "postgresql://engagic:engagic_secure_2025@localhost:5432/engagic"
+from config import config
 
 
 async def run_summary(conn, method_filter=None):
     """Print per-method health stats."""
-    where = ""
+    where_parts = ["m.processing_status = 'completed'"]
     params = []
     if method_filter:
-        where = "WHERE m.processing_method = $1"
+        where_parts.append("m.processing_method = $1")
         params = [method_filter]
+    where = " AND ".join(where_parts)
 
     rows = await conn.fetch(f"""
         SELECT
@@ -47,8 +51,7 @@ async def run_summary(conn, method_filter=None):
                 0 as overlap
             FROM items WHERE meeting_id = m.id
         ) stats ON true
-        {where}
-        AND m.processing_status = 'completed'
+        WHERE {where}
         GROUP BY m.processing_method
         ORDER BY COUNT(DISTINCT m.id) DESC
     """, *params)
@@ -67,6 +70,92 @@ async def run_summary(conn, method_filter=None):
             f"{r['total_empty_body'] or 0:>7} "
             f"{r['total_overlap'] or 0:>8}"
         )
+
+
+async def run_telemetry(conn):
+    """Print the persisted processing audit in a machine-readable snapshot."""
+    queries = {
+        "chunk_paths": """
+            SELECT COALESCE(run->>'ladder', '?') AS ladder,
+                   COALESCE(run->>'winning_rung', 'none') AS winning_rung,
+                   count(*) AS runs,
+                   sum(COALESCE((run->>'item_count')::int, 0)) AS items
+            FROM queue q
+            CROSS JOIN LATERAL jsonb_array_elements(
+                COALESCE(q.processing_metadata->'chunk'->'runs', '[]'::jsonb)
+            ) AS runs(run)
+            GROUP BY ladder, winning_rung
+            ORDER BY runs DESC
+        """,
+        "chunk_smells": """
+            SELECT COALESCE(
+                       processing_metadata->'chunk'->'quality'->>'seg_smell',
+                       'clean'
+                   ) AS smell,
+                   count(*) AS queue_rows
+            FROM queue
+            WHERE jsonb_typeof(
+                processing_metadata->'chunk'->'quality'
+            ) = 'object'
+            GROUP BY smell
+            ORDER BY queue_rows DESC
+        """,
+        "chunk_attempts": """
+            SELECT attempt->>'rung' AS rung,
+                   count(*) AS attempts,
+                   count(*) FILTER (
+                       WHERE COALESCE((attempt->>'items')::int, 0) > 0
+                   ) AS successes,
+                   round(avg(COALESCE((attempt->>'ms')::int, 0))) AS avg_ms,
+                   max(COALESCE((attempt->>'ms')::int, 0)) AS max_ms
+            FROM queue q
+            CROSS JOIN LATERAL jsonb_array_elements(
+                COALESCE(q.processing_metadata->'chunk'->'runs', '[]'::jsonb)
+            ) AS runs(run)
+            CROSS JOIN LATERAL jsonb_array_elements(
+                COALESCE(run->'attempts', '[]'::jsonb)
+            ) AS attempts(attempt)
+            GROUP BY rung
+            ORDER BY attempts DESC
+        """,
+        "ingest_paths": """
+            SELECT source_path, count(*) AS observations,
+                   sum(item_count) AS items,
+                   sum(attachment_count) AS attachments,
+                   sum(COALESCE(
+                       (audit->'attachment_filter'->>'excluded')::int, 0
+                   )) AS excluded_attachments
+            FROM meeting_ingest_audits
+            GROUP BY source_path
+            ORDER BY observations DESC
+        """,
+        "current_filters": """
+            SELECT filter_reason, filter_version, count(*) AS items
+            FROM items
+            WHERE filter_reason IS NOT NULL
+            GROUP BY filter_reason, filter_version
+            ORDER BY items DESC
+        """,
+        "filter_audits": """
+            SELECT source, COALESCE(new_reason, 'eligible') AS verdict,
+                   count(*) AS decisions
+            FROM item_filter_audits
+            GROUP BY source, verdict
+            ORDER BY decisions DESC
+        """,
+        "extraction": """
+            SELECT COALESCE(extraction_status, 'not_attempted') AS status,
+                   count(*) AS documents
+            FROM document_blob
+            GROUP BY status
+            ORDER BY documents DESC
+        """,
+    }
+    snapshot = {
+        name: [dict(row) for row in await conn.fetch(query)]
+        for name, query in queries.items()
+    }
+    print(json.dumps(snapshot, indent=2, default=str, sort_keys=True))
 
 
 async def run_flags(conn, method_filter=None, limit=20):
@@ -201,13 +290,16 @@ async def main():
     parser.add_argument("--sample", type=int, default=0, help="Sample N random meetings for inspection")
     parser.add_argument("--method", type=str, default=None, help="Filter to specific parse method (e.g. v2_toc)")
     parser.add_argument("--flags", action="store_true", help="Show meetings with quality flags")
+    parser.add_argument("--telemetry", action="store_true", help="Show persisted processing telemetry")
     parser.add_argument("--limit", type=int, default=20, help="Max rows for --flags")
     args = parser.parse_args()
 
-    conn = await asyncpg.connect(DB_URL)
+    conn = await asyncpg.connect(config.get_postgres_dsn())
 
     try:
-        if args.sample > 0:
+        if args.telemetry:
+            await run_telemetry(conn)
+        elif args.sample > 0:
             await run_sample(conn, n=args.sample, method_filter=args.method)
         elif args.flags:
             await run_flags(conn, method_filter=args.method, limit=args.limit)

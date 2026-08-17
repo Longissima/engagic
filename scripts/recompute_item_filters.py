@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Mapping
 
 from database.db_postgres import Database
@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
+    parser.add_argument("--sample-limit", type=int, default=10)
     return parser
 
 
@@ -55,6 +56,7 @@ async def _meeting_rows(conn, meeting_id: str, *, lock: bool = False):
                filter_rule_id, filter_version
         FROM items
         WHERE meeting_id = $1
+          AND filter_reason IS NOT NULL
         ORDER BY sequence, id
         {lock_clause}
         """,
@@ -78,6 +80,7 @@ async def _latest_metadata(conn, meeting_id: str):
 
 async def _apply_meeting(db: Database, meeting_id: str) -> Counter:
     counts: Counter = Counter()
+    became_eligible = False
     async with db.pool.acquire() as conn:
         async with conn.transaction():
             meeting = await db.meetings.get_meeting(
@@ -96,6 +99,7 @@ async def _apply_meeting(db: Database, meeting_id: str) -> Counter:
                     counts[
                         "cleared" if new_reason is None else "recategorized"
                     ] += 1
+                    became_eligible |= new_reason is None
                 elif (
                     row["filter_version"] != (decision.version if decision else None)
                     or row["filter_rule_id"] != (decision.rule_id if decision else None)
@@ -117,13 +121,16 @@ async def _apply_meeting(db: Database, meeting_id: str) -> Counter:
                     conn=conn,
                 )
 
-            items = await db.items.get_agenda_items(
-                meeting_id, conn=conn, lock_for_update=True
-            )
-            chunk = metadata.get("chunk")
-            should_enqueue, _ = EnqueueDecider().should_enqueue(
-                meeting, items, bool(items), chunk
-            )
+            if became_eligible:
+                items = await db.items.get_agenda_items(
+                    meeting_id, conn=conn, lock_for_update=True
+                )
+                chunk = metadata.get("chunk")
+                should_enqueue, _ = EnqueueDecider().should_enqueue(
+                    meeting, items, bool(items), chunk
+                )
+            else:
+                should_enqueue = False
             if should_enqueue:
                 work_version = meeting_work_version(meeting, items)
                 if chunk:
@@ -144,10 +151,14 @@ async def _apply_meeting(db: Database, meeting_id: str) -> Counter:
     return counts
 
 
-async def recompute(*, execute: bool, limit: int | None, batch_size: int):
+async def recompute(
+    *, execute: bool, limit: int | None, batch_size: int, sample_limit: int
+):
     db = await Database.create(min_size=1, max_size=5)
     counts: Counter = Counter()
+    transitions: Counter = Counter()
     samples = []
+    sampled: Counter = Counter()
     cursor = ""
     inspected = 0
     try:
@@ -167,33 +178,71 @@ async def recompute(*, execute: bool, limit: int | None, batch_size: int):
                 )
             if not meetings:
                 break
+            page_ids = [row["meeting_id"] for row in meetings]
+            if execute:
+                page_counts = await asyncio.gather(
+                    *(_apply_meeting(db, meeting_id) for meeting_id in page_ids)
+                )
+                for result in page_counts:
+                    counts.update(result)
+                inspected += len(page_ids)
+                cursor = page_ids[-1]
+                continue
+            dry_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            dry_metadata: dict[str, dict[str, Any]] = {}
+            if not execute:
+                async with db.pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT i.id, i.meeting_id, i.title, i.attachments,
+                               i.body_text, i.summary, i.filter_reason,
+                               i.filter_rule_id, i.filter_version
+                        FROM items i
+                        WHERE i.meeting_id = ANY($1::text[])
+                          AND i.filter_reason IS NOT NULL
+                        """,
+                        page_ids,
+                    )
+                    metadata_rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT ON (meeting_id)
+                               meeting_id, processing_metadata
+                        FROM queue
+                        WHERE meeting_id = ANY($1::text[])
+                          AND job_type = 'meeting'
+                        ORDER BY meeting_id,
+                                 last_enqueued_at DESC NULLS LAST,
+                                 id DESC
+                        """,
+                        page_ids,
+                    )
+                for raw in rows:
+                    dry_rows[raw["meeting_id"]].append(dict(raw))
+                dry_metadata = {
+                    raw["meeting_id"]: dict(raw["processing_metadata"] or {})
+                    for raw in metadata_rows
+                }
             for meeting_row in meetings:
                 meeting_id = meeting_row["meeting_id"]
                 cursor = meeting_id
                 inspected += 1
-                if execute:
-                    counts.update(await _apply_meeting(db, meeting_id))
-                    continue
-                async with db.pool.acquire() as conn:
-                    rows = await _meeting_rows(conn, meeting_id)
-                    metadata = await _latest_metadata(conn, meeting_id)
-                for raw in rows:
-                    row = dict(raw)
-                    if not row["filter_reason"]:
-                        continue
-                    decision = desired_filter(row, metadata)
+                for row in dry_rows[meeting_id]:
+                    decision = desired_filter(row, dry_metadata.get(meeting_id))
                     new_reason = decision.reason if decision else None
                     if row["filter_reason"] == new_reason:
                         counts["retained"] += 1
                     else:
                         key = "cleared" if new_reason is None else "recategorized"
                         counts[key] += 1
-                        if len(samples) < 25:
+                        transition = f"{row['filter_reason']}->{new_reason or 'eligible'}"
+                        transitions[transition] += 1
+                        if sampled[transition] < sample_limit:
+                            sampled[transition] += 1
                             samples.append({
                                 "item_id": row["id"],
                                 "old_reason": row["filter_reason"],
                                 "new_reason": new_reason,
-                                "title": row["title"],
+                                "title": str(row["title"] or "")[:200],
                             })
     finally:
         await db.close()
@@ -201,6 +250,7 @@ async def recompute(*, execute: bool, limit: int | None, batch_size: int):
         "mode": "execute" if execute else "dry-run",
         "meetings_inspected": inspected,
         "counts": dict(counts),
+        "transitions": dict(transitions),
         "samples": samples,
     }
 
@@ -211,6 +261,7 @@ def main() -> None:
         execute=args.execute,
         limit=args.limit,
         batch_size=args.batch_size,
+        sample_limit=args.sample_limit,
     )), indent=2, sort_keys=True))
 
 

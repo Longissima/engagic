@@ -64,6 +64,7 @@ PROCEDURAL_PATTERNS = [
     r'pledge of allegiance',
     r'flag salute',  # Regional variant of pledge
     r'approval of\s+(?:the\s+|draft\s+)?(?:meeting\s+)?(?:minutes|agenda)\b',  # "Approval of Draft Minutes", "Approval of Agenda"
+    r'^approval of.{0,80}\bminutes\b',  # "Approval of March 30, 2026 Work Session Meeting minutes"
     r'\bapprove\s+(?:the\s+|draft\s+)?(?:meeting\s+)?minutes\b',  # "Approve the minutes of..." -- requires "minutes" right after the verb, not "Approve and record into the minutes [tax refunds]"
     r'adopt minutes',
     r'review of minutes',
@@ -75,6 +76,7 @@ PROCEDURAL_PATTERNS = [
     r'moment of silence',
     r'public comment',  # The period itself, not the content
     r'^communications?\s*$',  # Standalone "Communications" agenda section -- not "Telecommunications Agreement"
+    r'^public communications?\s*$',
     r'communications? from\s+the\s+public',  # Public comment routing; substantive senders (mayor, manager, council, staff, board) fall through to summarization
     r'time fixed for next',
     r'identify items (to|for)',  # Future items placeholder ("identify items to discuss")
@@ -95,6 +97,7 @@ CEREMONIAL_PATTERNS = [
     r'\bswearing[ -]in\b',
     r'\bin memoriam\b',
     r'\bopening remarks?\b',
+    r'\b(?:employee|officer|firefighter|teacher) of the (?:month|quarter|year)\b',
     r'(?i)congratulations (to|extended to|for)',
     r'(?i)tribute to (late|the late)',
     r'(?i)\bon (his|her|their) retirement\b',
@@ -231,7 +234,7 @@ def should_skip_meeting(title: str) -> bool:
 def get_filter_decision(
     title: str, item_type: str = ""
 ) -> Optional[FilterDecision]:
-    combined = f"{title} {item_type}".lower()
+    combined = " ".join(part for part in (title, item_type) if part).strip().lower()
     for reason, patterns in (
         ("procedural", PROCEDURAL_PATTERNS),
         ("ceremonial", CEREMONIAL_PATTERNS),

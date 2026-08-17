@@ -570,7 +570,14 @@ class QueueRepository(BaseRepository):
         """
         row = await self._fetchrow(
             """
-            SELECT processing_metadata->'chunk'->'quality' AS quality
+            SELECT processing_metadata->'chunk'->'quality'
+                   || jsonb_build_object(
+                        'item_count',
+                        COALESCE(
+                            (processing_metadata->'chunk'->>'item_count')::int,
+                            0
+                        )
+                      ) AS quality
             FROM queue
             WHERE meeting_id = $1
               AND processing_metadata->'chunk'->'quality' IS NOT NULL

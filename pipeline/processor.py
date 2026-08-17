@@ -2580,12 +2580,11 @@ class Processor:
         return orchestrator
 
     async def _diverts_to_packet(self, meeting: Meeting) -> bool:
-        """True when the chunk audit smells under-split and a packet exists.
+        """True when the chunk audit says item slices are unsafe.
 
-        Under-split = the document's own numbered headings far outnumber the
-        extracted items, so the slices are probably wrong merges. One honest
-        monolithic summary beats N confident summaries of wrong slices. Items
-        stay stored (unsummarized); only the summarization strategy diverts.
+        Under-split documents always divert. Over-split documents divert only
+        when at least a quarter of their extracted titles are classified as
+        garbage. Items stay stored; only the summarization strategy diverts.
         """
         if not meeting.packet_url:
             return False
@@ -2594,7 +2593,16 @@ class Processor:
         except Exception as e:
             logger.debug("chunk quality lookup failed", meeting_id=meeting.id, error=str(e))
             return False
-        return bool(quality) and quality.get("seg_smell") == "under_split"
+        if not quality:
+            return False
+        smell = quality.get("seg_smell")
+        if smell == "under_split":
+            return True
+        if smell != "over_split":
+            return False
+        item_count = int(quality.get("item_count") or 0)
+        garbage = int(quality.get("garbage_titles") or 0)
+        return garbage >= max(5, item_count // 4)
 
     async def _is_bare_agenda(
         self,
@@ -2930,7 +2938,7 @@ class Processor:
                 has_content = any(item.attachments or item.body_text for item in agenda_items)
                 if has_content and await self._diverts_to_packet(meeting):
                     logger.info(
-                        "chunk audit smells under-split, preferring monolithic packet summary",
+                        "chunk audit marks item slices unsafe, preferring monolithic packet summary",
                         item_count=len(agenda_items),
                         meeting_title=meeting.title,
                     )

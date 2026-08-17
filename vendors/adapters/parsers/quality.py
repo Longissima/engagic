@@ -38,7 +38,8 @@ GARBAGE_TITLE_PATTERNS = [
     ("cover_page", re.compile(r"^[-–\s]*cover\s*page\s*$", re.I)),
     ("generic_label", re.compile(
         r"^[-–\s]*(agenda|attachment|staff\s*report|item|memo(randum)?|exhibit)\s*$", re.I)),
-    ("numeric_or_date", re.compile(r"^[\d\s./:–-]+$")),
+    ("numeric_or_date", re.compile(r"^[\d\s.,()$/:–-]+$")),
+    ("register_code", re.compile(r"^[A-Z]\d{5,}\s+\d+$", re.I)),
     ("empty_or_tiny", re.compile(r"^.{0,2}$")),
 ]
 
