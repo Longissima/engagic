@@ -147,6 +147,18 @@ class AsyncBaseAdapter:
         """
         session = await self._get_session()
 
+        # Discovery matrices already get retried at the city-sync boundary.
+        # Let those callers opt out of multiplying one dead host into three
+        # attempts for every candidate path while keeping the normal request
+        # policy as the default everywhere else.
+        max_attempts = kwargs.pop("_max_attempts", self._MAX_REQUEST_ATTEMPTS)
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts < 1
+        ):
+            raise ValueError("_max_attempts must be a positive integer")
+
         if "timeout" not in kwargs:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=config.VENDOR_HTTP_TIMEOUT)
 
@@ -164,7 +176,7 @@ class AsyncBaseAdapter:
 
         last_error: Optional[BaseException] = None
 
-        for attempt in range(self._MAX_REQUEST_ATTEMPTS):
+        for attempt in range(max_attempts):
             # Per-request politeness gate. Re-enter on every attempt so the
             # rate limiter spaces retries too.
             await get_rate_limiter().wait_if_needed(self.vendor)
@@ -218,7 +230,7 @@ class AsyncBaseAdapter:
                     # 5xx are usually transient (server bug, gateway hiccup,
                     # tenant-level throttle that didn't honor Retry-After).
                     # 4xx are application errors -- retrying won't help.
-                    if 500 <= response.status < 600 and attempt < self._MAX_REQUEST_ATTEMPTS - 1:
+                    if 500 <= response.status < 600 and attempt < max_attempts - 1:
                         last_error = err
                         await self._sleep_backoff(attempt)
                         continue
@@ -241,7 +253,7 @@ class AsyncBaseAdapter:
                     attempt=attempt + 1,
                 )
                 last_error = e
-                if attempt < self._MAX_REQUEST_ATTEMPTS - 1:
+                if attempt < max_attempts - 1:
                     await self._sleep_backoff(attempt)
                     continue
                 raise VendorHTTPError(f"Request timeout after {duration:.1f}s", vendor=self.vendor, url=url, city_slug=self.slug) from e
@@ -261,7 +273,7 @@ class AsyncBaseAdapter:
                     attempt=attempt + 1,
                 )
                 last_error = e
-                if attempt < self._MAX_REQUEST_ATTEMPTS - 1:
+                if attempt < max_attempts - 1:
                     await self._sleep_backoff(attempt)
                     continue
                 raise VendorHTTPError(f"Request failed: {e}", vendor=self.vendor, url=url, city_slug=self.slug) from e
@@ -277,7 +289,7 @@ class AsyncBaseAdapter:
         # Should be unreachable -- the final attempt either returned or raised.
         # Kept as a defensive fallback so the type checker sees a terminating path.
         raise VendorHTTPError(
-            f"Request failed after {self._MAX_REQUEST_ATTEMPTS} attempts: {last_error}",
+            f"Request failed after {max_attempts} attempts: {last_error}",
             vendor=self.vendor,
             url=url,
             city_slug=self.slug,

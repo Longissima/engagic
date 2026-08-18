@@ -131,6 +131,14 @@ uv run scripts/generate_tiles.py --upload   # Upload to Cloudflare R2
 
 ## Operational Tools
 
+### `ingest_corpus_attachment.py`
+
+Archive and extract one attachment without changing or rerunning its summary.
+
+```bash
+uv run python scripts/ingest_corpus_attachment.py URL --banana cityST
+```
+
 ### `recompute_item_filters.py`
 
 Re-evaluate stored item filters against the current rules. Dry-run is the

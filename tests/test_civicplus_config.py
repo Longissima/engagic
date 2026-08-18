@@ -2,6 +2,7 @@
 
 import json
 
+import aiohttp
 import pytest
 
 import vendors.adapters.civicplus_adapter_async as civicplus_module
@@ -45,7 +46,7 @@ async def test_manual_domain_overrides_failed_marker_and_clears_it_on_success(co
     adapter = AsyncCivicPlusAdapter("repaired-city")
     calls = []
 
-    async def get(url):
+    async def get(url, **kwargs):
         calls.append(url)
         return _Response()
 
@@ -68,14 +69,46 @@ async def test_transient_probe_failures_do_not_create_a_permanent_tombstone(
     adapter = AsyncCivicPlusAdapter("temporarily-offline")
     adapter._get_candidate_base_urls = lambda: ["https://offline.example.gov"]
 
-    async def unavailable(url):
-        raise VendorHTTPError(
+    async def unavailable(url, **kwargs):
+        error = VendorHTTPError(
             message,
             vendor="civicplus",
             status_code=status_code,
             city_slug="temporarily-offline",
         )
+        if status_code is None:
+            error.__cause__ = aiohttp.ClientConnectionError("offline")
+        raise error
 
     adapter._get = unavailable
-    assert await adapter._find_agenda_url() is None
+    with pytest.raises(VendorHTTPError, match="discovery failed transiently"):
+        await adapter._find_agenda_url()
     assert not (config_dir / "civicplus_sites.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_transient_discovery_is_a_failed_fetch_and_skips_dead_host_paths(
+    config_dir,
+):
+    adapter = AsyncCivicPlusAdapter("temporarily-offline")
+    adapter._get_candidate_base_urls = lambda: ["https://offline.example.gov"]
+    calls = []
+
+    async def unavailable(url, **kwargs):
+        calls.append((url, kwargs))
+        error = VendorHTTPError(
+            "offline",
+            vendor="civicplus",
+            city_slug="temporarily-offline",
+        )
+        error.__cause__ = aiohttp.ClientConnectionError("dns unavailable")
+        raise error
+
+    adapter._get = unavailable
+    result = await adapter.fetch_meetings()
+
+    assert result.success is False
+    assert result.error_type == "VendorHTTPError"
+    assert calls == [
+        ("https://offline.example.gov/AgendaCenter", {"_max_attempts": 1})
+    ]

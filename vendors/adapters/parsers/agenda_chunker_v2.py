@@ -1018,10 +1018,10 @@ def parse_agenda_pdf_v2(
                 {
                     "name": att.label or "Attachment",
                     "url": att.url,
-                    "type": _attachment_type(att.url) if att.url else "embedded",
+                    "type": _attachment_type(att.url),
                 }
                 for att in item.attachments
-                if att.url or att.label
+                if att.url
             ],
         }
 
@@ -1060,6 +1060,17 @@ def parse_agenda_pdf_v2(
             item_metadata["memo_pages"] = sum(
                 (m.page_end - m.page_start + 1) for m in item.memos
             )
+        embedded_documents = [
+            {
+                "name": att.label or "Embedded document",
+                "page_start": att.page_start,
+                "page_end": att.page_end,
+            }
+            for att in item.attachments
+            if not att.url and att.label
+        ]
+        if embedded_documents:
+            item_metadata["embedded_documents"] = embedded_documents
         if item_metadata:
             pipeline_item["metadata"] = item_metadata
 

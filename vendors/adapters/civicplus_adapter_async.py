@@ -143,7 +143,10 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             for pattern in patterns:
                 test_url = f"{base_url}{pattern}"
                 try:
-                    response = await self._get(test_url)
+                    # The fetcher retries failed city syncs. A discovery probe
+                    # gets one request attempt so a dead DNS name does not pay
+                    # the full request retry budget for every candidate path.
+                    response = await self._get(test_url, _max_attempts=1)
                     html = await response.text()
                     if response.status == 200 and (
                         "agenda" in html.lower()
@@ -168,15 +171,29 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                     # marker.
                     is_transient = error.is_retryable or error.status_code == 429
                     saw_retryable_failure = saw_retryable_failure or is_transient
+                    # A connection-level failure applies to the host, not this
+                    # particular path. Keep the remaining domain candidates
+                    # open, but do not probe four more paths on the same dead
+                    # host.
+                    if isinstance(error.__cause__, aiohttp.ClientConnectionError):
+                        break
                     continue
 
         if saw_retryable_failure:
             logger.warning(
-                "could not find agenda page because candidate probes failed transiently; will retry next sync",
+                "could not find agenda page because candidate probes failed transiently",
                 vendor="civicplus",
                 slug=self.slug,
             )
-            return None
+            # Do not collapse a known operational failure into a legitimate
+            # zero-meeting result. AsyncBaseAdapter converts this to
+            # FetchResult(success=False), so the fetcher retries and does not
+            # write a successful lifecycle checkpoint.
+            raise VendorHTTPError(
+                "CivicPlus agenda discovery failed transiently",
+                vendor="civicplus",
+                city_slug=self.slug,
+            )
 
         logger.warning("could not find agenda page, tombstoning slug", vendor="civicplus", slug=self.slug)
         self._update_site_config({"failed": True, "failed_at": datetime.now(timezone.utc).isoformat()})
