@@ -498,8 +498,14 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             matter_file = item_data.get("EventItemMatterFile")
             agenda_number = item_data.get("EventItemAgendaNumber")
 
-            # Get title
-            title = item_data.get("EventItemTitle") or item_data.get("EventItemMatterName") or "Untitled Item"
+            # Legistar sometimes represents a missing title with whitespace.
+            # A whitespace-only string is truthy, so strip each candidate before
+            # falling back or it will fail AgendaItemSchema validation later.
+            title = (
+                str(item_data.get("EventItemTitle") or "").strip()
+                or str(item_data.get("EventItemMatterName") or "").strip()
+                or "Untitled Item"
+            )
 
             # Get sequence
             sequence = item_data.get("EventItemAgendaSequence")

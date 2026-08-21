@@ -104,10 +104,10 @@ class Database:
         if initialize_corpus:
             init_corpus(self.document_blobs)
 
-        # Platform metrics are whole-table aggregates over 700k+ items: ~1s even
-        # split across connections, and the numbers move on the sync cadence, not
-        # per request. Cache with single-flight so a burst (SSR + its retries)
-        # costs one scan, not one per caller.
+        # Platform metrics are whole-table aggregates over 700k+ items and the
+        # numbers move on the sync cadence, not per request. Cache with
+        # single-flight so concurrent analytics/platform callers cost one compact
+        # snapshot scan, not one scan per endpoint or visitor.
         self._platform_metrics_cache: Optional[tuple[float, dict]] = None
         self._platform_metrics_lock = asyncio.Lock()
 
@@ -231,160 +231,301 @@ class Database:
     # minutes of staleness is invisible on a stats page.
     PLATFORM_METRICS_TTL_SECONDS = 300
 
-    # Each block is one round trip on its own pooled connection; they run
-    # concurrently so wall clock is the slowest block, not their sum. Splitting by
-    # cost keeps the expensive whole-table scans off the critical path of the
-    # cheap ones.
-    _PLATFORM_METRICS_COUNTS = """
-        SELECT
-            -- Core content
-            (SELECT COUNT(*) FROM jurisdictions) as total_cities,
-            (SELECT COUNT(DISTINCT banana) FROM meetings) as active_cities,
-            (SELECT COUNT(*) FROM meetings) as meetings,
-            (SELECT COUNT(*) FROM items) as agenda_items,
-            (SELECT COUNT(*) FROM city_matters) as matters,
-            (SELECT COUNT(*) FROM matter_appearances) as matter_appearances,
-            -- Civic infrastructure
-            (SELECT COUNT(*) FROM committees) as committees,
-            (SELECT COUNT(*) FROM council_members) as council_members,
-            (SELECT COUNT(*) FROM committee_members) as committee_assignments,
-            -- Accountability data
-            (SELECT COUNT(*) FROM votes) as votes,
-            (SELECT COUNT(*) FROM sponsorships) as sponsorships,
-            (SELECT COUNT(DISTINCT SPLIT_PART(council_member_id, '_', 1)) FROM votes) as cities_with_votes,
-            (SELECT COUNT(DISTINCT council_member_id) FROM votes) as officials_with_votes
-    """
-
-    # summarized_meetings counts meetings that have EITHER a meeting-level summary
-    # (legacy pymupdf_gemini path) OR at least one item-level summary (modern
-    # item-first pipeline). The modern pipeline never writes meetings.summary, so
-    # counting it alone undercounts ~5x.
-    #
-    # items_analyzed counts items belonging to a meeting that has been processed.
-    # Written as a semi-join against the set of summarized meeting ids: the two
-    # branches each hit an index (idx_items_meeting_summarized, meetings_pkey) and
-    # are unioned once, instead of the per-item EXISTS pair that re-probed 735k
-    # times and dominated the whole endpoint at ~2.8s.
-    _PLATFORM_METRICS_PROCESSING = """
-        WITH summarized_meeting_ids AS (
-            SELECT m.id FROM meetings m WHERE m.summary IS NOT NULL
-            UNION
-            SELECT DISTINCT i.meeting_id FROM items i WHERE i.summary IS NOT NULL
-        )
-        SELECT
-            (SELECT COUNT(*) FROM summarized_meeting_ids) as summarized_meetings,
-            (SELECT COUNT(*) FROM items WHERE summary IS NOT NULL) as summarized_items,
-            (SELECT COUNT(*) FROM items WHERE filter_reason IS NOT NULL) as filtered_items,
-            (SELECT COUNT(*) FROM items i
-             WHERE i.meeting_id IN (SELECT id FROM summarized_meeting_ids)) as items_analyzed
-    """
-
-    # meeting_summaries_30d: distinct meetings whose date falls in the last 30 days
-    # AND have at least one form of summary attached -- meeting level (legacy packet
-    # path), item level (modern item-first), or matter canonical (cross-meeting
-    # rollups). Anchored on meetings.date (immutable). Same unit as the weekly
-    # sparkline and the headline summarized_meetings stat.
-    _PLATFORM_METRICS_GROWTH = """
-        SELECT
-            (SELECT COUNT(*) FROM meetings
-             WHERE created_at >= NOW() - INTERVAL '30 days') as meetings_30d,
-            (SELECT COUNT(*) FROM items
-             WHERE created_at >= NOW() - INTERVAL '30 days') as items_30d,
-            (SELECT COUNT(*) FROM city_matters
-             WHERE created_at >= NOW() - INTERVAL '30 days') as matters_30d,
-            (SELECT COUNT(*) FROM votes
-             WHERE created_at >= NOW() - INTERVAL '30 days') as votes_30d,
-            (SELECT COUNT(*) FROM meetings m WHERE
-                m.date >= NOW() - INTERVAL '30 days'
-                AND (
+    # A cache miss used to launch five queries which independently scanned the
+    # 2 GB items relation. Under production I/O pressure the scans amplified one
+    # another and a nominal 3-5 second query became a 20 second request. Project
+    # the wide text rows to compact flags once, then derive totals, growth, weekly
+    # trends, and the analytics-page rollups from that shared projection.
+    _PLATFORM_METRICS_CONTENT = """
+        WITH
+            weeks AS (
+                SELECT generate_series(
+                    date_trunc('week', NOW() - INTERVAL '7 weeks'),
+                    date_trunc('week', NOW()),
+                    INTERVAL '1 week'
+                ) AS week_start
+            ),
+            matter_flags AS MATERIALIZED (
+                SELECT
+                    id,
+                    banana,
+                    created_at,
+                    canonical_summary IS NOT NULL
+                        AND canonical_summary != '' AS has_content
+                FROM city_matters
+            ),
+            item_flags AS MATERIALIZED (
+                SELECT
+                    i.meeting_id,
+                    i.created_at,
+                    i.matter_id IS NULL AS is_standalone,
+                    i.summary IS NOT NULL AS has_summary,
+                    i.summary IS NOT NULL AND i.summary != '' AS has_content,
+                    i.filter_reason IS NOT NULL AS has_filter,
+                    COALESCE(mf.has_content, FALSE) AS has_matter_content
+                FROM items i
+                LEFT JOIN matter_flags mf ON mf.id = i.matter_id
+            ),
+            item_stats AS MATERIALIZED (
+                SELECT
+                    meeting_id,
+                    COUNT(*) AS item_count,
+                    BOOL_OR(has_summary) AS has_summary,
+                    BOOL_OR(has_content) AS has_content,
+                    BOOL_OR(has_matter_content) AS has_matter_content
+                FROM item_flags
+                GROUP BY meeting_id
+            ),
+            item_rollup AS (
+                SELECT
+                    COUNT(*) AS agenda_items,
+                    COUNT(*) FILTER (WHERE has_summary) AS summarized_items,
+                    COUNT(*) FILTER (WHERE has_filter) AS filtered_items,
+                    COUNT(*) FILTER (
+                        WHERE is_standalone AND has_content
+                    ) AS standalone_items,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    ) AS items_30d
+                FROM item_flags
+            ),
+            item_weekly AS (
+                SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
+                FROM item_flags
+                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                GROUP BY 1
+            ),
+            matter_rollup AS (
+                SELECT
+                    COUNT(*) AS matters,
+                    COUNT(*) FILTER (WHERE has_content) AS matters_with_summary,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    ) AS matters_30d
+                FROM matter_flags
+            ),
+            matter_weekly AS (
+                SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
+                FROM matter_flags
+                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                GROUP BY 1
+            ),
+            meeting_flags AS MATERIALIZED (
+                SELECT
+                    m.id,
+                    m.banana,
+                    m.created_at,
+                    m.date,
+                    m.packet_url IS NOT NULL AND m.packet_url != '' AS has_packet,
+                    m.summary IS NOT NULL AND m.summary != '' AS has_meeting_content,
+                    m.summary IS NOT NULL
+                        OR COALESCE(s.has_summary, FALSE) AS is_processed,
                     (m.summary IS NOT NULL AND m.summary != '')
-                    OR EXISTS (
-                        SELECT 1 FROM items i
-                        WHERE i.meeting_id = m.id
-                          AND i.summary IS NOT NULL AND i.summary != ''
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM items i2
-                        JOIN city_matters cm ON cm.id = i2.matter_id
-                        WHERE i2.meeting_id = m.id
-                          AND cm.canonical_summary IS NOT NULL
-                          AND cm.canonical_summary != ''
-                    )
+                        OR COALESCE(s.has_content, FALSE)
+                        OR COALESCE(s.has_matter_content, FALSE) AS has_content,
+                    COALESCE(s.item_count, 0) AS item_count
+                FROM meetings m
+                LEFT JOIN item_stats s ON s.meeting_id = m.id
+            ),
+            meeting_rollup AS (
+                SELECT
+                    COUNT(*) AS meetings,
+                    COUNT(DISTINCT banana) AS active_cities,
+                    COUNT(*) FILTER (WHERE item_count > 0) AS meetings_with_items,
+                    COUNT(*) FILTER (WHERE has_packet) AS packets_count,
+                    COUNT(*) FILTER (WHERE has_meeting_content) AS summaries_count,
+                    COUNT(*) FILTER (WHERE is_processed) AS summarized_meetings,
+                    COUNT(*) FILTER (WHERE has_content) AS live_meetings,
+                    COALESCE(
+                        SUM(item_count) FILTER (WHERE is_processed), 0
+                    )::BIGINT AS items_analyzed,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    ) AS meetings_30d,
+                    COUNT(*) FILTER (
+                        WHERE date >= NOW() - INTERVAL '30 days'
+                          AND has_content
+                    ) AS meeting_summaries_30d
+                FROM meeting_flags
+            ),
+            meeting_weekly AS (
+                SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
+                FROM meeting_flags
+                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                GROUP BY 1
+            ),
+            summary_weekly AS (
+                SELECT date_trunc('week', date) AS wk, COUNT(*) AS cnt
+                FROM meeting_flags
+                WHERE date >= NOW() - INTERVAL '8 weeks' AND has_content
+                GROUP BY 1
+            ),
+            active_bananas AS (
+                SELECT DISTINCT banana FROM meeting_flags
+            ),
+            live_bananas AS (
+                SELECT banana FROM meeting_flags WHERE has_content
+                UNION
+                SELECT banana FROM matter_flags WHERE has_content
+            ),
+            frequently_updated AS (
+                SELECT banana
+                FROM meeting_flags
+                WHERE has_content
+                GROUP BY banana
+                HAVING COUNT(*) >= 7
+            ),
+            jurisdiction_rollup AS (
+                SELECT
+                    COUNT(*) AS total_cities,
+                    COUNT(*) FILTER (WHERE j.type = 'city') AS total_cities_only,
+                    COUNT(*) FILTER (WHERE j.type = 'county') AS total_counties,
+                    COUNT(*) FILTER (
+                        WHERE j.type = 'school_district'
+                    ) AS total_school_districts,
+                    COUNT(*) FILTER (
+                        WHERE ab.banana IS NOT NULL AND j.type = 'city'
+                    ) AS active_cities_only,
+                    COUNT(*) FILTER (
+                        WHERE ab.banana IS NOT NULL AND j.type = 'county'
+                    ) AS active_counties,
+                    COUNT(*) FILTER (
+                        WHERE ab.banana IS NOT NULL
+                          AND j.type = 'school_district'
+                    ) AS active_school_districts,
+                    COUNT(*) FILTER (
+                        WHERE lb.banana IS NOT NULL AND j.type = 'city'
+                    ) AS live_cities,
+                    COUNT(*) FILTER (
+                        WHERE lb.banana IS NOT NULL AND j.type = 'county'
+                    ) AS live_counties,
+                    COUNT(*) FILTER (
+                        WHERE lb.banana IS NOT NULL
+                          AND j.type = 'school_district'
+                    ) AS live_school_districts,
+                    COUNT(*) FILTER (
+                        WHERE lb.banana IS NOT NULL
+                    ) AS live_jurisdictions_total,
+                    COUNT(*) FILTER (
+                        WHERE fu.banana IS NOT NULL
+                    ) AS frequently_updated,
+                    COALESCE(SUM(j.population) FILTER (
+                        WHERE fu.banana IS NOT NULL
+                    ), 0) AS frequently_updated_pop,
+                    COALESCE(SUM(j.population) FILTER (
+                        WHERE j.geom IS NOT NULL
+                    ), 0) AS total_pop,
+                    COALESCE(SUM(j.population) FILTER (
+                        WHERE ab.banana IS NOT NULL
+                    ), 0) AS pop_with_data,
+                    COALESCE(SUM(j.population) FILTER (
+                        WHERE lb.banana IS NOT NULL
+                    ), 0) AS pop_with_summaries
+                FROM jurisdictions j
+                LEFT JOIN active_bananas ab ON ab.banana = j.banana
+                LEFT JOIN live_bananas lb ON lb.banana = j.banana
+                LEFT JOIN frequently_updated fu ON fu.banana = j.banana
+            )
+        SELECT
+            ir.*,
+            mr.*,
+            mar.*,
+            jr.*,
+            (
+                SELECT ARRAY_AGG(COALESCE(iw.cnt, 0) ORDER BY w.week_start)
+                FROM weeks w LEFT JOIN item_weekly iw ON iw.wk = w.week_start
+            ) AS item_trend,
+            (
+                SELECT ARRAY_AGG(COALESCE(mw.cnt, 0) ORDER BY w.week_start)
+                FROM weeks w LEFT JOIN meeting_weekly mw ON mw.wk = w.week_start
+            ) AS meeting_trend,
+            (
+                SELECT ARRAY_AGG(COALESCE(matw.cnt, 0) ORDER BY w.week_start)
+                FROM weeks w LEFT JOIN matter_weekly matw ON matw.wk = w.week_start
+            ) AS matter_trend,
+            (
+                SELECT ARRAY_AGG(COALESCE(sw.cnt, 0) ORDER BY w.week_start)
+                FROM weeks w LEFT JOIN summary_weekly sw ON sw.wk = w.week_start
+            ) AS summary_trend
+        FROM item_rollup ir
+        CROSS JOIN meeting_rollup mr
+        CROSS JOIN matter_rollup mar
+        CROSS JOIN jurisdiction_rollup jr
+    """
+
+    _PLATFORM_METRICS_INFRASTRUCTURE = """
+        SELECT
+            (SELECT COUNT(*) FROM matter_appearances) AS matter_appearances,
+            (SELECT COUNT(*) FROM committees) AS committees,
+            (SELECT COUNT(*) FROM council_members) AS council_members,
+            (SELECT COUNT(*) FROM committee_members) AS committee_assignments,
+            (SELECT COUNT(*) FROM sponsorships) AS sponsorships
+    """
+
+    # Votes use their own compact projection so the total, growth, city ranking,
+    # and weekly sparkline need one pass over votes instead of four.
+    _PLATFORM_METRICS_VOTES = """
+        WITH
+            weeks AS (
+                SELECT generate_series(
+                    date_trunc('week', NOW() - INTERVAL '7 weeks'),
+                    date_trunc('week', NOW()),
+                    INTERVAL '1 week'
+                ) AS week_start
+            ),
+            vote_flags AS MATERIALIZED (
+                SELECT council_member_id, created_at FROM votes
+            ),
+            vote_rollup AS (
+                SELECT
+                    COUNT(*) AS votes,
+                    COUNT(DISTINCT SPLIT_PART(council_member_id, '_', 1))
+                        AS cities_with_votes,
+                    COUNT(DISTINCT council_member_id) AS officials_with_votes,
+                    COUNT(*) FILTER (
+                        WHERE created_at >= NOW() - INTERVAL '30 days'
+                    ) AS votes_30d
+                FROM vote_flags
+            ),
+            vote_weekly AS (
+                SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
+                FROM vote_flags
+                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                GROUP BY 1
+            ),
+            vote_by_city AS (
+                SELECT
+                    SPLIT_PART(council_member_id, '_', 1) AS city,
+                    COUNT(*) AS votes,
+                    COUNT(DISTINCT council_member_id) AS voters
+                FROM vote_flags
+                GROUP BY 1
+                ORDER BY votes DESC
+                LIMIT 10
+            )
+        SELECT
+            vr.*,
+            (
+                SELECT ARRAY_AGG(COALESCE(vw.cnt, 0) ORDER BY w.week_start)
+                FROM weeks w LEFT JOIN vote_weekly vw ON vw.wk = w.week_start
+            ) AS vote_trend,
+            (
+                SELECT COALESCE(
+                    JSONB_AGG(JSONB_BUILD_OBJECT(
+                        'city', city,
+                        'votes', votes,
+                        'voters', voters
+                    ) ORDER BY votes DESC),
+                    '[]'::JSONB
                 )
-            ) as meeting_summaries_30d
-    """
-
-    _PLATFORM_METRICS_VOTES_BY_CITY = """
-        SELECT
-            SPLIT_PART(council_member_id, '_', 1) as city,
-            COUNT(*) as votes,
-            COUNT(DISTINCT council_member_id) as voters
-        FROM votes
-        GROUP BY 1
-        ORDER BY votes DESC
-        LIMIT 10
-    """
-
-    # Weekly trends for sparklines (last 8 weeks).
-    # `summaries` buckets summarized meetings by meetings.date (the meeting's
-    # actual occurrence) -- stable, parallels the meeting_summaries_30d badge.
-    _PLATFORM_METRICS_TRENDS = """
-        WITH weeks AS (
-            SELECT generate_series(
-                date_trunc('week', NOW() - INTERVAL '7 weeks'),
-                date_trunc('week', NOW()),
-                INTERVAL '1 week'
-            ) AS week_start
-        )
-        SELECT
-            w.week_start::date as week,
-            COALESCE(m.cnt, 0) as meetings,
-            COALESCE(i.cnt, 0) as items,
-            COALESCE(mat.cnt, 0) as matters,
-            COALESCE(v.cnt, 0) as votes,
-            COALESCE(s.cnt, 0) as summaries
-        FROM weeks w
-        LEFT JOIN (
-            SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-            FROM meetings WHERE created_at >= NOW() - INTERVAL '8 weeks'
-            GROUP BY 1
-        ) m ON m.wk = w.week_start
-        LEFT JOIN (
-            SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-            FROM items WHERE created_at >= NOW() - INTERVAL '8 weeks'
-            GROUP BY 1
-        ) i ON i.wk = w.week_start
-        LEFT JOIN (
-            SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-            FROM city_matters WHERE created_at >= NOW() - INTERVAL '8 weeks'
-            GROUP BY 1
-        ) mat ON mat.wk = w.week_start
-        LEFT JOIN (
-            SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-            FROM votes WHERE created_at >= NOW() - INTERVAL '8 weeks'
-            GROUP BY 1
-        ) v ON v.wk = w.week_start
-        LEFT JOIN (
-            SELECT date_trunc('week', m.date) AS wk, COUNT(DISTINCT m.id) AS cnt
-            FROM meetings m
-            LEFT JOIN items i ON i.meeting_id = m.id
-            LEFT JOIN city_matters cm ON cm.id = i.matter_id
-            WHERE m.date >= NOW() - INTERVAL '8 weeks'
-              AND ((m.summary IS NOT NULL AND m.summary != '')
-                   OR (i.summary IS NOT NULL AND i.summary != '')
-                   OR (cm.canonical_summary IS NOT NULL AND cm.canonical_summary != ''))
-            GROUP BY 1
-        ) s ON s.wk = w.week_start
-        ORDER BY w.week_start
+                FROM vote_by_city
+            ) AS votes_by_city
+        FROM vote_rollup vr
     """
 
     async def _fetchrow_on_own_connection(self, query: str) -> asyncpg.Record:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(query)
-
-    async def _fetch_on_own_connection(self, query: str) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as conn:
-            return await conn.fetch(query)
 
     async def get_platform_metrics(self, *, force_refresh: bool = False) -> dict:
         """Get comprehensive platform metrics for impact/about page.
@@ -403,15 +544,13 @@ class Database:
                 return cached[1]
 
             started = time.monotonic()
-            counts, processing, growth, vote_breakdown, trends = await asyncio.gather(
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_COUNTS),
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_PROCESSING),
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_GROWTH),
-                self._fetch_on_own_connection(self._PLATFORM_METRICS_VOTES_BY_CITY),
-                self._fetch_on_own_connection(self._PLATFORM_METRICS_TRENDS),
+            content, infrastructure, votes = await asyncio.gather(
+                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_CONTENT),
+                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_INFRASTRUCTURE),
+                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_VOTES),
             )
 
-            metrics = {**dict(counts), **dict(processing), **dict(growth)}
+            metrics = {**dict(content), **dict(infrastructure), **dict(votes)}
 
             # Rates use the processed-meeting denominator, not every item ever seen
             if metrics['meetings'] > 0:
@@ -424,13 +563,12 @@ class Database:
             else:
                 metrics['item_summary_rate'] = 0
 
-            metrics['votes_by_city'] = [dict(row) for row in vote_breakdown]
             metrics['trends'] = {
-                'meetings': [row['meetings'] for row in trends],
-                'items': [row['items'] for row in trends],
-                'matters': [row['matters'] for row in trends],
-                'votes': [row['votes'] for row in trends],
-                'summaries': [row['summaries'] for row in trends],
+                'meetings': metrics.pop('meeting_trend'),
+                'items': metrics.pop('item_trend'),
+                'matters': metrics.pop('matter_trend'),
+                'votes': metrics.pop('vote_trend'),
+                'summaries': metrics.pop('summary_trend'),
             }
 
             elapsed_ms = round((time.monotonic() - started) * 1000)

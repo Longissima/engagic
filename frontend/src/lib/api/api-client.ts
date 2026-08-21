@@ -83,7 +83,8 @@ async function fetchWithRetry(
 	url: string,
 	options: RequestInit = {},
 	retries: number = config.maxRetries,
-	requestHeaders?: Record<string, string>
+	requestHeaders?: Record<string, string>,
+	timeoutMs: number = config.requestTimeout
 ): Promise<Response> {
 	// Client-side: wait for initial Turnstile verification to settle before
 	// the first gated request. Capped at 3s so a broken widget doesn't hang
@@ -98,7 +99,7 @@ async function fetchWithRetry(
 	}
 
 	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), config.requestTimeout);
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
 	try {
 		const response = await fetch(url, {
@@ -123,7 +124,7 @@ async function fetchWithRetry(
 			if (body?.error === 'turnstile_required' && retries > 0) {
 				const ok = await reverify();
 				if (ok) {
-					return fetchWithRetry(url, options, retries - 1, requestHeaders);
+					return fetchWithRetry(url, options, retries - 1, requestHeaders, timeoutMs);
 				}
 			}
 		}
@@ -138,7 +139,7 @@ async function fetchWithRetry(
 
 		if (response.status >= 500 && retries > 0) {
 			await new Promise(resolve => setTimeout(resolve, config.retryDelay));
-			return fetchWithRetry(url, options, retries - 1, requestHeaders);
+			return fetchWithRetry(url, options, retries - 1, requestHeaders, timeoutMs);
 		}
 
 		throw new ApiError(errorMessages.generic, response.status, false);
@@ -154,7 +155,7 @@ async function fetchWithRetry(
 			if (error.name === 'AbortError') {
 				if (retries > 0) {
 					await new Promise(resolve => setTimeout(resolve, config.retryDelay));
-					return fetchWithRetry(url, options, retries - 1, requestHeaders);
+					return fetchWithRetry(url, options, retries - 1, requestHeaders, timeoutMs);
 				}
 				throw new NetworkError(errorMessages.timeout);
 			}
@@ -505,7 +506,16 @@ export const apiClient = {
 	},
 
 	async getCityCoverage(): Promise<CityCoverageResponse> {
-		const response = await fetchWithRetry(`${config.apiBaseUrl}/api/city-coverage`);
+		// This is a deliberate, user-triggered aggregate. Give the first request
+		// enough time to populate the backend cache, but do not create a retry
+		// storm while that database work is still running.
+		const response = await fetchWithRetry(
+			`${config.apiBaseUrl}/api/city-coverage`,
+			{},
+			0,
+			undefined,
+			config.aggregateRequestTimeout
+		);
 		return response.json();
 	},
 
@@ -527,9 +537,24 @@ export function createServerApiClient(clientIp: string | null, ssrAuthSecret?: s
 	const headers = buildRequestHeaders({ clientIp, ssrAuthSecret });
 
 	// Helper to wrap fetch calls with request-scoped headers
-	async function serverFetch(url: string, options: RequestInit = {}): Promise<Response> {
-		return fetchWithRetry(url, options, config.maxRetries, headers);
+	async function serverFetch(
+		url: string,
+		options: RequestInit = {},
+		policy: { retries?: number; timeoutMs?: number } = {}
+	): Promise<Response> {
+		return fetchWithRetry(
+			url,
+			options,
+			policy.retries ?? config.maxRetries,
+			headers,
+			policy.timeoutMs ?? config.requestTimeout
+		);
 	}
+
+	const aggregatePolicy = {
+		retries: 0,
+		timeoutMs: config.aggregateRequestTimeout
+	};
 
 	return {
 		async searchMeetings(query: string): Promise<SearchResult> {
@@ -578,12 +603,20 @@ export function createServerApiClient(clientIp: string | null, ssrAuthSecret?: s
 		},
 
 		async getAnalytics(): Promise<AnalyticsData> {
-			const response = await serverFetch(`${config.apiBaseUrl}/api/analytics`);
+			const response = await serverFetch(
+				`${config.apiBaseUrl}/api/analytics`,
+				{},
+				aggregatePolicy
+			);
 			return response.json();
 		},
 
 		async getPlatformMetrics(): Promise<PlatformMetrics> {
-			const response = await serverFetch(`${config.apiBaseUrl}/api/platform-metrics`);
+			const response = await serverFetch(
+				`${config.apiBaseUrl}/api/platform-metrics`,
+				{},
+				aggregatePolicy
+			);
 			return response.json();
 		},
 
@@ -612,7 +645,11 @@ export function createServerApiClient(clientIp: string | null, ssrAuthSecret?: s
 		},
 
 		async getCityCoverage(): Promise<CityCoverageResponse> {
-			const response = await serverFetch(`${config.apiBaseUrl}/api/city-coverage`);
+			const response = await serverFetch(
+				`${config.apiBaseUrl}/api/city-coverage`,
+				{},
+				aggregatePolicy
+			);
 			return response.json();
 		},
 

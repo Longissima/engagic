@@ -5,9 +5,10 @@ Clean, modular FastAPI application with separation of concerns.
 Routes, services, and utilities are organized into focused modules.
 """
 
+import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import stripe
 from fastapi import FastAPI
@@ -49,10 +50,27 @@ async def lifespan(app: FastAPI):
     # Store in app state
     app.state.db = db
 
+    # Populate the shared analytics/platform snapshot before the first visitor
+    # needs it. This runs in the background so health checks and deploy startup
+    # are not held hostage by an aggregate refresh.
+    async def warm_public_metrics() -> None:
+        try:
+            await db.get_platform_metrics()
+            logger.info("warmed public metrics cache")
+        except Exception as exc:
+            logger.warning("failed to warm public metrics cache", error=str(exc))
+
+    metrics_warm_task = asyncio.create_task(warm_public_metrics())
+
     yield
 
     # Shutdown: Close connection pool
     try:
+        if not metrics_warm_task.done():
+            metrics_warm_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await metrics_warm_task
+
         # Log connection count before closing
         active_connections = db.pool.get_size()
         logger.info(

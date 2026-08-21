@@ -1,10 +1,34 @@
 <script lang="ts">
 	import type { PageData } from './$types';
-	import type { CoverageType, JurisdictionType } from '$lib/api/types';
+	import type { CityCoverageResponse, CoverageType, JurisdictionType } from '$lib/api/types';
+	import { apiClient } from '$lib/api/api-client';
 	import SeoHead from '$lib/components/SeoHead.svelte';
 
 	let { data }: { data: PageData } = $props();
 	let activeView: 'overview' | 'coverage' = $state('overview');
+	let cityCoverage = $state<CityCoverageResponse | null>(null);
+	let coverageLoading = $state(false);
+	let coverageError = $state(false);
+
+	async function loadCoverage() {
+		if (cityCoverage || coverageLoading) return;
+
+		coverageLoading = true;
+		coverageError = false;
+		try {
+			cityCoverage = await apiClient.getCityCoverage();
+		} catch (error) {
+			console.error('Failed to load jurisdiction coverage:', error);
+			coverageError = true;
+		} finally {
+			coverageLoading = false;
+		}
+	}
+
+	function showCoverage() {
+		activeView = 'coverage';
+		void loadCoverage();
+	}
 
 	function formatNumber(num: number): string {
 		if (num >= 1000000) {
@@ -103,43 +127,43 @@
 		<button
 			class="toggle-btn"
 			class:active={activeView === 'coverage'}
-			onclick={() => activeView = 'coverage'}
+			onclick={showCoverage}
 		>
 			Jurisdiction Coverage
 		</button>
 	</div>
 
 	{#if activeView === 'coverage'}
-		{#if data.cityCoverage}
+		{#if cityCoverage}
 			<section class="metrics-section">
 				<h1 class="primary-heading">Jurisdiction Coverage</h1>
 				<p class="section-desc">All jurisdictions with active coverage — cities, counties, and school districts — sorted by population. Coverage depth indicates the granularity of legislative tracking.</p>
 
 				<div class="coverage-summary">
 					<div class="summary-item">
-						<span class="summary-count">{data.cityCoverage.summary.matter}</span>
+						<span class="summary-count">{cityCoverage.summary.matter}</span>
 						<span class="summary-label coverage-matter">Matter-level</span>
 					</div>
 					<div class="summary-item">
-						<span class="summary-count">{data.cityCoverage.summary.item}</span>
+						<span class="summary-count">{cityCoverage.summary.item}</span>
 						<span class="summary-label coverage-item">Item-level</span>
 					</div>
 					<div class="summary-item">
-						<span class="summary-count">{data.cityCoverage.summary.monolithic}</span>
+						<span class="summary-count">{cityCoverage.summary.monolithic}</span>
 						<span class="summary-label coverage-monolithic">Meeting-level</span>
 					</div>
 					<div class="summary-item">
-						<span class="summary-count">{data.cityCoverage.summary.synced}</span>
+						<span class="summary-count">{cityCoverage.summary.synced}</span>
 						<span class="summary-label coverage-synced">Synced</span>
 					</div>
 					<div class="summary-item">
-						<span class="summary-count">{data.cityCoverage.summary.total}</span>
+						<span class="summary-count">{cityCoverage.summary.total}</span>
 						<span class="summary-label">Total</span>
 					</div>
 				</div>
 
-				{#if data.cityCoverage.summary.by_type}
-					{@const bt = data.cityCoverage.summary.by_type}
+				{#if cityCoverage.summary.by_type}
+					{@const bt = cityCoverage.summary.by_type}
 					<p class="coverage-breakdown">{bt.city.toLocaleString()} cities · {bt.county.toLocaleString()} counties · {bt.school_district.toLocaleString()} school districts</p>
 				{/if}
 
@@ -155,7 +179,7 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each data.cityCoverage.cities as city}
+							{#each cityCoverage.cities as city}
 								<tr>
 									<td class="col-jurisdiction">{city.name}, {city.state}</td>
 									<td class="col-type">{jurisdictionLabel(city.type)}</td>
@@ -172,10 +196,16 @@
 					</table>
 				</div>
 			</section>
-		{:else}
+		{:else if coverageLoading}
 			<div class="loading-container">Loading coverage data...</div>
+		{:else if coverageError}
+			<div class="loading-container error-container">
+				<span>Coverage data is temporarily unavailable.</span>
+				<button class="toggle-btn" onclick={loadCoverage}>Try again</button>
+			</div>
 		{/if}
-	{:else if data.analytics}
+	{:else}
+		{#if data.analytics}
 		<section class="metrics-section">
 			<h1 class="primary-heading">Coverage Overview</h1>
 			<div class="cards-grid">
@@ -240,6 +270,7 @@
 				</div>
 			</div>
 		</section>
+		{/if}
 
 		{#if data.platformMetrics}
 			<section class="metrics-section">
@@ -355,8 +386,12 @@
 			</section>
 		{/if}
 
-	{:else}
-		<div class="loading-container">Loading metrics...</div>
+		{#if !data.analytics && !data.platformMetrics}
+			<div class="loading-container error-container">
+				<span>Metrics are temporarily unavailable.</span>
+				<a class="toggle-btn" href="/about/metrics">Try again</a>
+			</div>
+		{/if}
 	{/if}
 </article>
 
@@ -506,6 +541,11 @@
 		padding: var(--space-3xl);
 		font-family: var(--font-mono);
 		color: var(--text-secondary);
+	}
+
+	.error-container {
+		flex-direction: column;
+		gap: var(--space-md);
 	}
 
 	@media (max-width: 768px) {

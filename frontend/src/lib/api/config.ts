@@ -5,6 +5,7 @@ export const config = {
 	maxRetries: 2,
 	retryDelay: 500,
 	requestTimeout: 5000,
+	aggregateRequestTimeout: 20000,
 	debounceDelay: 300,
 } as const;
 

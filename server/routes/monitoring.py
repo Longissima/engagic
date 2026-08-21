@@ -404,119 +404,54 @@ async def prometheus_metrics(db: Database = Depends(get_db)):
 
 @router.get("/api/analytics")
 async def get_analytics(db: Database = Depends(get_db)):
-    """Get comprehensive analytics for public dashboard"""
+    """Get public dashboard analytics from the shared metrics snapshot.
+
+    Analytics and /api/platform-metrics used to run separate whole-table scans
+    even though they expose the same underlying facts. Sharing the database
+    layer's single-flight cache makes concurrent SSR calls pay for one snapshot.
+    """
     try:
-        # Consolidated query: combine simple counts into single round-trip
-        async with db.pool.acquire() as conn:
-            # Single query for all basic counts (scalar subqueries execute in parallel)
-            counts = await conn.fetchrow("""
-                SELECT
-                    (SELECT COUNT(*) FROM jurisdictions) as total_cities,
-                    (SELECT COUNT(DISTINCT banana) FROM meetings) as active_cities,
-                    (SELECT COUNT(*) FROM jurisdictions WHERE type = 'city') as total_cities_only,
-                    (SELECT COUNT(*) FROM jurisdictions WHERE type = 'county') as total_counties,
-                    (SELECT COUNT(*) FROM jurisdictions WHERE type = 'school_district') as total_school_districts,
-                    (SELECT COUNT(DISTINCT m.banana) FROM meetings m JOIN jurisdictions j ON m.banana = j.banana WHERE j.type = 'city') as active_cities_only,
-                    (SELECT COUNT(DISTINCT m.banana) FROM meetings m JOIN jurisdictions j ON m.banana = j.banana WHERE j.type = 'county') as active_counties,
-                    (SELECT COUNT(DISTINCT m.banana) FROM meetings m JOIN jurisdictions j ON m.banana = j.banana WHERE j.type = 'school_district') as active_school_districts,
-                    (SELECT COUNT(*) FROM meetings) as meetings_count,
-                    (SELECT COUNT(DISTINCT meeting_id) FROM items) as meetings_with_items,
-                    (SELECT COUNT(*) FROM meetings WHERE packet_url IS NOT NULL AND packet_url != '') as packets_count,
-                    (SELECT COUNT(*) FROM meetings WHERE summary IS NOT NULL AND summary != '') as summaries_count,
-                    (SELECT COUNT(*) FROM items) as items_count,
-                    (SELECT COUNT(*) FROM city_matters) as matters_count,
-                    (SELECT COUNT(*) FROM city_matters WHERE canonical_summary IS NOT NULL AND canonical_summary != '') as matters_with_summary,
-                    (SELECT COUNT(*) FROM items WHERE matter_id IS NULL AND summary IS NOT NULL AND summary != '') as standalone_items
-            """)
-
-            unique_summaries = counts["matters_with_summary"] + counts["standalone_items"]
-
-            # Complex aggregations that need CTEs - batch together
-            # "Live" / "switched on" = has a summary at meeting, item, or matter level.
-            # We surface live counts so dashboards reflect coverage with content,
-            # not naive table totals (empty shells skew the picture).
-            complex_stats = await conn.fetchrow("""
-                WITH
-                    summarized_meetings AS (
-                        SELECT DISTINCT m.id, m.banana
-                        FROM meetings m
-                        LEFT JOIN items i ON i.meeting_id = m.id
-                        LEFT JOIN city_matters cm ON cm.id = i.matter_id
-                        WHERE (m.summary IS NOT NULL AND m.summary != '')
-                           OR (i.summary IS NOT NULL AND i.summary != '')
-                           OR (cm.canonical_summary IS NOT NULL AND cm.canonical_summary != '')
-                    ),
-                    summarized_bananas AS (
-                        SELECT banana FROM summarized_meetings
-                        UNION
-                        SELECT banana FROM city_matters
-                        WHERE canonical_summary IS NOT NULL AND canonical_summary != ''
-                    ),
-                    live_jurisdictions AS (
-                        SELECT j.banana, j.type, j.population
-                        FROM jurisdictions j
-                        JOIN summarized_bananas sb ON sb.banana = j.banana
-                    ),
-                    frequently_updated AS (
-                        SELECT sm.banana, c.population as pop
-                        FROM summarized_meetings sm
-                        JOIN jurisdictions c ON sm.banana = c.banana
-                        GROUP BY sm.banana, c.population
-                        HAVING COUNT(*) >= 7
-                    ),
-                    active_bananas AS (
-                        SELECT DISTINCT banana FROM meetings
-                    )
-                SELECT
-                    (SELECT COUNT(*) FROM summarized_meetings) as live_meetings,
-                    (SELECT COUNT(*) FROM live_jurisdictions WHERE type = 'city') as live_cities,
-                    (SELECT COUNT(*) FROM live_jurisdictions WHERE type = 'county') as live_counties,
-                    (SELECT COUNT(*) FROM live_jurisdictions WHERE type = 'school_district') as live_school_districts,
-                    (SELECT COUNT(*) FROM live_jurisdictions) as live_jurisdictions_total,
-                    (SELECT COUNT(*) FROM frequently_updated) as frequently_updated,
-                    (SELECT COALESCE(SUM(pop), 0) FROM frequently_updated) as frequently_updated_pop,
-                    (SELECT COALESCE(SUM(population), 0) FROM jurisdictions WHERE geom IS NOT NULL) as total_pop,
-                    (SELECT COALESCE(SUM(c.population), 0) FROM jurisdictions c JOIN active_bananas ab ON c.banana = ab.banana) as pop_with_data,
-                    (SELECT COALESCE(SUM(c.population), 0) FROM jurisdictions c JOIN summarized_bananas sb ON c.banana = sb.banana) as pop_with_summaries
-            """)
+        metrics = await db.get_platform_metrics()
 
         return {
             "success": True,
             "timestamp": datetime.now().isoformat(),
             "real_metrics": {
-                "cities_covered": counts["total_cities"],
-                "active_cities": counts["active_cities"],
+                "cities_covered": metrics["total_cities"],
+                "active_cities": metrics["active_cities"],
                 "by_type": {
                     "total": {
-                        "city": counts["total_cities_only"],
-                        "county": counts["total_counties"],
-                        "school_district": counts["total_school_districts"],
+                        "city": metrics["total_cities_only"],
+                        "county": metrics["total_counties"],
+                        "school_district": metrics["total_school_districts"],
                     },
                     "active": {
-                        "city": counts["active_cities_only"],
-                        "county": counts["active_counties"],
-                        "school_district": counts["active_school_districts"],
+                        "city": metrics["active_cities_only"],
+                        "county": metrics["active_counties"],
+                        "school_district": metrics["active_school_districts"],
                     },
                     "live": {
-                        "city": complex_stats["live_cities"],
-                        "county": complex_stats["live_counties"],
-                        "school_district": complex_stats["live_school_districts"],
+                        "city": metrics["live_cities"],
+                        "county": metrics["live_counties"],
+                        "school_district": metrics["live_school_districts"],
                     },
                 },
-                "live_jurisdictions": complex_stats["live_jurisdictions_total"],
-                "frequently_updated_cities": complex_stats["frequently_updated"],
-                "frequently_updated_population": complex_stats["frequently_updated_pop"],
-                "meetings_tracked": counts["meetings_count"],
-                "meetings_with_summary": complex_stats["live_meetings"],
-                "meetings_with_items": counts["meetings_with_items"],
-                "meetings_with_packet": counts["packets_count"],
-                "agendas_summarized": counts["summaries_count"],
-                "agenda_items_processed": counts["items_count"],
-                "matters_tracked": counts["matters_count"],
-                "unique_item_summaries": unique_summaries,
-                "population_total": complex_stats["total_pop"],
-                "population_with_data": complex_stats["pop_with_data"],
-                "population_with_summaries": complex_stats["pop_with_summaries"],
+                "live_jurisdictions": metrics["live_jurisdictions_total"],
+                "frequently_updated_cities": metrics["frequently_updated"],
+                "frequently_updated_population": metrics["frequently_updated_pop"],
+                "meetings_tracked": metrics["meetings"],
+                "meetings_with_summary": metrics["live_meetings"],
+                "meetings_with_items": metrics["meetings_with_items"],
+                "meetings_with_packet": metrics["packets_count"],
+                "agendas_summarized": metrics["summaries_count"],
+                "agenda_items_processed": metrics["agenda_items"],
+                "matters_tracked": metrics["matters"],
+                "unique_item_summaries": (
+                    metrics["matters_with_summary"] + metrics["standalone_items"]
+                ),
+                "population_total": metrics["total_pop"],
+                "population_with_data": metrics["pop_with_data"],
+                "population_with_summaries": metrics["pop_with_summaries"],
             },
         }
 
