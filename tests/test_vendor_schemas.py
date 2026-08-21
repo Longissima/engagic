@@ -41,6 +41,26 @@ def test_invalid_optional_attachment_does_not_drop_parent_meeting() -> None:
     ]
 
 
+def test_out_of_range_sequence_uses_order_fallback() -> None:
+    meeting = validate_meeting_output(
+        {
+            "vendor_id": "meeting-1",
+            "title": "Board of Supervisors",
+            "start": "2026-08-19T09:00:00",
+            "items": [
+                {
+                    "vendor_item_id": "item-1",
+                    "title": "Approve the consent calendar",
+                    "sequence": 81_758_279_870,
+                }
+            ],
+        }
+    )
+
+    assert meeting.items is not None
+    assert meeting.items[0].sequence == 0
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

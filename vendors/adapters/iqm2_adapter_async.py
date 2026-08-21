@@ -75,7 +75,7 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
         return None
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 14
+        self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Scrape meetings from IQM2 calendar page with date filtering."""
         # Try each calendar URL pattern until one works

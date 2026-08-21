@@ -64,7 +64,7 @@ class AsyncRossAdapter(AsyncBaseAdapter):
     # ------------------------------------------------------------------
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 14
+        self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Scrape meetings table, then enrich from detail pages."""
         today = datetime.now()

@@ -73,7 +73,7 @@ class AsyncCivicWebAdapter(AsyncBaseAdapter):
     # ------------------------------------------------------------------
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 14
+        self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Scrape MeetingTypeList for meetings, fetch packet PDFs."""
         start_date, end_date = self._date_range(days_back, days_forward)

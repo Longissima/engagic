@@ -21,6 +21,9 @@ from config import get_logger
 
 logger = get_logger(__name__).bind(component="vendor_schema")
 
+POSTGRES_INT32_MIN = -(2**31)
+POSTGRES_INT32_MAX = 2**31 - 1
+
 
 class AttachmentSchema(BaseModel):
     """Attachment metadata from adapter"""
@@ -84,13 +87,23 @@ class AgendaItemSchema(BaseModel):
     @field_validator("sequence")
     @classmethod
     def validate_sequence(cls, v: Any) -> int:
-        """Ensure sequence is integer (catches string "0" from APIs)"""
+        """Normalize sequence while keeping it safe for PostgreSQL INTEGER."""
         if isinstance(v, str):
             try:
-                return int(v)
+                sequence = int(v)
             except ValueError:
                 raise ValueError(f"Sequence must be integer, got string: {v}")
-        return int(v)
+        else:
+            sequence = int(v)
+
+        if not POSTGRES_INT32_MIN <= sequence <= POSTGRES_INT32_MAX:
+            logger.warning(
+                "agenda item sequence outside database range; using order fallback",
+                sequence=str(v)[:64],
+            )
+            return 0
+
+        return sequence
 
     @field_validator("attachments", mode="before")
     @classmethod

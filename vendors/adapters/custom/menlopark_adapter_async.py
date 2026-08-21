@@ -55,7 +55,7 @@ class AsyncMenloParkAdapter(AsyncBaseAdapter):
         self.base_url = "https://menlopark.gov"
         self.pdf_extractor = PdfExtractor.shared()
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from all Menlo Park commissions, extracting items from PDFs."""
         today = datetime.now().date()
         start_date = today - timedelta(days=days_back)

@@ -160,7 +160,7 @@ class AsyncCivicEngageAdapter(AsyncBaseAdapter):
         return [DEFAULT_CATEGORY_ID]
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 14
+        self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Fetch agendas from CivicEngage Archive Center.
 

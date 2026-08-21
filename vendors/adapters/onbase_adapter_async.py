@@ -100,7 +100,7 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
             site_count=len(self.site_urls)
         )
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from all configured OnBase sites."""
         start_date, end_date = self._date_range(days_back, days_forward)
 

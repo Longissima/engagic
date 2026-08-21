@@ -580,17 +580,41 @@ def chunk_pdf(
         result.attempts.append(attempt)
 
         if items:
-            result.items = items
-            result.metadata = parsed.get("metadata") or {}
-            result.raw = parsed
-            result.winning_rung = rung
-
             # Quality signals, by failure layer: garbage titles = extraction
             # problem (repairable from the item's own page); count diverging
             # from the document's own numbering = chunking problem. Matter
             # files harvest before repair, which strips the same prefix.
             matter_files = extract_matter_files(items)
             repaired = repair_titles(items, pdf_path)
+
+            # An engine can mistake a bare agenda-number anchor ("1.") for a
+            # complete item and emit an empty title. Nested schema validation
+            # correctly rejects such an item, but letting it leave the chunker
+            # would reject the entire parent meeting. Give title repair first
+            # chance, then remove only the still-invalid rows. If a rung
+            # produced nothing usable, keep cascading instead of declaring a
+            # broken winner.
+            extracted_count = len(items)
+            items = [
+                item
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("title") or "").strip()
+            ]
+            dropped_empty_titles = extracted_count - len(items)
+            parsed["items"] = items
+            attempt.item_count = len(items)
+            if not items:
+                attempt.failure_reason = NO_ITEMS
+                attempt.error = (
+                    f"filtered {dropped_empty_titles} item(s) with empty titles"
+                )
+                continue
+
+            result.items = items
+            result.metadata = parsed.get("metadata") or {}
+            result.raw = parsed
+            result.winning_rung = rung
             result.quality = {
                 "garbage_titles": len(garbage_titles(items)),  # post-repair
                 "repaired_titles": repaired,
@@ -600,6 +624,8 @@ def chunk_pdf(
                     len(items),
                 ),
             }
+            if dropped_empty_titles:
+                result.quality["empty_titles_dropped"] = dropped_empty_titles
             _attach_ground_truth(result, pdf_path)
             _apply_ocr_shape_policy(result)
             return result

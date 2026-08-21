@@ -126,7 +126,7 @@ class AsyncProudCityAdapter(AsyncBaseAdapter):
     # ------------------------------------------------------------------
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 14
+        self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Fetch meetings via WP REST API, falling back to HTML scrape."""
         if not self.base_url:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import aiohttp
+from asyncpg.exceptions import DeadlockDetectedError, SerializationError
 
 from database.db_postgres import Database
 from database.models import Jurisdiction
@@ -523,7 +524,13 @@ class Fetcher:
                 if result.status == SyncStatus.CANCELLED:
                     return result
                 last_error = result.error_message or "Sync failed"
-            except (VendorError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+            except (
+                VendorError,
+                asyncio.TimeoutError,
+                aiohttp.ClientError,
+                DeadlockDetectedError,
+                SerializationError,
+            ) as e:
                 last_error = str(e)
 
             if attempt >= max_retries - 1:

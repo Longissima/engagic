@@ -389,8 +389,10 @@ def configure_structlog(is_development: bool = False, log_level: str = "INFO"):
 
     if is_development:
         # Development: Colored console output with readable formatting
+        # ConsoleRenderer owns exception rendering. Pre-formatting exc_info
+        # turns the traceback into a string first, which triggers structlog's
+        # warning and prevents its single pretty-exception rendering path.
         processors = shared_processors + [
-            structlog.processors.format_exc_info,
             structlog.dev.ConsoleRenderer(colors=True),
         ]
     else:

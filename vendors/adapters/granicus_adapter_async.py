@@ -357,7 +357,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         except UnicodeDecodeError:
             return data.decode("latin-1")
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from all configured view_ids, then fetch detail pages."""
         start_date, end_date = self._date_range(days_back, days_forward)
 

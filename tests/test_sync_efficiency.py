@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+from asyncpg.exceptions import DeadlockDetectedError, SerializationError
+
 from database.models import Jurisdiction
 from database.repositories_async.jurisdictions import (
     JurisdictionRepository,
@@ -279,6 +282,43 @@ def test_extra_vendor_retry_does_not_replay_successful_primary(monkeypatch):
         ("legistar", "extra"),
         ("legistar", "extra"),
     ]
+
+
+@pytest.mark.parametrize(
+    "conflict_type", [DeadlockDetectedError, SerializationError]
+)
+def test_transaction_conflict_retries_vendor_pass(monkeypatch, conflict_type):
+    city = _city("retryCA")
+    fetcher = Fetcher(cast(Any, _Database([city])))
+    calls = 0
+    sleeps = []
+
+    async def sync_vendor(city, vendor, slug):
+        nonlocal calls
+        del city, vendor, slug
+        calls += 1
+        if calls == 1:
+            raise conflict_type("transient transaction conflict")
+        return SyncResult(
+            city_banana="retryCA", status=SyncStatus.COMPLETED
+        )
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    fetcher._sync_with_vendor = sync_vendor
+    monkeypatch.setattr("pipeline.fetcher.asyncio.sleep", record_sleep)
+    monkeypatch.setattr("pipeline.fetcher.random.uniform", lambda *_: 0)
+
+    result = asyncio.run(
+        fetcher._sync_vendor_with_retry(
+            city, city.vendor, city.slug, max_retries=2
+        )
+    )
+
+    assert result.status is SyncStatus.COMPLETED
+    assert calls == 2
+    assert sleeps == [5]
 
 
 def test_shutdown_between_vendor_streams_does_not_checkpoint_city():

@@ -1060,7 +1060,7 @@ class AsyncBaseAdapter:
 
         return items
 
-    async def fetch_meetings(self, days_back: int = 14, days_forward: int = 14) -> FetchResult:
+    async def fetch_meetings(self, days_back: int = 14, days_forward: int = 28) -> FetchResult:
         """Fetch meetings, validate, return FetchResult.
 
         Returns FetchResult with success=True for valid results (even if empty).

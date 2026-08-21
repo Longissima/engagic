@@ -55,7 +55,7 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
         # Modern: slug IS the numeric site ID. Legacy single-tenant: empty id.
         self.site_id = cfg.get("site_id", city_slug)
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings across relevant months, extract items from agenda pages."""
         start_date, end_date = self._date_range(days_back, days_forward)
 

@@ -69,7 +69,7 @@ class AsyncBerkeleyAdapter(AsyncBaseAdapter):
         super().__init__(city_slug, vendor="berkeley", metrics=metrics)
         self.base_url = "https://berkeleyca.gov"
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from Berkeley's Drupal-based website."""
         today = datetime.now().date()
         start_date = today - timedelta(days=days_back)

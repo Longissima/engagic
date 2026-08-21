@@ -114,7 +114,7 @@ class AsyncWPEventsAdapter(AsyncBaseAdapter):
     # ------------------------------------------------------------------
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 14
+        self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Fetch events via WP REST API, then enrich with media attachments."""
         if not self.base_url:

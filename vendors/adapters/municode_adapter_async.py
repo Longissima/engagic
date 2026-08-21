@@ -640,7 +640,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             logger.warning("failed to parse CalendarDate", vendor="municode", slug=self.slug, calendar_date=calendar_date, error=str(e))
             return None
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from Municode API, PublishPage HTML, or Drupal listing."""
         if self._is_drupal:
             return await self._fetch_drupal_meetings(days_back, days_forward)

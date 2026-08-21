@@ -98,7 +98,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         super().__init__(city_slug, vendor="escribe", metrics=metrics)
         self.base_url = f"https://{self.slug}.escribemeetings.com"
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 14) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings via calendar API with item-level extraction."""
         start_date, end_date = self._date_range(days_back, days_forward)
 

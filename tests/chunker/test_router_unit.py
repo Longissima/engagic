@@ -135,3 +135,45 @@ class TestChunkPdfEdges:
         audit = router.chunk_pdf(str(bogus), "packet").audit()
         assert audit["ladder"] == "packet"
         assert audit["failure_reason"] == router.OPEN_FAILED
+
+    def test_empty_item_titles_do_not_win_the_cascade(
+        self, tmp_path, monkeypatch
+    ):
+        import fitz
+
+        pdf_path = tmp_path / "agenda.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.save(pdf_path)
+        doc.close()
+
+        def run_rung(rung, _pdf_path):
+            if rung == "v2:url":
+                return {
+                    "items": [
+                        {"title": "", "sequence": 1, "agenda_number": "1"}
+                    ],
+                    "metadata": {"parse_method": "v2_url"},
+                }
+            return {
+                "items": [
+                    {"title": "Approve the contract", "sequence": 1}
+                ],
+                "metadata": {"parse_method": "url"},
+            }
+
+        monkeypatch.setattr(router, "_run_rung", run_rung)
+
+        result = router.chunk_pdf(
+            str(pdf_path), ["v2:url", "v1:url"]
+        )
+
+        assert result.winning_rung == "v1:url"
+        assert [item["title"] for item in result.items] == [
+            "Approve the contract"
+        ]
+        assert result.attempts[0].failure_reason == router.NO_ITEMS
+        assert result.attempts[0].item_count == 0
+        assert result.attempts[0].error == (
+            "filtered 1 item(s) with empty titles"
+        )
