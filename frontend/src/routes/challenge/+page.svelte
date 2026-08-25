@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
+	import { SITE_KEY, SCRIPT_SRC, storeSession } from '$lib/turnstile';
 
-	const SITE_KEY = '0x4AAAAAAC8k9WNTYMFPIDOj';
 	let status = $state('Verifying...');
 	let showWidget = $state(false);
 
@@ -14,7 +14,7 @@
 
 		await new Promise<void>((resolve) => {
 			const s = document.createElement('script');
-			s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+			s.src = SCRIPT_SRC;
 			s.onload = () => resolve();
 			s.onerror = () => {
 				status = 'Could not load challenge. Check your connection and refresh.';
@@ -40,6 +40,10 @@
 						body: JSON.stringify({ token })
 					});
 					if (resp.ok) {
+						// Persist the API session so the app shell does not run a
+						// second solve right after this redirect.
+						const data = await resp.json().catch(() => null);
+						if (data?.session_token) storeSession(data.session_token);
 						window.location.href = safeReturn;
 					} else {
 						status = 'Verification failed. Refresh to retry.';
