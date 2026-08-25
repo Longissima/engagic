@@ -12,6 +12,7 @@ from config import config, get_logger
 from database.db_postgres import Database
 from server.dependencies import get_db
 from server.metrics import metrics, get_metrics_text
+from server.rate_limiter import GLOBAL_LIMITS
 
 logger = get_logger(__name__)
 
@@ -75,7 +76,7 @@ async def root():
                 "description": "Get cached AI summary of meeting agenda",
             },
         },
-        "rate_limiting": f"{config.RATE_LIMIT_REQUESTS} requests per {config.RATE_LIMIT_WINDOW} seconds per IP",
+        "rate_limiting": f"{GLOBAL_LIMITS['minute_limit']} requests per minute per IP",
         "features": [
             "ZIP code and city name search",
             "AI-powered meeting summaries",
@@ -238,7 +239,7 @@ async def health_check(db: Database = Depends(get_db)):
     health_status["checks"]["configuration"] = {
         "status": "healthy",
         "is_development": config.is_development(),
-        "rate_limiting": f"{config.RATE_LIMIT_REQUESTS} req/{config.RATE_LIMIT_WINDOW}s",
+        "rate_limiting": f"{GLOBAL_LIMITS['minute_limit']} req/min",
         "background_processing": config.BACKGROUND_PROCESSING,
     }
 
@@ -371,8 +372,9 @@ async def get_metrics(db: Database = Depends(get_db)):
                 "pending_meetings": stats.get("pending_meetings", 0),
             },
             "configuration": {
-                "rate_limit_window": config.RATE_LIMIT_WINDOW,
-                "rate_limit_requests": config.RATE_LIMIT_REQUESTS,
+                "rate_limit_minute": GLOBAL_LIMITS["minute_limit"],
+                "rate_limit_hour": GLOBAL_LIMITS["hour_limit"],
+                "rate_limit_day": GLOBAL_LIMITS["day_limit"],
                 "background_processing": config.BACKGROUND_PROCESSING,
             },
         }

@@ -5,6 +5,7 @@ server/middleware/
 server/routes/duckling.py
 server/rate_limiter.py
 server/turnstile.py
+server/security_config.py
 server/routes/turnstile.py
 # Byte-compiled / optimized / DLL files
 __pycache__/

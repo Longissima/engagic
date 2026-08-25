@@ -40,7 +40,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 		const cookieSecret = event.platform?.env?.CHALLENGE_COOKIE_SECRET;
 		if (cookieSecret) {
 			const cookie = event.cookies.get(COOKIE_NAME);
-			const valid = await verifyCookie(cookieSecret, cookie);
+			const valid = await verifyCookie(cookieSecret, cookie, event.locals.clientIp);
 			if (!valid) {
 				const returnTo = event.url.pathname + event.url.search;
 				return new Response(null, {

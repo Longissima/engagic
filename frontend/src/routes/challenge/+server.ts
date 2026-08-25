@@ -101,7 +101,7 @@ export const POST: RequestHandler = async ({ request, cookies, platform }) => {
 	}
 
 	const now = Math.floor(Date.now() / 1000);
-	const value = await signCookie(cookieSecret, now);
+	const value = await signCookie(cookieSecret, now, clientIp);
 	cookies.set(COOKIE_NAME, value, {
 		path: '/',
 		httpOnly: true,

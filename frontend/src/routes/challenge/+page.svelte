@@ -23,7 +23,6 @@
 			document.head.appendChild(s);
 		});
 
-		// @ts-expect-error global injected by Turnstile
 		const turnstile = window.turnstile;
 		if (!turnstile) return;
 

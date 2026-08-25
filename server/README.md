@@ -30,7 +30,8 @@ Provides:
 server/
 ├── main.py                 - FastAPI app initialization
 ├── dependencies.py         - Centralized dependency injection
-├── rate_limiter.py         - SQLite tiered rate limiting (Standard/Enterprise)
+├── rate_limiter.py         - In-memory rate limiting, SQLite temp bans
+├── security_config.py      - Single loader for /opt/engagic-ops/conf/security.json
 ├── metrics.py              - Prometheus instrumentation
 │
 ├── routes/                 - HTTP request handlers (17 modules)
@@ -153,8 +154,8 @@ app.add_middleware(RequestIDMiddleware)
 # GZip compression for responses > 500 bytes
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-# Global rate limiter (SQLite-based)
-rate_limiter = SQLiteRateLimiter(db_path="rate_limits.db", ...)
+# Global rate limiter (in-memory windows, SQLite temp bans)
+rate_limiter = RateLimiter(db_path="rate_limits.db")
 
 # Stripe and JWT initialization at startup
 stripe.api_key = config.STRIPE_SECRET_KEY
@@ -221,43 +222,37 @@ async def get_optional_user(request: Request) -> Optional[User]:
 
 ---
 
-### 2. `rate_limiter.py` - Tiered Rate Limiting
+### 2. `rate_limiter.py` - Rate Limiting
 
-**SQLite-based rate limiter with two tiers: Standard (everyone), Enterprise (API key holders).**
-
-#### SQLiteRateLimiter
+**In-memory sliding windows; SQLite only for temp bans.** The API runs as a
+single uvicorn worker, so process-local counters are authoritative and the
+request path touches no disk. Operator knobs live in
+`/opt/engagic-ops/conf/security.json`, loaded once by `server/security_config.py`
+(shared with the Turnstile middleware and the access-log classifier).
 
 ```python
-rate_limiter = SQLiteRateLimiter(db_path="rate_limits.db")
+rate_limiter = RateLimiter(db_path="rate_limits.db")
 
-# Check rate limit (returns tier info)
-is_allowed, remaining, limit_info = rate_limiter.check_rate_limit(
+is_allowed, limit_info = rate_limiter.check_rate_limit(
     client_ip_hash,  # SHA256[:16] of raw IP
-    api_key,         # Optional API key for enterprise tier
-    client_ip_raw,   # For whitelist check and logging
-    endpoint         # Optional: endpoint-specific limits (e.g., "/api/events")
+    client_ip_raw,   # For whitelist check and ban export
+    endpoint         # Path, for entity / route classification
 )
-
-# limit_info contains: tier, minute_limit, day_limit, remaining_minute, remaining_daily
+# denied: limit_info has limit_type, retry_after, message
+# allowed: limit_info has remaining_minute / remaining_hourly / remaining_daily
 ```
 
-**Limits:**
-- Standard: 60/min, 2000/day
-- Enterprise: 1000/min, 100000/day
-- /api/events: 120/min, 10000/day (endpoint override)
+**Layers, in order:**
+1. Whitelist (admin IPs, IP-verified Googlebot)
+2. Temp ban (memory mirror of SQLite `temp_bans`)
+3. Unique-entity budget per hour (`entity_hour_limit`; only new entities spend it, revisits are free)
+4. Per-route minute/hour/day windows (`route_limits`)
+5. Global minute/hour/day windows (`GLOBAL_LIMITS` in code)
 
-**Features:**
-- **Endpoint-aware:** Different limits per endpoint (e.g., lighter for analytics)
-- **Dual limits:** Per-minute burst + daily quota
-- **Progressive penalties:** Temp bans for repeated violations (10+ in 1h = 1h ban, 50+ in 1h = 24h ban, 100+ in 24h = 7d ban)
-- **Persistent:** SQLite, survives API restarts, WAL mode for concurrency
-- **nginx integration:** Exports blocked IPs for nginx geo blocking
-- **Admin whitelist:** Configurable IPs bypass rate limits entirely
-
-**Also includes:**
-- `RateLimitHandler` - Exponential backoff with jitter for outbound API calls
-- `APIRateLimitManager` - Global pause across multiple API endpoints
-- `with_rate_limit_retry` - Decorator for functions that need retry on rate limit
+**Bans:** violations (any 429 except entity budget) are deduplicated to one per
+client per 10s and evaluated against `ban_thresholds` (`hour_25`, `hour_75`,
+`day_200` = count in window -> ban seconds). Bans persist in SQLite, export to
+the nginx geo blocklist, and nginx reloads off the request path.
 
 ---
 
@@ -975,7 +970,7 @@ async def generate_meeting_flyer(
 Rate limit enforcement with endpoint-aware limits.
 
 ```python
-async def rate_limit_middleware(request: Request, call_next, rate_limiter: SQLiteRateLimiter):
+async def rate_limit_middleware(request: Request, call_next, rate_limiter: RateLimiter):
     """Check rate limits with unified endpoint-aware system
 
     IP Detection Chain (priority order):
@@ -1341,9 +1336,8 @@ ENGAGIC_API_PORT=8000
 ```
 
 **Rate Limiting:**
-Rate limits are hardcoded in `rate_limiter.py`:
-- Standard: 60 req/min, 2000 req/day
-- Enterprise: 1000 req/min, 100000 req/day
+Global limits (`GLOBAL_LIMITS`) are in `rate_limiter.py`; per-route limits,
+entity budget and ban thresholds are in `/opt/engagic-ops/conf/security.json`.
 
 **CORS:**
 ```bash
@@ -1374,7 +1368,7 @@ FRONTEND_URL=https://engagic.org
 ## Performance Characteristics
 
 - **Response time:** <100ms (cache hit)
-- **Rate limit:** 60 req/min, 2000/day per IP (Standard tier)
+- **Rate limit:** 40 req/min, 500/hour, 1000/day per IP globally, tighter per route
 - **Concurrent requests:** 1000+ (uvicorn default)
 - **Database:** Async PostgreSQL with connection pooling
 - **Memory:** ~200MB (API process)
@@ -1392,7 +1386,7 @@ FRONTEND_URL=https://engagic.org
 3. **Repository Pattern:** Database operations encapsulated in focused repositories
 4. **Service layer:** Business logic separated from HTTP concerns
 5. **Dependency injection:** Database and rate limiter injected via FastAPI deps
-6. **Persistent rate limiting:** SQLite-based, survives restarts, supports tiers
+6. **Rate limiting:** in-memory sliding windows, bans persist in SQLite
 7. **Modular routes:** 17 focused modules instead of one monolith
 8. **Pydantic validation:** Input validation + SQL injection prevention
 9. **Prometheus metrics:** Comprehensive instrumentation for observability

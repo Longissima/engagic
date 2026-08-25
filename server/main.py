@@ -7,7 +7,6 @@ Routes, services, and utilities are organized into focused modules.
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager, suppress
 
 import stripe
@@ -17,7 +16,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from config import config, get_logger
 from database.db_postgres import Database
-from server.rate_limiter import SQLiteRateLimiter
+from server.rate_limiter import get_rate_limiter
 from server.middleware.logging import log_requests
 from server.middleware.metrics import metrics_middleware
 from server.middleware.request_id import RequestIDMiddleware
@@ -115,11 +114,7 @@ app.add_middleware(RequestIDMiddleware)  # type: ignore[arg-type]
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Initialize global instances (non-async)
-rate_limiter = SQLiteRateLimiter(
-    db_path=os.path.join(config.DB_DIR, "rate_limits.db"),
-    requests_limit=config.RATE_LIMIT_REQUESTS,
-    window_seconds=config.RATE_LIMIT_WINDOW,
-)
+rate_limiter = get_rate_limiter()
 
 # Initialize Stripe at app startup (not per-request)
 if config.STRIPE_SECRET_KEY:
