@@ -208,15 +208,12 @@ async def produce_ground_truth(
     if source_url:
         _attach_incomplete_source_links(result, source_url)
 
-    # Stage-2 write-once: persist the child's ground-truth text when it is
-    # provably complete. Process extraction then serves these bytes from the
-    # corpus instead of re-extracting.
+    # Retain available text, including the pages still awaiting OCR.
     corpus_store = get_corpus()
     if (
         corpus_store
         and content_sha256
         and result.extraction
-        and result.extraction.get("ocr_pending", 0) == 0
     ):
         await corpus_store.persist_extraction(content_sha256, result.extraction)
 

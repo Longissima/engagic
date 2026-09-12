@@ -246,6 +246,7 @@ class CorpusStore:
                 and existing.get("text_key")
                 and existing.get("extract_version") == EXTRACT_VERSION
                 and not str(existing.get("extract_method") or "").endswith("-partial")
+                and not existing.get("ocr_pending_pages")
             ):
                 return True
 
@@ -260,10 +261,16 @@ class CorpusStore:
                 page_count=result.get("page_count"),
                 ocr_page_count=result.get("ocr_pages"),
                 text_chars=len(text),
+                ocr_pending_pages=result.get(
+                    "ocr_pending_pages",
+                    None if str(result.get("method") or "").endswith("-partial")
+                    or result.get("ocr_pending") else [],
+                ),
                 extraction_status=(
                     "partial"
                     if str(result.get("method") or "").endswith("-partial")
                     or int(result.get("ocr_pending") or 0) > 0
+                    or bool(result.get("ocr_pending_pages"))
                     else "succeeded"
                 ),
             )
@@ -292,12 +299,15 @@ class CorpusStore:
             )
             return False
 
-    async def lookup_extraction(self, content_sha256: str) -> Optional[Dict[str, Any]]:
+    async def lookup_extraction(
+        self, content_sha256: str, *, require_complete: bool = False
+    ) -> Optional[Dict[str, Any]]:
         """The dedup gate: return a ready extraction result for these bytes,
         or None if the corpus can't serve one (unknown hash, no text yet,
         stale extract_version, R2 hiccup). Shaped exactly like a fresh
         PdfExtractor result so callers can't tell the difference -- except
-        for the from_corpus marker.
+        for the from_corpus marker. Partial text is readable, with explicit
+        completeness metadata. Repair callers can require_complete to retry OCR.
         """
         try:
             blob = await self.blobs.get_blob(content_sha256)
@@ -306,12 +316,9 @@ class CorpusStore:
             extract_version = blob.get("extract_version")
             if extract_version not in COMPATIBLE_EXTRACT_VERSIONS:
                 return None  # older extractor produced this; re-extract fresh
-            if str(blob.get("extract_method") or "").endswith("-partial"):
-                logger.info(
-                    "partial corpus extraction requires OCR retry",
-                    sha=content_sha256[:16],
-                    extract_method=blob.get("extract_method"),
-                )
+            pending_pages = blob.get("ocr_pending_pages")
+            incomplete = bool(pending_pages) or str(blob.get("extract_method") or "").endswith("-partial")
+            if require_complete and incomplete:
                 return None
 
             text_bytes = await self.r2.get(blob["text_key"])
@@ -341,6 +348,9 @@ class CorpusStore:
                 "method": blob.get("extract_method"),
                 "page_count": blob.get("page_count") or 0,
                 "ocr_pages": blob.get("ocr_page_count") or 0,
+                "ocr_pending_pages": pending_pages,
+                "ocr_pending": len(pending_pages) if pending_pages is not None else None,
+                "extraction_incomplete": incomplete,
                 "extraction_time": 0.0,
                 "from_corpus": True,
             }

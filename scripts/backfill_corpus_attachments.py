@@ -71,10 +71,14 @@ CANDIDATES_SQL = """
       AND ($4::boolean IS FALSE OR i.filter_reason IS NULL)
       AND ($6::text IS NULL OR j.state = $6)
       AND NOT EXISTS (
-          SELECT 1 FROM document_source s
-          JOIN document_blob b USING (content_sha256)
-          WHERE s.source_identity = a->>'url'
-            AND b.text_key IS NOT NULL
+          SELECT 1 FROM (
+              SELECT b.text_key, b.extract_version
+              FROM document_source s JOIN document_blob b USING (content_sha256)
+              WHERE s.source_identity = a->>'url'
+              ORDER BY s.last_validated_at DESC NULLS LAST, s.first_seen DESC
+              LIMIT 1
+          ) b
+          WHERE b.text_key IS NOT NULL
             AND b.extract_version = ANY($5::text[])
       )
     ORDER BY m.date DESC, i.id
@@ -82,12 +86,14 @@ CANDIDATES_SQL = """
 
 # Same readiness rule motioncount applies: current text at this identity.
 READY_IDENTITIES_SQL = """
-    SELECT DISTINCT s.source_identity
-    FROM document_source s
-    JOIN document_blob b USING (content_sha256)
-    WHERE s.source_identity = ANY($1::text[])
-      AND b.text_key IS NOT NULL
-      AND b.extract_version = ANY($2::text[])
+    WITH current_revision AS (
+        SELECT DISTINCT ON (s.source_identity) s.source_identity, b.text_key, b.extract_version
+        FROM document_source s JOIN document_blob b USING (content_sha256)
+        WHERE s.source_identity = ANY($1::text[])
+        ORDER BY s.source_identity, s.last_validated_at DESC NULLS LAST, s.first_seen DESC
+    )
+    SELECT source_identity FROM current_revision
+    WHERE text_key IS NOT NULL AND extract_version = ANY($2::text[])
 """
 
 FAILURE_STATE_SQL = """

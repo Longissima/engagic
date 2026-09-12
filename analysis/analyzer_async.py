@@ -43,6 +43,7 @@ from pipeline.document_acquisition import DocumentResponse, DocumentSourceAcquir
 from pipeline.document_artifacts import (
     DocumentArtifact,
     DocumentFormat,
+    text_for_analysis,
     extract_document_links,
     rewrite_s3_virtual_host,
     sanitize_html_text,
@@ -542,15 +543,17 @@ class AsyncAnalyzer:
         return artifact.data
 
     async def extract_document_async(
-        self, url: str, banana: Optional[str] = None
+        self, url: str, banana: Optional[str] = None, *, retry_incomplete: bool = False
     ) -> Dict[str, Any]:
-        """Acquire and extract a supported document or useful HTML fallback."""
+        """Read available text; retry_incomplete explicitly retries partial OCR."""
         safe_url = attachment_identity(url)
         artifact = await self.acquire_document_async(url, banana=banana)
         corpus_store = get_corpus()
 
         if corpus_store:
             cached = await corpus_store.lookup_extraction(artifact.content_sha256)
+            if retry_incomplete and cached and cached.get("extraction_incomplete"):
+                cached = None
             if cached:
                 await corpus_store.record_sighting(
                     artifact.content_sha256, artifact.source_url, banana
@@ -627,21 +630,10 @@ class AsyncAnalyzer:
             corpus_persisted = await corpus_store.persist_extraction(
                 content_sha256, result
             )
-        ocr_pending = int(result.get("ocr_pending") or 0)
-        extraction_method = str(result.get("method") or "")
-        if ocr_pending > 0 or extraction_method.endswith("-partial"):
-            logger.warning(
-                "document extraction incomplete; refusing downstream analysis",
-                url=safe_url[:100],
-                method=extraction_method,
-                ocr_pending=ocr_pending,
-                corpus_persisted=corpus_persisted,
-            )
-            raise ExtractionError(
-                f"Document extraction incomplete: {ocr_pending} page(s) require OCR retry",
-                document_url=safe_url,
-                document_type=document_format.value,
-            )
+        result["extraction_incomplete"] = bool(
+            result.get("ocr_pending") or result.get("ocr_pending_pages")
+            or str(result.get("method") or "").endswith("-partial")
+        )
         result.update(
             content_sha256=content_sha256,
             corpus_persisted=corpus_persisted,
@@ -740,7 +732,7 @@ class AsyncAnalyzer:
             result = await self.extract_document_async(url, banana=banana)
 
             if result.get("success") and result.get("text"):
-                extracted_text = result["text"]
+                extracted_text = text_for_analysis(result)
 
                 # Parse participation info BEFORE AI summarization
                 participation = parse_participation_info(extracted_text)

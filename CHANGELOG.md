@@ -29,6 +29,11 @@ an offline regression slice; saved runs can be inspected and replayed without
 refetching. API/minutes sources coexist and are compared internally. Outcome
 encoding requires an explicit result; majority estimates are display-only.
 
+Minutes identities now reuse uniquely matching API-backed member IDs, with
+matching receipts and separate treatment of incomplete API comparisons. A
+bounded passage review also fixes remote-participant list boundaries and
+explicit absence/title variants; see `docs/MINUTES_IDENTITY_REVIEW.md`.
+
 A meeting minutes endpoint exposes revision hashes and corpus readiness.
 `docs/MOTION_DATA_CONTRACT.md` defines the Motioncount handoff and the migration,
 restart, and full reparse required to populate the new records.
@@ -3225,3 +3230,9 @@ motioncount.sh                     # Deploy script (124 lines)
 ## Future
 
 Track future milestones in VISION.md.
+
+### Corpus partial reads and revision readiness
+
+- Retain OCR-pending page numbers and serve available partial text with explicit completeness metadata; label partial inputs during summarization.
+- Select the current source revision before checking attachment backfill readiness, and use origin-validation ordering for minutes ingestion.
+- Expose current minutes readiness and older text availability separately. Migration 045 adds one nullable page-list column; no extraction history or corpus-wide reprocessing.

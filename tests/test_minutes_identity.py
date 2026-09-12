@@ -130,3 +130,4 @@ def test_raw_middle_initial_conflict_is_withheld_after_gazetteer_matching():
     assert parsed.published[0].member_votes==[]
     assert parsed.published[0].outcome=='PASS'
     assert 'Klarissa B. Peña' in parsed.observations[0].raw_text
+    assert parsed.published[0].tally=={'yes':1}

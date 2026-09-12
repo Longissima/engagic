@@ -13,7 +13,7 @@ from database.db_postgres import Database
 from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
 from pipeline.ground_truth import produce_ground_truth
-from pipeline.document_artifacts import DocumentFormat
+from pipeline.document_artifacts import DocumentFormat, text_for_analysis
 from pipeline.job_runner import (
     JobExecutionPolicy,
     JobRunner,
@@ -1918,7 +1918,7 @@ class Processor:
                     result = await analyzer.extract_document_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
                         logger.debug("extracted attachment text", attachment=att_name or att_url, pages=result.get('page_count', 0), chars=len(result['text']))
-                        return (att_name or att_url, result["text"], result.get("page_count", 0))
+                        return (att_name or att_url, text_for_analysis(result), result.get("page_count", 0))
                     return None
                 except (ExtractionError, OSError, IOError) as e:
                     logger.warning("failed to extract attachment", name=att_name or att_url, error=str(e))
@@ -3250,7 +3250,7 @@ class Processor:
                 try:
                     result = await analyzer.extract_document_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
-                        text = result["text"]
+                        text = text_for_analysis(result)
                         page_count = result.get("page_count", 0)
                         return att_url, {
                             "text": text,
@@ -3259,6 +3259,8 @@ class Processor:
                             "content_sha256": result.get("content_sha256"),
                             "source_url": result.get("source_url") or att_url,
                             "document_format": result.get("document_format"),
+                            "extraction_incomplete": result.get("extraction_incomplete", False),
+                            "ocr_pending_pages": result.get("ocr_pending_pages"),
                         }
                     return att_url, None
                 except (ExtractionError, OSError, IOError) as e:

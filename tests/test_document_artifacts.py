@@ -13,7 +13,6 @@ import pytest
 import analysis.analyzer_async as analyzer_module
 from analysis.analyzer_async import AsyncAnalyzer
 from corpus.store import CorpusOriginal, sha256_hex
-from exceptions import ExtractionError
 from parsing.pdf import PdfExtractor
 from parsing.subprocess_guard import GuardCrashed
 from pipeline.document_artifacts import (
@@ -590,7 +589,7 @@ def test_extraction_releases_artifact_before_guarded_child(monkeypatch):
     assert result["content_sha256"] == content_sha
 
 
-def test_partial_extraction_is_not_returned_for_summarization(monkeypatch):
+def test_partial_extraction_is_readable_and_labeled_for_analysis(monkeypatch):
     data = b"%PDF-1.7 incomplete-ocr"
     analyzer = AsyncAnalyzer(enable_llm=False)
 
@@ -610,16 +609,21 @@ def test_partial_extraction_is_not_returned_for_summarization(monkeypatch):
             "page_count": 12,
             "ocr_pages": 10,
             "ocr_pending": 1,
+            "ocr_pending_pages": [11],
         }
 
     analyzer.acquire_document_async = acquire
     monkeypatch.setattr(analyzer_module, "get_corpus", lambda: None)
     monkeypatch.setattr(analyzer_module, "_extract_pdf_in_subprocess", extract)
 
-    with pytest.raises(ExtractionError, match="extraction incomplete"):
-        asyncio.run(
-            analyzer.extract_document_async("https://example.test/incomplete.pdf")
-        )
+    result = asyncio.run(analyzer.extract_document_async("https://example.test/incomplete.pdf"))
+    assert result["text"] == "readable pages plus one missing scan"
+    assert result["extraction_incomplete"] is True
+    assert result["ocr_pending_pages"] == [11]
+    from pipeline.document_artifacts import text_for_analysis
+    assert "Pages awaiting OCR: 11" in text_for_analysis(result)
+    assert text_for_analysis(result).endswith(result["text"])
+    assert text_for_analysis({"text": "Complete"}) == "Complete"
 
 
 def test_guarded_pdf_crash_retries_without_legislative_geometry(monkeypatch):

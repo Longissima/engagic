@@ -59,7 +59,7 @@ class FakeBlobRepo:
 
     async def set_extraction(self, sha, text_key, extract_method, extract_version,
                              page_count, ocr_page_count, text_chars,
-                             extraction_status="succeeded"):
+                             extraction_status="succeeded", ocr_pending_pages=None):
         self.blobs[sha].update(
             text_key=text_key,
             extract_method=extract_method,
@@ -68,6 +68,7 @@ class FakeBlobRepo:
             ocr_page_count=ocr_page_count,
             text_chars=text_chars,
             extraction_status=extraction_status,
+            ocr_pending_pages=ocr_pending_pages,
         )
 
     async def record_extraction_failure(self, sha, *, error_type, error_message):
@@ -354,9 +355,22 @@ def test_partial_ocr_extraction_is_retryable_and_can_be_replaced():
         "method": "pymupdf+ocr-partial",
         "page_count": 497,
         "ocr_pages": 439,
+        "ocr_pending": 2,
+        "ocr_pending_pages": [7, 12],
     }
     assert run(store.persist_extraction(SHA, partial))
-    assert run(store.lookup_extraction(SHA)) is None
+    served = run(store.lookup_extraction(SHA))
+    assert served["text"] == partial["text"]
+    assert served["ocr_pending_pages"] == [7, 12]
+    assert served["ocr_pending"] == 2
+    assert served["extraction_incomplete"] is True
+    assert run(store.lookup_extraction(SHA, require_complete=True)) is None
+    # Legacy partial rows remain readable without inventing missing page numbers.
+    repo.blobs[SHA]["ocr_pending_pages"] = None
+    legacy = run(store.lookup_extraction(SHA))
+    assert legacy["extraction_incomplete"] is True
+    assert legacy["ocr_pending_pages"] is None
+    assert legacy["ocr_pending"] is None
 
     complete = {
         "success": True,
@@ -369,6 +383,8 @@ def test_partial_ocr_extraction_is_retryable_and_can_be_replaced():
     served = run(store.lookup_extraction(SHA))
     assert served is not None
     assert served["text"] == "Complete readable extraction"
+    assert served["ocr_pending_pages"] == []
+    assert served["extraction_incomplete"] is False
     assert repo.blobs[SHA]["extract_method"] == "pymupdf+ocr"
 
 

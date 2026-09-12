@@ -59,7 +59,7 @@ SOURCE_STATE_SQL = """
     FROM document_source s
     JOIN document_blob b USING (content_sha256)
     WHERE s.source_identity = ANY($1::text[])
-    ORDER BY s.source_identity, s.last_seen DESC, s.first_seen DESC
+    ORDER BY s.source_identity, s.last_validated_at DESC NULLS LAST, s.first_seen DESC
 """
 
 # Durable meeting -> minutes text link (migration 040). One row per revision;

@@ -83,10 +83,8 @@ class MemberIdentities:
         raw_id, target = self.resolve(raw_name), self.resolve(canonical_name)
         if raw_id and target and raw_id != target:
             return True
-        if not target:
-            return False
         raw = name_key(raw_name).split()
-        full = name_key(self.rows[target]['name']).split()
+        full = name_key(self.rows[target]['name'] if target else canonical_name).split()
         if len(raw) >= 3 and len(full) >= 3 and raw[0] == full[0] and raw[-1] == full[-1]:
             return len(raw) != len(full) or any(
                 a != b and not (len(a)==1 and b.startswith(a)) and not (len(b)==1 and a.startswith(b))
@@ -111,8 +109,8 @@ def reconcile_members(parsed, identities):
         obs.interpretation['member_identity_matches'] = matches
         counts = Counter(m['member_id'] for m in matches if m['member_id'])
         ambiguous_keys = identities.ambiguous
-        blocked = {n for n,_ in pub.member_votes if name_key(n) in ambiguous_keys or
-                   (identities.resolve(n) and counts[identities.resolve(n)] > 1)}
+        duplicates = {n for n,_ in pub.member_votes if identities.resolve(n) and counts[identities.resolve(n)] > 1}
+        blocked = duplicates | {n for n,_ in pub.member_votes if name_key(n) in ambiguous_keys}
         blocked.update(m['canonical_name'] for m in obs.interpretation['members']
                        if m['confirmed'] and identities.raw_name_conflicts(m['raw_name'],m['canonical_name']))
         if blocked:
@@ -122,7 +120,7 @@ def reconcile_members(parsed, identities):
             for member in obs.interpretation['members']:
                 if member['canonical_name'] in blocked:
                     member.update(confirmed=False,reason='ambiguous_or_duplicate_member_identity')
-            if pub.tally_basis == 'counted_names':
+            if duplicates and pub.tally_basis == 'counted_names':
                 pub.tally = {}
                 pub.tally_basis = None
                 obs.checks.append(dict(field='tally',status='withheld',reason='ambiguous_or_duplicate_member_identity'))

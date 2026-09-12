@@ -103,5 +103,11 @@ async def get_meeting_minutes(meeting_id: str, db: Database = Depends(get_db)):
     from server.utils.validation import require_meeting
     await require_meeting(db, meeting_id)
     documents = await db.document_blobs.get_minutes_documents(meeting_id)
+    current = documents[0] if documents else {}
+    older_ready = next((doc for doc in documents[1:] if doc["text_ready"]), None)
     return {"success": True, "meeting_id": meeting_id, "documents": documents,
-            "current_content_sha256": documents[0]["content_sha256"] if documents else None}
+            "current_content_sha256": current.get("content_sha256"),
+            "current_text_ready": current.get("text_ready", False),
+            "older_text_available": older_ready is not None,
+            "older_text_content_sha256": older_ready["content_sha256"] if older_ready else None,
+            "fallback_used": False}

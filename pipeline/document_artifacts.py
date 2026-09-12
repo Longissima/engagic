@@ -269,3 +269,19 @@ def verify_tls_for_url(url: str) -> bool:
     return True
 
 
+
+
+def text_for_analysis(result: dict) -> str:
+    """Label partial input for analysis without changing archived source text."""
+    text = result.get("text") or ""
+    if not (result.get("extraction_incomplete") or result.get("ocr_pending")
+            or result.get("ocr_pending_pages")
+            or str(result.get("method") or "").endswith("-partial")):
+        return text
+    pages = result.get("ocr_pending_pages")
+    detail = ", ".join(map(str, pages)) if pages else "page numbers unavailable"
+    return (
+        f"[PIPELINE NOTE: This document is partially extracted. Pages awaiting OCR: {detail}. "
+        "Use the available text; do not infer that something is absent from unreadable pages.]\n\n"
+        + text
+    )

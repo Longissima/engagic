@@ -48,7 +48,26 @@ async def audit(path):
                             'ordinal':obs.ordinal,'raw_text':obs.raw_text,'comparison':result,
                             'member_names':{r['id']:r['name'] for r in rosters[city] if r['id'] in
                                 {i for key in ('minutes_only','api_only') for i,v in result.get(key,[])}}}
-        result={'before':dict(before),'after':dict(after),'transitions':dict(transitions),'samples':list(samples.values())}
+        # Also check raw spellings on every published named motion, including
+        # cities without an API comparison for this particular meeting.
+        from parsing.rollcall.identity import MemberIdentities
+        targets = set()
+        identities = {}
+        async with conn.transaction(readonly=True):
+            async for row in conn.cursor("""SELECT p.meeting_id,m.banana,o.interpretation,o.publication
+                FROM minutes_publications p JOIN meetings m ON m.id=p.meeting_id
+                JOIN minutes_observations o ON o.run_id=p.run_id
+                WHERE jsonb_array_length(coalesce(o.publication->'votes','[]'::jsonb))>0""",prefetch=25):
+                city=row['banana']
+                if city not in identities:
+                    if city not in rosters:
+                        rosters[city]=[dict(r) for r in await conn.fetch(ROSTER_SQL,city)]
+                    identities[city]=MemberIdentities(rosters[city])
+                names={n for n,_ in row['publication']['votes']}
+                if any(m['canonical_name'] in names and identities[city].raw_name_conflicts(m['raw_name'],m['canonical_name'])
+                       for m in row['interpretation'].get('members',[])):
+                    targets.add(row['meeting_id'])
+        result={'before':dict(before),'after':dict(after),'transitions':dict(transitions),'samples':list(samples.values()),'raw_name_conflict_meetings':sorted(targets)}
         Path(path).write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
         print(json.dumps({k:v for k,v in result.items() if k!='samples'},indent=2))
         print('Saved audit:',path)

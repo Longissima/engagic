@@ -423,6 +423,7 @@ CREATE TABLE IF NOT EXISTS document_blob (
     extract_version TEXT,           -- bump corpus.store.EXTRACT_VERSION to force re-extraction
     page_count INTEGER,
     ocr_page_count INTEGER,
+    ocr_pending_pages INTEGER[],    -- NULL: unknown for older extractions; []: no pending pages
     text_chars BIGINT,
     extraction_status TEXT CHECK (
         extraction_status IS NULL OR extraction_status IN (

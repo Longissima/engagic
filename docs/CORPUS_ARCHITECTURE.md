@@ -369,3 +369,33 @@ Items 1–5 are pure wins; a semantic layer is a deliberate decision, not a free
 
 **The tell, to scan for more:** re-deriving something we could own, or discarding
 something we already produced.
+
+### Partial reads and current revisions (September 2026)
+
+Migration 045 adds one nullable `document_blob.ocr_pending_pages` integer array.
+Numbers are one-based PDF pages still awaiting OCR. New complete extractions store
+`[]`; older rows retain `NULL` because their page lists were not saved. The existing
+`-partial` extraction method still identifies older incomplete text.
+
+`CorpusStore.lookup_extraction` serves compatible partial text with
+`extraction_incomplete`, `ocr_pending_pages`, and `ocr_pending` (unknown counts are
+`None`). Ordinary reads do not retry OCR. An explicit repair can use
+`lookup_extraction(..., require_complete=True)` or
+`AsyncAnalyzer.extract_document_async(..., retry_incomplete=True)`. The latter
+reruns extraction using the existing acquisition/cache path; this change does not
+implement selective page repair. Summarization inputs label incomplete documents;
+archived text is not modified by that label.
+
+URL readers and maintenance readiness checks select the current source revision
+by `last_validated_at DESC NULLS LAST, first_seen DESC`, then check text readiness.
+Reading cached older bytes does not make them current. Compatible older text does
+not cause maintenance to skip a newer revision awaiting extraction. Motioncount's
+current attachment reader already uses this ordering; its code is maintained
+separately and can read the new column directly.
+
+The minutes endpoint retains its meeting revision ordering and now explicitly
+returns `current_text_ready`, `older_text_available`, the older text's hash when
+available, and `fallback_used: false`. Individual revisions expose
+`text_incomplete` and `ocr_pending_pages`. Readiness means compatible indexed text
+is available, not that every page was extracted. No automatic older-text fallback
+or extraction-version history is introduced.

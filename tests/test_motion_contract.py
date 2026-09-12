@@ -38,7 +38,7 @@ CREATE TABLE matter_appearances (matter_id text, meeting_id text, item_id text,
     appeared_at timestamp, vote_outcome text, vote_tally jsonb,
     UNIQUE(matter_id, meeting_id, item_id));
 CREATE TABLE document_blob (content_sha256 text PRIMARY KEY, original_key text,
-    text_key text, extract_version text, extract_method text);
+    text_key text, extract_version text, extract_method text, ocr_pending_pages integer[]);
 """
 
 
@@ -63,7 +63,7 @@ async def database():
             INSERT INTO city_matters(id, banana, title) VALUES ('matter', 'testCA', 'Housing');
             INSERT INTO items VALUES ('item', 'meeting', 'matter', 1), ('item2', 'meeting', 'matter', 2);
             INSERT INTO council_members(id) VALUES ('alice'), ('bob');
-            INSERT INTO document_blob VALUES ('sha', 'original/sha', 'text/sha', '2', 'text');
+            INSERT INTO document_blob(content_sha256,original_key,text_key,extract_version,extract_method) VALUES ('sha', 'original/sha', 'text/sha', '2', 'text');
             INSERT INTO minutes_documents(meeting_id,content_sha256,source_identity) VALUES ('meeting','sha','url');
         """)
         async def init(c):
@@ -449,3 +449,56 @@ async def test_identity_republication_moves_minutes_votes_without_changing_api(d
     assert dict(await conn.fetch('SELECT id,vote_count FROM council_members'))=={'alice':2,'bob':0}
     observation=await conn.fetchrow('SELECT interpretation FROM minutes_observations')
     assert observation['interpretation']['member_identity_matches'][0]['member_id']=='alice'
+
+
+@pytest.mark.asyncio
+async def test_corpus_readiness_uses_current_revision_and_exposes_older_text(database):
+    from scripts.backfill_corpus_attachments import READY_IDENTITIES_SQL
+    from scripts.ingest_minutes import SOURCE_STATE_SQL
+    from server.routes.meetings import get_meeting_minutes
+
+    conn, pool = database
+    # Exercise the additive migration, including a repeat application.
+    await conn.execute('ALTER TABLE document_blob DROP COLUMN ocr_pending_pages')
+    migration = Path('database/migrations/045_corpus_pending_pages.sql').read_text()
+    await conn.execute(migration)
+    await conn.execute(migration)
+    await conn.execute("""
+        CREATE TABLE document_source (
+            source_identity text, content_sha256 text, first_seen timestamp,
+            last_seen timestamp, last_validated_at timestamp, last_observed_at timestamp
+        );
+        INSERT INTO document_blob(content_sha256) VALUES ('new-sha');
+        INSERT INTO document_source VALUES
+            ('url', 'sha', '2026-01-01', '2026-09-11', '2026-01-01', '2026-09-12'),
+            ('url', 'new-sha', '2026-02-01', '2026-02-01', '2026-02-01', '2026-02-01');
+        INSERT INTO minutes_documents(meeting_id,content_sha256,source_identity,ingested_at)
+            VALUES ('meeting','new-sha','url', CURRENT_TIMESTAMP + interval '1 minute');
+        UPDATE document_blob SET extract_method='pymupdf-partial', ocr_pending_pages=ARRAY[3]
+            WHERE content_sha256='sha';
+    """)
+    assert await conn.fetch(READY_IDENTITIES_SQL, ['url'], ['1', '2']) == []
+    state = await conn.fetchrow(SOURCE_STATE_SQL, ['url'], ['1', '2'], 7)
+    assert state['content_sha256'] == 'new-sha'
+    assert state['corpus_ready'] is False
+    repo = DocumentBlobRepository(pool)
+    docs = await repo.get_minutes_documents('meeting')
+    assert docs[0]['text_ready'] is False
+    assert docs[1]['text_ready'] is True
+    assert docs[1]['text_incomplete'] is True
+    assert docs[1]['ocr_pending_pages'] == [3]
+
+    class Meetings:
+        async def get_meeting(self, meeting_id):
+            return {'id': meeting_id}
+
+    db = SimpleNamespace(document_blobs=repo, meetings=Meetings())
+    response = await get_meeting_minutes('meeting', db)
+    assert response['current_content_sha256'] == 'new-sha'
+    assert response['current_text_ready'] is False
+    assert response['older_text_available'] is True
+    assert response['older_text_content_sha256'] == 'sha'
+    assert response['fallback_used'] is False
+    # A genuine origin validation can make previously seen bytes current again.
+    await conn.execute("UPDATE document_source SET last_validated_at='2026-09-12' WHERE content_sha256='sha'")
+    assert len(await conn.fetch(READY_IDENTITIES_SQL, ['url'], ['1', '2'])) == 1

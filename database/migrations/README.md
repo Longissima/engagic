@@ -83,3 +83,7 @@ Not all migrations can be safely rolled back:
 - Data migrations: Depend on implementation
 
 If a migration cannot be rolled back, don't create a `.down.sql` file.
+
+Migration 045 (`corpus_pending_pages`) adds the nullable one-based OCR-pending page
+list to `document_blob`. Existing rows remain unknown; no re-extraction or data
+backfill is required.

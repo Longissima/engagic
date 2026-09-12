@@ -25,7 +25,9 @@ class DocumentBlobRepository(BaseRepository):
         from corpus.store import COMPATIBLE_EXTRACT_VERSIONS
         rows = await self._fetch("""
             SELECT md.meeting_id, md.content_sha256, md.source_identity, md.ingested_at,
-                   b.original_key, b.text_key, b.extract_version, b.extract_method,
+                   b.original_key, b.text_key, b.extract_version, b.extract_method, b.ocr_pending_pages,
+                   (COALESCE(b.extract_method LIKE '%-partial', false)
+                    OR COALESCE(cardinality(b.ocr_pending_pages), 0) > 0) AS text_incomplete,
                    COALESCE(b.text_key IS NOT NULL AND b.extract_version = ANY($2::text[]), false) AS text_ready
             FROM minutes_documents md JOIN document_blob b USING (content_sha256)
             WHERE md.meeting_id = $1
@@ -79,6 +81,7 @@ class DocumentBlobRepository(BaseRepository):
         ocr_page_count: Optional[int],
         text_chars: int,
         extraction_status: str = "succeeded",
+        ocr_pending_pages: Optional[list[int]] = None,
     ) -> None:
         """Record extracted text and its provenance for a blob."""
         await self._execute(
@@ -92,6 +95,7 @@ class DocumentBlobRepository(BaseRepository):
                 text_chars = $7,
                 text_extracted_at = CURRENT_TIMESTAMP,
                 extraction_status = $8,
+                ocr_pending_pages = $9,
                 extraction_attempted_at = CURRENT_TIMESTAMP,
                 extraction_error_type = NULL,
                 extraction_error_message = NULL
@@ -105,6 +109,7 @@ class DocumentBlobRepository(BaseRepository):
             ocr_page_count,
             text_chars,
             extraction_status,
+            ocr_pending_pages,
         )
 
     async def record_extraction_failure(
