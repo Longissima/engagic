@@ -52,6 +52,14 @@ _INLINE_LABEL_SPLIT_RE = re.compile(rf",\s*(?=(?:{_CATEGORY_WORDS})\s*[:–-])",
 _INLINE_COUNT_RE = re.compile(rf"(?P<cat>{_CATEGORY_WORDS})\s+(?P<count>\d+)\b", re.I)
 _BARE_COUNT_RE = re.compile(r"^\s*(\d+)\s*[-–]?\s*$")
 _NONE_RE = re.compile(r"^\s*\(?\s*(?:none|nil|n/a|-|0)\s*\)?\s*\.?\s*$", re.IGNORECASE)
+# "Abstain-None. Moved by Ald. Ben Delie, seconded by ..." -- the sentence after
+# the category ran into it and Delie was recorded as abstaining on a motion he had
+# voted aye on, so the duplicate-person guard then withheld his ballot. The
+# category is empty only when the full stop closes it; Petaluma extracts as
+# "No: None Vice Mayor DeCarli, Councilmember Shribbs", where a neighbouring
+# category's None bled in and two real no-votes follow it.
+_NONE_THEN_SENTENCE_RE = re.compile(r"^\s*\(?\s*(?:none|nil|n/a)\s*\)?\s*\.", re.IGNORECASE)
+_STRAY_NONE_RE = re.compile(r"^\s*\(?\s*(?:none|nil|n/a)\s*\)?[\s,;-]+(?=\S)", re.IGNORECASE)
 
 RESULT_RE = re.compile(
     r"(?P<result>"
@@ -88,17 +96,22 @@ TALLY_RE = re.compile(
 # different body than the one we are about to attribute it to.
 # The lead-in is case-insensitive; the name is not, so a sentence fragment
 # cannot masquerade as a mover.
+# A surname is not ASCII. "Lomelí" captured as "Lomel" and "Peña" as "Pe", so the
+# mover resolved to nobody and the membership gate rejected the whole motion --
+# 65 of Cudahy's ballots. The first character is a letter that is not lowercase,
+# which covers an accented capital without naming ranges.
+_NAME_WORD = r"(?![a-z])[^\W\d_](?:[^\W\d_]|['\u2019-])*"
 _MOVER_RE = re.compile(
     r"(?i:motion\s+(?:was\s+)?(?:made\s+)?by|(?:it\s+was\s+)?moved\s+by|on\s+a\s+motion\s+(?:of|by)"
     r"|motion\s+offered\s+by|motion\s+of|duly\s+seconded\s+by|seconded\s+by|second\s+by|supported\s+by)"
     # A lowercase office word may sit between the title and the surname
     # ("Council member Lewis", "Board Member Smith").
-    r"\s+(?P<name>[A-Z][A-Za-z'\u2019-]*\.?(?:\s+(?:member|members|president|chair|pro\s+tem))?"
-    r"(?:\s+[A-Z][A-Za-z'\u2019-]*\.?){0,3})",
+    rf"\s+(?P<name>{_NAME_WORD}\.?(?:\s+(?:member|members|president|chair|pro\s+tem))?"
+    rf"(?:\s+{_NAME_WORD}\.?){{0,3}})",
 )
 # "X moved, seconded by Y" / "Councilmember Morris seconded the motion"
 _MOVED_SUFFIX_RE = re.compile(
-    r"\b(?P<name>[A-Z][A-Za-z'\u2019-]+(?:\s+[A-Z][A-Za-z'\u2019-]+){0,2})\s+(?:moved|seconded)\b"
+    rf"\b(?P<name>{_NAME_WORD}(?:\s+{_NAME_WORD}){{0,2}})\s+(?:moved|seconded)\b"
 )
 _PROCEDURAL_MOTION_RE = re.compile(
     r"\bto\s+(?:adjourn|recess|reconvene|return\s+to\s+open\s+session|(?:go|convene|enter)\s+into\s+(?:closed|executive)\s+session)\b"
@@ -114,6 +127,19 @@ _UNANIMOUS_RE = re.compile(
     r"(?:carried|passed|approved|adopted|voted|voting|vote|consent)\s*:?\s*(?:\w+\s+){0,2}unanimous(?:ly)?"
     r"|unanimous(?:ly)?\s+(?:carried|passed|approved|adopted|consent)",
     re.IGNORECASE,
+)
+# "approved 8/11/26" puts a context word right before a date, so the context
+# guard alone cannot reject it. Every three-part all-slash number in the saved
+# corpus is a date (18,111 of them end in 26) and none is a vote, so the shape
+# itself is the test.
+_DATE_SHAPED_RE = re.compile(r"^\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{1,2}$")
+# Bainbridge Island prints the winning side first: "the motion failed 6-1 with
+# Councilmember Nelson voting in favor" is one aye and six noes, not six ayes.
+# The printed pair alone cannot reveal that -- a real supermajority threshold
+# looks identical -- so the order is only corrected when the sentence names the
+# supporters and that count matches the second number instead of the first.
+_IN_FAVOR_RE = re.compile(
+    r"\bwith\s+(?P<names>[^.]{3,200}?)\s+voting\s+in\s+favor", re.IGNORECASE
 )
 _TALLY_CONTEXT_RE = re.compile(
     r"(?:vote[sd]?\s+(?:of\s+)?|vote[sd]?|voting|carried|passed|prevailed|failed|motion|approved|adopted|denied|unanimously|result|\(|\[)\s*[:,]?\s*$",
@@ -198,10 +224,21 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
                 and all(looks_like_name(name) for name in vertical)
                 and any(clean_name(part) != part for part in blob_parts if part)):
             names = vertical
+        elif _NONE_RE.match((blob_parts[0] or "").strip()):
+            # The category's own line says none. Bend prints "No: none" and then
+            # "Councilor Norris was recused." on the next line: that sentence is
+            # not a no-vote, and reading it as one made the section contradict a
+            # printed 6-0 and withheld the whole roll call.
+            names = []
+        elif _NONE_THEN_SENTENCE_RE.match(blob or ""):
+            names = []
         else:
-            names = [] if _NONE_RE.match(blob or "") else split_names(blob)
+            # A stray None in front of real names is the neighbouring category
+            # bleeding in, not this one's value.
+            names = split_names(_STRAY_NONE_RE.sub("", blob or ""))
         if stated is None and not names:
-            if not blob or _NONE_RE.match(blob):
+            if (not blob or _NONE_THEN_SENTENCE_RE.match(blob) or _NONE_RE.match(blob)
+                    or _NONE_RE.match((blob_parts[0] or "").strip())):
                 stated = 0
             else:
                 # Unreadable category content is not a recorded zero.
@@ -215,12 +252,25 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
     return sections
 
 
+def _orient_tally(tally, outcome, context):
+    """Swap a failed motion's pair when the named supporters match the second number."""
+    if not tally or outcome != "FAIL" or tally[0] <= tally[1]:
+        return tally
+    m = _IN_FAVOR_RE.search(context)
+    if not m:
+        return tally
+    supporters = len(split_names(m.group("names")))
+    if supporters == tally[1] and supporters != tally[0]:
+        return (tally[1], tally[0], tally[2])
+    return tally
+
+
 def _tally_near(lines: List[str], idx: int, result_text: str) -> Optional[Tuple[int, int, int]]:
     candidates = [result_text] + lines[idx:idx + 2]
     for text in candidates:
         for m in TALLY_RE.finditer(text):
             before = text[:m.start()]
-            if _TALLY_CONTEXT_RE.search(before):
+            if _TALLY_CONTEXT_RE.search(before) and not _DATE_SHAPED_RE.match(m.group(0).strip()):
                 yes, no = int(m.group("yes")), int(m.group("no"))
                 third = int(m.group("third")) if m.group("third") else 0
                 if yes + no + third <= 60:
@@ -278,7 +328,8 @@ def find_evidence(block: str) -> List[Evidence]:
             ev.movers = [m.group("name") for m in _MOVER_RE.finditer(context)]
             ev.movers += [m.group("name") for m in _MOVED_SUFFIX_RE.finditer(context)]
             ev.procedural = bool(_PROCEDURAL_MOTION_RE.search(context))
-            ev.tally = _tally_near(lines, idx, line)
+            ev.tally = _orient_tally(_tally_near(lines, idx, line), outcome,
+                                     " ".join(lines[idx:idx + 3]))
             # "Motion Passed 5-0 with one abstention": somebody present did
             # not vote aye, so attendance arithmetic cannot name the ayes.
             if _ABSTENTION_MENTION_RE.search(window):

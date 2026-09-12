@@ -267,6 +267,185 @@ class TestGuards:
         assert clean_name("Dr. Michael Aiello") == "Michael Aiello"
         assert clean_name("Mr. J. Smith") == "J. Smith"
 
+    def test_winning_side_first_tally_is_corrected_only_by_named_supporters(self):
+        """Bainbridge Island prints the prevailing side first on a failed motion.
+
+        "failed 6-1 with Councilmember Nelson voting in favor" is one aye, and we
+        published six. The pair alone cannot show that -- a supermajority failure
+        looks the same -- so the order is corrected only when the sentence names
+        the supporters and that count matches the second number.
+        """
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence('The motion failed 6-1 with Councilmember Nelson voting in favor.')[0]
+        assert ev.outcome == 'FAIL' and ev.tally == (1, 6, 0)
+        ev = find_evidence('The motion failed 4-3 with Councilmembers Nelson and Lant '
+                           'and Deputy Mayor Hytopoulos voting in favor.')[0]
+        assert ev.tally == (3, 4, 0)
+        # No named supporters: the printed order stands.
+        assert find_evidence('Motion failed 4-2.')[0].tally == (4, 2, 0)
+        # A stated threshold explains more ayes than noes; nothing to correct.
+        ev = find_evidence('The motion failed 3-1 because the statute required four.')[0]
+        assert ev.tally == (3, 1, 0)
+
+    def test_a_date_is_not_a_tally_even_after_a_result_word(self):
+        """"approved 8/11/26" put a context word right before a date.
+
+        Every three-part all-slash number in the saved corpus is a date, so the
+        shape itself is the test; two-part slash tallies stay ("passed 2/0").
+        """
+        from parsing.rollcall.evidence import find_evidence
+        assert find_evidence('Resolution for Phase 1 (approved 8/11/26)')[0].tally is None
+        assert find_evidence('minutes of 6/29/26 approved 7/27/26')[0].tally is None
+        assert find_evidence('Motion passed 2/0')[0].tally == (2, 0, 0)
+        assert find_evidence('Int. No. 913-A, ***VOTE: 48-1-0')[0].tally == (48, 1, 0)
+
+    def test_remote_is_a_roll_call_category_not_part_of_a_name(self):
+        """DuPage prints PRESENT / ABSENT / REMOTE as three labels.
+
+        The unknown third label let the present list run into it, fusing the last
+        present name to the first remote one: "Ozog REMOTE Galassi" became a
+        single roster row and made both surnames ambiguous. A remote member is
+        present for quorum and for the vote.
+        """
+        from parsing.rollcall.attendance import parse_attendance
+        a = parse_attendance('2. ROLL CALL\n\n'
+                             '    PRESENT   Childress, Haider, Martinez, and Yoo\n'
+                             '    ABSENT    Eckhoff\n'
+                             '    REMOTE    Galassi\n'
+                             '3. REMARKS\n')
+        assert a.present == ['Childress', 'Haider', 'Martinez', 'Yoo', 'Galassi']
+        assert a.absent == ['Eckhoff']
+
+    def test_tabular_attendance_survives_district_numbers_and_arrival_times(self):
+        """Waco prints a table; a digit anywhere used to end the collection.
+
+        One name was found, the two-name plausibility floor then discarded the
+        whole roster, and the city ended up with no members at all -- which also
+        blocks the bootstrap, since members are only created from votes that
+        already resolved.
+        """
+        from parsing.rollcall.attendance import parse_attendance
+        a = parse_attendance(
+            'A.  CALL TO ORDER\n\n'
+            '   Attendance   Attendee Name                 Arrived\n'
+            '   Present        Jim Holmes, Mayor\n'
+            '                 Andrea Barefield, Council Member, District 1\n'
+            '                 Isabel Lozano, Council Member, District 2\n'
+            '                 Jed Cole, Council Member, District 3\n'
+            '                 Darius Ewing, Council Member, District 4      2:10 PM\n'
+            '   Absent        None\n')
+        assert a.present == ['Jim Holmes', 'Andrea Barefield', 'Isabel Lozano',
+                             'Jed Cole', 'Darius Ewing']
+        # "Council Member, District 1" must not create a person named "Council".
+        assert not any(n in ('Council', 'District', 'Member') for n in a.present)
+
+    def test_accented_surname_is_captured_whole_as_a_mover(self):
+        """The mover classes were ASCII: "Lomelí" captured as "Lomel".
+
+        The truncated mover resolved to nobody, the membership gate read that as
+        a mover outside the body, and every motion in the meeting was discarded --
+        65 ballots in Cudahy, where four of five members have accented surnames.
+        """
+        from parsing.rollcall.evidence import find_evidence
+        assert find_evidence('Motion by Vice Mayor Lomelí to approve. Motion carried 4-0.')[0].movers \
+            == ['Vice Mayor Lomelí']
+        assert find_evidence('Klarissa Peña moved and Dan Lewis seconded. Motion carried 5-0.')[0].movers \
+            == ['Klarissa Peña', 'Dan Lewis']
+
+    def test_a_category_opening_with_none_has_no_voters(self):
+        """Green Bay runs the next sentence into the last inline category.
+
+        "Abstain-None. Moved by Ald. Ben Delie, seconded by ..." recorded Delie as
+        abstaining on a motion he had voted aye on, and the duplicate-person guard
+        then withheld his ballot entirely.
+        """
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence(
+            '   Yes-Melinda Eck, Ben Delie, Jim Ridderbush, Ben DeBaker, No-None, Abstain-None.\n'
+            '   Moved by Ald. Ben Delie, seconded by Ald. Jim Ridderbush to approve request.\n'
+            '   Motion carried.\n')[0]
+        assert [(s.value, s.names, s.stated) for s in ev.sections] == [
+            ('AYE', ['Melinda Eck', 'Ben Delie', 'Jim Ridderbush', 'Ben DeBaker'], None),
+            ('NO', [], 0), ('ABSTAIN', [], 0)]
+
+    def test_a_none_only_label_line_closes_the_category(self):
+        """Bend prints "No: none" and then a sentence about a recusal.
+
+        "Councilor Norris was recused." is not a no-vote. Reading it as one made
+        the section contradict the printed 6-0 and the consistency guard withheld
+        the entire roll call -- the mirror of Petaluma, where the stray None sits
+        inline ahead of real names. The label's own line decides.
+        """
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence('The voice vote passed 6-0:\n'
+                           '    Yes: Kebler, Franzosa, Méndez, Perkins, Platt, Riley\n'
+                           '   No: none\n'
+                           '   Councilor Norris was recused.\n')[0]
+        assert [(s.value, s.names, s.stated) for s in ev.sections] == [
+            ('AYE', ['Kebler', 'Franzosa', 'Méndez', 'Perkins', 'Platt', 'Riley'], None),
+            ('NO', [], 0)]
+
+    def test_a_stray_none_in_front_of_real_names_is_not_the_category(self):
+        """Petaluma extracts as "No: None Vice Mayor DeCarli, Councilmember Shribbs".
+
+        A neighbouring category's None bled onto this line and two real no-votes
+        follow it, so the category is empty only when a full stop closes it.
+        Dropping the stray token also recovers DeCarli, whom the previous parser
+        recorded as a person called "None Vice Mayor DeCarli".
+        """
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence(
+            'Vote: Carried 5-2\n'
+            'Yes:  Councilmember Barnacle, Councilmember Nau, Councilmember Quint\n'
+            'No:        None Vice Mayor DeCarli, Councilmember Shribbs\n'
+            'Absent:     None\n')[0]
+        assert ev.tally == (5, 2, 0)
+        assert [(s.value, s.names) for s in ev.sections] == [
+            ('AYE', ['Barnacle', 'Nau', 'Quint']),
+            ('NO', ['DeCarli', 'Shribbs']),
+            ('ABSENT', [])]
+
+    def test_one_seat_two_offices_keeps_the_name_and_not_the_pair(self):
+        """A slash joins two offices on one seat, or two different people.
+
+        "Council / Agency Member Alcantar Loza" is one member; "Nelson/Lant" is a
+        mover and a seconder. Only a half made entirely of office words is dropped.
+        """
+        from parsing.rollcall.names import clean_name
+        assert clean_name('Council / Agency Member Alcantar Loza') == 'Alcantar Loza'
+        assert clean_name('Mayor Pro Tem/Councilor District 4 Mike Battaglino') == 'Mike Battaglino'
+        assert clean_name('Councilor At-Large Austin Cobb') == 'Austin Cobb'
+        assert clean_name('Council President Nelson Esparza') == 'Nelson Esparza'
+        assert clean_name('Nelson/Lant') == 'Nelson/Lant'
+
+    def test_a_partial_roster_does_not_gate_membership(self):
+        """A partial roll call is more dangerous than none.
+
+        No roster skips the mover-membership check; a half-read one arms it against
+        an incomplete body and discards every motion. Cudahy lost 110 ballots to a
+        two-of-four parse, so an unread line marks the roster partial.
+        """
+        from parsing.rollcall.attendance import parse_attendance
+        complete = parse_attendance(
+            'ROLL CALL\nPRESENT:  Council / Agency Member Fuentes\n'
+            '          Vice Mayor / Vice Chair Lomelí\n          Mayor / Chair Gonzalez\n')
+        assert complete.present == ['Fuentes', 'Lomelí', 'Gonzalez'] and not complete.partial
+        # A stated count we cannot match is the other way to know we read partially.
+        short = parse_attendance('ROLL CALL\n   Present 6 - Alice Adams, Bob Brown\n')
+        assert short.partial
+
+    def test_spelled_out_pro_tempore_strips_for_both_offices(self):
+        """A half-stripped title resolves to nobody, so the ballot goes unrecorded.
+
+        Casa Grande prints "Mayor Pro Tempore Brent BeDillon" in its aye list and
+        his recorded vote never reached his member page. 389 occurrences across
+        46 saved meetings. President Pro Tempore already handled the long form.
+        """
+        from parsing.rollcall.names import clean_name
+        assert clean_name("Mayor Pro Tempore Brent BeDillon") == "Brent BeDillon"
+        assert clean_name("Mayor Pro Tem Brent BeDillon") == "Brent BeDillon"
+        assert clean_name("President Pro Tempore Zeneta B Everhart") == "Zeneta B Everhart"
+
     def test_lowercase_office_word_inside_a_mover_name(self):
         from parsing.rollcall.evidence import find_evidence
         ev = find_evidence("A motion offered by Council member Lewis, duly seconded by Council member Hinds, carried by the following vote:\nAye: 2 - Lewis, Hinds\n")[0]

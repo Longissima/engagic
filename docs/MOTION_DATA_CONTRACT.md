@@ -189,15 +189,55 @@ are withheld. Comparisons distinguish incomplete roll calls from differing
 ballot values. See [the bounded identity review](MINUTES_IDENTITY_REVIEW.md) for
 rules, reviewed source examples and regression commands.
 
+### Storage is verbatim; preference is a read
+
+What the page says and what we show are separate decisions. Storage records the
+document as printed, including where the document is wrong or contradicts itself:
+a stated tally of 7 is stored as 7 even when we can only name six of the voters,
+because a wrong thing recorded accurately is still evidence, while a tally quietly
+rewritten to match our own incomplete name list is fabrication. API rows are
+likewise retained in full. No source preference ever deletes a row.
+
+The preference applies at read: which source a page shows, and the denormalized
+counters derived from those reads. That makes the counters a cache of a read
+policy, not a record -- change the policy and every stored count is stale until
+`recompute_attribution_counts` sweeps.
+
+It follows that a published tally exceeding its own published name list is our
+defect, not the document's, and belongs in the name-resolution path (roster
+coverage, title stripping) rather than in the tally. 1,431 of 6,036 published
+named motions are short this way, 943 of them by exactly one name; none has more
+names than its tally.
+
 ### Minutes preference and motion semantics
 
 Public motion groups now prefer confirmed minutes for an item; remaining API-only
-groups carry `selection_basis: api_fallback_no_confirmed_minutes`. Member voting
-history and topic profiles use the same preference so duplicate API/minutes rows
-do not inflate the displayed record. Raw `votes` remains a source-separated audit
-store: downstream SQL consumers must apply this preference themselves and must
-not sum both sources. `get_motion_groups(include_api_comparison=True)` retains both
-sources for internal inspection.
+groups carry `selection_basis: api_fallback_no_confirmed_minutes`.
+`get_motion_groups(include_api_comparison=True)` retains both sources for
+internal inspection.
+
+The preference answers two questions at two grains, and they do not have the
+same answer.
+
+At **outcome grain** minutes always win, enforced by `vote_source` on
+`matter_appearances`: a minutes motion that records only "passed" still states
+the outcome better than the API does, and a later API refresh cannot overwrite it.
+
+At **ballot grain** -- member voting history, the topic profile, and the
+denormalized `council_members.vote_count` -- the preference exists only to remove
+a duplicate, so it yields to minutes exactly where minutes recorded a competing
+ballot: `item_motions.method = 'named'`, the one method that carries per-member
+votes. A tally- or outcome-only minutes motion names nobody, duplicates no
+ballot, and must not suppress an API ballot; doing so deletes the only record
+that a member voted at all. The predicate is defined once, as
+`council_members.MINUTES_PREFERRED_VOTE`, and every ballot-grain reader composes
+it -- including the counter update in `scripts/parse_minutes_votes.py`, which
+runs last and therefore owns the final value.
+
+Raw `votes` remains a source-separated audit store: a consumer writing its own
+SQL must compose `MINUTES_PREFERRED_VOTE` rather than restate it, and must not
+sum both sources. Note the sentinel: `votes.item_key` is `NOT NULL DEFAULT ''`,
+so "no item identity" is `''` and an `IS NULL` test against it is unreachable.
 
 `outcome` describes the motion itself. A successful motion to deny is passed;
 `DENIED` alone describes the subject and does not establish motion failure. See

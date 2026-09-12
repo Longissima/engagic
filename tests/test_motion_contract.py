@@ -29,7 +29,12 @@ CREATE TABLE city_matters (id text PRIMARY KEY, banana text, title text, matter_
     first_seen timestamp, last_seen timestamp, appearance_count int, status text, updated_at timestamp);
 CREATE TABLE items (id text PRIMARY KEY, meeting_id text, matter_id text, sequence int);
 CREATE TABLE council_members (id text PRIMARY KEY, vote_count int DEFAULT 0,
-    last_seen timestamp, updated_at timestamp);
+    sponsorship_count int DEFAULT 0, last_seen timestamp, updated_at timestamp);
+-- recompute_attribution_counts replaces both counters in one statement, so the
+-- minutes publisher reads this table too now that it calls that one owner.
+CREATE TABLE sponsorships (id bigserial PRIMARY KEY, council_member_id text NOT NULL,
+    matter_id text NOT NULL, is_primary boolean DEFAULT false, sponsor_order int,
+    created_at timestamp DEFAULT now());
 CREATE TABLE votes (id bigserial PRIMARY KEY, council_member_id text NOT NULL REFERENCES council_members,
     matter_id text NOT NULL REFERENCES city_matters, meeting_id text NOT NULL REFERENCES meetings,
     vote text, vote_date timestamp, sequence int, metadata jsonb, created_at timestamp DEFAULT now(),
@@ -453,7 +458,9 @@ async def test_identity_republication_moves_minutes_votes_without_changing_api(d
     assert counts['meetings_written']==1 and not counts['failed']
     assert dict(await conn.fetchrow("SELECT * FROM votes WHERE source='api'")) == original_api
     assert await conn.fetchval("SELECT council_member_id FROM votes WHERE source='minutes'")=='alice'
-    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members'))=={'alice':2,'bob':0}
+    # Alice cast one vote, recorded twice. The retained API row is audit
+    # provenance, not a second ballot, so the counter reports one.
+    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members'))=={'alice':1,'bob':0}
     observation=await conn.fetchrow('SELECT interpretation FROM minutes_observations')
     assert observation['interpretation']['member_identity_matches'][0]['member_id']=='alice'
 
@@ -522,3 +529,54 @@ async def test_minutes_own_appearance_outcome_over_api(database):
     assert dict(row) == {'vote_outcome':'passed', 'vote_source':'minutes'}
     await MatterRepository(pool).update_appearance_outcome('matter','meeting','item','failed',{'yes':0,'no':2},conn=conn)
     assert dict(await conn.fetchrow('SELECT vote_outcome,vote_source FROM matter_appearances')) == dict(row)
+
+
+@pytest.mark.asyncio
+async def test_ballot_preference_reaches_api_votes_with_no_item_identity(database):
+    """The production shape: an API vote carries item_key='', never NULL.
+
+    votes.item_key is NOT NULL DEFAULT '' (migration 044), so a preference
+    written against IS NULL is unreachable and reads both sources silently.
+    Every API vote in production has no item identity, so this is the only
+    shape that matters and the one no earlier case covered.
+    """
+    conn, pool = database
+    repo = CouncilMemberRepository(pool)
+    await repo.record_vote('alice', 'matter', 'meeting', 'yes', conn=conn)
+    assert await conn.fetchval("SELECT item_key FROM votes WHERE source='api'") == ''
+    await persist_meeting(conn, ROW, published(motion()), ROSTER)
+
+    history = await repo.get_member_voting_record('alice')
+    assert [v['source'] for v in history] == ['minutes']
+    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 1
+    # The topic profile is the third reader of the same preference: Alice voted
+    # once on housing, not twice, and the minutes ballot is the one that counts.
+    await conn.execute("""
+        CREATE TABLE matter_topics (matter_id text, topic text);
+        CREATE TABLE item_topics (item_id text, topic text);
+        INSERT INTO matter_topics VALUES ('matter', 'housing');
+    """)
+    assert await repo.get_member_topic_profile('alice') == [
+        {'topic': 'housing', 'yes': 1, 'no': 0, 'abstain': 0, 'absent': 0,
+         'other': 0, 'total': 1, 'yes_rate': 1.0}]
+
+
+@pytest.mark.asyncio
+async def test_minutes_that_name_nobody_do_not_delete_an_api_ballot(database):
+    """Deduplication only removes a duplicate.
+
+    A tally- or outcome-only minutes motion records an outcome and names no
+    voter, so it competes with nothing at ballot grain. Yielding to it would
+    erase the only record that a member voted at all. Outcome grain still
+    prefers minutes; that is asserted separately on matter_appearances.
+    """
+    conn, pool = database
+    repo = CouncilMemberRepository(pool)
+    await repo.record_vote('alice', 'matter', 'meeting', 'yes', conn=conn)
+    await persist_meeting(conn, ROW, published(
+        motion(method='outcome', votes=[], tally={}, outcome='passed')), ROSTER)
+
+    history = await repo.get_member_voting_record('alice')
+    assert [v['source'] for v in history] == ['api']
+    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 1
+    assert await conn.fetchval('SELECT vote_source FROM matter_appearances') == 'minutes'

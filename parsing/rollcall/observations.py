@@ -16,6 +16,7 @@ from parsing.rollcall.evidence import Evidence, Section, find_evidence
 from parsing.rollcall.names import clean_name, fold
 from parsing.rollcall.spike import load_spike_parser, norm_file
 
+
 PARSER_VERSION = "minutes-observations-1"
 VOTE_LANGUAGE = re.compile(r"\b(?:motion|moved|seconded|ayes?|nays?|yeas?|noes|abstain\w*|recus\w*|unanimous\w*|roll\s*call)\b", re.I)
 CATEGORY_TO_DB = {"AYE": "yes", "NO": "no", "ABSTAIN": "abstain", "RECUSED": "recused",
@@ -97,7 +98,8 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
         _check(obs, 'alignment', 'withheld', 'reported_committee_action')
     elif ev.procedural or _is_heading(str(item.get('title') or '')):
         _check(obs, 'alignment', 'withheld', 'procedural_or_heading')
-    elif attendance.present and gazetteer.canonical and not _membership_ok(ev.movers, gazetteer, attendance.present):
+    elif (attendance.present and not attendance.partial and gazetteer.canonical
+            and not _membership_ok(ev.movers, gazetteer, attendance.present)):
         _check(obs, 'alignment', 'withheld', 'mover_outside_recorded_body')
     else:
         _check(obs, 'alignment', 'confirmed', rung)
@@ -153,6 +155,10 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
     elif ev.sections and structural and not any(n > 1 for n in raw_seen.values()) and not duplicate_people:
         tally = section_tally
         tally_basis = 'printed_categories' if all(s.stated is not None for s in ev.sections) else 'counted_names'
+    if tally and not any(tally.values()):
+        # Nobody voted for anything: that is an outcome, not a recorded tally.
+        _check(obs, 'tally', 'withheld', 'tally_is_all_zero')
+        tally, tally_basis = {}, None
     if ev.tally and ev.sections and (
         section_tally.get('yes', 0), section_tally.get('no', 0)
     ) != ev.tally[:2]:

@@ -140,7 +140,10 @@ def _membership_ok(movers: Sequence[str], gazetteer: "Gazetteer", present: Seque
     is a roster to check against; with nothing to compare, it proves nothing
     and must not block (the named or unanimous gate still applies).
     """
-    known = {fold(n) for n in (present or gazetteer.canonical)}
+    # Both sides must be canonical or neither matches: Apache Junction's roll call
+    # prints bare surnames while the roster holds full names, so comparing a
+    # resolved "Darryl Cross" against a printed "Cross" rejected every mover.
+    known = {fold(gazetteer.resolve(n) or n) for n in (present or gazetteer.canonical)}
     if not known:
         return True
     candidates = [clean_name(m) for m in movers]

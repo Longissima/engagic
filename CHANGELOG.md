@@ -3242,3 +3242,48 @@ Track future milestones in VISION.md.
 - Prefer confirmed minutes per item in public motion groups, member history, and topic profiles; retain explicit API fallback and internal comparisons.
 - Preserve motion success independently of a denied application/appeal, and remove historical denial prose from motion outcomes.
 - Recover district-prefixed/vertical member lists, `Recuse:` categories, and compact count lines; reject dates as tallies and unparseable lists as zero votes.
+
+### Ballot-grain minutes preference actually fires
+
+- Read the minutes preference against `item_key = ''`, the schema's sentinel for a vote with no item identity: `votes.item_key` is `NOT NULL DEFAULT ''`, so the previous `IS NULL` test was unreachable and both sources were read while one was reported. 33,629 duplicate API ballot rows across 855 members were affected.
+- Yield to minutes only where minutes recorded a competing ballot (`item_motions.method = 'named'`). A tally- or outcome-only minutes motion names nobody, so suppressing an API ballot under it would delete the only record that a member voted rather than remove a duplicate.
+- Define the predicate once and compose it in every ballot-grain reader. `recompute_attribution_counts` is now the single owner of both denormalized counters; the minutes publisher calls it instead of counting again, which is how the undeduplicated `vote_count` kept coming back -- the later of two implementations silently won.
+- Nothing is removed from storage. Both sources stay in `votes` verbatim; the preference lives only in reads and in the counter derived from them.
+- Strip the spelled-out "Mayor Pro Tempore" title, which left a half-stripped name that resolved to nobody and dropped that member's recorded ballot. 389 occurrences across 46 saved meetings; the long form was already handled for President Pro Tempore.
+
+### Minutes name resolution and tally sanity
+
+Measured by replaying all 8,109 saved meetings through the publish gate against
+the previous parser: 4,392 member ballots gained across 15 cities, 6 lost, 132
+tests green. Four of the six losses are one DuPage member the minutes list under
+ABSENT whom we had been publishing as voting aye.
+
+- Strip the spelled-out "Mayor Pro Tempore" and generational suffixes. A
+  half-stripped title resolves to nobody; "Chambers Jr" keyed its surname
+  variant as "jr", so the roster's "Michael Chambers Jr" and the minutes'
+  "Chambers Jr" could never meet. `_SUFFIX_RE` had been defined and never called.
+- Treat an abbreviated title's period as its own separator, so Milwaukee's
+  "Ald.Westmoreland" resolves, and split a line that runs two of them together.
+- Reject a bare office word as a person: "Council Member, District 1" split on
+  the comma and created a member named "Council".
+- Strip a seat label that precedes a name with no office word ("District 1
+  Isabel Lozano"), which otherwise kept the digit and was discarded as not a
+  name. This also repairs first-initial keys: Atlanta's two Bonds are printed
+  "K. Bond" and "M. Bond" and the roster stored "District 2 Kelsea Bond".
+- Read REMOTE and its siblings as roll-call categories. An unknown label let the
+  present list run into it and fuse two members into one name; "Ozog REMOTE
+  Galassi" cost Jim Zay and Andrew Honig their identities by making their
+  surnames ambiguous. A remote list extends a roster and is never one on its own.
+- Collect a tabular roster: a digit anywhere used to end collection, so a
+  district column or an arrival time left one name, the plausibility floor then
+  discarded the roster, and the city ended with no members at all. A line that is
+  itself a category label is never a wrapped name tail.
+- Reject a date as a tally. "approved 8/11/26" put a context word right before a
+  date; every three-part all-slash number in the saved corpus is a date and none
+  is a vote, so the shape itself is the test.
+- Withhold an all-zero tally, which records an outcome and no votes.
+- Correct a failed motion's printed pair only where the sentence names the
+  supporters: Bainbridge Island prints the prevailing side first, so "failed 6-1
+  with Councilmember Nelson voting in favor" is one aye and we published six. A
+  genuine supermajority failure looks identical, so nothing is assumed without
+  the named corroboration.

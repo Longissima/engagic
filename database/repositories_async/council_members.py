@@ -28,6 +28,33 @@ from config import get_logger
 logger = get_logger(__name__).bind(component="council_member_repository")
 
 
+# Ballot-grain minutes preference, for the readers that count or list one
+# member's votes. Its only job is to remove a duplicate, so it yields to
+# minutes exactly where minutes recorded a competing ballot: method='named'
+# is the one method that carries per-member votes (outcome and tally motions
+# record an outcome and name nobody). A minutes motion that names nobody
+# duplicates no ballot, and suppressing an API ballot under it would delete
+# evidence rather than deduplicate it -- 13,115 rows in production.
+# Outcome grain is a separate question with the opposite answer: minutes
+# always win there, enforced on matter_appearances.vote_source.
+#
+# One definition, three readers -- member history, topic profile, and the
+# denormalized vote_count -- because the first two were hand-copied and both
+# copies were dead: votes.item_key is NOT NULL DEFAULT '' (migration 044), so
+# '' and not NULL is the "no item identity" sentinel, and an IS NULL test
+# there is unreachable by schema. A preference that never fires reads both
+# sources while reporting that it read one. Requires votes aliased as `v`.
+# Confidence 9/10: sentinel is schema-guaranteed, method/ballot correlation
+# is 6261/6261 in production, suppression set measured read-only.
+MINUTES_PREFERRED_VOTE = """(v.source = 'minutes' OR NOT EXISTS (
+                  SELECT 1 FROM item_motions im
+                  WHERE im.source = 'minutes' AND im.method = 'named'
+                    AND im.meeting_id = v.meeting_id
+                    AND im.matter_id = v.matter_id
+                    AND (v.item_key = '' OR im.item_id = v.item_key)
+              ))"""
+
+
 class CouncilMemberRepository(BaseRepository):
     """Repository for council member and sponsorship operations
 
@@ -80,11 +107,17 @@ class CouncilMemberRepository(BaseRepository):
         )
 
     @staticmethod
-    async def _recompute_attribution_counts(
+    async def recompute_attribution_counts(
         member_ids: set[str],
         conn: Connection,
     ) -> None:
-        """Replace both denormalized counters from retained relationships."""
+        """Replace both denormalized counters from retained relationships.
+
+        The only writer of sponsorship_count and vote_count. The minutes
+        publisher calls this rather than counting again: two implementations of
+        one counter means the later writer silently wins, which is how
+        vote_count kept reporting the undeduplicated total.
+        """
         ordered_ids = sorted(member_ids)
         if not ordered_ids:
             return
@@ -99,7 +132,7 @@ class CouncilMemberRepository(BaseRepository):
             ordered_ids,
         )
         await conn.execute(
-            """
+            f"""
             UPDATE council_members cm
             SET sponsorship_count = (
                     SELECT COUNT(*)::int
@@ -110,6 +143,7 @@ class CouncilMemberRepository(BaseRepository):
                     SELECT COUNT(*)::int
                     FROM votes v
                     WHERE v.council_member_id = cm.id
+                      AND {MINUTES_PREFERRED_VOTE}
                 ),
                 updated_at = CURRENT_TIMESTAMP
             WHERE cm.id = ANY($1::text[])
@@ -701,7 +735,7 @@ class CouncilMemberRepository(BaseRepository):
                 """,
                 desired_records,
             )
-        await self._recompute_attribution_counts(touched_member_ids, conn)
+        await self.recompute_attribution_counts(touched_member_ids, conn)
         deleted_count = self._parse_row_count(deleted)
         logger.debug(
             "reconciled matter sponsorships",
@@ -1007,7 +1041,7 @@ class CouncilMemberRepository(BaseRepository):
         touched_member_ids.update(
             row["council_member_id"] for row in deleted_rows
         )
-        await self._recompute_attribution_counts(touched_member_ids, conn)
+        await self.recompute_attribution_counts(touched_member_ids, conn)
         logger.debug(
             "reconciled meeting votes",
             banana=banana,
@@ -1124,19 +1158,14 @@ class CouncilMemberRepository(BaseRepository):
             List of vote dicts with matter info
         """
         rows = await self._fetch(
-            """
+            f"""
             SELECT v.id, v.matter_id, v.meeting_id, v.vote, v.vote_date, v.sequence,
                    v.item_id, v.item_key, v.motion_index, v.motion_text, v.source, v.content_sha256, v.receipt, v.parse_run_id, v.observation_ordinal,
                    m.matter_file, m.title, m.matter_type
             FROM votes v
             JOIN city_matters m ON v.matter_id = m.id
             WHERE v.council_member_id = $1
-              AND (v.source = 'minutes' OR NOT EXISTS (
-                  SELECT 1 FROM item_motions im
-                  WHERE im.source = 'minutes' AND im.meeting_id = v.meeting_id
-                    AND im.matter_id = v.matter_id
-                    AND (v.item_key IS NULL OR im.item_id = v.item_key)
-              ))
+              AND {MINUTES_PREFERRED_VOTE}
             ORDER BY v.vote_date DESC NULLS LAST
             LIMIT $2
             """,
@@ -1172,7 +1201,7 @@ class CouncilMemberRepository(BaseRepository):
         contribute. "Votes yes on housing 94% of the time" is this query.
         """
         rows = await self._fetch(
-            """
+            f"""
             SELECT t.topic, v.vote, COUNT(*) AS cnt
             FROM votes v
             JOIN LATERAL (
@@ -1185,12 +1214,7 @@ class CouncilMemberRepository(BaseRepository):
                 WHERE i.matter_id = v.matter_id
             ) t ON TRUE
             WHERE v.council_member_id = $1
-              AND (v.source = 'minutes' OR NOT EXISTS (
-                  SELECT 1 FROM item_motions im
-                  WHERE im.source = 'minutes' AND im.meeting_id = v.meeting_id
-                    AND im.matter_id = v.matter_id
-                    AND (v.item_key IS NULL OR im.item_id = v.item_key)
-              ))
+              AND {MINUTES_PREFERRED_VOTE}
             GROUP BY t.topic, v.vote
             ORDER BY t.topic
             """,

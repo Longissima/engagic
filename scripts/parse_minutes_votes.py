@@ -25,6 +25,7 @@ from config import get_logger
 from corpus.store import close_corpus, get_corpus, init_corpus
 from database.db_postgres import Database
 from database.id_generation import generate_matter_id
+from database.repositories_async.council_members import CouncilMemberRepository
 from database.repositories_async.minutes import MinutesRepository, digest, run_key, compare_api
 from parsing.rollcall import DIALECTS
 from parsing.rollcall.observations import parser_build
@@ -239,11 +240,16 @@ async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=
             outcome = pub.outcome
             await conn.execute(UPSERT_APPEARANCE_SQL, pub.matter_id, row["meeting_id"],
                 pub.item_id, row["date"], outcome, {**pub.tally, "method": pub.method})
+        # The repository owns both counters; this writer lands after its recompute,
+        # so it calls that one implementation instead of counting again.
+        await CouncilMemberRepository.recompute_attribution_counts(member_ids, conn)
+        # last_seen is this writer's own business and takes no source preference:
+        # it answers "when did we last see this member", which a superseded API
+        # ballot still answers truthfully.
         await conn.execute("""
-            UPDATE council_members cm SET vote_count = (
-                SELECT count(*) FROM votes v WHERE v.council_member_id = cm.id
-            ), last_seen = GREATEST(last_seen, (SELECT max(vote_date) FROM votes v
-                WHERE v.council_member_id = cm.id)), updated_at = CURRENT_TIMESTAMP
+            UPDATE council_members cm
+            SET last_seen = GREATEST(last_seen, (SELECT max(vote_date) FROM votes v
+                WHERE v.council_member_id = cm.id))
             WHERE cm.id = ANY($1::text[])
         """, sorted(member_ids))
         if run_id:
