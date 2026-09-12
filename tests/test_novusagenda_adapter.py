@@ -51,13 +51,23 @@ LEGACY_GENERIC_GRID_HTML = """
 """
 
 
+# Real markup, verified live on plano and claycounty 2026-09-11: the minutes
+# anchor sits in the agenda's own row and points at DisplayAgendaPDF.ashx
+# with a MinutesMeetingID. The second row carries no anchor, which is how a
+# portal says minutes are not published yet.
 MINUTES_GRID_HTML = """
 <html><body>
   <table id="ctl00_SearchAgendasMeetings_radGridMeetings_ctl00">
     <thead><tr><th>Meeting Date</th><th>Meeting Type</th><th>Minutes</th></tr></thead>
     <tbody><tr class="rgRow">
-      <td>08/05/26</td><td>Regular Council Meeting</td>
-      <td><a onclick="window.open('MeetingView.aspx?MeetingID=652&amp;MinutesMeetingID=700&amp;doctype=Minutes')">View Minutes HTML</a></td>
+      <td>08/05/26</td>
+      <td><a href="DisplayAgendaPDF.ashx?MeetingID=652">Regular Council Meeting</a></td>
+      <td><a id="ctl00_hypMinutesPDF" href="DisplayAgendaPDF.ashx?MinutesMeetingID=700" target="_blank"><img src="images/ico_pdf.gif" alt="Legal Minutes" /></a></td>
+    </tr>
+    <tr class="rgAltRow">
+      <td>08/12/26</td>
+      <td><a href="DisplayAgendaPDF.ashx?MeetingID=653">Special Council Meeting</a></td>
+      <td>&nbsp;</td>
     </tr></tbody>
   </table>
 </body></html>
@@ -126,7 +136,7 @@ def test_minutes_discovery_uses_iso_date_and_native_meeting_id():
             "start": "2026-08-05",
             "minutes_url": (
                 "https://davie.novusagenda.com/agendapublic/"
-                "MeetingView.aspx?MeetingID=652&MinutesMeetingID=700&doctype=Minutes"
+                "DisplayAgendaPDF.ashx?MinutesMeetingID=700"
             ),
         }
     ]

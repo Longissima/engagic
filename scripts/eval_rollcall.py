@@ -27,6 +27,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from config import get_logger
 from corpus.store import close_corpus, get_corpus, init_corpus
 from database.db_postgres import Database
 from parsing.rollcall import DIALECTS, load_spike_parser, norm_file
+from parsing.rollcall.evidence import RESULT_RE
 
 logger = get_logger(__name__).bind(component="eval_rollcall")
 
@@ -50,6 +52,33 @@ DB_TO_CANON = {
     "not_voting": "NONVOTING",
 }
 OUTCOME_TO_CANON = {"passed": "PASS", "failed": "FAIL"}
+
+# Deliberately broader than anything the parser matches: if a clerk recorded
+# a vote at all, one of these words is in the document. A document with none
+# of them recorded no vote, and belongs in no coverage denominator -- a
+# cancelled meeting or a discussion-only committee is not a miss.
+VOTE_LANGUAGE_RE = re.compile(
+    r"\b(?:motion|motioned|moved|second(?:ed)?|ayes?|nays?|yeas?|abstain\w*|"
+    r"roll\s*call|carried|unanimous\w*|in\s+favor|opposed)\b",
+    re.IGNORECASE,
+)
+
+COVERAGE_SQL = """
+    SELECT DISTINCT ON (md.meeting_id)
+           md.meeting_id, md.content_sha256, m.banana, j.vendor
+    FROM minutes_documents md
+    JOIN meetings m ON m.id = md.meeting_id
+    JOIN jurisdictions j USING (banana)
+    WHERE ($1::text IS NULL OR m.banana = $1)
+    ORDER BY md.meeting_id, md.ingested_at DESC
+"""
+COVERAGE_ITEMS_SQL = """
+    SELECT i.id, i.sequence, i.agenda_number, i.title, i.matter_id,
+           COALESCE(i.matter_file, cm.matter_file) AS matter_file
+    FROM items i
+    LEFT JOIN city_matters cm ON cm.id = i.matter_id
+    WHERE i.meeting_id = $1
+"""
 
 MEETINGS_SQL = """
     SELECT DISTINCT ON (md.meeting_id)
@@ -177,12 +206,84 @@ def summarize(counts: Counter) -> Dict[str, Any]:
     return out
 
 
+async def coverage(db, corpus, banana: Optional[str], limit: Optional[int]) -> Dict[str, Any]:
+    """Two numbers, kept apart: documents held, and votes recorded vs encoded.
+
+    Supply ("minutes fetched") and extraction ("vote pattern outcome") fail
+    for unrelated reasons and mixing them hides both. Only documents that
+    record a vote enter the extraction denominator.
+    """
+    from parsing.rollcall.engine import parse_meeting
+
+    async with db.pool.acquire() as conn:
+        rows = await conn.fetch(COVERAGE_SQL, banana)
+    if limit:
+        rows = rows[:limit]
+    stage: Counter = Counter()
+    per_vendor: Dict[str, Counter] = defaultdict(Counter)
+    for row in rows:
+        vendor = row["vendor"]
+        result = await corpus.lookup_extraction(row["content_sha256"])
+        text = (result or {}).get("text") or ""
+        if not text:
+            stage["held_no_text"] += 1
+            continue
+        if not VOTE_LANGUAGE_RE.search(text):
+            stage["held_records_no_vote"] += 1
+            per_vendor[vendor]["no_vote"] += 1
+            continue
+        async with db.pool.acquire() as conn:
+            items = [dict(r) for r in await conn.fetch(COVERAGE_ITEMS_SQL, row["meeting_id"])]
+            roster = [r["name"] for r in await conn.fetch(ROSTER_SQL, row["banana"])]
+        per_vendor[vendor]["denominator"] += 1
+        if not items:
+            stage["miss_meeting_has_no_items"] += 1
+            continue
+        parsed = parse_meeting(text, items, roster)
+        if parsed.items_anchored == 0:
+            stage["miss_no_item_anchored"] += 1
+        elif parsed.evidence_seen == 0:
+            # Split the biggest miss bucket by cause: a result the parser
+            # recognizes somewhere in the document means the item blocks are
+            # drawn wrong; none anywhere means the phrasing is unknown to us.
+            # They need opposite fixes, so counting them together hides both.
+            if RESULT_RE.search(text):
+                stage["miss_evidence_outside_blocks"] += 1
+            else:
+                stage["miss_phrasing_unrecognized"] += 1
+        elif not parsed.published:
+            stage["miss_all_abstained"] += 1
+        else:
+            stage["hit_published"] += 1
+            per_vendor[vendor]["published"] += 1
+    denominator = sum(v for k, v in stage.items() if k.startswith(("miss_", "hit_")))
+    return {
+        "documents_held": len(rows),
+        "held_records_no_vote": stage["held_records_no_vote"],
+        "held_no_text": stage["held_no_text"],
+        "extraction_denominator": denominator,
+        "extraction_rate": round(stage["hit_published"] / denominator, 4) if denominator else None,
+        "stages": dict(stage),
+        "by_vendor": {
+            v: {
+                "denominator": c["denominator"],
+                "published": c["published"],
+                "records_no_vote": c["no_vote"],
+                "rate": round(c["published"] / c["denominator"], 3) if c["denominator"] else None,
+            }
+            for v, c in sorted(per_vendor.items(), key=lambda kv: -kv[1]["denominator"])
+        },
+    }
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Roll-call parser over corpus minutes: scored vs API votes, or gate consistency")
     ap.add_argument("--banana")
     ap.add_argument("--all", action="store_true", help="consistency mode over every meeting with minutes text")
     ap.add_argument("--audit", type=int, default=0, help="print N published passages for human review")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--coverage", action="store_true",
+                    help="report supply and extraction coverage separately")
     ap.add_argument("--json", help="write machine-readable results here")
     args = ap.parse_args()
 
@@ -194,6 +295,10 @@ async def main() -> int:
         logger.error("corpus unavailable")
         return 2
     try:
+        if args.coverage:
+            report = await coverage(db, corpus, args.banana, args.limit)
+            print(json.dumps(report, indent=1, default=str))
+            return 0
         async with db.pool.acquire() as conn:
             meetings = await conn.fetch(MEETINGS_SQL, args.banana)
         if not args.all:

@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 from config import get_logger
+from vendors.utils.documents import find_minutes_links, pick_document
 from vendors.utils.attachments import classify_attachment_type
 from parsing.participation import parse_participation_info
 
@@ -129,18 +130,21 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
 
         # Minutes column: direct document links (services/minutes attachment,
         # minutes PDF) preferred over MinutesViewer.php viewer pages.
+        # Rank every minutes link in the row rather than keeping the first of
+        # each kind: a row can carry draft and approved copies, and the
+        # document always beats the viewer that renders it.
         minutes_doc_href = None
         minutes_viewer_href = None
-        for link in row.find_all('a', href=True):
-            link_href = _string_attribute(link, 'href')
-            if not link_href or link_href.startswith(('#', 'javascript:')):
-                continue
-            if 'MinutesViewer' in link_href:
-                minutes_viewer_href = minutes_viewer_href or link_href
-                continue
-            link_text = link.get_text(strip=True).lower()
-            if 'minutes' in link_text or '/minutes/' in link_href.lower():
-                minutes_doc_href = minutes_doc_href or link_href
+        row_candidates = find_minutes_links(row)
+        best = pick_document(row_candidates)
+        if best:
+            if 'MinutesViewer' in best.url:
+                minutes_viewer_href = best.url
+            else:
+                minutes_doc_href = best.url
+        if not minutes_viewer_href:
+            viewer = next((c.url for c in row_candidates if 'MinutesViewer' in c.url), None)
+            minutes_viewer_href = viewer
         if not minutes_doc_href and not minutes_viewer_href:
             option = row.find(
                 'option', value=_attribute_contains('MinutesViewer')

@@ -49,6 +49,31 @@ SKIP_CATEGORY_KEYWORDS = re.compile(
 )
 
 
+# Minutes live in their own archive category, parallel to the agenda one and
+# discarded by SKIP_CATEGORY_KEYWORDS. Pairing is by body name and meeting
+# date, because the minutes document carries a different ADID.
+MINUTES_CATEGORY_RE = re.compile(r"minutes", re.IGNORECASE)
+# Type words to strip when reducing a category label to its body name. The
+# ordinal prefix is lakezurich ("A. Village Board & Board Committee Agendas"
+# against "C. Village Board Minutes"); "meeting packet" is burlington-wi.
+_CATEGORY_TYPE_RE = re.compile(
+    r"\s*(?:meeting\s+packets?|packets?|agendas?|action\s+agendas?|minutes)\s*:?\s*$",
+    re.IGNORECASE,
+)
+_CATEGORY_PREFIX_RE = re.compile(r"^[A-Z]\.\s*")
+_STUDY_SESSION_RE = re.compile(r"study\s+session|work\s*shop|work\s+session", re.IGNORECASE)
+
+
+def _category_body(label: str) -> str:
+    """Body name of an archive category, comparable across agenda and minutes."""
+    body = _CATEGORY_PREFIX_RE.sub("", label or "").strip()
+    previous = None
+    while previous != body:
+        previous = body
+        body = _CATEGORY_TYPE_RE.sub("", body).strip()
+    return re.sub(r"\s+", " ", body).casefold()
+
+
 class AsyncCivicEngageAdapter(AsyncBaseAdapter):
     """Async adapter for CivicPlus CivicEngage Archive Center sites."""
 
@@ -159,6 +184,76 @@ class AsyncCivicEngageAdapter(AsyncBaseAdapter):
         )
         return [DEFAULT_CATEGORY_ID]
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
+    async def _discover_minutes_categories(self, html: str) -> Dict[str, List[int]]:
+        """Body name -> minutes category ids, from the same archive dropdown."""
+        soup = BeautifulSoup(html, "html.parser")
+        select = soup.find("select", {"name": "lngArchiveMasterID"})
+        if not select:
+            return {}
+        by_body: Dict[str, List[int]] = {}
+        for option in select.find_all("option"):
+            value = option.get("value")
+            label = option.get_text(strip=True)
+            if not isinstance(value, str) or not value.isdigit() or value == "0":
+                continue
+            if not MINUTES_CATEGORY_RE.search(label):
+                continue
+            by_body.setdefault(_category_body(label), []).append(int(value))
+        return by_body
+
+    async def _minutes_index(
+        self, minutes_categories: Dict[str, List[int]], start_date, end_date
+    ) -> Dict[tuple, str]:
+        """(body, date, is_study_session) -> minutes URL.
+
+        A date alone is not a key: hpca holds a regular meeting and a study
+        session on the same day and publishes minutes for both. An ambiguous
+        key is dropped rather than guessed.
+        """
+        index: Dict[tuple, str] = {}
+        ambiguous = set()
+        for body, category_ids in minutes_categories.items():
+            for category_id in category_ids:
+                listing = await self._fetch_listing_search(category_id, start_date, end_date)
+                for meeting in self._parse_listing_html(listing):
+                    if not meeting.get("start"):
+                        continue
+                    key = (body, meeting["start"], bool(_STUDY_SESSION_RE.search(meeting["title"])))
+                    if key in index and index[key] != meeting["packet_url"]:
+                        ambiguous.add(key)
+                        continue
+                    index[key] = meeting["packet_url"]
+        for key in ambiguous:
+            index.pop(key, None)
+        return index
+
+    def _attach_minutes(self, meetings: List[Dict[str, Any]], index: Dict[tuple, str], bodies: List[str]) -> None:
+        """Match each meeting to its minutes by body and date, then by date alone.
+
+        Label pairing fails outright on cities that name the two categories
+        differently (lakezurich), so a unique same-date match across every
+        body is accepted as a fallback.
+        """
+        by_date: Dict[tuple, List[str]] = {}
+        for (_, date, study), url in index.items():
+            by_date.setdefault((date, study), []).append(url)
+        for meeting in meetings:
+            date = meeting.get("start")
+            if not date:
+                continue
+            study = bool(_STUDY_SESSION_RE.search(meeting.get("title") or ""))
+            for body in bodies:
+                url = index.get((body, date, study))
+                if url:
+                    meeting["minutes_url"] = url
+                    break
+            else:
+                candidates = by_date.get((date, study), [])
+                if len(candidates) == 1:
+                    meeting["minutes_url"] = candidates[0]
+
     async def _fetch_meetings_impl(
         self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
@@ -178,6 +273,7 @@ class AsyncCivicEngageAdapter(AsyncBaseAdapter):
             return []
 
         # Auto-discover category IDs if not configured
+        archive_html = None
         if not self.category_ids:
             archive_html = await (await self._get(f"{self.base_url}/Archive.aspx")).text()
             self.category_ids = await self._discover_category_ids(archive_html)
@@ -197,6 +293,18 @@ class AsyncCivicEngageAdapter(AsyncBaseAdapter):
                 if vid not in seen_adids:
                     seen_adids.add(vid)
                     all_meetings.append(m)
+
+        if archive_html is None:
+            archive_html = await (await self._get(f"{self.base_url}/Archive.aspx")).text()
+        minutes_categories = await self._discover_minutes_categories(archive_html)
+        if minutes_categories:
+            index = await self._minutes_index(minutes_categories, start_date, end_date)
+            self._attach_minutes(all_meetings, index, list(minutes_categories))
+
+        if self._minutes_discovery_only:
+            # Discovery mode never opens a PDF. vendor_id stays the agenda's
+            # ADID so sweep_minutes can recompute the stored meeting id.
+            return [m for m in all_meetings if m.get("minutes_url")]
 
         # Parse packet PDFs for structured items
         await self._bounded_gather(

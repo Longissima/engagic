@@ -18,9 +18,11 @@ land on matter_appearances for every published item, including tally-only
 ones where no member can be named. Roster members named by the minutes are
 created in council_members on first publish (source in metadata).
 
-Phase-1 constraint (migration 041): the old UNIQUE(member, matter, meeting)
-still stands, so only the final motion per item is written, at
-motion_index 0. Meetings that already carry API votes are left alone.
+Every motion on an item is stored, in document order, at its own
+motion_index (migration 043 removed the constraint that allowed only one).
+A single item can carry an amendment that failed and an adoption that
+passed, and collapsing them to the disposition threw away the dissent.
+Meetings that already carry API votes are left alone.
 
 Usage:
     uv run scripts/parse_minutes_votes.py --banana denverCO         # dry run
@@ -79,8 +81,8 @@ ROSTER_SQL = "SELECT id, name FROM council_members WHERE banana = $1"
 UPSERT_VOTE_SQL = """
     INSERT INTO votes (council_member_id, matter_id, meeting_id, vote, vote_date, sequence, metadata,
                        item_id, motion_index, motion_text, source, content_sha256, receipt)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, 'minutes', $10, $11)
-    ON CONFLICT (council_member_id, matter_id, meeting_id) DO UPDATE SET
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $12, $9, 'minutes', $10, $11)
+    ON CONFLICT (council_member_id, matter_id, meeting_id, motion_index) DO UPDATE SET
         vote = EXCLUDED.vote, sequence = EXCLUDED.sequence, item_id = EXCLUDED.item_id,
         metadata = EXCLUDED.metadata, motion_text = EXCLUDED.motion_text,
         content_sha256 = EXCLUDED.content_sha256, receipt = EXCLUDED.receipt
@@ -109,6 +111,7 @@ UPSERT_APPEARANCE_SQL = """
 
 @dataclass
 class Publishable:
+    motion_index: int
     item_id: str
     matter_id: Optional[str]
     method: str
@@ -132,14 +135,15 @@ def locate(text: str, motion_text: str, sha: str, hint: int = -1) -> Dict[str, A
     return {"sha256": sha, "start": -1, "end": -1}
 
 
-def via_driver(parse, dialect: str, text: str, items, roster: Dict[str, str], sha: str, counts: Counter, reasons: Counter) -> Dict[str, Publishable]:
+def via_driver(parse, dialect: str, text: str, items, roster: Dict[str, str], sha: str, counts: Counter, reasons: Counter) -> Dict[Tuple[str, int], Publishable]:
     by_file: Dict[str, Any] = {}
     for item in items:
         key = norm_file(dialect, item["matter_file"])
         if key and item["matter_id"]:
             by_file.setdefault(key, item)
     gazetteer = parse.Gazetteer(sorted(roster))
-    out: Dict[str, Publishable] = {}
+    out: Dict[Tuple[str, int], Publishable] = {}
+    motion_counts: Counter = Counter()
     for passage in parse.PARSERS[dialect](text):
         if not passage.sections:
             continue
@@ -154,10 +158,11 @@ def via_driver(parse, dialect: str, text: str, items, roster: Dict[str, str], sh
             for reason in decision.reasons:
                 reasons[reason.split(":")[0]] += 1
             continue
-        if item["id"] in out:
-            counts["earlier_motions_dropped_phase1"] += 1
+        motion_index = motion_counts[item["id"]]
+        motion_counts[item["id"]] += 1
         tally = compute_vote_tally([{"vote": CANON_TO_DB.get(v, "present")} for _, v in decision.votes])
-        out[item["id"]] = Publishable(
+        out[(item["id"], motion_index)] = Publishable(
+            motion_index=motion_index,
             item_id=item["id"], matter_id=item["matter_id"], method="driver",
             votes=decision.votes, outcome=OUTCOME_TO_DB.get(passage.outcome or ""), tally=tally,
             motion_text=passage.motion_text, receipt=locate(text, passage.motion_text, sha),
@@ -165,7 +170,7 @@ def via_driver(parse, dialect: str, text: str, items, roster: Dict[str, str], sh
     return out
 
 
-def via_engine(text: str, items, roster: Dict[str, str], sha: str, counts: Counter, reasons: Counter) -> Tuple[Dict[str, Publishable], List[str]]:
+def via_engine(text: str, items, roster: Dict[str, str], sha: str, counts: Counter, reasons: Counter) -> Tuple[Dict[Tuple[str, int], Publishable], List[str]]:
     parsed = parse_meeting(text, [dict(i) for i in items], list(roster))
     counts["items_anchored"] += parsed.items_anchored
     counts["items_total"] += parsed.items_total
@@ -174,13 +179,14 @@ def via_engine(text: str, items, roster: Dict[str, str], sha: str, counts: Count
     for ab in parsed.abstained:
         for reason in ab.reasons:
             reasons[reason.split(":")[0]] += 1
-    out: Dict[str, Publishable] = {}
+    out: Dict[Tuple[str, int], Publishable] = {}
     for iv in parsed.published:
         counts[f"method_{iv.method}"] += 1
         tally = dict(iv.tally) if iv.tally else compute_vote_tally(
             [{"vote": CANON_TO_DB.get(v, "present")} for _, v in iv.member_votes]
         )
-        out[iv.item["id"]] = Publishable(
+        out[(iv.item["id"], iv.motion_index)] = Publishable(
+            motion_index=iv.motion_index,
             item_id=iv.item["id"], matter_id=iv.item["matter_id"], method=iv.method,
             votes=iv.member_votes, outcome=OUTCOME_TO_DB.get(iv.outcome or ""), tally=tally,
             motion_text=iv.motion_text, receipt=locate(text, iv.motion_text, sha, hint=iv.offset),
@@ -247,12 +253,18 @@ async def main() -> int:
                 matter_id = generate_matter_id(row["banana"], title=titles.get(pub.item_id) or "")
                 if matter_id:
                     pub.matter_id = matter_id
-                    to_create.append((matter_id, pub.item_id, titles[pub.item_id]))
-                    counts["title_keyed_matters"] += 1
+                    if pub.motion_index == 0:
+                        to_create.append((matter_id, pub.item_id, titles[pub.item_id]))
+                        counts["title_keyed_matters"] += 1
                 else:
                     counts["generic_title_unkeyed"] += 1
             published = {k: v for k, v in published.items() if v.matter_id}
-            counts["publishable_items"] += len(published)
+            last_motion: Dict[str, int] = {}
+            for pub in published.values():
+                last_motion[pub.item_id] = max(last_motion.get(pub.item_id, 0), pub.motion_index)
+            counts["motions_published"] += len(published)
+            counts["publishable_items"] += len(last_motion)
+            counts["extra_motions"] += len(published) - len(last_motion)
             counts["vote_rows"] += sum(len(p.votes) for p in published.values())
             per_city[row["banana"]] += len(published)
             if not args.apply or not published:
@@ -273,8 +285,14 @@ async def main() -> int:
                             await conn.execute(
                                 UPSERT_VOTE_SQL, member_id, pub.matter_id, row["meeting_id"],
                                 CANON_TO_DB.get(canon, "present"), row["date"], seq,
-                                {"method": pub.method}, pub.item_id, pub.motion_text, sha, pub.receipt,
+                                {"method": pub.method}, pub.item_id, pub.motion_text, sha,
+                                pub.receipt, pub.motion_index,
                             )
+                        # matter_appearances holds one disposition per
+                        # appearance, so the last motion on the item wins
+                        # there while every motion survives in votes.
+                        if pub.motion_index != last_motion.get(pub.item_id):
+                            continue
                         outcome = pub.outcome or determine_vote_outcome(pub.tally)
                         await conn.execute(
                             UPSERT_APPEARANCE_SQL, pub.matter_id, row["meeting_id"], pub.item_id,

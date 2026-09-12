@@ -61,6 +61,24 @@ def _load_onbase_config() -> Dict[str, List[str]]:
     return AsyncBaseAdapter._load_vendor_config(ONBASE_CONFIG_FILE, required=True)
 
 
+def _extract_meeting_objects(html: str) -> List[str]:
+    """Brace-balanced JSON objects that start with an "ID" field."""
+    found: List[str] = []
+    for match in re.finditer(r'\{"ID":\d+', html):
+        depth, index = 0, match.start()
+        while index < len(html):
+            char = html[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    found.append(html[match.start():index + 1])
+                    break
+            index += 1
+    return found
+
+
 class AsyncOnBaseAdapter(AsyncBaseAdapter):
     """Async adapter for direct OnBase Agenda Online instances."""
 
@@ -214,7 +232,11 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
         seen_ids = set()
 
         # Method 1: Extract from inline JSON (Durham-style pages embed meeting data)
-        json_meetings = re.findall(r'\{"ID":\d+[^}]+\}', html)
+        # A meeting object can nest another object (a populated "Media"), and
+        # [^}]+ stops at the inner closing brace, so json.loads fails and the
+        # meeting is dropped outright -- 74 of 198 on one city, precisely the
+        # council meetings that have video. Scan brace-balanced instead.
+        json_meetings = _extract_meeting_objects(html)
         for json_str in json_meetings:
             try:
                 data = json.loads(json_str)
@@ -237,6 +259,11 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
                     "title": data.get("Name", "Meeting"),
                     "date": meeting_date,
                     "has_agenda": data.get("IsAgendaAvailable", False),
+                    # The same payload declares whether minutes exist and
+                    # under what name; sites that render their document links
+                    # in JavaScript expose nothing else.
+                    "has_minutes": data.get("IsMinutesAvailable", False),
+                    "minutes_name": data.get("MinutesUniqueName") or data.get("MinutesPacketUniqueName"),
                 })
                 seen_ids.add(meeting_id)
             except (json.JSONDecodeError, KeyError):
@@ -292,6 +319,17 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
                 minutes_href = minutes_by_id.get(meeting["id"])
                 if minutes_href:
                     meeting["minutes_url"] = minutes_href
+
+        # Fall back to the JSON declaration for sites whose document links are
+        # rendered client-side, where no DownloadFile href exists in the HTML.
+        for meeting in meetings:
+            if meeting.get("minutes_url") or not meeting.get("has_minutes"):
+                continue
+            unique_name = meeting.get("minutes_name")
+            if unique_name:
+                meeting["minutes_url"] = (
+                    f"{self.base_url}/Documents/DownloadFileBytes/{unique_name}"
+                )
 
         return meetings
 

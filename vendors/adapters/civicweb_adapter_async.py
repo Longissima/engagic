@@ -16,12 +16,25 @@ Architecture:
 The packet PDF is typically a compiled agenda+staff reports document with
 a PDF TOC (bookmarks). The chunker handles item extraction via TOC entries.
 
-Minutes: not exposed in the surfaces this adapter fetches. MeetingTypeList
-carries no minutes links, and MeetingInformation static HTML embeds only the
-primary agenda/packet document URL -- minutes load via the page's XHR layer
-(the SPA config exposes meetingOutputTypes {agenda:1, minutes:2} and a
-MinutesDocument button, but no document href). Verified hemetca Id=6986 and
-hudson Id=2843, Aug 2026.
+Minutes are not in the static HTML, but the SPA's own XHR serves them
+without authentication:
+
+    GET /Services/MeetingsService.svc/meetings/{Id}/meetingDocuments
+
+{Id} is the same meeting id already scraped from MeetingTypeList. The reply
+lists documents with a DocumentType from the portal's packageDocumentTypes
+enum; minutes are 9/49 (HTML open), 10 (PDF open), 53/54 (adopted), with
+11/12/51 the closed-session counterparts. Each downloads at
+{base_url}/document/{Id}. Verified live 2026-09-11 on issaquah, evanston,
+hudson, washingtoncounty and beecave.
+
+Per-city: *.civicweb.net returns a bare JSON array while
+*.community.diligentoneplatform.com wraps it in {"Documents": [...]};
+issaquah and pearland publish type 53 only, evanston and stlouisco publish
+some meetings as HTML (type 9) with no PDF at all; hemetca, beaverton and
+pullman publish no minutes. Do not record a vendor-wide negative here again:
+the note this replaces claimed minutes were unreachable, naming hudson as
+verified, and hudson publishes them.
 
 Slug is the civicweb subdomain (e.g. 'sonomacity' for sonomacity.civicweb.net).
 """
@@ -56,6 +69,12 @@ _DOC_URL_RE = re.compile(
 )
 
 
+# Minutes document types from the portal's own packageDocumentTypes config,
+# in preference order: adopted PDF, open PDF, then HTML when a city posts no
+# PDF. Closed-session types (11, 12, 51, 54) are deliberately excluded.
+_MINUTES_DOCUMENT_TYPES = (53, 10, 49, 9)
+
+
 class AsyncCivicWebAdapter(AsyncBaseAdapter):
     """Async adapter for cities on the CivicWeb portal platform.
 
@@ -72,6 +91,37 @@ class AsyncCivicWebAdapter(AsyncBaseAdapter):
     # Main fetch
     # ------------------------------------------------------------------
 
+    MINUTES_DISCOVERY_SUPPORTED = True
+
+    async def _fetch_minutes_url(self, meeting: Dict[str, Any]) -> None:
+        """Set minutes_url from the meeting-documents service, when published."""
+        vendor_id = meeting.get("vendor_id")
+        if not vendor_id:
+            return
+        url = f"{self.base_url}/Services/MeetingsService.svc/meetings/{vendor_id}/meetingDocuments"
+        try:
+            response = await self._get(url)
+            payload = await response.json(content_type=None)
+        except (VendorHTTPError, ValueError) as e:
+            logger.debug(
+                "civicweb meeting documents unavailable",
+                slug=self.slug,
+                vendor_id=vendor_id,
+                error=str(e),
+            )
+            return
+        documents = payload if isinstance(payload, list) else (payload or {}).get("Documents") or []
+        by_type = {}
+        for document in documents:
+            if not isinstance(document, dict) or not document.get("Id"):
+                continue
+            by_type.setdefault(document.get("DocumentType"), document)
+        for document_type in _MINUTES_DOCUMENT_TYPES:
+            document = by_type.get(document_type)
+            if document:
+                meeting["minutes_url"] = f"{self.base_url}/document/{document['Id']}"
+                return
+
     async def _fetch_meetings_impl(
         self, days_back: int = 14, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
@@ -79,6 +129,16 @@ class AsyncCivicWebAdapter(AsyncBaseAdapter):
         start_date, end_date = self._date_range(days_back, days_forward)
 
         meetings = await self._scrape_meeting_type_list(start_date, end_date)
+
+        if self._minutes_discovery_only:
+            # Discovery mode touches neither meeting pages nor PDFs. The
+            # vendor_id/title/start tuple must stay byte-identical to the
+            # normal path: sweep_minutes recomputes the meeting id from it.
+            await self._bounded_gather(
+                [self._fetch_minutes_url(m) for m in meetings],
+                max_concurrent=5,
+            )
+            return [m for m in meetings if m.get("minutes_url")]
 
         logger.info(
             "civicweb meetings scraped",
@@ -91,6 +151,10 @@ class AsyncCivicWebAdapter(AsyncBaseAdapter):
         # Fetch packet PDF URL for each meeting (concurrent, bounded)
         enriched = await self._bounded_gather(
             [self._enrich_meeting(m) for m in meetings],
+            max_concurrent=5,
+        )
+        await self._bounded_gather(
+            [self._fetch_minutes_url(m) for m in meetings],
             max_concurrent=5,
         )
 

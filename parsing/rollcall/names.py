@@ -18,6 +18,12 @@ _TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _SUFFIX_RE = re.compile(r"\s*,?\s*(?:jr\.?|sr\.?|ii|iii|iv)\s*$", re.IGNORECASE)
+# A roster line often runs "…Aaron Van Krey Members Absent 0"; the role word
+# rides along on the last name.
+_TRAILING_ROLE_RE = re.compile(
+    r"\s+(?:members?|commissioners?|aldermen|alderpersons?|councilmembers?|trustees?|present|absent|excused)\s*$",
+    re.IGNORECASE,
+)
 _PARENS_RE = re.compile(r"\([^)]*\)")
 _LEAD_JUNK_RE = re.compile(r"^[^A-Za-z]+")
 # A fragment that starts with one of these is sentence debris swept up by a
@@ -47,15 +53,44 @@ def looks_like_name(text: str) -> bool:
     return any(w[:1].isupper() for w in words)
 
 
+_TRAILING_CLAUSE_RE = re.compile(r"\s+(?:The|Motion|Second|Seconded|Vote|It)\b.*$")
+_SENTENCE_BREAK_RE = re.compile(r"\.\s+(?=\S)")
+
+
+def _cut_sentence_tail(raw: str) -> str:
+    """Drop the sentence that follows a name, keeping honorifics intact.
+
+    "Ron Leino. Motion passed" is a name and then prose. "Dr. Michael Aiello"
+    is one name: the period belongs to the honorific, which is why the break
+    only counts after a word long enough not to be a title or an initial.
+    """
+    text = _TRAILING_CLAUSE_RE.sub("", raw)
+    for match in _SENTENCE_BREAK_RE.finditer(text):
+        preceding = text[:match.start()].split()
+        if preceding and len(preceding[-1]) > 3:
+            return text[:match.start()]
+    return text
+
+
 def clean_name(raw: str) -> str:
-    """Strip titles, parentheticals and trailing punctuation; collapse whitespace."""
-    name = _PARENS_RE.sub("", raw)
+    """Strip titles, parentheticals and trailing punctuation; collapse whitespace.
+
+    A name captured out of running prose keeps the sentence behind it
+    ("Ron Leino. Motion passed"); cut at the sentence break so the roster
+    lookup sees the name and nothing else.
+    """
+    name = _cut_sentence_tail(raw)
+    name = _PARENS_RE.sub("", name)
     name = _LEAD_JUNK_RE.sub("", name)
     name = re.sub(r"\s+", " ", name).strip(" ,.;:-–")
     previous = None
     while previous != name:
         previous = name
         name = _TITLE_RE.sub("", name).strip(" ,.")
+    previous = None
+    while previous != name:
+        previous = name
+        name = _TRAILING_ROLE_RE.sub("", name).strip(" ,.")
     # A title with nobody behind it ("Vice Chair", "Chair") is not a name.
     if _TITLE_RE.match(name + " x"):
         return ""

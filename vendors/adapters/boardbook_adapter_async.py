@@ -40,6 +40,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
+from vendors.utils.documents import find_minutes_links, pick_document_url
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from pipeline.protocols import MetricsCollector
 
@@ -196,15 +197,14 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
 
             location = self._parse_location_cell(cells[1])
 
-            # Minutes viewer link lives alongside the Agenda link in cell 2
-            minutes_link = cells[2].find(
-                "a", href=lambda h: bool(h) and "/Public/Minutes/" in h
-            )
-            minutes_url = None
-            if minutes_link:
-                minutes_href = minutes_link.get("href")
-                if isinstance(minutes_href, str):
-                    minutes_url = urljoin(self.base_url, minutes_href)
+            # Minutes usually sit beside the Agenda link, but four-column
+            # rows put them elsewhere, so search the whole row rather than a
+            # fixed cell. /Public/Minutes/ is an HTML viewer wrapping a PDF
+            # that /Public/DownloadMinutes/ serves directly; hand the parser
+            # the document, not the page that displays it.
+            minutes_url = pick_document_url(find_minutes_links(row, self.base_url))
+            if minutes_url and "/Public/Minutes/" in minutes_url:
+                minutes_url = minutes_url.replace("/Public/Minutes/", "/Public/DownloadMinutes/")
 
             title = body_name or "Board Meeting"
             if meeting_type:

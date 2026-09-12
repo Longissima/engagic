@@ -28,6 +28,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
+from vendors.utils.documents import find_minutes_links, pick_document_url
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from exceptions import VendorHTTPError
 from pipeline.protocols import MetricsCollector
@@ -219,8 +220,15 @@ class AsyncRossAdapter(AsyncBaseAdapter):
         # Agenda PDFs (column 2)
         agenda_urls = self._extract_pdf_links(cells[2])
 
-        # Minutes PDFs (column 3)
-        minutes_urls = self._extract_pdf_links(cells[3])
+        # Minutes PDFs (column 3). The cell can hold both the regular and the
+        # closed-session minutes; taking index 0 stored the closed session
+        # whenever it came first in the DOM, which is a different record.
+        minutes_urls = [
+            pick_document_url(find_minutes_links(cells[3], self.base_url))
+            or url
+            for url in [next(iter(self._extract_pdf_links(cells[3])), None)]
+            if url or find_minutes_links(cells[3], self.base_url)
+        ]
 
         # Staff reports page link (column 4)
         staff_link = cells[4].find("a")

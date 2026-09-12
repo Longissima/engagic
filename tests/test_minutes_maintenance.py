@@ -419,6 +419,11 @@ def test_sweep_city_uses_minutes_discovery_for_primary_and_extra(monkeypatch):
             # that dry-run reports parity drift instead of claiming a fill.
             return {"minutes_url": None} if len(id_lookups) == 1 else None
 
+        async def fetch(self, query, *args):
+            # Dry-run classifies a miss against same-instant siblings.
+            assert query == sweep_minutes.FALLBACK_DIAGNOSTIC_SQL
+            return []
+
     class Acquire:
         async def __aenter__(self):
             return Connection()

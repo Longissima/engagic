@@ -83,6 +83,7 @@ class Gazetteer:
 @dataclass
 class ItemVotes:
     item: Any
+    motion_index: int = field(default=0, kw_only=True)
     method: str                                  # named | unanimous | tally
     outcome: Optional[str]                       # PASS | FAIL | None
     tally: Dict[str, int]
@@ -114,6 +115,16 @@ class MeetingParse:
 # An agenda "item" that is really a section heading ("OLD BUSINESS:",
 # "ITEMS SCHEDULED FOR VOTING SESSIONS") owns no motion; a vote landing on
 # one is a misalignment, not a record.
+# Approving the minutes or adopting the agenda is a real vote and a
+# meaningless one; the item funnel already suppresses these as procedural,
+# and the titles the chunker produces for them ("June 23, 2026 - Policy
+# Meeting minutes") slip past the shared filter.
+_PROCEDURAL_TITLE_RE = re.compile(
+    r"\bminutes\b|\badopt(?:ion)?\s+(?:of\s+)?(?:the\s+)?agenda\b|\bapprov\w*\s+(?:of\s+)?(?:the\s+)?agenda\b"
+    r"|\bconsent\s+agenda\b|\broll\s*call\b|\bcall\s+to\s+order\b|\badjourn",
+    re.IGNORECASE,
+)
+
 _HEADING_RE = re.compile(
     r"^\s*(?:old|new|unfinished|other)\s+business\b|^\s*items?\s+(?:scheduled|for)\b"
     r"|^\s*(?:consent|regular|public\s+hearing|discussion|action|information)\s+(?:agenda|items?|calendar)\b"
@@ -124,7 +135,7 @@ _HEADING_RE = re.compile(
 
 def _is_heading(title: str) -> bool:
     stripped = (title or "").strip()
-    if _HEADING_RE.search(stripped):
+    if _HEADING_RE.search(stripped) or _PROCEDURAL_TITLE_RE.search(stripped):
         return True
     # A short all-caps line ending in a colon is a heading, not an item.
     return stripped.endswith(":") and len(stripped) < 60 and stripped == stripped.upper()
@@ -135,16 +146,27 @@ def _membership_ok(movers: Sequence[str], gazetteer: "Gazetteer", present: Seque
 
     Cheap and decisive: a packet holding several bodies' minutes anchors a
     committee motion under a council item, and the movers are the only names
-    in the sentence that say which body acted.
+    in the sentence that say which body acted. The check only runs when there
+    is a roster to check against; with nothing to compare, it proves nothing
+    and must not block (the named or unanimous gate still applies).
     """
-    if not movers:
+    known = {fold(n) for n in (present or gazetteer.canonical)}
+    if not known:
         return True
-    known = {fold(n) for n in present} if present else {fold(n) for n in gazetteer.canonical}
-    resolved = [gazetteer.resolve(m) for m in movers]
-    named = [r for r in resolved if r]
-    if not named:
-        return False
-    return any(fold(r) in known for r in named)
+    candidates = [clean_name(m) for m in movers]
+    candidates = [c for c in candidates if c and not _ROLE_ONLY_RE.fullmatch(c)]
+    if not candidates:
+        return True
+    return any(fold(r) in known for r in (gazetteer.resolve(c) or "" for c in candidates))
+
+
+# A mover captured as a bare office ("Council", "Floor Leader", "Chair")
+# names nobody; it cannot confirm or deny membership.
+_ROLE_ONLY_RE = re.compile(
+    r"(?:council|board|commission|committee|floor\s+leader|chair|president|mayor|"
+    r"clerk|staff|member|motion|second)\.?",
+    re.IGNORECASE,
+)
 
 
 def _dedupe(names: Sequence[str]) -> List[str]:
@@ -252,66 +274,84 @@ def parse_meeting(text: str, items: Sequence[Dict[str, Any]], roster: Sequence[s
         if get_filter_decision(title) or _is_heading(title):
             result.procedural_skipped += 1
             continue
-        ev = evidence[-1]
-        if ev.procedural:
-            # A motion to adjourn or reconvene rides at the end of whatever
-            # block it fell in; it is not a vote on that item.
-            result.procedural_skipped += 1
-            continue
-        if not _membership_ok(ev.movers, gazetteer, present):
-            result.abstained.append(Abstention(
-                item=block["item"],
-                reasons=[f"membership: mover not on this roster ({ev.movers[:2]})"],
-                motion_text=ev.result_text,
-            ))
-            continue
-        motion_text = ev.result_text
-        offset = block["start"] + ev.offset
-
-        if ev.named:
-            votes, reasons = _gate_named(ev, gazetteer)
-            if reasons:
-                result.abstained.append(Abstention(item=block["item"], reasons=reasons, motion_text=motion_text))
-                continue
-            tally = _tally_from_sections(ev)
-            outcome = ev.outcome or ("PASS" if tally["yes"] > tally["no"] else "FAIL")
-            result.published.append(ItemVotes(
-                item=block["item"], method="named", outcome=outcome, tally=tally,
-                member_votes=votes, motion_text=motion_text, offset=offset, rung=block["rung"],
-            ))
-            continue
-
-        if ev.tally:
-            yes, no, third = ev.tally
-            tally = {"yes": yes, "no": no, "abstain": third, "absent": len(absent), "present": 0}
-            outcome = ev.outcome or ("PASS" if yes > no else "FAIL")
-            if no == 0 and third == 0 and present and len(present) == yes:
-                member_votes = [(n, "AYE") for n in present] + [(n, "ABSENT") for n in absent]
-                result.published.append(ItemVotes(
-                    item=block["item"], method="unanimous", outcome=outcome, tally=tally,
-                    member_votes=member_votes, motion_text=motion_text, offset=offset, rung=block["rung"],
-                ))
-            else:
-                result.published.append(ItemVotes(
-                    item=block["item"], method="tally", outcome=outcome, tally=tally,
-                    motion_text=motion_text, offset=offset, rung=block["rung"],
-                ))
-            continue
-
-        if ev.unanimous and ev.outcome and present:
-            tally = {"yes": len(present), "no": 0, "abstain": 0, "absent": len(absent), "present": 0}
-            result.published.append(ItemVotes(
-                item=block["item"], method="unanimous", outcome=ev.outcome, tally=tally,
-                member_votes=[(n, "AYE") for n in present] + [(n, "ABSENT") for n in absent],
-                motion_text=motion_text, offset=offset, rung=block["rung"],
-            ))
-            continue
-
-        if ev.outcome:
-            result.published.append(ItemVotes(
-                item=block["item"], method="outcome", outcome=ev.outcome,
-                tally={}, motion_text=motion_text, offset=offset, rung=block["rung"],
-            ))
-            continue
-        result.abstained.append(Abstention(item=block["item"], reasons=["no outcome or tally"], motion_text=motion_text))
+        # Every motion on the item, in document order. An item can be amended
+        # and then adopted, and keeping only the disposition erased the vote
+        # on the amendment -- often the only one anybody disagreed on.
+        motion_index = 0
+        for ev in evidence:
+            published_before = len(result.published)
+            _publish_one(
+                ev, block, motion_index, gazetteer, present, absent, result
+            )
+            if len(result.published) > published_before:
+                motion_index += 1
     return result
+
+def _publish_one(ev, block, motion_index, gazetteer, present, absent, result) -> None:
+    """Evaluate one motion and append its outcome, or an abstention."""
+    if ev.procedural:
+        # A motion to adjourn or reconvene rides at the end of whatever
+        # block it fell in; it is not a vote on that item.
+        result.procedural_skipped += 1
+        return
+    if not _membership_ok(ev.movers, gazetteer, present):
+        result.abstained.append(Abstention(
+            item=block["item"],
+            reasons=[f"membership: mover not on this roster ({ev.movers[:2]})"],
+            motion_text=ev.result_text,
+        ))
+        return
+    motion_text = ev.result_text
+    offset = block["start"] + ev.offset
+
+    if ev.named:
+        votes, reasons = _gate_named(ev, gazetteer)
+        if reasons:
+            result.abstained.append(Abstention(item=block["item"], reasons=reasons, motion_text=motion_text))
+            return
+        tally = _tally_from_sections(ev)
+        outcome = ev.outcome or ("PASS" if tally["yes"] > tally["no"] else "FAIL")
+        result.published.append(ItemVotes(
+            item=block["item"], method="named", outcome=outcome, tally=tally,
+            member_votes=votes, motion_text=motion_text, offset=offset, rung=block["rung"],
+            motion_index=motion_index,
+        ))
+        return
+
+    if ev.tally:
+        yes, no, third = ev.tally
+        tally = {"yes": yes, "no": no, "abstain": third, "absent": len(absent), "present": 0}
+        outcome = ev.outcome or ("PASS" if yes > no else "FAIL")
+        if no == 0 and third == 0 and present and len(present) == yes:
+            member_votes = [(n, "AYE") for n in present] + [(n, "ABSENT") for n in absent]
+            result.published.append(ItemVotes(
+                item=block["item"], method="unanimous", outcome=outcome, tally=tally,
+                member_votes=member_votes, motion_text=motion_text, offset=offset, rung=block["rung"],
+                motion_index=motion_index,
+            ))
+        else:
+            result.published.append(ItemVotes(
+                item=block["item"], method="tally", outcome=outcome, tally=tally,
+                motion_text=motion_text, offset=offset, rung=block["rung"],
+                motion_index=motion_index,
+            ))
+        return
+
+    if ev.unanimous and ev.outcome and present:
+        tally = {"yes": len(present), "no": 0, "abstain": 0, "absent": len(absent), "present": 0}
+        result.published.append(ItemVotes(
+            item=block["item"], method="unanimous", outcome=ev.outcome, tally=tally,
+            member_votes=[(n, "AYE") for n in present] + [(n, "ABSENT") for n in absent],
+            motion_text=motion_text, offset=offset, rung=block["rung"],
+            motion_index=motion_index,
+        ))
+        return
+
+    if ev.outcome:
+        result.published.append(ItemVotes(
+            item=block["item"], method="outcome", outcome=ev.outcome,
+            tally={}, motion_text=motion_text, offset=offset, rung=block["rung"],
+            motion_index=motion_index,
+        ))
+        return
+    result.abstained.append(Abstention(item=block["item"], reasons=["no outcome or tally"], motion_text=motion_text))

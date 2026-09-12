@@ -75,6 +75,172 @@ refetch. Migration 042 sets the five child tables of city_matters to ON
 DELETE CASCADE as the schema file documents; live had SET NULL against NOT
 NULL columns, which made every matter delete fail.
 
+**The full chain: every motion, not just the disposition.** Migration 041
+added the motion grain but kept the old three-column constraint, so an item
+could hold one stored motion. An item that is amended and then adopted has
+two roll calls, and collapsing them to the disposition erased the vote on
+the amendment, which is usually the only one anybody disagreed on.
+`record_vote` now takes a motion index and the provenance fields and targets
+the four-column index. The reconciler deletes only API-sourced rows, so a
+vendor API that has never heard of a minutes-parsed vote cannot treat it as
+an orphan. The engine publishes every motion in a block in document order
+rather than the last one, and the writer stores them all while
+`matter_appearances` still records one disposition per appearance, taken
+from the final motion. Migration 043 then dropped the old constraint, in
+that order, with the services restarted in between so no running writer lost
+its ON CONFLICT target. The down migration deliberately fails while extra
+motions exist rather than choosing which recorded votes to destroy.
+
+**A two-year-old browser signature was reading as three empty vendors.** The
+session manager pinned Chrome/119, which WAFs now reject as stale, and a
+vendor blocked that way looks identical to a vendor that publishes nothing.
+Sebastopol answers 403 to Chrome/119 and 200 to Chrome/131 and above on the
+same URL. menlopark, wp_events and visioninternet sat at exactly zero
+coverage through a sweep that filled 4,788 rows elsewhere, which is the
+tell: a sweep cannot fix a 403. Bumped to Chrome/140, with a note that the
+version expires and that vendor-wide zero coverage is a transport symptom
+before it is a publishing one.
+
+**BoardBook closed itself.** Running the sweep took it from 41.5% to 74.4%
+fill, about 1,427 meetings, with no code change at all: the listing surface
+the adapter already read had the documents, and nothing had ever asked for
+them.
+
+**Municode could not see a past window at all.** Its Drupal listing parser
+took the first views-table on the page, which is the upcoming list, so a
+back-window returned nothing; it now reads every table. The PublishPage path
+fell back to page one of the archive when p=-1 was refused and stopped
+there, so it saw only the newest page; it now walks pages until one yields
+nothing new. The details payload also wraps its record in a Meetings array,
+which the earlier fix read past. One city went from zero fillable minutes to
+83.
+
+**eScribe accepts the minutes a site does not label.** MinutesWithAttachments
+is the same record with its exhibits, and Cape Coral files a document
+literally named Minutes.pdf under AdditionalDocuments while declaring no
+minutes type on any meeting. Typed documents still win; an untyped one is
+taken only when nothing typed exists. Cape Coral went from zero to 22.
+
+**CivicPlus subdomains are being retired.** 113 of 177 active slugs no longer
+resolve in DNS, which fails before a request is made and silences the city
+for agendas as much as minutes. Most already carry a domain override, and
+`scripts/repair_civicplus_domains.py` finds the rest by probing hostnames
+built from the city name and state. It requires the page to serve real
+AgendaCenter markup *and* to name that city and that state: every CivicPlus
+portal looks alike, city names repeat across states, and binding a city to
+another state's portal is precisely the wrong-jurisdiction failure this
+codebase has already paid for once. An unverifiable city is left alone.
+
+**No RSS path for Granicus.** The minutes link belongs in the agenda's own
+row, and the row-level scan now finds it wherever the city puts it. On the
+sites where the DB shows nothing, the served HTML defines a Minutes column
+and fills it for no row, so there is nothing in the row to find.
+
+**A shared way to choose between copies of one document**
+(`vendors/utils/documents.py`). Three adapters picked the wrong file for the
+same reason: selection was by position, not preference. A meeting rarely has
+one minutes document; it has two to four representations of one, plus
+sometimes a draft and sometimes a closed session. `pick_document` ranks them,
+session first (open over closed, because those are different records), then
+status (approved over draft), then payload (a document over a page that
+displays one), then format. `find_minutes_links` is the vendor-neutral
+fallback for portals that name no field: it reads every place a city might
+put the word, including an icon's alt text and an element id, so
+"ctl00_hypMinutesPDF" is recognized. Wired into Ross, which was storing
+closed-session minutes because they came first in the DOM, BoardBook, which
+stored a viewer over an available PDF and only ever looked in column three,
+and the Granicus row parser.
+
+**Legistar reaches its own archive now.** The InSite calendar defaults to a
+narrow view and its year filter is an ASP.NET postback rather than a query
+parameter, so a back-window of any size read the same handful of rows. For
+genuine back-windows only, past 45 days, the adapter now replays the page's
+form with the year set to All Years. Cities whose API answers also get their
+HTML minutes merged in, additively, because EventMinutesFile is consistent
+with the API's own timestamps but not with what the portal publishes.
+Measured on a 150-day window: Rockville went from zero fillable minutes to
+nine, El Paso from one to twenty-nine.
+
+**IQM2 was reading the wrong page.** `/Citizens` is the portal home, whose
+past list runs about three days, so no back-window could reach the archive;
+it now requests `Calendar.aspx` with an explicit range. Minutes are document
+slot `Type=12`, which is the portal's own identifier, rather than a link
+labelled "Minutes" -- Buffalo calls the slot "Proceedings" and could never
+match. The old pattern also accepted `FileView.ashx`, a spelling that exists
+on none of the live sites. One city went from zero to 69 fillable.
+
+**OnBase was dropping meetings, not just minutes.** Its meeting regex could
+not cross a closing brace, so any meeting whose payload carried a populated
+media object failed to parse and vanished, 74 of 198 on one city, precisely
+the council meetings with video. Scanning is now brace-balanced. It also
+ignored `IsMinutesAvailable` and `MinutesUniqueName` in JSON it already
+parsed, which is the only surface on sites that render their document links
+client-side.
+
+**Minutes discovery audited across every adapter.** Findings acted on this
+pass: PrimeGov missed Los Angeles entirely because that city calls its
+minutes the Journal, and it took the first template match, which put a
+one-kilobyte HTML stub in 372 rows that each had a PDF under the same
+template id; selection is now ranked by format. CivicClerk matched the type
+string "Minutes" exactly, so Greenville's "Approved Minutes" and Travis
+County's "Minutes Packet" were invisible; drafts are accepted only when
+nothing else is offered. Destiny required the literal folder "mindocs/" when
+the real path is "{prefix}docs/", so it worked on exactly one city by
+coincidence. Municode read MinutesLinksURL off list.json, which carries
+fifteen keys and no links at all, while `_fetch_meeting_details` sat unused
+with the real links in details.json; it is now called.
+
+Still open from that audit, in order of size: Legistar's API path never
+checks the `View.ashx?M=M` link the HTML calendar exposes, and 35 sampled
+cities show 3,196 past meetings with those links against 199 filled. IQM2
+reads the portal home page, whose past list is about three days deep, rather
+than the archive calendar, and filters minutes by label text instead of the
+document type slot. OnBase ignores IsMinutesAvailable and MinutesUniqueName
+in JSON it already parses, and its meeting regex cannot cross a closing
+brace, so meetings carrying a Media object are dropped outright. Municode's
+listing returns nothing for a past window at all, which is why the details
+fix cannot yet be measured. 32 of 144 CivicPlus subdomains now NXDOMAIN,
+which breaks agendas as well as minutes.
+
+**Three adapters that reported no minutes actually have them.** All three
+blocking claims in the code were wrong, verified against live portals.
+NovusAgenda already advertised support and matched markup that exists on
+none of 13 portals, so the sweep counted it as covered and found nothing;
+the real anchor is `DisplayAgendaPDF.ashx?MinutesMeetingID=`. Its ids must
+never be synthesized: Sunrise returns HTTP 200 with an application/pdf
+content type over an ASP.NET error page, so only the anchor's presence is
+trustworthy. CivicWeb's docstring said minutes were unreachable and named
+Hudson as verified; Hudson publishes them, and the SPA's own unauthenticated
+service at `/Services/MeetingsService.svc/meetings/{id}/meetingDocuments`
+lists them by document type. CivicEngage keeps minutes in a parallel archive
+category that category discovery deliberately discarded; pairing is by body
+name and date, with a study-session qualifier because one city holds two
+meetings a day, and an ambiguous pair is dropped rather than guessed.
+Verified live: Evanston, Elgin and Plano all return real minutes PDFs.
+
+**Minutes votes are live.** `scripts/parse_minutes_votes.py --apply` over the
+reservoir: 7,777 per-member vote rows across 294 meetings, 975 matters and
+1,316 officials, plus 2,593 appearance outcomes. Cities with any vote record
+went from 157 to 277; 144 of them have votes only because the minutes were
+parsed, spread over nine vendors (CivicClerk 49 cities, Legistar 30,
+Granicus 26, CivicPlus 18). Attribution method rides on every row:
+named 3,842, unanimous-against-attendance 2,765, per-city driver 1,170.
+Officials named only by the minutes are created with metadata source=minutes
+(2,160 of them).
+
+**Guards the audit forced.** Sampling published votes against their source
+passage caught six ways to publish a true-looking lie, each now a rule and a
+test: a motion moved by someone absent from the roster in play (a packet
+holding two bodies' minutes) abstains; motions to adjourn or reconvene are
+not votes on the preceding item; section headings and minutes-approval items
+are not vote targets; a block ends at the next all-caps heading unless that
+line is itself the vote record; "DEEMED NAY" and similar dissent labels are
+read, so a recorded dissent cannot vanish into a unanimous tally; and
+sentence debris ("for the vote", "Ron Leino. Motion") is no longer a name.
+Fixed in passing: `update_member_metadata` double-encoded its dict against
+the pool's jsonb codec, turning `{}` || value into an array; 2,161 rows
+repaired.
+
 **Historical relink.** `scripts/relink_vendor_keyed_items.py` moved 4,178
 vendor-keyed items (Las Vegas, Long Beach, Oklahoma City lead) onto 2,811
 cited-identifier matters, 501 of them merging several per-agenda GUID

@@ -20,6 +20,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
+from vendors.utils.documents import DocumentCandidate, looks_like_minutes, pick_document_url
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from vendors.adapters.html_attrs import string_attr, string_list_attr
 from pipeline.protocols import MetricsCollector
@@ -83,6 +84,9 @@ _PLACEHOLDER_BODY = re.compile(
     r"|attachments\s*\|\s*public comments)\.?$",
     re.IGNORECASE,
 )
+
+
+_ESCRIBE_MINUTES_TYPES = ("Minutes", "PostMinutes", "MinutesWithAttachments")
 
 
 class AsyncEscribeAdapter(AsyncBaseAdapter):
@@ -241,20 +245,33 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
 
         # Minutes ride the same payload; Type is "PostMinutes" on some sites,
         # "Minutes" on others. Never eligible for packet/agenda selection above.
-        minutes_url = None
-        if isinstance(doc_links, list):
-            for doc in doc_links:
-                if not isinstance(doc, dict) or doc.get("Type") not in ("Minutes", "PostMinutes"):
+        # Typed minutes first. MinutesWithAttachments is the same record with
+        # its exhibits, and some sites file minutes under no type at all --
+        # Cape Coral posts a document literally named Minutes.pdf in
+        # AdditionalDocuments and declares no minutes type on any meeting --
+        # so an untyped document whose own name says minutes is accepted when
+        # nothing typed exists.
+        typed = []
+        untyped = []
+        for source in (doc_links, meeting_json.get("AdditionalDocuments")):
+            if not isinstance(source, list):
+                continue
+            for doc in source:
+                if not isinstance(doc, dict) or not doc.get("Url"):
                     continue
-                if not doc.get("Url"):
-                    continue
-                if doc.get("Format") == ".pdf":
-                    minutes_url = doc["Url"]
-                    break
-                if not minutes_url:
-                    minutes_url = doc["Url"]
-            if minutes_url and not minutes_url.startswith("http"):
-                minutes_url = urljoin(self.base_url, minutes_url)
+                url = doc["Url"]
+                if not url.startswith("http"):
+                    url = urljoin(self.base_url, url)
+                doc_type = doc.get("Type") or ""
+                label = f"{doc_type} {doc.get('Title') or ''} {doc.get('Name') or ''}".strip()
+                candidate = DocumentCandidate(
+                    url=url, label=label, document_format=doc.get("Format")
+                )
+                if doc_type in _ESCRIBE_MINUTES_TYPES:
+                    typed.append(candidate)
+                elif looks_like_minutes(label) or looks_like_minutes(url.rsplit("/", 1)[-1]):
+                    untyped.append(candidate)
+        minutes_url = pick_document_url(typed or untyped)
 
         result = {
             "vendor_id": vendor_id,

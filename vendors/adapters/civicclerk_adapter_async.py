@@ -18,6 +18,10 @@ from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from pipeline.protocols import MetricsCollector
 
 
+_MINUTES_TYPE_RE = re.compile(r"\bminutes\b", re.IGNORECASE)
+_DRAFT_RE = re.compile(r"\bdraft|unapproved|unofficial\b", re.IGNORECASE)
+
+
 class AsyncCivicClerkAdapter(AsyncBaseAdapter):
     """Async adapter for cities using CivicClerk platform"""
 
@@ -154,10 +158,19 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
 
         # Post-meeting minutes are published alongside agenda files;
         # GetMeetingFileStream serves the document directly.
-        minutes_doc = next(
-            (doc for doc in event.get("publishedFiles", [])
-             if doc.get("type") == "Minutes" and doc.get("fileId")),
-            None,
+        # Tenants name the type themselves: greenvillesc publishes "Approved
+        # Minutes", traviscotx "Minutes Packet". An exact match on "Minutes"
+        # silently covered neither. Draft is accepted only when nothing else
+        # is offered, and "summary of action" stays out: it is a different
+        # document, not another name for the minutes.
+        minutes_docs = [
+            doc for doc in event.get("publishedFiles", [])
+            if doc.get("fileId") and _MINUTES_TYPE_RE.search(doc.get("type") or "")
+        ]
+        minutes_doc = min(
+            minutes_docs,
+            key=lambda doc: 1 if _DRAFT_RE.search(doc.get("type") or "") else 0,
+            default=None,
         )
         if minutes_doc:
             result["minutes_url"] = self._build_packet_url(minutes_doc)

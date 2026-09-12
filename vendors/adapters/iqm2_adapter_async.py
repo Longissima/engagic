@@ -11,10 +11,17 @@ from datetime import datetime
 from urllib.parse import urljoin
 import aiohttp
 
+from vendors.adapters.html_attrs import string_attr
+from vendors.utils.documents import DocumentCandidate, looks_like_minutes, pick_document_url
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
 from vendors.adapters.html_attrs import string_attr
 from pipeline.protocols import MetricsCollector
 from bs4 import BeautifulSoup
+
+
+# Minutes are document slot Type=12 in FileOpen/FileView URLs.
+_IQM2_MINUTES_SLOT_RE = re.compile(r"[?&]Type=12(?![0-9])", re.IGNORECASE)
+_IQM2_DOCUMENT_RE = re.compile(r"File(?:Open|View)\.(?:aspx|ashx)", re.IGNORECASE)
 
 
 class AsyncIQM2Adapter(AsyncBaseAdapter):
@@ -26,14 +33,25 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
         super().__init__(city_slug, vendor="iqm2", metrics=metrics)
         self.base_url = f"https://{self.slug}.iqm2.com"
 
-        # Try multiple calendar URL patterns (IQM2 sites vary)
+        # Try multiple calendar URL patterns (IQM2 sites vary). The bare
+        # /Citizens home page lists only about three days of past meetings,
+        # so it is last: a back-window of any size is inert against it. The
+        # archive is Calendar.aspx with an explicit From/To range, which the
+        # caller fills in per request.
         self.calendar_url_patterns = [
-            f"{self.base_url}/Citizens",
             f"{self.base_url}/Citizens/Calendar.aspx",
             f"{self.base_url}/Citizens/Default.aspx",
+            f"{self.base_url}/Citizens",
         ]
 
         logger.info("initialized async IQM2 adapter", vendor="iqm2", slug=self.slug)
+
+    def _calendar_urls(self, start_date, end_date) -> List[str]:
+        """Listing URLs for a date range, archive form first."""
+        span = f"From={start_date.strftime('%m/%d/%Y')}&To={end_date.strftime('%m/%d/%Y')}"
+        urls = [f"{self.base_url}/Citizens/Calendar.aspx?{span}"]
+        urls.extend(u for u in self.calendar_url_patterns if u not in urls)
+        return urls
 
     def _dedupe_attachments(self, attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Deduplicate attachments by file ID extracted from URL.
@@ -62,17 +80,27 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
     def _extract_row_minutes_url(self, row) -> Optional[str]:
         """Extract the minutes document URL from a calendar listing row.
 
-        Only FileOpen.aspx/FileView.ashx hrefs are documents; "Minutes" links
-        that point at Detail_Meeting.aspx are viewer pages and are skipped.
+        Minutes are document slot ``Type=12``. Matching on the link's words
+        instead missed every city that labels the slot something else --
+        Buffalo calls it "Proceedings" -- and the old pattern also accepted
+        ``FileView.ashx``, a spelling that appears on none of the live sites
+        (the real one is ``FileView.aspx``). The slot number is the portal's
+        own identifier and does not vary with local vocabulary.
         """
+        candidates = []
         for link in row.find_all("a", href=True):
-            if "minutes" not in link.get_text(strip=True).lower():
-                continue
             href = link["href"]
-            if href and re.search(r"File(?:Open\.aspx|View\.ashx)", href, re.IGNORECASE):
-                # Row hrefs are relative to the /Citizens/ calendar pages
-                return urljoin(f"{self.base_url}/Citizens/", href)
-        return None
+            if not href or not _IQM2_DOCUMENT_RE.search(href):
+                continue
+            label = f"{link.get_text(strip=True)} {string_attr(link, 'title')}"
+            if _IQM2_MINUTES_SLOT_RE.search(href) or looks_like_minutes(label):
+                candidates.append(
+                    DocumentCandidate(
+                        url=urljoin(f"{self.base_url}/Citizens/", href),
+                        label=label,
+                    )
+                )
+        return pick_document_url(candidates)
 
     async def _fetch_meetings_impl(
         self, days_back: int = 14, days_forward: int = 28
@@ -83,7 +111,8 @@ class AsyncIQM2Adapter(AsyncBaseAdapter):
         working_url = None
         meeting_rows = []
 
-        for calendar_url in self.calendar_url_patterns:
+        window_start, window_end = self._date_range(days_back, days_forward)
+        for calendar_url in self._calendar_urls(window_start, window_end):
             try:
                 logger.info("trying calendar URL", vendor="iqm2", slug=self.slug, url=calendar_url)
                 response = await self._get(calendar_url)

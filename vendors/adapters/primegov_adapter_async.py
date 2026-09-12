@@ -7,6 +7,7 @@ Cities using PrimeGov: Palo Alto CA, Mountain View CA, Sunnyvale CA, and many ot
 from datetime import datetime
 from typing import Any, Dict, List, Optional, cast
 from urllib.parse import urlencode
+import re
 import asyncio
 import aiohttp
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
@@ -33,6 +34,12 @@ _AGENDA_KEYWORD_PRIORITY = [
     ("agenda", "agenda"),
     ("packet", "packet"),
 ]
+
+
+# "Minutes", "HTML Minutes", "Journal" (Los Angeles), "Journal of Proceedings".
+_MINUTES_TEMPLATE_RE = re.compile(r"minute|journal", re.IGNORECASE)
+# compileOutputType: 1 PDF, 2 DOCX, 3 HTML.
+_MINUTES_FORMAT_RANK = {1: 0, 2: 1, 3: 2}
 
 
 class AsyncPrimeGovAdapter(AsyncBaseAdapter):
@@ -104,16 +111,26 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         return None
 
     def _find_minutes_doc(self, document_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Find a compiled Minutes document by template name.
+        """Best compiled minutes document, by name and then by format.
 
         Separate from _find_packet_doc on purpose -- packet selection
         (first doc with compileOutputType) must stay untouched.
+
+        A meeting does not have one minutes document, it has two to four
+        representations of one. Taking the first match put an HTML stub of
+        about a kilobyte into 372 rows that each had a real PDF under the
+        same template id, so candidates are ranked: compileOutputType 1 is
+        the PDF, 3 the HTML viewer, 2 the DOCX.
+        Los Angeles calls its minutes the Journal.
         """
-        for doc in document_list:
-            name = (doc.get("templateName") or "").lower()
-            if "minute" in name and doc.get("compileOutputType"):
-                return doc
-        return None
+        candidates = [
+            doc for doc in document_list
+            if doc.get("compileOutputType")
+            and _MINUTES_TEMPLATE_RE.search(doc.get("templateName") or "")
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda doc: _MINUTES_FORMAT_RANK.get(doc.get("compileOutputType"), 9))
 
     async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from PrimeGov API (upcoming + archived concurrently)."""

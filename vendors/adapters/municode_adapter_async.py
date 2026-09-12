@@ -71,6 +71,24 @@ class _CurlCffiResponse:
         return self._resp.content
 
 
+def _first_document_url(links: Any, fields: tuple) -> Optional[str]:
+    """First usable URL in a details.json link list, PDF field preferred."""
+    if not isinstance(links, list):
+        return None
+    for entry in links:
+        if not isinstance(entry, dict):
+            continue
+        for field in fields:
+            value = entry.get(field)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+    return None
+
+
+# Numbered PublishPage pages to walk when p=-1 is refused.
+MAX_PUBLISH_PAGES = 12
+
+
 class AsyncMunicodeAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Municode platform."""
 
@@ -433,8 +451,12 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         soup = BeautifulSoup(html, "html.parser")
         meetings: List[Dict[str, Any]] = []
 
-        table = soup.find("table", class_="views-table")
-        if not table:
+        # A Drupal meetings page carries several views-table blocks -- the
+        # upcoming list first, the archive below it. Taking the first one read
+        # only upcoming meetings, so a back-window returned nothing. Parse
+        # every table and let the caller's date filter decide.
+        tables = soup.find_all("table", class_="views-table")
+        if not tables:
             return []
 
         def find_by_prefix(cell_map: Dict[str, Any], *prefixes: str) -> Any:
@@ -444,7 +466,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                         return cell
             return None
 
-        for row in table.find_all("tr"):
+        for row in [r for t in tables for r in t.find_all("tr")]:
             cells = row.find_all("td")
             if not cells:
                 continue
@@ -686,28 +708,55 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             for ppid in ppids:
                 base_publish_url = f"{self.base_url}/PublishPage/index?cid={self.city_code}&ppid={ppid}"
 
-                # p=-1 fetches all meetings, but some ppids 500 on it -- fall back to p=1
-                html = None
-                for page_param in ["-1", "1"]:
+                # p=-1 asks for every meeting at once. Some ppids answer it
+                # with a 500, and the old fallback took page 1 and stopped --
+                # page 1 is the newest page only, so a back-window could never
+                # see the archive. When p=-1 fails, walk numbered pages until
+                # one yields nothing new.
+                async def fetch_page(page_param: str) -> Optional[str]:
                     url = f"{base_publish_url}&p={page_param}"
                     try:
                         response = await self._get(url)
-                        html = await response.text()
-                        # Sanity: error pages can return 200 with "Sorry, something went wrong";
-                        # treat them as failures to trigger fallback.
-                        if "Friendly Error Page" in html or "Sorry, something went wrong" in html:
-                            html = None
-                            continue
-                        break
+                        page_html = await response.text()
                     except Exception as e:
-                        logger.debug("publish page param failed, trying next", vendor="municode", slug=self.slug, ppid=ppid, p=page_param, error=str(e))
+                        logger.debug(
+                            "publish page param failed",
+                            vendor="municode", slug=self.slug, ppid=ppid,
+                            p=page_param, error=str(e),
+                        )
+                        return None
+                    # Error pages return 200 with a friendly message.
+                    if "Friendly Error Page" in page_html or "Sorry, something went wrong" in page_html:
+                        return None
+                    return page_html
 
-                if not html:
+                ppid_meetings: List[Dict[str, Any]] = []
+                html = await fetch_page("-1")
+                if html:
+                    ppid_meetings = await asyncio.to_thread(self._parse_publish_page_html, html)
+                else:
+                    seen_keys: set = set()
+                    for page_number in range(1, MAX_PUBLISH_PAGES + 1):
+                        page_html = await fetch_page(str(page_number))
+                        if not page_html:
+                            break
+                        page_meetings = await asyncio.to_thread(
+                            self._parse_publish_page_html, page_html
+                        )
+                        fresh = [
+                            m for m in page_meetings
+                            if (m.get("vendor_id"), m.get("start")) not in seen_keys
+                        ]
+                        if not fresh:
+                            break
+                        seen_keys.update((m.get("vendor_id"), m.get("start")) for m in fresh)
+                        ppid_meetings.extend(fresh)
+
+                if not ppid_meetings:
                     logger.warning("publish page attempts failed for ppid", vendor="municode", slug=self.slug, ppid=ppid)
                     continue
 
-                meetings = await asyncio.to_thread(self._parse_publish_page_html, html)
-                all_meetings.extend(meetings)
+                all_meetings.extend(ppid_meetings)
 
             if not all_meetings:
                 logger.error("all publish page attempts failed", vendor="municode", slug=self.slug, ppid_count=len(ppids))
@@ -1009,8 +1058,26 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         packet_url = meeting.get("PacketLinksURL") or meeting.get("PacketLinksHtmlURL")
         agenda_api_url = meeting.get("AgendaLinksHtmlURL") or meeting.get("AgendaLinksURL")
 
-        # Minutes when the API exposes them (PDF first, HTML viewer fallback)
+        # Minutes when the API exposes them (PDF first, HTML viewer fallback).
+        #
+        # list.json carries no URL fields at all -- fifteen keys, none of them
+        # a link -- so these two reads could only ever return None, and the
+        # vendor showed as publishing almost no minutes. details.json is where
+        # the links live, under MinutesLinks[]. _fetch_meeting_details existed
+        # for this and had no caller.
         minutes_url = meeting.get("MinutesLinksURL") or meeting.get("MinutesLinksHtmlURL")
+        if not minutes_url:
+            details = await self._fetch_meeting_details(meeting_id)
+            # details.json wraps the record: {"Meetings": [ {...} ], "errors": []}
+            detail_meetings = (details or {}).get("Meetings") or []
+            detail = detail_meetings[0] if detail_meetings else {}
+            minutes_url = _first_document_url(
+                detail.get("MinutesLinks"),
+                ("MinutesLinksURL", "URL"),
+            ) or _first_document_url(
+                detail.get("MinutesLinksHtml"),
+                ("MinutesLinksHtmlURL", "HtmlURL"),
+            )
         if minutes_url:
             result["minutes_url"] = minutes_url
 

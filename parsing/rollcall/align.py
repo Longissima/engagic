@@ -161,24 +161,69 @@ _BREAK_RE = re.compile(
 _CAPS_HEADING_RE = re.compile(r"^[ \t]*(?=[^a-z\n]*[A-Z])[A-Z0-9 .()\-&/',:]{4,60}$", re.MULTILINE)
 
 
-def _caps_heading(text: str, start: int, end: int) -> Optional[int]:
+# Our own extractor stamps a page separator into the corpus text it writes
+# (parsing/pdf.py). It is short, all-caps and built from the same characters
+# as a section heading, so the heading rule below read every page break as a
+# new section: an item heading on one page lost the motion printed on the
+# next. Measured on 142 minutes documents, this accounted for 306 of 638
+# early block ends and discarded real vote evidence 74 times.
+#
+# The marker is skipped in place rather than stripped from the text, because
+# published votes carry byte-offset receipts into exactly this string and
+# rewriting it would invalidate every one of them.
+_PAGE_MARKER_RE = re.compile(r"^[ \t]*-{2,}\s*PAGE\s+\d+\s*-{2,}[ \t]*$")
+
+# A caps line that announces the vote itself is scaffolding around the motion,
+# not a new section. "D. MOTION" and "VOTE:" were each cutting an item away
+# from the vote printed directly beneath them.
+_VOTE_SCAFFOLD_RE = re.compile(
+    r"^[ \t]*(?:[A-Z0-9]{1,4}[.)]\s*)?(?:MOTION|VOTE|ROLL\s*CALL\s*VOTE|RECORDED\s+VOTE)\b[ \t]*:?[ \t]*$",
+    re.IGNORECASE,
+)
+
+
+def _repeated_lines(text: str, threshold: int = 3) -> frozenset:
+    """Lines a document repeats are running headers, not section headings.
+
+    Letterhead reprinted on every page ("CITY OF MARLBOROUGH") is typeset in
+    capitals and otherwise identical to a heading. A real section heading
+    appears once. Counting is done per document and cached by the caller.
+    """
+    counts: Dict[str, int] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if len(stripped) >= 4:
+            counts[stripped] = counts.get(stripped, 0) + 1
+    return frozenset(line for line, n in counts.items() if n >= threshold)
+
+
+def _caps_heading(
+    text: str, start: int, end: int, furniture: frozenset = frozenset()
+) -> Optional[int]:
     """First all-caps heading in the range that is not itself vote evidence.
 
     Clerks print the record in capitals too ("RESULT: APPROVED BY UNANIMOUS
     CONSENT", "NAYS: NONE"); cutting there would sever every block from the
-    vote it exists to carry.
+    vote it exists to carry. Our own page separator, the labels that announce
+    a vote, and any line the document repeats are likewise not headings.
     """
     for match in _CAPS_HEADING_RE.finditer(text, start, end):
         line = match.group(0)
         if CATEGORY_LINE_RE.match(line) or RESULT_RE.search(line):
             continue
+        if _PAGE_MARKER_RE.match(line) or _VOTE_SCAFFOLD_RE.match(line):
+            continue
+        if line.strip() in furniture:
+            continue
         return match.start()
     return None
 
 
-def _first_break(text: str, start: int, end: int) -> Optional[int]:
+def _first_break(
+    text: str, start: int, end: int, furniture: frozenset = frozenset()
+) -> Optional[int]:
     cuts = [m.start() for m in (_BREAK_RE.search(text, start, end),) if m]
-    caps = _caps_heading(text, start, end)
+    caps = _caps_heading(text, start, end, furniture)
     if caps is not None:
         cuts.append(caps)
     return min(cuts) if cuts else None
@@ -188,6 +233,7 @@ def blocks(text: str, anchors: List[Anchor]) -> List[Dict[str, Any]]:
     """[{item, start, end, rung}] covering each anchored item to the next
     anchor or the next section heading, whichever comes first."""
     out = []
+    furniture = _repeated_lines(text)
     for i, anchor in enumerate(anchors):
         end = anchors[i + 1].start if i + 1 < len(anchors) else len(text)
         # Skip past the anchor's own line so its heading never ends its block.
@@ -195,7 +241,7 @@ def blocks(text: str, anchors: List[Anchor]) -> List[Dict[str, Any]]:
         if body == -1 or body >= end:
             out.append({"item": anchor.item, "start": anchor.start, "end": end, "rung": anchor.rung})
             continue
-        cut = _first_break(text, body + 1, end)
+        cut = _first_break(text, body + 1, end, furniture)
         if cut is not None:
             end = cut
         out.append({"item": anchor.item, "start": anchor.start, "end": end, "rung": anchor.rung})

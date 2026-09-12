@@ -98,6 +98,21 @@ def map_matter_status(raw: Optional[str]) -> Optional[str]:
     return _MATTER_STATUS_MAP.get(" ".join(raw.split()).lower())
 
 
+# The InSite calendar's year filter, and the option that lifts its window.
+_YEARS_CONTROL = "ctl00$ContentPlaceHolder1$lstYears"
+_ALL_YEARS = "All Years"
+_ASP_STATE_FIELDS = ("__VIEWSTATE", "__VIEWSTATEGENERATOR", "__EVENTVALIDATION")
+# Back-window beyond which the narrow default view cannot answer the request.
+WIDE_CALENDAR_DAYS = 45
+
+
+def _hidden_field(html: str, name: str) -> str:
+    match = re.search(
+        r'name="%s"[^>]*value="([^"]*)"' % re.escape(name), html
+    ) or re.search(r'id="%s"[^>]*value="([^"]*)"' % re.escape(name), html)
+    return match.group(1) if match else ""
+
+
 class AsyncLegistarAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Legistar platform."""
 
@@ -149,7 +164,55 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             meetings = await self._fetch_meetings_html(days_back, days_forward)
         else:
             logger.info("legistar API success", slug=self.slug, count=len(meetings))
+            meetings = await self._merge_html_minutes(meetings, days_back, days_forward)
 
+        return meetings
+
+    async def _merge_html_minutes(
+        self, meetings: List[Dict[str, Any]], days_back: int, days_forward: int
+    ) -> List[Dict[str, Any]]:
+        """Fill minutes the API omits from the InSite calendar's own links.
+
+        EventMinutesFile is internally consistent with the API's publish
+        timestamps, but it does not reflect what the public portal shows:
+        Bellevue's API declares 2 minutes files where the calendar carries 69
+        View.ashx?M=M links, Charlotte 0 against 55. The API path was
+        authoritative and never consulted the HTML, so for every city whose
+        API answers at all, those links were unreachable.
+
+        Additive only. An API-supplied minutes URL is never replaced, and a
+        failure here leaves the API result untouched.
+        """
+        missing = [m for m in meetings if not m.get("minutes_url")]
+        if not missing:
+            return meetings
+        try:
+            html_meetings = await self._fetch_meetings_html(days_back, days_forward)
+        except (VendorHTTPError, aiohttp.ClientError) as e:
+            logger.debug("legistar html minutes merge skipped", slug=self.slug, error=str(e))
+            return meetings
+        by_id = {
+            str(m.get("vendor_id")): m.get("minutes_url")
+            for m in html_meetings
+            if m.get("vendor_id") and m.get("minutes_url")
+        }
+        by_start = {
+            (m.get("start"), (m.get("title") or "").strip().casefold()): m.get("minutes_url")
+            for m in html_meetings
+            if m.get("start") and m.get("minutes_url")
+        }
+        filled = 0
+        for meeting in missing:
+            url = by_id.get(str(meeting.get("vendor_id")))
+            if not url:
+                url = by_start.get(
+                    (meeting.get("start"), (meeting.get("title") or "").strip().casefold())
+                )
+            if url:
+                meeting["minutes_url"] = url
+                filled += 1
+        if filled:
+            logger.info("legistar minutes merged from html", slug=self.slug, filled=filled)
         return meetings
 
     def _api_items_are_garbage(self, meetings: List[Dict[str, Any]]) -> bool:
@@ -920,6 +983,51 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             logger.warning("XML parsing error for sponsors", error=str(e))
             return []
 
+    async def _widen_calendar(self, url: str, html: str) -> Optional[str]:
+        """Re-request the calendar with its year filter set to All Years.
+
+        InSite's Calendar.aspx defaults to a narrow view -- often the current
+        month -- so a back-window of any size reads the same handful of rows.
+        The year control is an ASP.NET postback, not a query parameter, so
+        widening means replaying the page's own form. San Jose goes from a
+        default view to 159 meeting rows this way.
+
+        Only for genuine back-windows: a routine sync looks back two weeks and
+        should not pull a megabyte per city. Returns None on any failure, so
+        the caller keeps the narrow page rather than losing the city.
+        """
+        fields = {name: _hidden_field(html, name) for name in _ASP_STATE_FIELDS}
+        if not fields.get("__VIEWSTATE"):
+            return None
+        fields.update({
+            "__EVENTTARGET": _YEARS_CONTROL,
+            "__EVENTARGUMENT": "",
+            _YEARS_CONTROL: _ALL_YEARS,
+            f"{_YEARS_CONTROL.replace('$', '_')}_ClientState": json.dumps(
+                {"logEntries": [], "value": _ALL_YEARS, "text": _ALL_YEARS,
+                 "enabled": True, "checkedIndices": [], "checkedItemsTextOverflows": False}
+            ),
+        })
+        try:
+            response = await self._post(
+                url,
+                data=fields,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "Referer": url},
+            )
+            widened = await response.text()
+        except (VendorHTTPError, aiohttp.ClientError) as e:
+            logger.debug("legistar calendar widening failed", slug=self.slug, error=str(e))
+            return None
+        if len(widened) <= len(html):
+            return None
+        logger.info(
+            "legistar calendar widened",
+            slug=self.slug,
+            narrow_bytes=len(html),
+            wide_bytes=len(widened),
+        )
+        return widened
+
     async def _fetch_meetings_html(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings by scraping HTML calendar (fallback)."""
         # Try common Legistar calendar URL patterns
@@ -934,6 +1042,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             try:
                 response = await self._get(url)
                 html = await response.text()
+                if days_back > WIDE_CALENDAR_DAYS:
+                    html = await self._widen_calendar(url, html) or html
                 # Parse HTML in thread pool (BeautifulSoup is CPU-bound)
                 soup = await asyncio.to_thread(self._parse_html, html)
                 calendar_url = url

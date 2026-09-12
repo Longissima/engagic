@@ -56,18 +56,28 @@ RESULT_RE = re.compile(
     r"|(?:carried|passed|failed|prevailed)\s+by\s+the\s*following\s*vote"
     r"|(?:this|the)\s+\w+\s+was\s+(?:adopted|approved|passed|placed\s+on\s+file|referred|held|denied)"
     r"|vote[sd]?\s*[:\-–]?\s*\d{1,2}\s*[-–/]\s*\d{1,2}"
+    # "Motion/second to approve by Commissioners Fuller/McCord carried 6-0":
+    # the result word is nowhere near the word motion, the tally is the anchor.
+    r"|(?:carried|passed|failed|approved|adopted|denied)\s+\(?\d{1,2}\s*[-–/]\s*\d{1,2}"
+    # A bare disposition on its own line, closing an Ayes/Nays/Abstain block
+    # (Clinton Township). Anchored to the line start so the word cannot be
+    # picked out of running prose.
+    r"|^[ \t]*(?:passed|failed|adopted|approved|denied|carried)[ \t]*\.?[ \t]*$"
     r"|result\s*:\s*(?:passed|failed|adopted|approved|denied|carried)"
     # "unanimous" only counts beside a vote word; "the unanimous request of
     # the Board" is prose, not a roll call.
     r"|(?:carried|passed|approved|adopted|voted|voting\s*:?|vote\s*:?)\s+unanimous(?:ly)?"
     r"|unanimous(?:ly)?\s+(?:carried|passed|approved|adopted|vote)"
     r")",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 _FAIL_RE = re.compile(r"\b(?:failed|defeated|denied|did\s+not\s+(?:carry|pass))\b", re.IGNORECASE)
 _PASS_RE = re.compile(r"\b(?:carried|passed|prevailed|approved|adopted|unanimous(?:ly)?|placed\s+on\s+file|referred|held)\b", re.IGNORECASE)
 TALLY_RE = re.compile(
-    r"(?<![\d./-])(?P<yes>\d{1,2})\s*(?:[-–/]|\bto\b)\s*(?P<no>\d{1,2})(?:\s*[-–/]\s*(?P<third>\d{1,2}))?(?![\d./-])",
+    # The trailing guard rejects a longer number or a decimal continuation
+    # ("6-0.5"), but a sentence-ending period is not one ("carried 5-0.").
+    r"(?<![\d./-])(?P<yes>\d{1,2})\s*(?:[-–/]|\bto\b)\s*(?P<no>\d{1,2})"
+    r"(?:\s*[-–/]\s*(?P<third>\d{1,2}))?(?!\d|[./-]\d)",
     re.IGNORECASE,
 )
 # Who moved and seconded. Used as a cheap membership check: a motion moved by
@@ -78,10 +88,15 @@ TALLY_RE = re.compile(
 _MOVER_RE = re.compile(
     r"(?i:motion\s+(?:was\s+)?(?:made\s+)?by|(?:it\s+was\s+)?moved\s+by|on\s+a\s+motion\s+(?:of|by)"
     r"|motion\s+offered\s+by|motion\s+of|duly\s+seconded\s+by|seconded\s+by|second\s+by|supported\s+by)"
-    r"\s+(?P<name>[A-Z][A-Za-z.'\u2019-]*(?:\s+[A-Z][A-Za-z.'\u2019-]*){0,3})",
+    # A lowercase office word may sit between the title and the surname
+    # ("Council member Lewis", "Board Member Smith").
+    r"\s+(?P<name>[A-Z][A-Za-z'\u2019-]*\.?(?:\s+(?:member|members|president|chair|pro\s+tem))?"
+    r"(?:\s+[A-Z][A-Za-z'\u2019-]*\.?){0,3})",
 )
-# "X moved, seconded by Y" / "Lokensgard moved, seconded by Vargas"
-_MOVED_SUFFIX_RE = re.compile(r"\b(?P<name>[A-Z][A-Za-z.'\u2019-]+(?:\s+[A-Z][A-Za-z.'\u2019-]+)?)\s+moved\b")
+# "X moved, seconded by Y" / "Councilmember Morris seconded the motion"
+_MOVED_SUFFIX_RE = re.compile(
+    r"\b(?P<name>[A-Z][A-Za-z'\u2019-]+(?:\s+[A-Z][A-Za-z'\u2019-]+){0,2})\s+(?:moved|seconded)\b"
+)
 _PROCEDURAL_MOTION_RE = re.compile(
     r"\bto\s+(?:adjourn|recess|reconvene|return\s+to\s+open\s+session|go\s+into\s+(?:closed|executive)\s+session)\b"
     r"|\bthe\s+(?:meeting|board|committee|council)\s+be\s+adjourned\b|\badjournment\b",

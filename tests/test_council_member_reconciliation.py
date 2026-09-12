@@ -237,9 +237,17 @@ async def test_record_vote_corrects_conflict_without_incrementing_count():
     assert query.startswith("UPDATE votes SET vote = $4")
     assert "vote IS DISTINCT FROM $4" in query
     assert "UPDATE council_members" not in query
+    # The trailing arguments carry the motion grain: index, then the
+    # provenance fields a minutes-sourced correction fills and an
+    # API-sourced one leaves alone.
     assert args[3:] == (
         "no",
         datetime(2026, 3, 1),
         4,
         {"corrected": True},
+        0,
+        None,
+        None,
+        None,
+        None,
     )

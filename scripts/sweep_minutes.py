@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import re
 import asyncio
 import sys
 from pathlib import Path
@@ -75,9 +76,56 @@ MEETING_STATE_SQL = """
 # a different id (20% of a 2026-09-11 sweep). Same city, same start datetime,
 # still unfilled, exactly one row: that is the meeting.
 FALLBACK_SQL = """
-    SELECT id FROM meetings
+    SELECT id, title FROM meetings
     WHERE banana = $1 AND date = $2 AND minutes_url IS NULL
 """
+
+# Dry-run diagnostics only: every meeting the city holds at that instant,
+# filled or not, so a miss can be told apart from an already-filled row and
+# from a genuinely unsynced meeting.
+FALLBACK_DIAGNOSTIC_SQL = """
+    SELECT id, title, date, date = $2 AS exact_instant,
+           minutes_url IS NOT NULL AS filled
+    FROM meetings WHERE banana = $1 AND date::date = $2::date
+"""
+
+_TITLE_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+_TITLE_NOISE = {
+    "meeting", "meetings", "regular", "special", "city", "county", "town",
+    "village", "board", "committee", "commission", "council", "session",
+    "the", "and", "of", "for", "adjourned", "rescheduled", "cancelled",
+    "canceled", "start", "time", "times", "note", "revised", "amended",
+    "continued", "reconvened", "rescheduled",
+}
+
+
+def title_key(title: str) -> frozenset:
+    """Significant words of a meeting title, for same-meeting confirmation.
+
+    Listings rename meetings after the fact ("* Special Start Time"), which is
+    what breaks id parity in the first place, so the comparison has to survive
+    added qualifiers while still separating two different bodies meeting at
+    the same instant.
+    """
+    words = {w.lower() for w in _TITLE_WORD_RE.findall(title or "")}
+    return frozenset(words - _TITLE_NOISE)
+
+
+def titles_agree(listing: str, stored: str) -> bool:
+    """True when the two titles cannot be naming different bodies.
+
+    Both generic ("City Council Regular Meeting" against the same with a
+    start-time note) counts as agreement. One naming a body the other never
+    mentions does not, even though the empty set is trivially a subset: that
+    is exactly the planning-commission-versus-council confusion this guard
+    exists to prevent.
+    """
+    a, b = title_key(listing), title_key(stored)
+    if not a and not b:
+        return True
+    if not a or not b:
+        return False
+    return a <= b or b <= a
 
 
 def vendor_streams(city_row) -> list[tuple[str, str]]:
@@ -94,6 +142,8 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
     counts = {"fetched": 0, "with_minutes": 0, "would_fill": 0, "filled": 0,
               "enqueued": 0, "already_set": 0,
               "id_miss": 0, "id_fallback": 0, "fetch_failed": 0,
+              "miss_no_meeting_that_day": 0, "miss_time_drift": 0, "miss_title_disagrees": 0, "miss_ambiguous": 0,
+              "miss_already_filled": 0, "miss_recoverable": 0, "miss_no_date": 0,
               "unsupported": 0}
 
     for vendor, slug in vendor_streams(city_row):
@@ -160,6 +210,26 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                     existing = await conn.fetchrow(MEETING_STATE_SQL, meeting_id)
                 if existing is None:
                     counts["id_miss"] += 1
+                    if meeting_date is not None:
+                        async with db.pool.acquire() as conn:
+                            siblings = await conn.fetch(
+                                FALLBACK_DIAGNOSTIC_SQL, banana, meeting_date
+                            )
+                        agreeing = [r for r in siblings if titles_agree(title, r["title"])]
+                        if agreeing and not any(r["exact_instant"] for r in agreeing):
+                            counts["miss_time_drift"] += 1
+                        if not siblings:
+                            counts["miss_no_meeting_that_day"] += 1
+                        elif not agreeing:
+                            counts["miss_title_disagrees"] += 1
+                        elif len(agreeing) > 1:
+                            counts["miss_ambiguous"] += 1
+                        elif agreeing[0]["filled"]:
+                            counts["miss_already_filled"] += 1
+                        else:
+                            counts["miss_recoverable"] += 1
+                    else:
+                        counts["miss_no_date"] += 1
                     logger.warning(
                         "dry-run id parity miss",
                         banana=banana,
@@ -193,7 +263,15 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                         meeting_id, conn=conn, lock_for_update=True
                     )
                     if meeting is None and meeting_date is not None:
-                        fallback = await conn.fetch(FALLBACK_SQL, banana, meeting_date)
+                        # Same city, same instant, still unfilled, exactly one
+                        # candidate, and the titles must agree on their body
+                        # words. Without the title check two committees
+                        # meeting at the same time could swap minutes, and a
+                        # wrong link is far worse than a missing one.
+                        fallback = [
+                            row for row in await conn.fetch(FALLBACK_SQL, banana, meeting_date)
+                            if titles_agree(title, row["title"])
+                        ]
                         if len(fallback) == 1:
                             meeting_id = fallback[0]["id"]
                             meeting = await db.meetings.get_meeting(

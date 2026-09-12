@@ -253,8 +253,11 @@ class CouncilMemberRepository(BaseRepository):
                 if isinstance(metadata, str):
                     metadata = json.loads(metadata)
                 # Use JSONB merge to preserve existing keys while adding new ones
+                # The pool registers a jsonb codec, so a dict is encoded
+                # once on the way out. json.dumps here would encode it twice
+                # and `{} || "<string>"` yields an array, not a merged object.
                 updates.append(f"metadata = COALESCE(metadata, '{{}}'::jsonb) || ${param_idx}::jsonb")
-                params.append(json.dumps(metadata))
+                params.append(metadata)
                 param_idx += 1
 
             if not updates:
@@ -728,6 +731,12 @@ class CouncilMemberRepository(BaseRepository):
         sequence: Optional[int] = None,
         metadata: Optional[dict] = None,
         conn: Optional[Connection] = None,
+        motion_index: int = 0,
+        item_id: Optional[str] = None,
+        motion_text: Optional[str] = None,
+        source: str = "api",
+        content_sha256: Optional[str] = None,
+        receipt: Optional[dict] = None,
     ) -> bool:
         """Record a single vote for a council member on a matter in a meeting.
 
@@ -740,9 +749,13 @@ class CouncilMemberRepository(BaseRepository):
             # Use RETURNING to detect if insert succeeded (no redundant SELECT)
             result = await c.fetchval(
                 """
-                INSERT INTO votes (council_member_id, matter_id, meeting_id, vote, vote_date, sequence, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (council_member_id, matter_id, meeting_id) DO NOTHING
+                INSERT INTO votes (
+                    council_member_id, matter_id, meeting_id, vote, vote_date,
+                    sequence, metadata, motion_index, item_id, motion_text,
+                    source, content_sha256, receipt
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ON CONFLICT (council_member_id, matter_id, meeting_id, motion_index) DO NOTHING
                 RETURNING id
                 """,
                 council_member_id,
@@ -752,6 +765,12 @@ class CouncilMemberRepository(BaseRepository):
                 vote_date,
                 sequence,
                 metadata,
+                motion_index,
+                item_id,
+                motion_text,
+                source,
+                content_sha256,
+                receipt,
             )
 
             if not result:
@@ -761,10 +780,15 @@ class CouncilMemberRepository(BaseRepository):
                     SET vote = $4,
                         vote_date = $5,
                         sequence = $6,
-                        metadata = $7
+                        metadata = $7,
+                        item_id = COALESCE($9, item_id),
+                        motion_text = COALESCE($10, motion_text),
+                        content_sha256 = COALESCE($11, content_sha256),
+                        receipt = COALESCE($12, receipt)
                     WHERE council_member_id = $1
                       AND matter_id = $2
                       AND meeting_id = $3
+                      AND motion_index = $8
                       AND (
                             vote IS DISTINCT FROM $4
                             OR vote_date IS DISTINCT FROM $5
@@ -779,6 +803,11 @@ class CouncilMemberRepository(BaseRepository):
                     vote_date,
                     sequence,
                     metadata,
+                    motion_index,
+                    item_id,
+                    motion_text,
+                    content_sha256,
+                    receipt,
                 )
                 return False
 
@@ -960,11 +989,16 @@ class CouncilMemberRepository(BaseRepository):
                 conn=conn,
             )
 
+        # Only API-sourced rows are this reconciler's to remove. Votes read
+        # out of minutes are produced by a different pass with its own
+        # evidence, and a vendor API that has never heard of them must not
+        # treat them as orphans.
         deleted_rows = await conn.fetch(
             """
             DELETE FROM votes v
             WHERE v.meeting_id = $1
               AND v.matter_id = ANY($2::text[])
+              AND v.source = 'api'
               AND NOT EXISTS (
                   SELECT 1
                   FROM items i

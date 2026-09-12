@@ -263,32 +263,29 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                         if meeting_id_match:
                             meeting_id = meeting_id_match.group(1)
 
-            # Minutes publish post-meeting: a DisplayMinutesPDF handler when the
-            # portal exposes a direct PDF, else the MeetingView doctype=Minutes
-            # viewer. Rows carry MinutesMeetingID=-1 until minutes exist, so
-            # neither pattern appears pre-publication.
+            # Minutes ride in the same row as the agenda, behind an anchor
+            # whose href is DisplayAgendaPDF.ashx with a MinutesMeetingID
+            # parameter -- not a separate handler. Verified 2026-09-11 on
+            # plano and claycounty; the DisplayMinutesPDF.ashx and
+            # doctype=Minutes shapes this code looked for before appear on
+            # none of 13 live portals, so the vendor advertised minutes
+            # support and silently returned nothing.
+            #
+            # Never synthesize the URL from a MinutesMeetingID found
+            # elsewhere in the row: sunrise carries ids on rows with no
+            # minutes anchor, and requesting one returns HTTP 200 with
+            # content-type application/pdf whose body is an ASP.NET runtime
+            # error page. The anchor's presence is the only honest signal.
             minutes_url = None
-            minutes_pdf_link = row.find("a", href=re.compile(r"DisplayMinutesPDF\.ashx", re.IGNORECASE))
-            if minutes_pdf_link:
+            minutes_link = row.find(
+                "a",
+                href=re.compile(r"DisplayAgendaPDF\.ashx\?MinutesMeetingID=\d+", re.IGNORECASE),
+            )
+            if minutes_link:
                 minutes_url = urljoin(
                     f"{self.base_url}/agendapublic/",
-                    string_attr(minutes_pdf_link, "href"),
+                    string_attr(minutes_link, "href"),
                 )
-            else:
-                minutes_view_link = row.find(
-                    "a", onclick=re.compile(r"doctype=Minutes", re.IGNORECASE)
-                )
-                if minutes_view_link:
-                    minutes_match = re.search(
-                        r"MeetingView\.aspx\?[^'\"]+",
-                        string_attr(minutes_view_link, "onclick"),
-                        re.IGNORECASE,
-                    )
-                    if minutes_match:
-                        minutes_url = urljoin(
-                            f"{self.base_url}/agendapublic/",
-                            minutes_match.group(0),
-                        )
 
             if not meeting_id:
                 meeting_id = self._generate_fallback_vendor_id(

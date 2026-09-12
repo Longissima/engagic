@@ -43,6 +43,9 @@ from pipeline.protocols import MetricsCollector
 DESTINY_CONFIG_FILE = "data/destiny_sites.json"
 
 
+_DOCS_PATH_RE = re.compile(r"/[a-z0-9_-]*docs/", re.IGNORECASE)
+
+
 class AsyncDestinyAdapter(AsyncBaseAdapter):
     """Async Destiny/AgendaQuick - structured HTML agendas with staff report memos"""
 
@@ -532,7 +535,11 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
             label = (
                 f"{string_attr(link, 'title')} {link.get_text(strip=True)}"
             ).lower()
-            if 'mindocs/' in href.lower() and 'minute' in label:
+            # The document folder is "{site prefix}docs/", so requiring the
+            # literal "mindocs/" only ever matched sites whose prefix happens
+            # to end in "min". The label is what identifies minutes; a direct
+            # PDF is preferred over the dsp=min viewer below.
+            if _DOCS_PATH_RE.search(href) and 'minute' in label:
                 return urljoin(self.base_url, href)
             if viewer_url is None and re.search(r'[?&]dsp=min(?![a-z])', href):
                 viewer_url = urljoin(self.base_url, href)

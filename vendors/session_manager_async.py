@@ -50,6 +50,13 @@ def _ca_supplemented_context() -> ssl.SSLContext:
     return _supplemented_ssl_context
 
 
+# Bumped 2026-09-11. Keep this within a year or two of current Chrome.
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
+
 class AsyncSessionManager:
     """
     Manages aiohttp client sessions for vendor adapters.
@@ -106,9 +113,19 @@ class AsyncSessionManager:
                 connector_kwargs["ssl"] = _ca_supplemented_context()
             connector = aiohttp.TCPConnector(**connector_kwargs)
 
-            # Browser-like headers to avoid bot detection
+            # Browser-like headers to avoid bot detection.
+            #
+            # The version here is load-bearing and it expires. Chrome/119 was
+            # pinned in 2024; by 2026 WAFs reject it as a stale-browser
+            # signature, and a vendor blocked this way looks exactly like a
+            # vendor that publishes nothing. Sebastopol returned 403 to
+            # Chrome/119 and 200 to Chrome/131 and everything above it on the
+            # same URL (verified 2026-09-11), which is how three adapters sat
+            # at zero coverage through a sweep that filled 4,788 rows.
+            # Re-check this when an adapter's coverage is zero across a whole
+            # vendor rather than assuming the sites are empty.
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+                "User-Agent": _BROWSER_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate, br",

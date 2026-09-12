@@ -32,11 +32,15 @@ ALAMEDA = """
 """
 
 ALPHARETTA = """
-         1.  DRB Meeting Minutes of June 19, 2026
+         1.  DRB260012 Jiffy Lube 207 South Main St Review signage
      Board Member Rowen offered a motion to approve.
                 Board Member Owens seconded the motion.
                 Motion carried (6-0).
 """
+ALPHARETTA_ITEM = [{
+    "id": "i1", "sequence": 1, "agenda_number": "1.", "matter_file": None,
+    "matter_id": "m1", "title": "DRB260012 Jiffy Lube 207 South Main St Review signage",
+}]
 
 
 class TestAttendance:
@@ -106,6 +110,25 @@ class TestEvidence:
         ev = find_evidence("RESULT: Approved\nAYES: Mayr, Bratt, Nerbun\nDEEMED NAY: Bach\n")[0]
         assert ("NO", ["Bach"]) in [(s.value, s.names) for s in ev.sections]
 
+    def test_bare_disposition_line_closes_a_named_block(self):
+        block = (
+            "Dr. Michael Aiello motioned, seconded by Julie Matuzak to approve the Consent Agenda.\n"
+            "Ayes: Dr. Michael Aiello, Julie Matuzak, Bruce Wade\n"
+            "Nays: None\n"
+            "Abstain: None\n"
+            "Absent: Shannon King\n"
+            "Passed\n"
+        )
+        ev = find_evidence(block)[-1]
+        assert ev.outcome == "PASS"
+        assert ("AYE", ["Michael Aiello", "Julie Matuzak", "Bruce Wade"]) in [
+            (s.value, s.names) for s in ev.sections
+        ]
+
+    def test_tally_detached_from_the_word_motion(self):
+        ev = find_evidence("Motion/second to approve the Agenda by Commissioners Fuller/McCord carried 6-0.\n")[0]
+        assert ev.outcome == "PASS" and ev.tally == (6, 0, 0)
+
     def test_tally_only(self):
         ev = find_evidence(ALPHARETTA)
         assert ev[-1].outcome == "PASS" and ev[-1].tally == (6, 0, 0) and not ev[-1].named
@@ -158,16 +181,14 @@ class TestEngine:
         assert second.tally["yes"] == 2 and second.tally["no"] == 3
 
     def test_unanimous_tally_attributes_against_attendance(self):
-        text = "Present: Smith, Jones, Lee\n" + ALPHARETTA.replace("(6-0)", "(3-0)")
-        items = [{"id": "i1", "sequence": 1, "agenda_number": "1.", "matter_file": None, "matter_id": "m1", "title": "DRB Meeting Minutes of June 19, 2026"}]
-        parsed = parse_meeting(text, items, roster=[])
+        text = "Present: Rowen, Owens, Lee\n" + ALPHARETTA.replace("(6-0)", "(3-0)")
+        parsed = parse_meeting(text, ALPHARETTA_ITEM, roster=[])
         assert parsed.published and parsed.published[0].method == "unanimous"
-        assert sorted(parsed.published[0].member_votes) == [("Jones", "AYE"), ("Lee", "AYE"), ("Smith", "AYE")]
+        assert sorted(parsed.published[0].member_votes) == [("Lee", "AYE"), ("Owens", "AYE"), ("Rowen", "AYE")]
 
     def test_split_tally_without_names_is_outcome_only(self):
-        text = "Present: Smith, Jones, Lee, Kim\n" + ALPHARETTA.replace("(6-0)", "(3-1)")
-        items = [{"id": "i1", "sequence": 1, "agenda_number": "1.", "matter_file": None, "matter_id": "m1", "title": "DRB Meeting Minutes of June 19, 2026"}]
-        parsed = parse_meeting(text, items, roster=[])
+        text = "Present: Rowen, Owens, Lee, Kim\n" + ALPHARETTA.replace("(6-0)", "(3-1)")
+        parsed = parse_meeting(text, ALPHARETTA_ITEM, roster=[])
         assert parsed.published[0].method == "tally" and parsed.published[0].member_votes == []
 
     def test_named_lists_seed_roster_when_document_is_the_only_source(self):
@@ -229,6 +250,42 @@ class TestGuards:
         parsed = parse_meeting(text, items, roster=[])
         assert parsed.published == [] and parsed.procedural_skipped == 1
 
+    def test_mover_name_stops_at_the_sentence(self):
+        from parsing.rollcall.names import clean_name
+        assert clean_name("Ron Leino. Motion passed unanimously") == "Ron Leino"
+        assert clean_name("Darla LeClair. The motion carried") == "Darla LeClair"
+
+    def test_honorific_period_is_not_a_sentence_break(self):
+        from parsing.rollcall.names import clean_name
+        assert clean_name("Dr. Michael Aiello") == "Michael Aiello"
+        assert clean_name("Mr. J. Smith") == "J. Smith"
+
+    def test_lowercase_office_word_inside_a_mover_name(self):
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence("A motion offered by Council member Lewis, duly seconded by Council member Hinds, carried by the following vote:\nAye: 2 - Lewis, Hinds\n")[0]
+        assert any("Lewis" in m for m in ev.movers)
+
+    def test_seconder_suffix_form_counts_as_a_mover(self):
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence("Ordinance 26-24 presented. Councilmember Morris seconded the motion. The motion passed 5-0.\n")[0]
+        assert any("Morris" in m for m in ev.movers)
+
+    def test_no_roster_means_no_membership_check(self):
+        text = "1. Site Plan approval for the corner parcel\nMotion by Commissioner Forest, second by Commissioner deJong. Motion carried 5-0.\n"
+        items = [{"id": "i1", "sequence": 1, "agenda_number": "1.", "matter_file": None, "matter_id": "m1", "title": "Site Plan approval for the corner parcel"}]
+        parsed = parse_meeting(text, items, roster=[])
+        assert [p.method for p in parsed.published] == ["tally"]
+
+    def test_minutes_approval_items_are_procedure(self):
+        items = [{"id": "i1", "sequence": 1, "agenda_number": "8.", "matter_file": None, "matter_id": "m1", "title": "June 23, 2026 - Policy Meeting minutes"}]
+        text = "Present: Wurth, Ratchford\n8. June 23, 2026 - Policy Meeting minutes\nWurth moved, seconded by Ratchford. Motion carried 2-0.\n"
+        parsed = parse_meeting(text, items, roster=[])
+        assert parsed.published == [] and parsed.procedural_skipped == 1
+
+    def test_trailing_role_word_is_stripped(self):
+        from parsing.rollcall.names import clean_name
+        assert clean_name("Aaron Van Krey Members") == "Aaron Van Krey"
+
     def test_committee_member_title_is_stripped(self):
         from parsing.rollcall.names import clean_name
         assert clean_name("Committee Member James Liggins") == "James Liggins"
@@ -256,6 +313,57 @@ class TestAlign:
         items = [{"id": "x", "sequence": 1, "agenda_number": "1.", "matter_file": None, "matter_id": "m", "title": "Budget review of the year"}]
         anchors = anchor_items(text, items)
         assert anchors and text[blocks(text, anchors)[0]["end"]:].startswith("5. ADJOURN")
+
+    def test_page_marker_does_not_close_block(self):
+        """Powell OH, 2026-08-04: our own extractor stamps the page separator,
+        and reading it as a heading stranded the motion on the next page."""
+        from parsing.rollcall.align import blocks
+        text = (
+            "RESOLUTION 2026-39\n"
+            "Mayor Karr read the resolution and council discussed it.\n"
+            "--- PAGE 8 ---\n"
+            "MOTION: Vice-Mayor Tom Counts moved to approve Resolution 2026-39. "
+            "Councilmember David Lester seconded. Motion passed.\n"
+        )
+        items = [{"id": "x", "sequence": 1, "agenda_number": None,
+                  "matter_file": "RESOLUTION 2026-39", "matter_id": "m",
+                  "title": "Extend professional services agreement"}]
+        anchors = anchor_items(text, items)
+        block = blocks(text, anchors)[0]
+        assert "Motion passed" in text[block["start"]:block["end"]]
+
+    def test_vote_label_heading_does_not_close_block(self):
+        """A caps line that announces the vote is scaffolding, not a section."""
+        from parsing.rollcall.align import blocks
+        text = (
+            "1. Budget Amendment\n"
+            "The finance director presented the amendment.\n"
+            "D. MOTION\n"
+            "Motion carried 5-0.\n"
+        )
+        items = [{"id": "x", "sequence": 1, "agenda_number": "1.", "matter_file": None,
+                  "matter_id": "m", "title": "Budget Amendment for the fiscal year"}]
+        anchors = anchor_items(text, items)
+        block = blocks(text, anchors)[0]
+        assert "Motion carried" in text[block["start"]:block["end"]]
+
+    def test_running_header_does_not_close_block(self):
+        """Letterhead reprinted on every page is furniture; a real heading
+        appears once and still closes the block."""
+        from parsing.rollcall.align import blocks
+        text = (
+            "CITY OF MARLBOROUGH\n"
+            "1. Zoning Petition Review\n"
+            "The board heard the petition.\n"
+            "CITY OF MARLBOROUGH\n"
+            "Motion carried 7-0.\n"
+            "CITY OF MARLBOROUGH\n"
+        )
+        items = [{"id": "x", "sequence": 1, "agenda_number": "1.", "matter_file": None,
+                  "matter_id": "m", "title": "Zoning Petition Review for the parcel"}]
+        anchors = anchor_items(text, items)
+        block = blocks(text, anchors)[0]
+        assert "Motion carried" in text[block["start"]:block["end"]]
 
     def test_measurement_numbers_are_not_agenda_anchors(self):
         text = "43.7 %, where 30% is the maximum\nVote: 3-0-0"
