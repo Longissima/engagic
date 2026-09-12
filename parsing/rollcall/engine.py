@@ -80,6 +80,7 @@ class ItemVotes:
     rung: str = ""
     observation_index: int = 0
     tally_basis: Optional[str] = None
+    reported_body: Optional[str] = None   # A body credited with this action.
 
 
 @dataclass

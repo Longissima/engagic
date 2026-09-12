@@ -113,6 +113,7 @@ class Publishable:
     receipt: Dict[str, Any]
     observation_index: Optional[int] = None
     tally_basis: Optional[str] = None
+    reported_body: Optional[str] = None
 
 
 def locate(text: str, motion_text: str, sha: str, hint: int = -1) -> Dict[str, Any]:
@@ -145,15 +146,16 @@ async def ensure_members(db, banana: str, names: List[str], roster: Dict[str, st
 
 UPSERT_MOTION_SQL = """
     INSERT INTO item_motions (item_id, motion_index, matter_id, meeting_id,
-        motion_text, outcome, tally, method, source, content_sha256, receipt, parse_run_id, observation_ordinal, tally_basis)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'minutes', $9, $10, $11, $12, $13)
+        motion_text, outcome, tally, method, source, content_sha256, receipt, parse_run_id, observation_ordinal, tally_basis, reported_body)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'minutes', $9, $10, $11, $12, $13, $14)
     ON CONFLICT (item_id, motion_index, source) DO UPDATE SET
         matter_id = EXCLUDED.matter_id, meeting_id = EXCLUDED.meeting_id,
         motion_text = EXCLUDED.motion_text, outcome = EXCLUDED.outcome,
         tally = EXCLUDED.tally, method = EXCLUDED.method,
         content_sha256 = EXCLUDED.content_sha256, receipt = EXCLUDED.receipt,
         parse_run_id=EXCLUDED.parse_run_id, observation_ordinal=EXCLUDED.observation_ordinal,
-        tally_basis=EXCLUDED.tally_basis, updated_at = CURRENT_TIMESTAMP
+        tally_basis=EXCLUDED.tally_basis, reported_body=EXCLUDED.reported_body,
+        updated_at = CURRENT_TIMESTAMP
     WHERE item_motions.source = 'minutes'
 """
 
@@ -208,7 +210,8 @@ async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=
             outcome = pub.outcome
             await conn.execute(UPSERT_MOTION_SQL, pub.item_id, pub.motion_index,
                 pub.matter_id, row["meeting_id"], pub.motion_text, outcome,
-                pub.tally or None, pub.method, row["content_sha256"], pub.receipt, run_id, pub.observation_index, pub.tally_basis)
+                pub.tally or None, pub.method, row["content_sha256"], pub.receipt, run_id, pub.observation_index,
+                pub.tally_basis, pub.reported_body)
             motion_keys.append({"item_id": pub.item_id, "motion_index": pub.motion_index})
             for seq, (name, canon) in enumerate(pub.votes, 1):
                 member_id = roster[name]
@@ -331,7 +334,8 @@ async def process_one(db, corpus, audit, row, build, apply, counts, reasons):
                        'extract_version':row['extract_version'],'unit':'unicode_codepoint',
                        'start':obs.start,'end':obs.end}
             pub = Publishable(iv.motion_index,iv.item['id'],matter_id,iv.method,iv.member_votes,
-                OUTCOME_TO_DB.get(iv.outcome),dict(iv.tally),iv.motion_text,receipt,obs.ordinal,iv.tally_basis)
+                OUTCOME_TO_DB.get(iv.outcome),dict(iv.tally),iv.motion_text,receipt,obs.ordinal,
+                iv.tally_basis,iv.reported_body)
             obs.publication = asdict(pub)
             published[(iv.item['id'],iv.motion_index)] = pub
         counts['meetings'] += 1

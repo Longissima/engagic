@@ -60,7 +60,8 @@ async def database():
         await conn.execute(SCHEMA)
         migrations = Path(__file__).resolve().parents[1] / 'database/migrations'
         for name in ('040_minutes_documents.sql', '041_votes_motion_grain.sql',
-                     '043_votes_motion_grain_phase2.sql', '044_item_motions.sql'):
+                     '043_votes_motion_grain_phase2.sql', '044_item_motions.sql',
+                     '049_reported_body.sql'):
             await conn.execute((migrations / name).read_text())
         await conn.set_type_codec('jsonb', schema='pg_catalog', encoder=json.dumps, decoder=json.loads)
         await conn.execute("""

@@ -91,10 +91,13 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
     from parsing.rollcall.engine import ItemVotes, _is_heading, _membership_ok
     obs.item_id = item.get('id') if item else None
     obs.interpretation = {'item': item, 'alignment': rung, 'motion_index': motion_index,
-                          'raw_outcome': ev.outcome, 'subject_disposition': ev.disposition, 'unanimous': ev.unanimous, 'members': []}
+                          'raw_outcome': ev.outcome, 'subject_disposition': ev.disposition,
+                          'reported_body': ev.reported_body, 'unanimous': ev.unanimous, 'members': []}
     if not item:
         _check(obs, 'alignment', 'withheld', 'no_unique_item')
-    elif 'reported_committee_action' in ev.qualifications:
+    elif ev.reported_body and not ev.sections and not ev.movers:
+        # A bare mention with no roll call and nobody moving is prose about another
+        # body, not a recorded action: "per the recommendation of the X Committee".
         _check(obs, 'alignment', 'withheld', 'reported_committee_action')
     elif ev.procedural or _is_heading(str(item.get('title') or '')):
         _check(obs, 'alignment', 'withheld', 'procedural_or_heading')
@@ -182,7 +185,8 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
     method = 'named' if resolved else 'tally' if tally else 'outcome'
     pub = ItemVotes(item=item, motion_index=motion_index, method=method, outcome=outcome,
         tally=tally, member_votes=resolved, motion_text=ev.result_text, offset=obs.start,
-        rung=rung, observation_index=obs.ordinal, tally_basis=tally_basis if tally else None)
+        rung=rung, observation_index=obs.ordinal, tally_basis=tally_basis if tally else None,
+        reported_body=ev.reported_body)
     obs.publication = asdict(pub)
     return pub
 

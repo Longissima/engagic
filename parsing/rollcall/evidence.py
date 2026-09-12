@@ -113,6 +113,27 @@ _MOVER_RE = re.compile(
 _MOVED_SUFFIX_RE = re.compile(
     rf"\b(?P<name>{_NAME_WORD}(?:\s+{_NAME_WORD}){{0,2}})\s+(?:moved|seconded)\b"
 )
+# The minutes credit a body with acting in several shapes, and the old detector
+# wanted one exact lead-in: it found 16 of the 1,326 mentions in the corpus.
+# Each word of the name must be capitalized, so the match cannot run back across
+# "At its June 24th meeting, the ..." into the sentence before it. "The Committee"
+# and "The Board" alone are anaphora for the body already sitting, not a second
+# actor, so a bare article form is not a name.
+_BODY_NAME = (r"(?:[A-Z][\w'\-]*|of|and|for|the|&)"
+              r"(?:\s+(?:[A-Z][\w'\-]*|of|and|for|the|&)){0,7}"
+              r"\s+(?:Committee|Commission|Board|Authority)")
+_REPORTED_BODY_RE = re.compile(
+    # "recommended by the X Committee", "referred to the X Commission"
+    r"(?:\brecommended\s+by|\breferred\s+to|\b(?:on|per)\s+the\s+recommendation\s+of"
+    r"|\b(?:adopted|approved|passed|denied)\s+by)"
+    rf"\s+(?:the\s+)?(?P<body>{_BODY_NAME})\b"
+    # "the X Committee voted 5-2 to recommend denial", "X Board introduced"
+    rf"|\b(?P<body2>{_BODY_NAME})\s+(?:unanimously\s+)?(?:voted[^.]{{0,40}}?\s+to\s+)?"
+    r"(?:recommend\w*|moved|introduced|sponsored|submitted)\b",
+)
+_ANAPHORIC_BODY_RE = re.compile(
+    r"^(?:the\s+)?(?:committee|commission|board|council|authority)$", re.IGNORECASE
+)
 _PROCEDURAL_MOTION_RE = re.compile(
     r"\bto\s+(?:adjourn|recess|reconvene|return\s+to\s+open\s+session|(?:go|convene|enter)\s+into\s+(?:closed|executive)\s+session)\b"
     r"|\bconvene\s+into\s+(?:closed|executive)\s+session\b"
@@ -169,6 +190,7 @@ class Evidence:
     source_end: int = 0
     qualifications: List[str] = field(default_factory=list)
     disposition: Optional[str] = None  # Subject disposition is not a motion outcome.
+    reported_body: Optional[str] = None    # A body the minutes credit with acting.
     procedural: bool = False               # a motion to adjourn, recess, reconvene
 
     @property
@@ -252,6 +274,18 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
     return sections
 
 
+def _reported_body(context: str) -> Optional[str]:
+    """The body the minutes credit with acting, or None when it is this one."""
+    match = _REPORTED_BODY_RE.search(context)
+    if not match:
+        return None
+    name = (match.group("body") or match.group("body2") or "").strip(" ,.;-")
+    name = re.sub(r"^(?:the|a)\s+", "", re.sub(r"\s+", " ", name), flags=re.IGNORECASE)
+    if _ANAPHORIC_BODY_RE.match(name):
+        return None
+    return name or None
+
+
 def _orient_tally(tally, outcome, context):
     """Swap a failed motion's pair when the named supporters match the second number."""
     if not tally or outcome != "FAIL" or tally[0] <= tally[1]:
@@ -312,9 +346,16 @@ def find_evidence(block: str) -> List[Evidence]:
                 source_end=offsets[min(len(lines)-1, idx + 20)] + len(lines[min(len(lines)-1, idx + 20)]),
                 unanimous=bool(_UNANIMOUS_RE.search(window)),
             )
-            if (re.match(r"(?:this|the)\s+(?:resolution|ordinance|item|matter)\s+was", result_text, re.I)
-                    and re.match(r"\s+by\s+the\s+[A-Z][^.!?]{1,100}\b(?:Committee|Commission)\b",
-                                 line[m.end():] + " " + " ".join(lines[idx + 1:idx + 3]))):
+            # Only the sentence carrying this result may credit a body. A block
+            # mention cannot be applied to every motion in the block: an item
+            # whose narrative says the Planning Commission recommended denial
+            # usually continues with the council's own vote, and crediting that
+            # vote to the commission is the mis-attribution the withhold existed
+            # to prevent. A bare mention is a fact about the matter's referral,
+            # not about any motion here.
+            ev.reported_body = _reported_body(
+                line + " " + " ".join(lines[idx + 1:idx + 3]))
+            if ev.reported_body:
                 ev.qualifications.append('reported_committee_action')
             ev.sections = _parse_sections(lines, idx + 1, 14)
             if not ev.sections and idx > 0:

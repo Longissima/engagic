@@ -142,6 +142,20 @@ ROSTER_SQL = """
     WHERE ($1::text IS NULL OR cm.banana = $1)
     ORDER BY cm.banana, cm.id
 """
+REPORTED_BODIES_SQL = """
+    SELECT im.item_id, im.motion_index, im.source, im.reported_body, m.banana
+    FROM item_motions im
+    JOIN meetings mt ON mt.id = im.meeting_id
+    JOIN city_matters m ON m.id = im.matter_id
+    WHERE im.reported_body IS NOT NULL
+      AND ($1::text IS NULL OR m.banana = $1)
+"""
+SPONSORSHIPS_SQL = """
+    SELECT s.matter_id, s.council_member_id, s.is_primary, s.sponsor_order
+    FROM sponsorships s
+    JOIN council_members cm ON cm.id = s.council_member_id
+    WHERE ($1::text IS NULL OR cm.banana = $1)
+"""
 BODY_VOTES_SQL = """
     SELECT v.council_member_id, m.title AS body,
            count(*)::int AS vote_count,
@@ -242,6 +256,8 @@ async def main() -> int:
         async with db.pool.acquire() as conn:
             rows = [dict(r) for r in await conn.fetch(ROSTER_SQL, args.banana)]
             body_rows = [dict(r) for r in await conn.fetch(BODY_VOTES_SQL, args.banana)]
+            sponsorships = [dict(r) for r in await conn.fetch(SPONSORSHIPS_SQL, args.banana)]
+            reported = [dict(r) for r in await conn.fetch(REPORTED_BODIES_SQL, args.banana)]
 
         by_city: Dict[str, List[dict]] = defaultdict(list)
         member_banana: Dict[str, str] = {}
@@ -302,8 +318,7 @@ async def main() -> int:
                                              {"name": name, "venue": False, "actor": False})
                 entry["actor"] = True
                 actor_of_row[row["id"]] = (banana, fold(name))
-        counts["bodies"] = len(body_rows)
-        counts["bodies_seen_acting"] = sum(1 for v in body_rows.values() if v["actor"])
+
         counts["member_body_rows"] = len(bodies)
         counts["members_in_more_than_one_body"] = sum(
             1 for n in Counter(m for m, _ in bodies).values() if n > 1)
@@ -314,9 +329,55 @@ async def main() -> int:
         f"{k.split(':')[1]}={v}" for k, v in sorted(counts.items()) if k.startswith("kind:")))
         print(f"  clustered duplicates {counts['clustered_duplicates']}")
         print(f"profile rows to write  {len(profiles)}")
+        # The same sponsorship, expressed with the actor it names. A role-only
+        # sponsor ("Mayor") names no actor to attribute to and is left out rather
+        # than guessed at; the raw sponsorship still records what was printed.
+        kind_of: Dict[str, str] = {}
+        for banana, city_rows in by_city.items():
+            for row in city_rows:
+                kind_of[row["id"]] = classify(row["name"])[1]
+        matter_actors: Dict[Tuple[str, str, Optional[str], Optional[str]], dict] = {}
+        for sp in sponsorships:
+            member = sp["council_member_id"]
+            kind = kind_of.get(member)
+            if kind == "person":
+                key = (sp["matter_id"], "sponsor", member, None)
+            elif kind == "body" and member in actor_of_row:
+                banana, folded = actor_of_row[member]
+                key = (sp["matter_id"], "sponsor", None, body_id(banana, folded))
+            else:
+                counts[f"sponsorship_unattributable:{kind}"] += 1
+                continue
+            keep = matter_actors.setdefault(key, {"is_primary": False, "order": sp["sponsor_order"]})
+            keep["is_primary"] = keep["is_primary"] or bool(sp["is_primary"])
+        # A recommending body named in the minutes becomes an actor on the motion.
+        # The name is resolved through the same body key as everything else, and a
+        # body named only here still earns a row -- it acted, it just has no
+        # meetings of its own in the corpus.
+        motion_rows: List[Tuple[str, int, str, str, str]] = []
+        for r in reported:
+            banana, name = r["banana"], body_of(r["reported_body"]) or r["reported_body"]
+            folded = fold(name)
+            entry = body_rows.setdefault((banana, folded),
+                                         {"name": name, "venue": False, "actor": False})
+            entry["actor"] = True
+            motion_rows.append((r["item_id"], r["motion_index"], r["source"],
+                                "recommender", body_id(banana, folded)))
+        counts["motion_actors"] = len(motion_rows)
+        counts["matter_actors"] = len(matter_actors)
+        counts["matter_actors_body"] = sum(1 for k in matter_actors if k[3])
+
+        counts["bodies"] = len(body_rows)
+        counts["bodies_seen_acting"] = sum(1 for v in body_rows.values() if v["actor"])
         print(f"bodies                 {counts['bodies']}"
               f"  (seen acting: {counts['bodies_seen_acting']})")
         print(f"member_bodies rows     {counts['member_body_rows']}")
+        print(f"motion_actors          {counts['motion_actors']} (recommending bodies)")
+        print(f"matter_actors          {counts['matter_actors']}"
+              f"  (body sponsors: {counts['matter_actors_body']})")
+        for k, v in sorted(counts.items()):
+            if k.startswith("sponsorship_unattributable"):
+                print(f"  unattributable {k.split(':')[1]:<10} {v}")
         print(f"  members in 2+ bodies {counts['members_in_more_than_one_body']}")
         print(f"  votes with no body   {counts['votes_with_no_body']}")
 
@@ -350,6 +411,24 @@ async def main() -> int:
                 await conn.execute(
                     f"DELETE FROM member_bodies WHERE council_member_id IN ({scope_sql})",
                     args.banana)
+                await conn.execute(
+                    "DELETE FROM motion_actors WHERE body_id IN"
+                    " (SELECT id FROM bodies WHERE ($1::text IS NULL OR banana = $1))",
+                    args.banana)
+                await conn.executemany(
+                    """INSERT INTO motion_actors (item_id, motion_index, source, role, body_id)
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT DO NOTHING""", motion_rows)
+                await conn.execute(
+                    "DELETE FROM matter_actors WHERE person_id IN (" + scope_sql + ")"
+                    " OR body_id IN (SELECT id FROM bodies WHERE ($1::text IS NULL OR banana = $1))",
+                    args.banana)
+                await conn.executemany(
+                    """INSERT INTO matter_actors
+                           (matter_id, role, person_id, body_id, is_primary, actor_order)
+                       VALUES ($1, $2, $3, $4, $5, $6)""",
+                    [(m, r, p_id, b_id, v["is_primary"], v["order"])
+                     for (m, r, p_id, b_id), v in matter_actors.items()])
                 await conn.executemany(
                     """INSERT INTO member_bodies
                            (council_member_id, body, vote_count, first_vote, last_vote)
