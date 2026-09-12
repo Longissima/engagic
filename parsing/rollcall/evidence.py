@@ -30,7 +30,7 @@ CATEGORY_CANON = {
     "against": "NO", "nay": "NO", "nays": "NO", "no": "NO", "noes": "NO", "opposed": "NO",
     "abstain": "ABSTAIN", "abstained": "ABSTAIN", "abstaining": "ABSTAIN",
     "abstention": "ABSTAIN", "abstentions": "ABSTAIN",
-    "absent": "ABSENT", "excused": "EXCUSED", "recused": "RECUSED", "recusal": "RECUSED",
+    "not present": "ABSENT", "absent": "ABSENT", "excused": "EXCUSED", "recused": "RECUSED", "recusal": "RECUSED",
     "present": "PRESENT", "not voting": "NONVOTING",
     # Recorded dissent that the clerk formats as its own label. Missing these
     # publishes a unanimous vote over a dissent, the one error that matters most.
@@ -40,13 +40,14 @@ CATEGORY_CANON = {
 }
 _CATEGORY_WORDS = "|".join(sorted((re.escape(k) for k in CATEGORY_CANON), key=len, reverse=True))
 CATEGORY_LINE_RE = re.compile(
-    rf"^[ \t]*(?P<cat>{_CATEGORY_WORDS})\s*[:,]\s*(?:(?P<count>\d+)\s*[-–]\s*)?(?P<rest>.*)$",
+    rf"^[ \t]*(?P<cat>{_CATEGORY_WORDS})(?:\s*[:,]\s*|\s+(?=\d))(?:(?P<count>\d+)\s*(?:[-–]\s*|$))?(?P<rest>.*)$",
     re.IGNORECASE,
 )
 _TRAILING_COUNT_RE = re.compile(
     r"\s*[-–]?\s*(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen)\s*)?\((?P<count>\d+)\)\s*\.?\s*$",
     re.IGNORECASE,
 )
+_ANY_LABEL_RE = re.compile(r"^[ \t]*[A-Za-z][A-Za-z /-]{0,35}:\s*")
 _BARE_COUNT_RE = re.compile(r"^\s*(\d+)\s*[-–]?\s*$")
 _NONE_RE = re.compile(r"^\s*\(?\s*(?:none|nil|n/a|-|0)\s*\)?\s*\.?\s*$", re.IGNORECASE)
 
@@ -58,7 +59,7 @@ RESULT_RE = re.compile(
     r"|vote[sd]?\s*[:\-–]?\s*\d{1,2}\s*[-–/]\s*\d{1,2}"
     # "Motion/second to approve by Commissioners Fuller/McCord carried 6-0":
     # the result word is nowhere near the word motion, the tally is the anchor.
-    r"|(?:carried|passed|failed|approved|adopted|denied)\s+\(?\d{1,2}\s*[-–/]\s*\d{1,2}"
+    r"|(?:carried|passed|prevailed|failed|approved|adopted|denied)\s+\(?\d{1,2}\s*[-–/]\s*\d{1,2}"
     # A bare disposition on its own line, closing an Ayes/Nays/Abstain block
     # (Clinton Township). Anchored to the line start so the word cannot be
     # picked out of running prose.
@@ -72,7 +73,7 @@ RESULT_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _FAIL_RE = re.compile(r"\b(?:failed|defeated|denied|did\s+not\s+(?:carry|pass))\b", re.IGNORECASE)
-_PASS_RE = re.compile(r"\b(?:carried|passed|prevailed|approved|adopted|unanimous(?:ly)?|placed\s+on\s+file|referred|held)\b", re.IGNORECASE)
+_PASS_RE = re.compile(r"\b(?:carried|passed|prevailed|approved|adopted)\b", re.IGNORECASE)
 TALLY_RE = re.compile(
     # The trailing guard rejects a longer number or a decimal continuation
     # ("6-0.5"), but a sentence-ending period is not one ("carried 5-0.").
@@ -112,7 +113,7 @@ _UNANIMOUS_RE = re.compile(
     re.IGNORECASE,
 )
 _TALLY_CONTEXT_RE = re.compile(
-    r"(?:vote[sd]?|voting|carried|passed|failed|motion|approved|adopted|denied|unanimously|result|\(|\[)\s*[:,]?\s*$",
+    r"(?:vote[sd]?|voting|carried|passed|prevailed|failed|motion|approved|adopted|denied|unanimously|result|\(|\[)\s*[:,]?\s*$",
     re.IGNORECASE,
 )
 
@@ -122,6 +123,8 @@ class Section:
     value: str
     names: List[str]
     stated: Optional[int]
+    raw_text: str = ""
+    raw_label: str = ""
 
 
 @dataclass
@@ -133,6 +136,9 @@ class Evidence:
     tally: Optional[Tuple[int, int, int]] = None  # (yes, no, other)
     unanimous: bool = False
     movers: List[str] = field(default_factory=list)
+    source_start: int = 0
+    source_end: int = 0
+    qualifications: List[str] = field(default_factory=list)
     procedural: bool = False               # a motion to adjourn, recess, reconvene
 
     @property
@@ -146,6 +152,8 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
     while i < min(len(lines), start + limit):
         m = CATEGORY_LINE_RE.match(lines[i])
         if not m:
+            if RESULT_RE.search(lines[i]):
+                break
             if sections and lines[i].strip() == "":
                 # one blank line inside a list is layout; two end it
                 if i + 1 < len(lines) and lines[i + 1].strip() == "":
@@ -158,7 +166,7 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
         j = i + 1
         while j < len(lines) and j < i + 6:
             nxt = lines[j]
-            if CATEGORY_LINE_RE.match(nxt) or RESULT_RE.search(nxt) or nxt.strip() == "":
+            if _ANY_LABEL_RE.match(nxt) or CATEGORY_LINE_RE.match(nxt) or RESULT_RE.search(nxt) or nxt.strip() == "":
                 break
             bare = _BARE_COUNT_RE.match(nxt)
             if bare:
@@ -175,7 +183,8 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
         names = [] if _NONE_RE.match(blob or "") else split_names(blob)
         if stated is None and not names:
             stated = 0
-        sections.append(Section(value=value, names=names, stated=stated))
+        sections.append(Section(value=value, names=names, stated=stated,
+                                raw_text="\n".join(lines[i:j]), raw_label=m.group("cat")))
         i = j
     return sections
 
@@ -195,26 +204,29 @@ def _tally_near(lines: List[str], idx: int, result_text: str) -> Optional[Tuple[
 
 def find_evidence(block: str) -> List[Evidence]:
     """Every result anchor in the block with its attached lists and tally."""
-    lines = block.splitlines()
+    raw_lines = block.splitlines(keepends=True)
+    lines = [line.splitlines()[0] for line in raw_lines]
     offsets = []
     pos = 0
-    for line in lines:
+    for line in raw_lines:
         offsets.append(pos)
-        pos += len(line) + 1
+        pos += len(line)
     found: List[Evidence] = []
     for idx, line in enumerate(lines):
         for m in RESULT_RE.finditer(line):
             result_text = m.group("result")
             window = " ".join(lines[idx:idx + 2])
             outcome = None
-            if _FAIL_RE.search(result_text) or (_FAIL_RE.search(window) and not _PASS_RE.search(result_text)):
+            if _FAIL_RE.search(result_text):
                 outcome = "FAIL"
-            elif _PASS_RE.search(result_text) or _PASS_RE.search(window):
+            elif _PASS_RE.search(result_text):
                 outcome = "PASS"
             ev = Evidence(
                 result_text=re.sub(r"\s+", " ", line.strip())[:300],
                 outcome=outcome,
                 offset=offsets[idx] + m.start(),
+                source_start=offsets[max(0, idx - 8)],
+                source_end=offsets[min(len(lines)-1, idx + 20)] + len(lines[min(len(lines)-1, idx + 20)]),
                 unanimous=bool(_UNANIMOUS_RE.search(window)),
             )
             ev.sections = _parse_sections(lines, idx + 1, 14)
@@ -234,11 +246,11 @@ def find_evidence(block: str) -> List[Evidence]:
             # not vote aye, so attendance arithmetic cannot name the ayes.
             if _ABSTENTION_MENTION_RE.search(window):
                 ev.unanimous = False
-            if ev.tally and _ABSTENTION_MENTION_RE.search(window):
-                ev.tally = (ev.tally[0], ev.tally[1], max(ev.tally[2], 1))
+            if _ABSTENTION_MENTION_RE.search(window):
+                ev.qualifications.append(window)
             found.append(ev)
             break
-    return _dedupe(found)
+    return found
 
 
 def _dedupe(evidence: List[Evidence]) -> List[Evidence]:

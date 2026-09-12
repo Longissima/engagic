@@ -1,0 +1,103 @@
+{
+  "meeting": {
+    "meeting_id": "acworthGA_01288e3a",
+    "content_sha256": "364d1efe95196966717d1e781c0ddae6d8819369c6647a9d7087e553238ca2be",
+    "title": "Planning and Zoning",
+    "banana": "acworthGA",
+    "date": "2026-07-28 19:00:00",
+    "extract_version": "2",
+    "bytes": 105729
+  },
+  "text_sha256": "a74793cd8bd9389e455dbc11402e1ca504edb324a931a59bdddbdbe00605c993",
+  "items": [
+    {
+      "id": "acworthGA_01288e3a_1_dup2",
+      "sequence": 3,
+      "agenda_number": "1",
+      "title": "2026-02-VAR Requested by Josh Hampton for property located in land lot 72, parcel 213, otherwise known as 5020 Proctor Landing . The Applicant is requesting 1 foot",
+      "matter_id": "acworthGA_ecca73c7665ec734",
+      "matter_file": "2026-02"
+    },
+    {
+      "id": "acworthGA_01288e3a_2",
+      "sequence": 4,
+      "agenda_number": "2",
+      "title": "2026-01-SLUP & 2026-06-R Requested by Rolling Thunder LLC., for property located in Land Lot 30, Parcel 1, otherwise known as 4643 Cowan Road. The",
+      "matter_id": "acworthGA_a2cf1c443fed7737",
+      "matter_file": "2026-01"
+    },
+    {
+      "id": "acworthGA_01288e3a_1",
+      "sequence": 1,
+      "agenda_number": "1",
+      "title": "Approval of the June 23, 2026, Planning and Zoning Commission meeting minutes.",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "acworthGA_01288e3a_v",
+      "sequence": 2,
+      "agenda_number": "V",
+      "title": "Public Input Items",
+      "matter_id": null,
+      "matter_file": null
+    }
+  ],
+  "roster": [
+    {
+      "id": "acworthGA_cm_0a97a841e9ed8c8b",
+      "name": "Scott Butzen"
+    },
+    {
+      "id": "acworthGA_cm_0cc254505571f91b",
+      "name": "Cheno Echevarria"
+    },
+    {
+      "id": "acworthGA_cm_1f5e65cb88aba2cb",
+      "name": "Clay Fletcher"
+    },
+    {
+      "id": "acworthGA_cm_39cf4edb0af550e5",
+      "name": "Kim Brown"
+    },
+    {
+      "id": "acworthGA_cm_7efe0b0374aa99dd",
+      "name": "Craig Reidy"
+    },
+    {
+      "id": "acworthGA_cm_9440807eca58a96c",
+      "name": "Richard Boyer"
+    },
+    {
+      "id": "acworthGA_cm_96788bfc3cadd2ef",
+      "name": "Jeff Steorts"
+    },
+    {
+      "id": "acworthGA_cm_9d61667ed578be0e",
+      "name": "Ben Flanagan"
+    }
+  ],
+  "api_votes": [],
+  "expected": [
+    {
+      "item_id": "acworthGA_01288e3a_1_dup2",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 8
+      },
+      "member_count": 8
+    },
+    {
+      "item_id": "acworthGA_01288e3a_2",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 8
+      },
+      "member_count": 8
+    }
+  ],
+  "expected_motion_candidates": 8,
+  "review_note": "Narrative/result duplicates; motion to table passes, without implying adoption."
+}

@@ -324,7 +324,7 @@ DEN_MOTION2 = re.compile(
 # start on the next one, depending on which text extractor laid the PDF out.
 DEN_CATEGORY = re.compile(r"^(Aye|Nay|No|Abstain|Excused|Absent|Present|Recused):\s*(.*)$")
 DEN_TERMINAL = re.compile(r"\((\d+)\)\s*$")
-DEN_FILE = re.compile(r"^(\d{2}-\d{4})\b")
+DEN_FILE = re.compile(r"^(\d{2}-\d{4})\b(?!\s+be\b)", re.I)
 DEN_FILE_IN_MOTION = re.compile(r"\b(\d{2}-\d{4})\b")
 
 

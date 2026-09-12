@@ -3,7 +3,7 @@
 	import { onMount } from 'svelte';
 	import { getCouncilMemberVotes, getMemberCommittees } from '$lib/api';
 	import SeoHead from '$lib/components/SeoHead.svelte';
-	import type { CouncilMember, VoteRecord, VoteTally, CommitteeAssignment } from '$lib/api/types';
+	import type { CouncilMember, VoteRecord, VoteStatistics, CommitteeAssignment } from '$lib/api/types';
 	import Footer from '$lib/components/Footer.svelte';
 	import { logger } from '$lib/services/logger';
 
@@ -13,13 +13,13 @@
 
 	let member = $state<CouncilMember | null>(null);
 	let votingRecord = $state<VoteRecord[]>([]);
-	let statistics = $state<VoteTally | null>(null);
+	let statistics = $state<VoteStatistics | null>(null);
 	let committees = $state<CommitteeAssignment[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
 
 	// Computed stats
-	const totalVotes = $derived(statistics ? statistics.yes + statistics.no + statistics.abstain + statistics.absent : 0);
+	const totalVotes = $derived(statistics ? statistics.yes + statistics.no + statistics.abstain + statistics.absent + (statistics.present ?? 0) + (statistics.recused ?? 0) + (statistics.not_voting ?? 0) : 0);
 	const yesPercent = $derived(totalVotes > 0 && statistics ? Math.round((statistics.yes / totalVotes) * 100) : 0);
 	const noPercent = $derived(totalVotes > 0 && statistics ? Math.round((statistics.no / totalVotes) * 100) : 0);
 	const abstainPercent = $derived(totalVotes > 0 && statistics ? Math.round((statistics.abstain / totalVotes) * 100) : 0);

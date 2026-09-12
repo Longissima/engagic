@@ -37,7 +37,7 @@ logger = get_logger(__name__).bind(component="corpus")
 # lookup_extraction treats rows from other versions as misses, so re-extraction
 # happens lazily exactly where documents are touched again.
 EXTRACT_VERSION = "2"
-_COMPATIBLE_EXTRACT_VERSIONS = frozenset({"1", EXTRACT_VERSION})
+COMPATIBLE_EXTRACT_VERSIONS = frozenset({"1", EXTRACT_VERSION})
 
 _ORIGINAL_PREFIX = "originals/"
 _TEXT_PREFIX = "text/"
@@ -304,7 +304,7 @@ class CorpusStore:
             if not blob or not blob.get("text_key"):
                 return None
             extract_version = blob.get("extract_version")
-            if extract_version not in _COMPATIBLE_EXTRACT_VERSIONS:
+            if extract_version not in COMPATIBLE_EXTRACT_VERSIONS:
                 return None  # older extractor produced this; re-extract fresh
             if str(blob.get("extract_method") or "").endswith("-partial"):
                 logger.info(

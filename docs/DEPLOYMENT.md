@@ -397,3 +397,7 @@ See `/opt/engagic/.claude/projects/-opt-engagic/memory/migration-todo.md` for th
 5. Install zsh + bun for root user (quality of life)
 6. Commit uv.lock changes back to repo
 7. Monitor for Python 3.14 compat issues
+
+Motion publication changes in migration 044 require a coordinated writer restart
+and a full minutes reparse. See [the motion data contract](MOTION_DATA_CONTRACT.md#publication-and-rollout)
+for the order, new reader fields, and counter ownership.

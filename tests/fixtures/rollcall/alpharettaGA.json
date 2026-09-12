@@ -1,0 +1,136 @@
+{
+  "meeting": {
+    "meeting_id": "alpharettaGA_08b6482f",
+    "content_sha256": "ea1863384e37b0c154cb2052e6c656994e450df46ef545ab1351999d567d8629",
+    "title": "Design Review Board July 2026",
+    "banana": "alpharettaGA",
+    "date": "2026-07-17 08:30:00",
+    "extract_version": "2",
+    "bytes": 57654
+  },
+  "text_sha256": "fd5a9d2a9643ba3a6578e59befd430848807d7d6a04935382a93cf1a65ee034c",
+  "items": [
+    {
+      "id": "alpharettaGA_08b6482f_33886",
+      "sequence": 8,
+      "agenda_number": "2025-894",
+      "title": "DRB Meeting Minutes of June 19, 2026",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "alpharettaGA_08b6482f_36228",
+      "sequence": 10,
+      "agenda_number": "2026-644",
+      "title": "Announcement of Public Hearing Procedure",
+      "matter_id": "alpharettaGA_8cd1f82eeb879779",
+      "matter_file": null
+    },
+    {
+      "id": "alpharettaGA_08b6482f_36227",
+      "sequence": 15,
+      "agenda_number": "2026-643",
+      "title": "DRB260016 Amasa Kitchen 15 Academy St Consider signage",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "alpharettaGA_08b6482f_36223",
+      "sequence": 11,
+      "agenda_number": "2026-639",
+      "title": "DRB260012 Jiffy Lube 207 South Main St Review signage",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "alpharettaGA_08b6482f_36224",
+      "sequence": 12,
+      "agenda_number": "2026-640",
+      "title": "DRB260013 Little Alley Steak 102 South Main St Consideration of exterior changes and signage",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "alpharettaGA_08b6482f_36225",
+      "sequence": 13,
+      "agenda_number": "2026-641",
+      "title": "DRB260014 CSI Labs 2580 Westside Parkway Consideration of exterior changes ​",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "alpharettaGA_08b6482f_36226",
+      "sequence": 14,
+      "agenda_number": "2026-642",
+      "title": "DRB260015 Sapporo Sushi & Steak House 10575 Davis Dr Consideration of exterior changes",
+      "matter_id": null,
+      "matter_file": null
+    }
+  ],
+  "roster": [],
+  "api_votes": [],
+  "expected": [
+    {
+      "item_id": "alpharettaGA_08b6482f_36223",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 6,
+        "no": 0
+      },
+      "member_count": 0
+    },
+    {
+      "item_id": "alpharettaGA_08b6482f_36224",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 6,
+        "no": 0
+      },
+      "member_count": 0
+    },
+    {
+      "item_id": "alpharettaGA_08b6482f_36224",
+      "motion_index": 1,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 6,
+        "no": 0
+      },
+      "member_count": 0
+    },
+    {
+      "item_id": "alpharettaGA_08b6482f_36225",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 5,
+        "no": 1
+      },
+      "member_count": 0
+    },
+    {
+      "item_id": "alpharettaGA_08b6482f_36226",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 6,
+        "no": 0
+      },
+      "member_count": 0
+    },
+    {
+      "item_id": "alpharettaGA_08b6482f_36227",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 5,
+        "no": 1
+      },
+      "member_count": 0
+    }
+  ],
+  "expected_motion_candidates": 7,
+  "review_note": "Compact title identifiers; unofficial minutes; printed totals do not identify individual voters."
+}

@@ -783,7 +783,7 @@ class MatterRepository(BaseRepository):
             await c.execute(
                 """
                 UPDATE matter_appearances
-                SET vote_outcome = $1, vote_tally = $2
+                SET vote_outcome = $1, vote_tally = $2, vote_source = 'api'
                 WHERE matter_id = $3 AND meeting_id = $4 AND item_id = $5
                 """,
                 vote_outcome,

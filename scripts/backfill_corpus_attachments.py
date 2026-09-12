@@ -108,7 +108,7 @@ CORPUS_READY_SQL = """
 """
 
 # Extract version 1 text is still served to readers; re-extracting it would
-# only churn R2. Mirrors corpus.store._COMPATIBLE_EXTRACT_VERSIONS.
+# only churn R2. Mirrors corpus.store.COMPATIBLE_EXTRACT_VERSIONS.
 COMPATIBLE_EXTRACT_VERSIONS = ["1", EXTRACT_VERSION]
 
 

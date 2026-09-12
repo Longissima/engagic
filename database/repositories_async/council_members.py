@@ -755,7 +755,7 @@ class CouncilMemberRepository(BaseRepository):
                     source, content_sha256, receipt
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ON CONFLICT (council_member_id, matter_id, meeting_id, motion_index) DO NOTHING
+                ON CONFLICT (council_member_id, matter_id, meeting_id, item_key, motion_index, source) DO NOTHING
                 RETURNING id
                 """,
                 council_member_id,
@@ -789,11 +789,16 @@ class CouncilMemberRepository(BaseRepository):
                       AND matter_id = $2
                       AND meeting_id = $3
                       AND motion_index = $8
+                      AND item_key = COALESCE($9, '')
+                      AND source = $13
                       AND (
                             vote IS DISTINCT FROM $4
                             OR vote_date IS DISTINCT FROM $5
                             OR sequence IS DISTINCT FROM $6
                             OR metadata IS DISTINCT FROM $7
+                            OR motion_text IS DISTINCT FROM COALESCE($10, motion_text)
+                            OR content_sha256 IS DISTINCT FROM COALESCE($11, content_sha256)
+                            OR receipt IS DISTINCT FROM COALESCE($12, receipt)
                           )
                     """,
                     council_member_id,
@@ -808,22 +813,11 @@ class CouncilMemberRepository(BaseRepository):
                     motion_text,
                     content_sha256,
                     receipt,
+                    source,
                 )
                 return False
 
-            # Only increment count when INSERT actually succeeded
-            await c.execute(
-                """
-                UPDATE council_members
-                SET vote_count = vote_count + 1,
-                    last_seen = GREATEST(last_seen, $2),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = $1
-                """,
-                council_member_id,
-                vote_date,
-            )
-
+            # Database triggers maintain vote counts for every writer.
             logger.debug(
                 "recorded vote",
                 council_member_id=council_member_id,
@@ -899,8 +893,8 @@ class CouncilMemberRepository(BaseRepository):
     ) -> Dict[str, int]:
         """Correct observed votes and remove only provably orphaned rows.
 
-        The vote schema has no item identifier. An omitted member list is
-        therefore not sufficient evidence to delete votes while the matter
+        Legacy API votes may have no item identifier. An omitted member list
+        is not sufficient evidence to delete those votes while the matter
         still has any retained item in this meeting. This boundary safely:
 
         * upserts every observed current member/value for retained matters;
@@ -1044,10 +1038,11 @@ class CouncilMemberRepository(BaseRepository):
         rows = await self._fetch(
             """
             SELECT id, council_member_id, matter_id, meeting_id, vote,
-                   vote_date, sequence, metadata, created_at
+                   vote_date, sequence, metadata, created_at, item_id, item_key, motion_index,
+                   motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal
             FROM votes
             WHERE meeting_id = $1
-            ORDER BY matter_id, sequence ASC NULLS LAST
+            ORDER BY matter_id, item_id NULLS LAST, motion_index, sequence ASC NULLS LAST
             """,
             meeting_id,
         )
@@ -1063,6 +1058,10 @@ class CouncilMemberRepository(BaseRepository):
                 sequence=row["sequence"],
                 metadata=row["metadata"],
                 created_at=row["created_at"],
+                item_id=row["item_id"], item_key=row["item_key"], motion_index=row["motion_index"],
+                motion_text=row["motion_text"], source=row["source"],
+                content_sha256=row["content_sha256"], receipt=row["receipt"],
+                parse_run_id=row["parse_run_id"], observation_ordinal=row["observation_ordinal"],
             )
             for row in rows
         ]
@@ -1082,10 +1081,11 @@ class CouncilMemberRepository(BaseRepository):
         rows = await self._fetch(
             """
             SELECT id, council_member_id, matter_id, meeting_id, vote,
-                   vote_date, sequence, metadata, created_at
+                   vote_date, sequence, metadata, created_at, item_id, item_key, motion_index,
+                   motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal
             FROM votes
             WHERE matter_id = $1
-            ORDER BY vote_date DESC NULLS LAST, sequence ASC NULLS LAST
+            ORDER BY vote_date DESC NULLS LAST, meeting_id, item_id NULLS LAST, motion_index, sequence ASC NULLS LAST
             """,
             matter_id,
         )
@@ -1101,6 +1101,10 @@ class CouncilMemberRepository(BaseRepository):
                 sequence=row["sequence"],
                 metadata=row["metadata"],
                 created_at=row["created_at"],
+                item_id=row["item_id"], item_key=row["item_key"], motion_index=row["motion_index"],
+                motion_text=row["motion_text"], source=row["source"],
+                content_sha256=row["content_sha256"], receipt=row["receipt"],
+                parse_run_id=row["parse_run_id"], observation_ordinal=row["observation_ordinal"],
             )
             for row in rows
         ]
@@ -1122,6 +1126,7 @@ class CouncilMemberRepository(BaseRepository):
         rows = await self._fetch(
             """
             SELECT v.id, v.matter_id, v.meeting_id, v.vote, v.vote_date, v.sequence,
+                   v.item_id, v.item_key, v.motion_index, v.motion_text, v.source, v.content_sha256, v.receipt, v.parse_run_id, v.observation_ordinal,
                    m.matter_file, m.title, m.matter_type
             FROM votes v
             JOIN city_matters m ON v.matter_id = m.id
@@ -1144,6 +1149,10 @@ class CouncilMemberRepository(BaseRepository):
                 "matter_file": row["matter_file"],
                 "title": row["title"],
                 "matter_type": row["matter_type"],
+                "item_id": row["item_id"], "item_key": row["item_key"], "motion_index": row["motion_index"],
+                "motion_text": row["motion_text"], "source": row["source"],
+                "content_sha256": row["content_sha256"], "receipt": row["receipt"],
+                "parse_run_id": row["parse_run_id"], "observation_ordinal": row["observation_ordinal"],
             }
             for row in rows
         ]
@@ -1195,45 +1204,41 @@ class CouncilMemberRepository(BaseRepository):
         out.sort(key=lambda e: e["total"], reverse=True)
         return out
 
-    async def get_vote_tally_for_matter(
-        self,
-        matter_id: str,
-        meeting_id: Optional[str] = None,
-    ) -> Dict[str, int]:
-        """Get vote tally (counts) for a matter
+    async def get_motions(self, *, matter_id=None, meeting_id=None) -> List[Dict]:
+        """Read motion evidence, including motions with no individual votes."""
+        if matter_id is None and meeting_id is None:
+            raise ValueError("A matter or meeting is required")
+        rows = await self._fetch("""
+            SELECT im.*, m.date AS vote_date, i.sequence AS item_sequence
+            FROM item_motions im JOIN meetings m ON m.id = im.meeting_id
+            LEFT JOIN items i ON i.id = im.item_id
+            WHERE ($1::text IS NULL OR im.matter_id = $1)
+              AND ($2::text IS NULL OR im.meeting_id = $2)
+            ORDER BY m.date, im.meeting_id, i.sequence, im.item_id, im.motion_index
+        """, matter_id, meeting_id)
+        return [dict(row) for row in rows]
 
-        Args:
-            matter_id: Matter ID
-            meeting_id: Optional meeting ID to filter to specific vote
+    async def get_motion_groups(self, *, matter_id=None, meeting_id=None) -> List[Dict]:
+        """Read both halves of the projection in one database snapshot."""
+        from database.vote_utils import group_motions
+        if matter_id is None and meeting_id is None:
+            raise ValueError("A matter or meeting is required")
+        row = await self._fetchrow("""
+            SELECT
+                (SELECT jsonb_agg(to_jsonb(v)) FROM votes v
+                 WHERE ($1::text IS NULL OR v.matter_id = $1)
+                   AND ($2::text IS NULL OR v.meeting_id = $2)) AS votes,
+                (SELECT jsonb_agg(to_jsonb(motion)) FROM (
+                    SELECT im.*, m.date AS vote_date, i.sequence AS item_sequence
+                    FROM item_motions im JOIN meetings m ON m.id = im.meeting_id
+                    LEFT JOIN items i ON i.id = im.item_id
+                    WHERE ($1::text IS NULL OR im.matter_id = $1)
+                      AND ($2::text IS NULL OR im.meeting_id = $2)
+                ) motion) AS motions
+        """, matter_id, meeting_id)
+        return group_motions(row["votes"] or [], row["motions"] or [])
 
-        Returns:
-            Dict with vote counts: {yes: N, no: N, abstain: N, ...}
-        """
-        if meeting_id:
-            rows = await self._fetch(
-                """
-                SELECT vote, COUNT(*) as count
-                FROM votes
-                WHERE matter_id = $1 AND meeting_id = $2
-                GROUP BY vote
-                """,
-                matter_id,
-                meeting_id,
-            )
-        else:
-            # Get most recent meeting's votes
-            rows = await self._fetch(
-                """
-                SELECT vote, COUNT(*) as count
-                FROM votes
-                WHERE matter_id = $1
-                  AND meeting_id = (
-                      SELECT meeting_id FROM votes WHERE matter_id = $1
-                      ORDER BY vote_date DESC NULLS LAST LIMIT 1
-                  )
-                GROUP BY vote
-                """,
-                matter_id,
-            )
-
-        return {row["vote"]: row["count"] for row in rows}
+    async def get_vote_tally_for_matter(self, matter_id: str, meeting_id=None) -> Optional[Dict[str, int]]:
+        """Tally of the last recorded motion; None when no tally is known."""
+        motions = await self.get_motion_groups(matter_id=matter_id, meeting_id=meeting_id)
+        return motions[-1]["tally"] if motions else None

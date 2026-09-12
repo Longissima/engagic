@@ -1,49 +1,34 @@
 #!/usr/bin/env python3
-"""
-Turn ingested minutes into per-member votes and appearance outcomes.
+"""Observe existing minutes, retain evidence, and publish confirmed motion facts.
 
-This is the minutes route: for the cities whose vendor exposes no votes API,
-the minutes document IS the record. Two parsers, both deterministic and both
-behind a publish gate that abstains on any inconsistency:
+Format drivers and generic evidence use shared claim-level validation. Internal
+runs preserve exact text and unresolved observations. Public minutes projection
+is atomically replaceable; API evidence stays independent. No vendor refetches.
+See docs/MOTION_DATA_CONTRACT.md for lineage, replay and migration details.
 
-  driver   per-city template (parsing.rollcall.spike) for Legistar-generated
-           minutes with a file number beside every motion
-  engine   parsing.rollcall.engine for everyone else: align the minutes to
-           the meeting's own items, read attendance, publish what the clerk
-           recorded at the attribution the document supports
-
-Per-member attribution lands in `votes` (source='minutes', item_id,
-motion_text, byte-offset receipt into the corpus text). Outcome and tally
-land on matter_appearances for every published item, including tally-only
-ones where no member can be named. Roster members named by the minutes are
-created in council_members on first publish (source in metadata).
-
-Every motion on an item is stored, in document order, at its own
-motion_index (migration 043 removed the constraint that allowed only one).
-A single item can carry an amendment that failed and an adoption that
-passed, and collapsing them to the disposition threw away the dissent.
-Meetings that already carry API votes are left alone.
-
-Usage:
-    uv run scripts/parse_minutes_votes.py --banana denverCO         # dry run
-    uv run scripts/parse_minutes_votes.py --apply --days-back 180
+    python -m scripts.parse_minutes_votes --banana denverCO  # dry run
+    python -m scripts.parse_minutes_votes --apply --concurrency 4
 """
 
 import argparse
 import asyncio
+import asyncpg
 import json
+import hashlib
 import re
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import get_logger
 from corpus.store import close_corpus, get_corpus, init_corpus
 from database.db_postgres import Database
 from database.id_generation import generate_matter_id
-from database.vote_utils import compute_vote_tally, determine_vote_outcome
-from parsing.rollcall import DIALECTS, load_spike_parser, norm_file
+from database.repositories_async.minutes import MinutesRepository, digest, run_key, compare_api
+from parsing.rollcall import DIALECTS
+from parsing.rollcall.observations import parser_build
+from parsing.rollcall.identity import MemberIdentities, reconcile_members
 from parsing.rollcall.engine import parse_meeting
 
 logger = get_logger(__name__).bind(component="parse_minutes_votes")
@@ -63,12 +48,13 @@ OUTCOME_TO_DB = {"PASS": "passed", "FAIL": "failed"}
 MEETINGS_SQL = """
     SELECT DISTINCT ON (md.meeting_id)
            md.meeting_id, md.content_sha256, m.banana, m.date,
-           EXISTS (SELECT 1 FROM votes v WHERE v.meeting_id = md.meeting_id AND v.source = 'api') AS has_api_votes
+           b.extract_version, b.text_key, b.text_extracted_at, b.extract_method
     FROM minutes_documents md
     JOIN meetings m ON m.id = md.meeting_id
+    JOIN document_blob b USING(content_sha256)
     WHERE ($1::text IS NULL OR m.banana = $1)
       AND ($2::int IS NULL OR m.date >= now() - make_interval(days => $2))
-    ORDER BY md.meeting_id, md.ingested_at DESC
+    ORDER BY md.meeting_id, md.ingested_at DESC, md.content_sha256 DESC
 """
 ITEMS_SQL = """
     SELECT i.id, i.sequence, i.agenda_number, i.title, i.matter_id,
@@ -77,15 +63,18 @@ ITEMS_SQL = """
     LEFT JOIN city_matters cm ON cm.id = i.matter_id
     WHERE i.meeting_id = $1
 """
-ROSTER_SQL = "SELECT id, name FROM council_members WHERE banana = $1"
+ROSTER_SQL = """SELECT cm.id, cm.name,
+    EXISTS(SELECT 1 FROM votes v WHERE v.council_member_id=cm.id AND v.source='api') AS has_api_votes
+    FROM council_members cm WHERE cm.banana=$1"""
 UPSERT_VOTE_SQL = """
     INSERT INTO votes (council_member_id, matter_id, meeting_id, vote, vote_date, sequence, metadata,
-                       item_id, motion_index, motion_text, source, content_sha256, receipt)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $12, $9, 'minutes', $10, $11)
-    ON CONFLICT (council_member_id, matter_id, meeting_id, motion_index) DO UPDATE SET
-        vote = EXCLUDED.vote, sequence = EXCLUDED.sequence, item_id = EXCLUDED.item_id,
+                       item_id, motion_index, motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $12, $9, 'minutes', $10, $11, $13, $14)
+    ON CONFLICT (council_member_id, matter_id, meeting_id, item_key, motion_index, source) DO UPDATE SET
+        vote = EXCLUDED.vote, vote_date = EXCLUDED.vote_date, sequence = EXCLUDED.sequence, item_id = EXCLUDED.item_id,
         metadata = EXCLUDED.metadata, motion_text = EXCLUDED.motion_text,
-        content_sha256 = EXCLUDED.content_sha256, receipt = EXCLUDED.receipt
+        content_sha256 = EXCLUDED.content_sha256, receipt = EXCLUDED.receipt,
+        parse_run_id=EXCLUDED.parse_run_id, observation_ordinal=EXCLUDED.observation_ordinal
     WHERE votes.source = 'minutes'
 """
 # An item the council voted on is a matter even when no vendor or text gave
@@ -102,10 +91,12 @@ CREATE_TITLE_MATTER_SQL = """
 LINK_ITEM_SQL = "UPDATE items SET matter_id = $1 WHERE id = $2 AND matter_id IS NULL"
 
 UPSERT_APPEARANCE_SQL = """
-    INSERT INTO matter_appearances (matter_id, meeting_id, item_id, appeared_at, vote_outcome, vote_tally)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO matter_appearances (matter_id, meeting_id, item_id, appeared_at, vote_outcome, vote_tally, vote_source)
+    VALUES ($1, $2, $3, $4, $5, $6, 'minutes')
     ON CONFLICT (matter_id, meeting_id, item_id) DO UPDATE SET
-        vote_outcome = EXCLUDED.vote_outcome, vote_tally = EXCLUDED.vote_tally
+        vote_outcome = EXCLUDED.vote_outcome, vote_tally = EXCLUDED.vote_tally,
+        vote_source = 'minutes'
+    WHERE matter_appearances.vote_source IS DISTINCT FROM 'api'
 """
 
 
@@ -120,78 +111,21 @@ class Publishable:
     tally: Dict[str, int]
     motion_text: str
     receipt: Dict[str, Any]
+    observation_index: Optional[int] = None
+    tally_basis: Optional[str] = None
 
 
 def locate(text: str, motion_text: str, sha: str, hint: int = -1) -> Dict[str, Any]:
-    """Byte-offset receipt for the motion sentence, whitespace-insensitive."""
+    """Half-open Unicode character offsets into the hash-pinned corpus text."""
     if hint >= 0:
-        return {"sha256": sha, "start": hint, "end": hint + len(motion_text)}
+        return {"sha256": sha, "unit": "unicode_codepoint", "start": hint, "end": hint + len(motion_text)}
     probe = re.sub(r"\s+", " ", motion_text)[:80].strip()
     if probe:
         pattern = re.compile(r"\s+".join(re.escape(w) for w in probe.split(" ")))
         match = pattern.search(text)
         if match:
-            return {"sha256": sha, "start": match.start(), "end": match.end()}
-    return {"sha256": sha, "start": -1, "end": -1}
-
-
-def via_driver(parse, dialect: str, text: str, items, roster: Dict[str, str], sha: str, counts: Counter, reasons: Counter) -> Dict[Tuple[str, int], Publishable]:
-    by_file: Dict[str, Any] = {}
-    for item in items:
-        key = norm_file(dialect, item["matter_file"])
-        if key and item["matter_id"]:
-            by_file.setdefault(key, item)
-    gazetteer = parse.Gazetteer(sorted(roster))
-    out: Dict[Tuple[str, int], Publishable] = {}
-    motion_counts: Counter = Counter()
-    for passage in parse.PARSERS[dialect](text):
-        if not passage.sections:
-            continue
-        counts["passages"] += 1
-        item = by_file.get(norm_file(dialect, passage.matter_file) or "")
-        if item is None:
-            counts["unaligned"] += 1
-            continue
-        decision = passage.evaluate_publish_gate(gazetteer)
-        if not decision.publishable:
-            counts["abstained"] += 1
-            for reason in decision.reasons:
-                reasons[reason.split(":")[0]] += 1
-            continue
-        motion_index = motion_counts[item["id"]]
-        motion_counts[item["id"]] += 1
-        tally = compute_vote_tally([{"vote": CANON_TO_DB.get(v, "present")} for _, v in decision.votes])
-        out[(item["id"], motion_index)] = Publishable(
-            motion_index=motion_index,
-            item_id=item["id"], matter_id=item["matter_id"], method="driver",
-            votes=decision.votes, outcome=OUTCOME_TO_DB.get(passage.outcome or ""), tally=tally,
-            motion_text=passage.motion_text, receipt=locate(text, passage.motion_text, sha),
-        )
-    return out
-
-
-def via_engine(text: str, items, roster: Dict[str, str], sha: str, counts: Counter, reasons: Counter) -> Tuple[Dict[Tuple[str, int], Publishable], List[str]]:
-    parsed = parse_meeting(text, [dict(i) for i in items], list(roster))
-    counts["items_anchored"] += parsed.items_anchored
-    counts["items_total"] += parsed.items_total
-    counts["passages"] += parsed.evidence_seen
-    counts["abstained"] += len(parsed.abstained)
-    for ab in parsed.abstained:
-        for reason in ab.reasons:
-            reasons[reason.split(":")[0]] += 1
-    out: Dict[Tuple[str, int], Publishable] = {}
-    for iv in parsed.published:
-        counts[f"method_{iv.method}"] += 1
-        tally = dict(iv.tally) if iv.tally else compute_vote_tally(
-            [{"vote": CANON_TO_DB.get(v, "present")} for _, v in iv.member_votes]
-        )
-        out[(iv.item["id"], iv.motion_index)] = Publishable(
-            motion_index=iv.motion_index,
-            item_id=iv.item["id"], matter_id=iv.item["matter_id"], method=iv.method,
-            votes=iv.member_votes, outcome=OUTCOME_TO_DB.get(iv.outcome or ""), tally=tally,
-            motion_text=iv.motion_text, receipt=locate(text, iv.motion_text, sha, hint=iv.offset),
-        )
-    return out, parsed.attendance.present + parsed.attendance.absent
+            return {"sha256": sha, "unit": "unicode_codepoint", "start": match.start(), "end": match.end()}
+    return {"sha256": sha, "unit": "unicode_codepoint", "start": -1, "end": -1}
 
 
 async def ensure_members(db, banana: str, names: List[str], roster: Dict[str, str]) -> None:
@@ -199,117 +133,263 @@ async def ensure_members(db, banana: str, names: List[str], roster: Dict[str, st
     for name in names:
         if name in roster:
             continue
-        member = await db.council_members.find_or_create_member(banana, name)
+        try:
+            member = await db.council_members.find_or_create_member(banana, name)
+        except asyncpg.UniqueViolationError:
+            # Another meeting in the same city may establish the same person.
+            member = await db.council_members.find_or_create_member(banana, name)
         if member is not None:
             roster[name] = member.id
             await db.council_members.update_member_metadata(member.id, metadata={"source": "minutes"})
 
 
-async def main() -> int:
-    ap = argparse.ArgumentParser(description="Write per-member votes and outcomes from ingested minutes")
-    ap.add_argument("--banana")
-    ap.add_argument("--days-back", type=int, default=None)
-    ap.add_argument("--apply", action="store_true", help="write (default is dry run)")
-    args = ap.parse_args()
+UPSERT_MOTION_SQL = """
+    INSERT INTO item_motions (item_id, motion_index, matter_id, meeting_id,
+        motion_text, outcome, tally, method, source, content_sha256, receipt, parse_run_id, observation_ordinal, tally_basis)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'minutes', $9, $10, $11, $12, $13)
+    ON CONFLICT (item_id, motion_index, source) DO UPDATE SET
+        matter_id = EXCLUDED.matter_id, meeting_id = EXCLUDED.meeting_id,
+        motion_text = EXCLUDED.motion_text, outcome = EXCLUDED.outcome,
+        tally = EXCLUDED.tally, method = EXCLUDED.method,
+        content_sha256 = EXCLUDED.content_sha256, receipt = EXCLUDED.receipt,
+        parse_run_id=EXCLUDED.parse_run_id, observation_ordinal=EXCLUDED.observation_ordinal,
+        tally_basis=EXCLUDED.tally_basis, updated_at = CURRENT_TIMESTAMP
+    WHERE item_motions.source = 'minutes'
+"""
 
-    parse = load_spike_parser()
+
+async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=None, final_indices=None, expected_items=None) -> bool:
+    """Atomically replace a successfully parsed minutes projection, even empty.
+
+    Missing corpus text and parser exceptions never call this function. API
+    rows belong to their own writer. Revision changes abort this publication.
+    Retained vote ids survive reruns; removed motions/members are retracted.
+    """
+    async with conn.transaction():
+        await conn.fetchval("SELECT id FROM meetings WHERE id = $1 FOR UPDATE", row["meeting_id"])
+        current_sha = await conn.fetchval("""
+            SELECT content_sha256 FROM minutes_documents WHERE meeting_id = $1
+            ORDER BY ingested_at DESC, content_sha256 DESC LIMIT 1
+        """, row["meeting_id"])
+        if current_sha != row["content_sha256"]:
+            return False
+        if expected_items is not None:
+            observed_items = [dict(i) for i in await conn.fetch(ITEMS_SQL, row['meeting_id'])]
+            if sorted(observed_items, key=lambda i:i['id']) != sorted(expected_items, key=lambda i:i['id']):
+                return False
+        current_items = {i["id"]: i["matter_id"] for i in await conn.fetch(
+            "SELECT id, matter_id FROM items WHERE meeting_id = $1", row["meeting_id"])}
+        for pub in published.values():
+            if pub.item_id not in current_items or current_items[pub.item_id] not in (None, pub.matter_id):
+                return False
+        old_members = await conn.fetch(
+            "SELECT DISTINCT council_member_id FROM votes WHERE meeting_id = $1 AND source = 'minutes'",
+            row["meeting_id"],
+        )
+        member_ids = {r["council_member_id"] for r in old_members}
+        for pub in published.values():
+            for name, _ in pub.votes:
+                if name not in roster:
+                    raise ValueError(f"Unmapped minutes voter: {name}")
+                member_ids.add(roster[name])
+        # Lock counters before changing their underlying rows, in one order.
+        await conn.fetch("SELECT id FROM council_members WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE", sorted(member_ids))
+        for matter_id, item_id, title in to_create:
+            await conn.execute(CREATE_TITLE_MATTER_SQL, matter_id, row["banana"], title, row["date"])
+            await conn.execute(LINK_ITEM_SQL, matter_id, item_id)
+        # Explicit ownership also covers older tally-only publications.
+        await conn.execute("""
+            UPDATE matter_appearances SET vote_outcome = NULL, vote_tally = NULL, vote_source = NULL
+            WHERE meeting_id = $1 AND vote_source = 'minutes'
+        """, row["meeting_id"])
+        vote_keys, motion_keys = [], []
+        final = {}
+        for pub in published.values():
+            outcome = pub.outcome
+            await conn.execute(UPSERT_MOTION_SQL, pub.item_id, pub.motion_index,
+                pub.matter_id, row["meeting_id"], pub.motion_text, outcome,
+                pub.tally or None, pub.method, row["content_sha256"], pub.receipt, run_id, pub.observation_index, pub.tally_basis)
+            motion_keys.append({"item_id": pub.item_id, "motion_index": pub.motion_index})
+            for seq, (name, canon) in enumerate(pub.votes, 1):
+                member_id = roster[name]
+                await conn.execute(UPSERT_VOTE_SQL, member_id, pub.matter_id, row["meeting_id"],
+                    CANON_TO_DB[canon], row["date"], seq, {"method": pub.method},
+                    pub.item_id, pub.motion_text, row["content_sha256"], pub.receipt, pub.motion_index, run_id, pub.observation_index)
+                vote_keys.append({"member_id": member_id, "matter_id": pub.matter_id,
+                                  "item_id": pub.item_id, "motion_index": pub.motion_index})
+            if pub.item_id not in final or pub.motion_index > final[pub.item_id].motion_index:
+                final[pub.item_id] = pub
+        await conn.execute("""
+            DELETE FROM votes v WHERE v.meeting_id = $1 AND v.source = 'minutes'
+            AND NOT EXISTS (
+                SELECT 1 FROM jsonb_to_recordset($2::jsonb)
+                    AS k(member_id text, matter_id text, item_id text, motion_index int)
+                WHERE k.member_id = v.council_member_id AND k.matter_id = v.matter_id
+                  AND k.item_id = v.item_id AND k.motion_index = v.motion_index
+            )
+        """, row["meeting_id"], vote_keys)
+        await conn.execute("""
+            DELETE FROM item_motions m WHERE m.meeting_id = $1 AND m.source = 'minutes'
+            AND NOT EXISTS (SELECT 1 FROM jsonb_to_recordset($2::jsonb)
+                AS k(item_id text, motion_index int)
+                WHERE k.item_id = m.item_id AND k.motion_index = m.motion_index)
+        """, row["meeting_id"], motion_keys)
+        for pub in final.values():
+            if final_indices is not None and final_indices.get(pub.item_id) != pub.motion_index:
+                continue
+            outcome = pub.outcome
+            await conn.execute(UPSERT_APPEARANCE_SQL, pub.matter_id, row["meeting_id"],
+                pub.item_id, row["date"], outcome, {**pub.tally, "method": pub.method})
+        await conn.execute("""
+            UPDATE council_members cm SET vote_count = (
+                SELECT count(*) FROM votes v WHERE v.council_member_id = cm.id
+            ), last_seen = GREATEST(last_seen, (SELECT max(vote_date) FROM votes v
+                WHERE v.council_member_id = cm.id)), updated_at = CURRENT_TIMESTAMP
+            WHERE cm.id = ANY($1::text[])
+        """, sorted(member_ids))
+        if run_id:
+            await conn.execute("""INSERT INTO minutes_publications(meeting_id,run_id) VALUES($1,$2)
+                ON CONFLICT(meeting_id) DO UPDATE SET run_id=EXCLUDED.run_id,published_at=CURRENT_TIMESTAMP""",
+                row['meeting_id'], run_id)
+    return True
+
+
+API_VOTES_SQL = """
+    SELECT id, council_member_id, matter_id, item_id, motion_index, vote
+    FROM votes WHERE meeting_id=$1 AND source='api' ORDER BY id
+"""
+
+
+async def process_one(db, corpus, audit, row, build, apply, counts, reasons):
+    text = None
+    parsed = None
+    inputs = {}
+    try:
+        async with db.pool.acquire() as conn:
+            items = [dict(i) for i in await conn.fetch(ITEMS_SQL, row['meeting_id'])]
+            roster_rows = [dict(i) for i in await conn.fetch(ROSTER_SQL + ' ORDER BY cm.id', row['banana'])]
+            api_votes = [dict(i) for i in await conn.fetch(API_VOTES_SQL, row['meeting_id'])]
+        fingerprint = digest([row.get(k) for k in ('text_key', 'text_extracted_at', 'extract_method', 'extract_version')])
+        inputs = {'items': sorted(items, key=lambda i:i['id']), 'roster': roster_rows,
+                  'api_votes': api_votes, 'extraction_fingerprint': fingerprint,
+                  'dialect': DIALECTS.get(row['banana'])}
+        if row.get('text_extracted_at'):
+            text = await audit.cached_text(row['content_sha256'], row['extract_version'], fingerprint)
+        if text is not None:
+            counts['text_cache_hits'] += 1
+        else:
+            result = await corpus.lookup_extraction(row['content_sha256'])
+            text = (result or {}).get('text')
+        if not text:
+            counts['missing_text'] += 1
+            if apply:
+                async with db.pool.acquire() as conn:
+                    async with conn.transaction():
+                        await audit.save_run(conn,row,None,build,inputs,status='missing_text')
+            return
+        text_sha = hashlib.sha256(text.encode()).hexdigest()
+        if apply and await audit.is_current(row['meeting_id'],run_key(row,text_sha,build,inputs)):
+            counts['unchanged_runs'] += 1
+            return
+        identities = MemberIdentities(roster_rows, [v['council_member_id'] for v in api_votes])
+        roster, _ = identities.roster_map()
+        parsed = parse_meeting(text,items,[r['name'] for r in roster_rows],DIALECTS.get(row['banana']))
+        reconcile_members(parsed,identities)
+        compare_api(parsed,api_votes,items,roster_rows)
+        published = {}
+        to_create = {}
+        final_indices = {}
+        for obs in parsed.observations:
+            if obs.item_id and obs.kind == 'motion':
+                final_indices[obs.item_id] = max(final_indices.get(obs.item_id,-1),obs.interpretation['motion_index'])
+            for check in obs.checks:
+                if check['status'] == 'withheld':
+                    reasons[check['reason']] += 1
+        for iv in parsed.published:
+            obs = parsed.observations[iv.observation_index]
+            matter_id = iv.item.get('matter_id') or generate_matter_id(row['banana'],title=iv.item.get('title') or '')
+            if not matter_id:
+                obs.checks.append(dict(field='matter',status='withheld',reason='no_durable_matter_identity'))
+                obs.publication = None
+                continue
+            if not iv.item.get('matter_id'):
+                to_create[iv.item['id']] = (matter_id,iv.item['id'],iv.item['title'])
+            receipt = {'sha256':row['content_sha256'],'text_sha256':text_sha,
+                       'extract_version':row['extract_version'],'unit':'unicode_codepoint',
+                       'start':obs.start,'end':obs.end}
+            pub = Publishable(iv.motion_index,iv.item['id'],matter_id,iv.method,iv.member_votes,
+                OUTCOME_TO_DB.get(iv.outcome),dict(iv.tally),iv.motion_text,receipt,obs.ordinal,iv.tally_basis)
+            obs.publication = asdict(pub)
+            published[(iv.item['id'],iv.motion_index)] = pub
+        counts['meetings'] += 1
+        counts['observations'] += len(parsed.observations)
+        counts['published_motions'] += len(published)
+        counts['vote_rows'] += sum(len(p.votes) for p in published.values())
+        if not apply:
+            return
+        needed = sorted({name for pub in published.values() for name,_ in pub.votes})
+        await ensure_members(db,row['banana'],needed,roster)
+        async with db.pool.acquire() as conn:
+            async with conn.transaction():
+                # Serializes ledger/cache publication with another minutes worker.
+                await conn.fetchval('SELECT id FROM meetings WHERE id=$1 FOR UPDATE',row['meeting_id'])
+                run_id = await audit.save_run(conn,row,text,build,inputs,parsed)
+                written = await persist_meeting(conn,row,published,roster,list(to_create.values()),
+                                               run_id=run_id,final_indices=final_indices,expected_items=items)
+        counts['meetings_written' if written else 'changed_during_parse'] += 1
+    except Exception as exc:
+        counts['failed'] += 1
+        logger.exception('minutes interpretation failed',meeting_id=row['meeting_id'])
+        if apply:
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    await audit.save_run(conn,row,text,build,inputs,parsed,status='failed',
+                        error={'type':type(exc).__name__,'message':str(exc)[:2000]})
+
+
+async def main() -> int:
+    ap = argparse.ArgumentParser(description='Observe minutes, validate claims, publish confirmed facts')
+    ap.add_argument('--banana')
+    ap.add_argument('--meeting-id')
+    ap.add_argument('--days-back',type=int,default=None)
+    ap.add_argument('--limit',type=int)
+    ap.add_argument('--concurrency',type=int,default=4)
+    ap.add_argument('--apply',action='store_true',help='persist ledger and public projection (default dry run)')
+    args = ap.parse_args()
     db = await Database.create()
     init_corpus(db.document_blobs)
     corpus = get_corpus()
     if corpus is None:
-        logger.error("corpus unavailable")
+        await db.pool.close()
+        logger.error('corpus unavailable')
         return 2
-    counts: Counter = Counter()
-    reasons: Counter = Counter()
-    per_city: Counter = Counter()
+    audit = MinutesRepository(db.pool)
+    counts,reasons = Counter(),Counter()
     try:
         async with db.pool.acquire() as conn:
-            meetings = await conn.fetch(MEETINGS_SQL, args.banana, args.days_back)
-        for row in meetings:
-            if row["has_api_votes"]:
-                counts["skipped_api_meeting"] += 1
-                continue
-            result = await corpus.lookup_extraction(row["content_sha256"])
-            text = (result or {}).get("text") or ""
-            if not text:
-                counts["no_text"] += 1
-                continue
-            async with db.pool.acquire() as conn:
-                roster = {r["name"]: r["id"] for r in await conn.fetch(ROSTER_SQL, row["banana"])}
-                items = await conn.fetch(ITEMS_SQL, row["meeting_id"])
-            counts["meetings"] += 1
-            sha = row["content_sha256"]
-            dialect = DIALECTS.get(row["banana"])
-            if dialect:
-                published = via_driver(parse, dialect, text, items, roster, sha, counts, reasons)
-                new_names: List[str] = []
-            else:
-                published, new_names = via_engine(text, items, roster, sha, counts, reasons)
-            titles = {i["id"]: i["title"] for i in items}
-            to_create: List[Tuple[str, str, str]] = []
-            for pub in published.values():
-                if pub.matter_id:
-                    continue
-                matter_id = generate_matter_id(row["banana"], title=titles.get(pub.item_id) or "")
-                if matter_id:
-                    pub.matter_id = matter_id
-                    if pub.motion_index == 0:
-                        to_create.append((matter_id, pub.item_id, titles[pub.item_id]))
-                        counts["title_keyed_matters"] += 1
-                else:
-                    counts["generic_title_unkeyed"] += 1
-            published = {k: v for k, v in published.items() if v.matter_id}
-            last_motion: Dict[str, int] = {}
-            for pub in published.values():
-                last_motion[pub.item_id] = max(last_motion.get(pub.item_id, 0), pub.motion_index)
-            counts["motions_published"] += len(published)
-            counts["publishable_items"] += len(last_motion)
-            counts["extra_motions"] += len(published) - len(last_motion)
-            counts["vote_rows"] += sum(len(p.votes) for p in published.values())
-            per_city[row["banana"]] += len(published)
-            if not args.apply or not published:
-                continue
-            needed = sorted({name for p in published.values() for name, _ in p.votes} | set(new_names))
-            await ensure_members(db, row["banana"], needed, roster)
-            async with db.pool.acquire() as conn:
-                async with conn.transaction():
-                    for matter_id, item_id, title in to_create:
-                        await conn.execute(CREATE_TITLE_MATTER_SQL, matter_id, row["banana"], title, row["date"])
-                        await conn.execute(LINK_ITEM_SQL, matter_id, item_id)
-                    for pub in published.values():
-                        for seq, (member, canon) in enumerate(pub.votes, 1):
-                            member_id = roster.get(member)
-                            if member_id is None:
-                                counts["member_unmapped"] += 1
-                                continue
-                            await conn.execute(
-                                UPSERT_VOTE_SQL, member_id, pub.matter_id, row["meeting_id"],
-                                CANON_TO_DB.get(canon, "present"), row["date"], seq,
-                                {"method": pub.method}, pub.item_id, pub.motion_text, sha,
-                                pub.receipt, pub.motion_index,
-                            )
-                        # matter_appearances holds one disposition per
-                        # appearance, so the last motion on the item wins
-                        # there while every motion survives in votes.
-                        if pub.motion_index != last_motion.get(pub.item_id):
-                            continue
-                        outcome = pub.outcome or determine_vote_outcome(pub.tally)
-                        await conn.execute(
-                            UPSERT_APPEARANCE_SQL, pub.matter_id, row["meeting_id"], pub.item_id,
-                            row["date"], outcome, {**pub.tally, "method": pub.method},
-                        )
-            counts["meetings_written"] += 1
-        logger.info("minutes votes", apply=args.apply, **counts)
-        print(json.dumps({
-            "counts": dict(counts),
-            "abstained": dict(reasons),
-            "top_cities": per_city.most_common(15),
-        }, indent=1))
-        return 0
+            rows = [dict(r) for r in await conn.fetch(MEETINGS_SQL,args.banana,args.days_back)]
+        if args.meeting_id:
+            rows = [r for r in rows if r['meeting_id']==args.meeting_id]
+        if args.limit is not None:
+            rows = rows[:args.limit]
+        build = parser_build()
+        queue = asyncio.Queue()
+        for row in rows:
+            queue.put_nowait(row)
+        async def worker():
+            while not queue.empty():
+                row = queue.get_nowait()
+                await process_one(db,corpus,audit,row,build,args.apply,counts,reasons)
+                queue.task_done()
+                if (len(rows)-queue.qsize()) % 100 == 0:
+                    logger.info('minutes progress',remaining=queue.qsize(),**counts)
+        await asyncio.gather(*(worker() for _ in range(max(1,min(args.concurrency,8)))))
+        print(json.dumps({'counts':dict(counts),'withheld':dict(reasons)},indent=2))
+        return 1 if counts['failed'] else 0
     finally:
         await close_corpus()
         await db.pool.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(asyncio.run(main()))

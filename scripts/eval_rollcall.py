@@ -5,7 +5,8 @@ Run the roll-call parser over ingested minutes and measure it two ways.
 Scored mode (default): meetings whose vendor API also supplied per-member
 votes (Legistar cities, Chicago). Parsed votes are compared tuple-by-tuple to
 the `votes` table and outcomes to matter_appearances.vote_outcome. This is
-the only place the parser can be tuned against truth.
+a legacy API comparison, not ground truth. The pinned fixtures in
+tests/test_minutes_fixtures.py exercise the current production observer.
 
 Consistency mode (--all): every meeting with minutes text and a dialect
 driver, API votes or not. There is no truth for a minutes-only city, so what
@@ -83,7 +84,7 @@ COVERAGE_ITEMS_SQL = """
 MEETINGS_SQL = """
     SELECT DISTINCT ON (md.meeting_id)
            md.meeting_id, md.content_sha256, m.banana, m.title, m.date,
-           EXISTS (SELECT 1 FROM votes v WHERE v.meeting_id = md.meeting_id) AS has_api_votes
+           EXISTS (SELECT 1 FROM votes v WHERE v.meeting_id = md.meeting_id AND v.source = 'api') AS has_api_votes
     FROM minutes_documents md
     JOIN meetings m ON m.id = md.meeting_id
     WHERE ($1::text IS NULL OR m.banana = $1)
@@ -97,7 +98,7 @@ GT_SQL = """
     JOIN city_matters cm ON cm.id = v.matter_id
     LEFT JOIN matter_appearances ma
            ON ma.matter_id = v.matter_id AND ma.meeting_id = v.meeting_id
-    WHERE v.meeting_id = $1
+    WHERE v.meeting_id = $1 AND v.source = 'api'
 """
 
 ROSTER_SQL = "SELECT name FROM council_members WHERE banana = $1"

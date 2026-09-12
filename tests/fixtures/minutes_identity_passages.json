@@ -1,0 +1,35 @@
+[
+  {
+    "city": "dupagecountyIL",
+    "meeting_id": "dupagecountyIL_56a08503",
+    "source": {
+      "content_sha256": "f968d8493a7a177f427ca22304042665cb53235789fc785f13e9c658fc189c73",
+      "text_sha256": "92a1e905bff0ff6d8474be545295cb7db8eb4b0c912d68663378b0de97c92f27",
+      "start_offset": 7503,
+      "end_offset": 8066,
+      "raw_text": "       8.C.   26-1739\n           Amendment to purchase order 7938-0001 SERV, issued to United Staffing Network,\n                 Inc., to extend the contract through November 30, 2026, to continue to provide\n              supplemental pharmacy staffing for the DuPage Care Center.\n\n          RESULT:     APPROVED AND SENT TO FINANCE\n         MOVER:      Dawn DeSart\n         SECONDER:    Saba Haider\n          AYES:           DeSart, Deacon Garcia, Haider, and Yoo\n          ABSENT:       Cronin Cahill, and Schwarze\n         REMOTE:       Galassi, and LaPlante\n\n"
+    }
+  },
+  {
+    "city": "fortlauderdaleFL",
+    "meeting_id": "fortlauderdaleFL_1e813512",
+    "source": {
+      "content_sha256": "aa6ace729c65e4ef977a68f14a62314fffe54ad00c987ac7e4370b062f421425",
+      "text_sha256": "ed117c16c22ed0bbcf4e7a5abda564c518c6cf7ff999094445ab7c7a49ac9d5a",
+      "start_offset": 5738,
+      "end_offset": 6184,
+      "raw_text": "CM-1  26-0471      Motion Approving an Outdoor Event Agreement with DW\n                    Consultants Inc for I Love Cabo Verde on June 20, 2026, at\n                   Esplanade Park - (Commission District 2)\n\n                 APPROVED\n\n                      Yea: 4 -  Commissioner Glassman, Commissioner Beasley-Pittman, Vice\n                              Mayor Sorensen and Commissioner Herbst\n\n              Not Present: 1 -  Mayor Trantalis\n"
+    }
+  },
+  {
+    "city": "milwaukeeWI",
+    "meeting_id": "milwaukeeWI_ab429a4b",
+    "source": {
+      "content_sha256": "c5e31854391ea60227bfe999c0f51cd534fcc9ca1e575f7d4a93f4c0b6d427de",
+      "text_sha256": "a3cc4d9af8b6f1487a420b6cbbb64aa08390478f72b135f36eff4cc81ebd45c7",
+      "start_offset": 4336,
+      "end_offset": 5076,
+      "raw_text": "5.    252153           Resolution relating to the appeal of Jason Musante-Klumb for property\n                     damage.\n\n                    A motion was made by ALD. BAUMAN that this Resolution be RECOMMENDED\n                    FOR DISALLOWANCE & INDEF. POSTPONEMENT. This motion PREVAILED by\n                             the following vote:\n\n                        Aye  3 -   Pratt, Bauman, and Perez\n\n                       No  0\n\n\n\n\nCity of Milwaukee                                           Page 2\n\n--- PAGE 3 ---\nJUDICIARY & LEGISLATION                     Meeting Minutes                                     July 27, 2026\nCOMMITTEE\n\n                     Excused  1 -  Westmoreland\n\n                        Abstain  1 -  Jackson\n"
+    }
+  }
+]

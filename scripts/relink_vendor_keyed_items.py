@@ -87,6 +87,7 @@ MOVE_APPEARANCES_SQL = """
     UPDATE matter_appearances SET matter_id = $1
     WHERE item_id = ANY($2::text[]) AND matter_id <> $1
 """
+MOVE_MOTIONS_SQL = "UPDATE item_motions SET matter_id = $1 WHERE item_id = ANY($2::text[])"
 MOVE_DELIBERATIONS_SQL = "UPDATE deliberations SET matter_id = $1 WHERE matter_id = ANY($2::text[])"
 COPY_SPONSORSHIPS_SQL = """
     INSERT INTO sponsorships (council_member_id, matter_id, is_primary, sponsor_order)
@@ -96,11 +97,11 @@ COPY_SPONSORSHIPS_SQL = """
 """
 COPY_VOTES_SQL = """
     INSERT INTO votes (council_member_id, matter_id, meeting_id, vote, vote_date, sequence, metadata,
-                       item_id, motion_index, motion_text, source, content_sha256, receipt)
+                       item_id, item_key, motion_index, motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal)
     SELECT council_member_id, $1::text, meeting_id, vote, vote_date, sequence, metadata,
-           item_id, motion_index, motion_text, source, content_sha256, receipt
+           item_id, item_key, motion_index, motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal
     FROM votes WHERE matter_id = ANY($2::text[])
-    ON CONFLICT (council_member_id, matter_id, meeting_id, motion_index) DO NOTHING
+    ON CONFLICT (council_member_id, matter_id, meeting_id, item_key, motion_index, source) DO NOTHING
 """
 COPY_TOPICS_SQL = """
     INSERT INTO matter_topics (matter_id, topic)
@@ -168,6 +169,7 @@ async def apply_group(conn, target: str, group: Target) -> int:
             return 0
         await conn.execute(CREATE_SQL, target, seeds[0]["id"], group.matter_file, group.matter_type)
         moved = await conn.fetch(MOVE_ITEMS_SQL, target, group.matter_file, group.matter_type, group.items)
+        await conn.execute(MOVE_MOTIONS_SQL, target, group.items)
         await conn.execute(MOVE_APPEARANCES_SQL, target, group.items)
         await conn.execute(MOVE_DELIBERATIONS_SQL, target, sources)
         await conn.execute(COPY_SPONSORSHIPS_SQL, target, sources)

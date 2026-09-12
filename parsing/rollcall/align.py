@@ -63,7 +63,7 @@ def _title_match(text_lower: str, lines_lower: List[str], line_offsets: List[int
     if len(words) < 3:
         return None
     probe = r"\W+(?:\w+\W+){0,3}?".join(re.escape(w) for w in words[:5])
-    m = re.search(probe, text_lower)
+    m = re.search(probe, text_lower, re.IGNORECASE)
     if m:
         return m.start()
     # Fuzzy fallback only over lines that share the title's rarest word;
@@ -106,12 +106,13 @@ def anchor_items(text: str, items: Sequence[Any]) -> List[Anchor]:
 
     Each item is a mapping with title, agenda_number, matter_file, sequence.
     """
-    text_lower = text.lower()
-    lines = text.splitlines()
+    text_lower = text  # Preserve original Unicode offsets; regex handles case.
+    raw_lines = text.splitlines(keepends=True)
+    lines = [line.splitlines()[0] for line in raw_lines]
     line_offsets, pos = [], 0
-    for line in lines:
+    for line in raw_lines:
         line_offsets.append(pos)
-        pos += len(line) + 1
+        pos += len(line)
     lines_lower = [line.lower() for line in lines]
 
     anchors: List[Anchor] = []
@@ -122,6 +123,14 @@ def anchor_items(text: str, items: Sequence[Any]) -> List[Anchor]:
             m = pattern.search(text) if pattern else None
             if m:
                 start, rung = m.start(), "matter_file"
+        if start is None and item.get("title"):
+            # Compact case numbers are often present only in the title.
+            # Match the complete token, never its alphabetic prefix (DRB260012).
+            code = re.match(r"^\s*([A-Za-z]{1,8}\d{4,10})\b", str(item["title"]))
+            pattern = _file_pattern(code.group(1)) if code else None
+            match = pattern.search(text) if pattern else None
+            if match:
+                start, rung = match.start(), "title_identifier"
         if start is None and item.get("agenda_number"):
             pattern = _agenda_pattern(str(item["agenda_number"]))
             m = pattern.search(text) if pattern else None

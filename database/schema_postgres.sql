@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS matter_appearances (
     action TEXT,
     vote_outcome TEXT CHECK (vote_outcome IS NULL OR vote_outcome IN ('passed', 'failed', 'tabled', 'withdrawn', 'referred', 'amended', 'unknown', 'no_vote')),
     vote_tally JSONB,  -- {yes: N, no: N, abstain: N, absent: N}
+    vote_source TEXT CHECK (vote_source IN ('api', 'minutes')),
     committee_id TEXT,  -- FK to committees for relational queries
     sequence INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -576,6 +577,49 @@ CREATE TABLE IF NOT EXISTS sponsorships (
     UNIQUE(council_member_id, matter_id)
 );
 
+CREATE TABLE IF NOT EXISTS minutes_text_snapshots (
+    text_sha256 TEXT PRIMARY KEY,
+    text_content TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS minutes_parse_runs (
+    id TEXT PRIMARY KEY,
+    cache_key TEXT NOT NULL,
+    meeting_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    text_sha256 TEXT REFERENCES minutes_text_snapshots(text_sha256),
+    extract_version TEXT,
+    parser_version TEXT NOT NULL,
+    parser_build TEXT NOT NULL,
+    inputs JSONB NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed', 'missing_text')),
+    error JSONB,
+    summary JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_minutes_completed_input ON minutes_parse_runs(cache_key) WHERE status = 'completed';
+CREATE INDEX IF NOT EXISTS idx_minutes_runs_meeting ON minutes_parse_runs(meeting_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS minutes_observations (
+    run_id TEXT NOT NULL REFERENCES minutes_parse_runs(id),
+    ordinal INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    raw_text TEXT NOT NULL,
+    item_id TEXT,
+    evidence JSONB NOT NULL,
+    interpretation JSONB NOT NULL,
+    checks JSONB NOT NULL,
+    publication JSONB,
+    PRIMARY KEY (run_id, ordinal)
+);
+CREATE TABLE IF NOT EXISTS minutes_publications (
+    meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES minutes_parse_runs(id),
+    published_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
 -- Votes: Individual voting records per member per matter per meeting
 CREATE TABLE IF NOT EXISTS votes (
     id BIGSERIAL PRIMARY KEY,
@@ -586,11 +630,20 @@ CREATE TABLE IF NOT EXISTS votes (
     vote_date TIMESTAMP,  -- Date of vote (usually meeting date)
     sequence INTEGER,  -- Order in roll call if available
     metadata JSONB,  -- Vendor-specific (motion_id, voice_vote, etc.)
+    item_id TEXT REFERENCES items(id) ON DELETE SET NULL,
+    item_key TEXT NOT NULL DEFAULT '',
+    motion_index SMALLINT NOT NULL DEFAULT 0,
+    motion_text TEXT,
+    source TEXT NOT NULL DEFAULT 'api' CHECK (source IN ('api', 'minutes')),
+    content_sha256 TEXT,
+    receipt JSONB,
+    parse_run_id TEXT,
+    observation_ordinal INTEGER,
+    FOREIGN KEY (parse_run_id, observation_ordinal) REFERENCES minutes_observations(run_id, ordinal),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (council_member_id) REFERENCES council_members(id) ON DELETE CASCADE,
     FOREIGN KEY (matter_id) REFERENCES city_matters(id) ON DELETE CASCADE,
-    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
-    UNIQUE(council_member_id, matter_id, meeting_id)
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
 
 -- =======================
@@ -695,7 +748,7 @@ CREATE TABLE IF NOT EXISTS deliberation_results (
 CREATE TABLE IF NOT EXISTS happening_items (
     id SERIAL PRIMARY KEY,
     banana TEXT NOT NULL REFERENCES jurisdictions(banana) ON DELETE CASCADE,
-    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    item_id TEXT NOT NULL, -- original item identity retained with motion evidence
     meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
     meeting_date TIMESTAMP NOT NULL,
     rank INTEGER NOT NULL,
@@ -1015,7 +1068,7 @@ CREATE TRIGGER trg_meeting_revisions
 
 CREATE TABLE IF NOT EXISTS item_revisions (
     id BIGSERIAL PRIMARY KEY,
-    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    item_id TEXT NOT NULL, -- original item identity retained with motion evidence
     meeting_id TEXT NOT NULL,  -- denormalized for meeting-history queries
     changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     changes JSONB NOT NULL
@@ -1078,3 +1131,74 @@ WHERE m.date IS NOT NULL
   AND i.created_at > m.created_at + INTERVAL '6 hours'
   AND i.created_at > m.date - INTERVAL '72 hours'
   AND i.created_at < m.date;
+
+CREATE TABLE IF NOT EXISTS item_motions (
+    item_id TEXT NOT NULL, -- historical identity; retained if the agenda item is removed
+    motion_index SMALLINT NOT NULL CHECK (motion_index >= 0),
+    matter_id TEXT NOT NULL REFERENCES city_matters(id) ON DELETE CASCADE,
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    motion_text TEXT NOT NULL,
+    outcome TEXT,
+    tally JSONB,
+    method TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'minutes' CHECK (source IN ('api', 'minutes')),
+    content_sha256 TEXT,
+    receipt JSONB,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tally_basis TEXT,
+    parse_run_id TEXT,
+    observation_ordinal INTEGER,
+    FOREIGN KEY (parse_run_id, observation_ordinal) REFERENCES minutes_observations(run_id, ordinal),
+    PRIMARY KEY (item_id, motion_index, source)
+);
+CREATE INDEX IF NOT EXISTS idx_item_motions_matter ON item_motions(matter_id, meeting_id);
+CREATE INDEX IF NOT EXISTS idx_item_motions_meeting ON item_motions(meeting_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_votes_member_item_motion
+    ON votes(council_member_id, matter_id, meeting_id, item_key, motion_index, source);
+
+CREATE TABLE IF NOT EXISTS minutes_documents (
+    meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    content_sha256 TEXT NOT NULL REFERENCES document_blob(content_sha256) ON DELETE CASCADE,
+    source_identity TEXT NOT NULL,
+    ingested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (meeting_id, content_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_minutes_documents_sha ON minutes_documents(content_sha256);
+
+CREATE OR REPLACE FUNCTION preserve_vote_item_key() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.item_id IS NOT NULL THEN
+        NEW.item_key := NEW.item_id;
+    ELSIF TG_OP = 'UPDATE' THEN
+        NEW.item_key := OLD.item_key;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS votes_preserve_item_key ON votes;
+CREATE TRIGGER votes_preserve_item_key
+    BEFORE INSERT OR UPDATE OF item_id ON votes
+    FOR EACH ROW EXECUTE FUNCTION preserve_vote_item_key();
+-- Counts cover direct writes and relationship moves as well as repository calls.
+CREATE OR REPLACE FUNCTION maintain_vote_count() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND OLD.council_member_id = NEW.council_member_id THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP IN ('DELETE', 'UPDATE') THEN
+        UPDATE council_members SET vote_count = vote_count - 1,
+            updated_at = CURRENT_TIMESTAMP WHERE id = OLD.council_member_id;
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        UPDATE council_members SET vote_count = vote_count + 1,
+            last_seen = GREATEST(last_seen, NEW.vote_date), updated_at = CURRENT_TIMESTAMP
+        WHERE id = NEW.council_member_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DROP TRIGGER IF EXISTS votes_maintain_member_count ON votes;
+CREATE TRIGGER votes_maintain_member_count
+    AFTER INSERT OR DELETE OR UPDATE OF council_member_id ON votes
+    FOR EACH ROW EXECUTE FUNCTION maintain_vote_count();

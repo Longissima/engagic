@@ -5,8 +5,8 @@ Two tiers. Per-city template drivers (the validated spike, loaded by
 system and print a file number beside every motion. The generic ``engine``
 for everyone else: it aligns the minutes to the meeting's own agenda items,
 reads the attendance roster, and publishes whatever the clerk actually
-recorded, per-member when names or a unanimous tally against attendance
-make attribution deterministic, outcome-and-tally otherwise.
+recorded, per-member when explicit names resolve deterministically,
+outcome-and-tally otherwise. Unresolved evidence is retained internally.
 """
 
 from parsing.rollcall.spike import DIALECTS, load_spike_parser, norm_file

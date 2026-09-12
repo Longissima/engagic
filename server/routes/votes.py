@@ -4,7 +4,7 @@ from server.utils.validation import capped_limit
 from fastapi import APIRouter, Depends
 
 from database.db_postgres import Database
-from database.vote_utils import compute_vote_tally, determine_vote_outcome
+from database.vote_utils import compute_vote_tally
 from server.dependencies import get_db
 from server.metrics import metrics
 from server.utils.validation import (
@@ -19,132 +19,68 @@ router = APIRouter(prefix="/api")
 
 @router.get("/matters/{matter_id}/votes")
 async def get_matter_votes(matter_id: str, db: Database = Depends(get_db)):
-    """Get all votes on a matter across all meetings.
-
-    Returns individual votes grouped by meeting/committee, plus aggregate tally.
-    """
+    """Motion records and votes; summary tally is the last recorded motion."""
     matter = await require_matter(db, matter_id)
-
-    votes = await db.council_members.get_votes_for_matter(matter_id)
-    tally = await db.council_members.get_vote_tally_for_matter(matter_id)
+    motions = await db.council_members.get_motion_groups(matter_id=matter_id)
+    votes = [vote for motion in motions for vote in motion["votes"]]
     outcomes = await db.matters.get_matter_vote_outcomes(matter_id)
-
-    # Group votes by meeting with committee context
-    votes_by_meeting: dict[str, dict] = {}
-    for vote in votes:
-        mid = vote.meeting_id
-        if mid not in votes_by_meeting:
-            votes_by_meeting[mid] = {
-                "meeting_id": mid,
-                "votes": [],
-                "committee": None,
-                "meeting_date": None
-            }
-        votes_by_meeting[mid]["votes"].append(vote.to_dict())
-
-    # Enrich with meeting and committee info
-    if votes_by_meeting:
-        meeting_ids = list(votes_by_meeting.keys())
+    by_meeting = {}
+    for motion in motions:
+        mid = motion["meeting_id"]
+        group = by_meeting.setdefault(mid, {"meeting_id": mid, "votes": [], "motions": []})
+        group["votes"].extend(motion["votes"])
+        group["motions"].append(motion)
+        group.update(computed_tally=motion["tally"], vote_tally=motion["tally"],
+                     vote_outcome=motion["outcome"])
+    if by_meeting:
         async with db.pool.acquire() as conn:
-            meeting_info = await conn.fetch(
-                """
-                SELECT
-                    m.id as meeting_id,
-                    m.title as meeting_title,
-                    m.date as meeting_date,
-                    ma.committee,
-                    ma.committee_id,
-                    ma.vote_outcome,
-                    ma.vote_tally,
-                    cm.name as committee_name
+            rows = await conn.fetch("""
+                SELECT m.id, m.title, m.date,
+                    ma.committee, ma.committee_id, c.name AS committee_name
                 FROM meetings m
-                LEFT JOIN matter_appearances ma ON ma.meeting_id = m.id AND ma.matter_id = $1
-                LEFT JOIN committees cm ON ma.committee_id = cm.id
-                WHERE m.id = ANY($2)
-                ORDER BY m.date ASC
-                """,
-                matter_id, meeting_ids
-            )
-
-        for row in meeting_info:
-            mid = row["meeting_id"]
-            if mid in votes_by_meeting:
-                votes_by_meeting[mid]["meeting_title"] = row["meeting_title"]
-                votes_by_meeting[mid]["meeting_date"] = row["meeting_date"].isoformat() if row["meeting_date"] else None
-                votes_by_meeting[mid]["committee"] = row["committee_name"] or row["committee"]
-                votes_by_meeting[mid]["committee_id"] = row["committee_id"]
-                votes_by_meeting[mid]["vote_outcome"] = row["vote_outcome"]
-                votes_by_meeting[mid]["vote_tally"] = row["vote_tally"]
-
-                # Compute tally from individual votes for this meeting
-                meeting_votes = votes_by_meeting[mid]["votes"]
-                votes_by_meeting[mid]["computed_tally"] = compute_vote_tally(meeting_votes)
-
+                LEFT JOIN LATERAL (
+                    SELECT committee, committee_id FROM matter_appearances
+                    WHERE meeting_id = m.id AND matter_id = $1
+                    ORDER BY sequence DESC NULLS LAST, item_id DESC LIMIT 1
+                ) ma ON true
+                LEFT JOIN committees c ON c.id = ma.committee_id
+                WHERE m.id = ANY($2::text[])
+            """, matter_id, list(by_meeting))
+        for row in rows:
+            by_meeting[row["id"]].update(
+                meeting_title=row["title"], meeting_date=row["date"].isoformat() if row["date"] else None,
+                committee=row["committee_name"] or row["committee"], committee_id=row["committee_id"])
     metrics.matter_engagement.labels(action='votes').inc()
-
-    return {
-        "success": True,
-        "matter_id": matter_id,
-        "matter_title": matter.title,
-        "votes": [v.to_dict() for v in votes],
-        "votes_by_meeting": list(votes_by_meeting.values()),
-        "tally": tally,
-        "outcomes": outcomes
-    }
+    return {"success": True, "matter_id": matter_id, "matter_title": matter.title,
+            "votes": votes, "motions": motions,
+            "votes_by_meeting": list(reversed(list(by_meeting.values()))),
+            "tally": motions[-1]["tally"] if motions else None,
+            "outcome": motions[-1]["outcome"] if motions else None,
+            "summary_scope": "last_recorded_motion", "outcomes": outcomes}
 
 
 @router.get("/meetings/{meeting_id}/votes")
 async def get_meeting_votes(meeting_id: str, db: Database = Depends(get_db)):
-    """Get all votes cast in a meeting.
-
-    Returns votes grouped by matter.
-    """
+    """Votes grouped by matter, with separate outcomes and tallies per motion."""
     meeting = await require_meeting(db, meeting_id)
-
-    votes = await db.council_members.get_votes_for_meeting(meeting_id)
-
-    # Group votes by matter
-    votes_by_matter: dict[str, list] = {}
-    for vote in votes:
-        mid = vote.matter_id
-        if mid not in votes_by_matter:
-            votes_by_matter[mid] = []
-        votes_by_matter[mid].append(vote.to_dict())
-
-    # Get matter details using repository (batch fetch)
-    matter_ids = list(votes_by_matter.keys())
-    matters_batch = await db.matters.get_matters_batch(matter_ids) if matter_ids else {}
-    matters_data = {
-        mid: {"title": m.title, "matter_file": m.matter_file}
-        for mid, m in matters_batch.items()
-    }
-
-    # Build response grouped by matter
-    matters_with_votes = []
-    for mid, matter_votes in votes_by_matter.items():
-        matter_info = matters_data.get(mid, {})
-
-        # Use shared vote tally and outcome functions
-        tally = compute_vote_tally(matter_votes)
-        outcome = determine_vote_outcome(tally)
-
-        matters_with_votes.append({
-            "matter_id": mid,
-            "matter_title": matter_info.get("title"),
-            "matter_file": matter_info.get("matter_file"),
-            "votes": matter_votes,
-            "tally": tally,
-            "outcome": outcome
-        })
-
-    return {
-        "success": True,
-        "meeting_id": meeting_id,
-        "meeting_title": meeting.title,
-        "meeting_date": meeting.date.isoformat() if meeting.date else None,
-        "matters_with_votes": matters_with_votes,
-        "total": len(votes)
-    }
+    motions = await db.council_members.get_motion_groups(meeting_id=meeting_id)
+    votes = [vote for motion in motions for vote in motion["votes"]]
+    by_matter = {}
+    for motion in motions:
+        mid = motion["matter_id"]
+        group = by_matter.setdefault(mid, {"matter_id": mid, "votes": [], "motions": []})
+        group["votes"].extend(motion["votes"])
+        group["motions"].append(motion)
+        group.update(tally=motion["tally"], outcome=motion["outcome"], summary_scope="last_recorded_motion")
+    matters = await db.matters.get_matters_batch(list(by_matter)) if by_matter else {}
+    for mid, group in by_matter.items():
+        matter = matters.get(mid)
+        group.update(matter_title=matter.title if matter else None,
+                     matter_file=matter.matter_file if matter else None)
+    return {"success": True, "meeting_id": meeting_id, "meeting_title": meeting.title,
+            "meeting_date": meeting.date.isoformat() if meeting.date else None,
+            "matters_with_votes": list(by_matter.values()), "total": len(votes),
+            "motion_count": len(motions)}
 
 
 @router.get("/council-members/{member_id}/votes")

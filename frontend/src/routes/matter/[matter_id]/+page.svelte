@@ -67,7 +67,7 @@
 
 	// Votes data from server load
 	const votesData = $derived(data.votes as MatterVotesResponse | null);
-	const hasVotes = $derived(votesData?.votes?.length ? votesData.votes.length > 0 : false);
+	const hasVotes = $derived((votesData?.motions?.length ?? 0) > 0);
 
 	// Collapsible sections
 	let attachmentsExpanded = $state(false);
@@ -256,7 +256,7 @@
 						<h2 class="section-title">Voting Record</h2>
 						<VoteBadge
 							tally={votesData.tally}
-							outcome={votesData.outcomes?.[0]?.outcome}
+							outcome={votesData.outcome}
 							size="small"
 							showDetails={true}
 						/>
@@ -265,76 +265,28 @@
 				</button>
 
 				{#if votesExpanded}
-					{#if votesData.votes_by_meeting && votesData.votes_by_meeting.length > 1}
-						<!-- Multiple meetings: group by committee -->
-						<div class="votes-by-committee">
-							{#each votesData.votes_by_meeting as meetingVotes (meetingVotes.meeting_id)}
-								<div class="committee-vote-group">
-									<div class="committee-vote-header">
-										<div class="committee-info">
-											{#if meetingVotes.committee && meetingVotes.committee_id}
-												<a href="/{matter.banana}/committees/{meetingVotes.committee_id}"
-												   class="committee-name-link"
-												   data-sveltekit-preload-data="tap">
-													{meetingVotes.committee}
-												</a>
-											{:else if meetingVotes.committee}
-												<span class="committee-name">{meetingVotes.committee}</span>
-											{:else if meetingVotes.meeting_title}
-												<span class="meeting-name">{meetingVotes.meeting_title}</span>
-											{/if}
-											{#if meetingVotes.meeting_date}
-												<span class="vote-date">{formatDate(meetingVotes.meeting_date)}</span>
-											{/if}
+					{#each votesData.votes_by_meeting ?? [] as meetingVotes (meetingVotes.meeting_id)}
+						<div class="committee-vote-group">
+							<h3>{meetingVotes.committee || meetingVotes.meeting_title || 'Meeting'}</h3>
+							{#if meetingVotes.meeting_date}<p>{formatDate(meetingVotes.meeting_date)}</p>{/if}
+							{#each meetingVotes.motions as motion}
+								<div class="vote-list">
+									<p>{motion.source === 'minutes' ? 'Minutes' : 'Vendor record'}: {motion.motion_text || `Motion ${motion.motion_index + 1}`}</p>
+									<VoteBadge tally={motion.tally} outcome={motion.outcome} size="small" />
+									{#if !motion.votes.length}<p>Individual votes are unavailable.</p>{/if}
+									{#each motion.votes as vote (vote.id)}
+										{@const member = findCouncilMemberById(vote.council_member_id)}
+										<div class="vote-row">
+											{#if member}
+												<a href="/{matter.banana}/council/{member.id}" class="voter-link" data-sveltekit-preload-data="tap">{member.name}</a>
+											{:else}<span class="voter-name">Unknown member</span>{/if}
+											<span class="vote-value {vote.vote}">{vote.vote}</span>
 										</div>
-										{#if meetingVotes.computed_tally}
-											<VoteBadge
-												tally={meetingVotes.computed_tally}
-												outcome={meetingVotes.vote_outcome}
-												size="small"
-											/>
-										{/if}
-									</div>
-									<div class="vote-list">
-										{#each meetingVotes.votes as vote (vote.id)}
-											{@const member = findCouncilMemberById(vote.council_member_id)}
-											<div class="vote-row">
-												{#if member}
-													<a href="/{matter.banana}/council/{member.id}"
-													   class="voter-link"
-													   data-sveltekit-preload-data="tap">
-														{member.name}
-													</a>
-												{:else}
-													<span class="voter-name">Unknown member</span>
-												{/if}
-												<span class="vote-value {vote.vote}">{vote.vote}</span>
-											</div>
-										{/each}
-									</div>
+									{/each}
 								</div>
 							{/each}
 						</div>
-					{:else}
-						<!-- Single meeting: flat list -->
-						<div class="vote-list">
-							{#each votesData.votes as vote (vote.id)}
-								{@const member = findCouncilMemberById(vote.council_member_id)}
-								<div class="vote-row">
-									{#if member}
-										<a href="/{matter.banana}/council/{member.id}"
-										   class="voter-link"
-										   data-sveltekit-preload-data="tap">
-											{member.name}
-										</a>
-									{:else}
-										<span class="voter-name">Unknown member</span>
-									{/if}
-									<span class="vote-value {vote.vote}">{vote.vote}</span>
-								</div>
-							{/each}
-						</div>
-					{/if}
+					{/each}
 				{/if}
 			</div>
 		{/if}
@@ -889,11 +841,6 @@
 		color: var(--text-primary);
 	}
 
-	.committee-vote-header .vote-date {
-		font-family: var(--font-mono);
-		font-size: 0.75rem;
-		color: var(--civic-gray);
-	}
 
 	.committee-vote-group .vote-list {
 		margin-top: 0;

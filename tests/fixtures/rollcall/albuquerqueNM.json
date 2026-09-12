@@ -1,0 +1,174 @@
+{
+  "meeting": {
+    "meeting_id": "albuquerqueNM_508e31b7",
+    "content_sha256": "9ddd8cf4db5a9d511abc31b9ed77142628347a5186048e85e4812d75b0819a32",
+    "title": "Land Use, Planning, and Zoning Committee",
+    "banana": "albuquerqueNM",
+    "date": "2026-06-10 17:00:00",
+    "extract_version": "2",
+    "bytes": 174872
+  },
+  "text_sha256": "0a4f68460ba5a6b60b07ca944f63205ae5984798e9f7fa4243856e4835194a79",
+  "items": [
+    {
+      "id": "albuquerqueNM_508e31b7_153429",
+      "sequence": 3,
+      "agenda_number": null,
+      "title": "\r\n\r\n",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "albuquerqueNM_508e31b7_153428",
+      "sequence": 2,
+      "agenda_number": "a.",
+      "title": "Amending The Integrated Development Ordinance To Revise Regulations For Cannabis And Nicotine Retail Uses In Table 4-2-1: Allowable Uses And Section 14-16-4-3 (Grout, by request)",
+      "matter_id": "albuquerqueNM_dd76a39ed4da311f",
+      "matter_file": "O-26-39"
+    },
+    {
+      "id": "albuquerqueNM_508e31b7_153427",
+      "sequence": 1,
+      "agenda_number": null,
+      "title": "Attendance:",
+      "matter_id": null,
+      "matter_file": null
+    }
+  ],
+  "roster": [
+    {
+      "id": "albuquerqueNM_cm_06726ac652d4318e",
+      "name": "Joaquin Baca (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_25a12d93995e2fde",
+      "name": "Stephanie W. Telles"
+    },
+    {
+      "id": "albuquerqueNM_cm_2d37f072aab5b016",
+      "name": "Stephanie W. Telles (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_45c77b3847bf7062",
+      "name": "Renee Grout (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_4d00d85b23fe7dd1",
+      "name": "Klarissa J. Peña (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_5a5b3ac50c5b97d5",
+      "name": "Brook Bassan (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_67674799ca7b210d",
+      "name": "Nichole Rogers"
+    },
+    {
+      "id": "albuquerqueNM_cm_7ec2f0333b96617f",
+      "name": "Renée Grout"
+    },
+    {
+      "id": "albuquerqueNM_cm_827d3f9b4bb67786",
+      "name": "Nichole Rogers (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_8773febccb15b29e",
+      "name": "Klarissa J. Peña"
+    },
+    {
+      "id": "albuquerqueNM_cm_883393238d20ac61",
+      "name": "Brook Bassan"
+    },
+    {
+      "id": "albuquerqueNM_cm_8ef51b8367c36517",
+      "name": "Dan Lewis"
+    },
+    {
+      "id": "albuquerqueNM_cm_9b18eb1678efab51",
+      "name": "Joaquín Baca"
+    },
+    {
+      "id": "albuquerqueNM_cm_ce97fba0920f5d90",
+      "name": "Tammy Fiebelkorn"
+    },
+    {
+      "id": "albuquerqueNM_cm_d9c2a26c766fe862",
+      "name": "Tammy Fiebelkorn (By Request)"
+    },
+    {
+      "id": "albuquerqueNM_cm_eeea05b515a57a67",
+      "name": "Dan Champine"
+    }
+  ],
+  "api_votes": [
+    {
+      "council_member_id": "albuquerqueNM_cm_67674799ca7b210d",
+      "matter_id": "albuquerqueNM_dd76a39ed4da311f",
+      "item_id": null,
+      "vote": "not_voting",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "albuquerqueNM_cm_7ec2f0333b96617f",
+      "matter_id": "albuquerqueNM_dd76a39ed4da311f",
+      "item_id": null,
+      "vote": "not_voting",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "albuquerqueNM_cm_883393238d20ac61",
+      "matter_id": "albuquerqueNM_dd76a39ed4da311f",
+      "item_id": null,
+      "vote": "not_voting",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "albuquerqueNM_cm_ce97fba0920f5d90",
+      "matter_id": "albuquerqueNM_dd76a39ed4da311f",
+      "item_id": null,
+      "vote": "not_voting",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "albuquerqueNM_cm_eeea05b515a57a67",
+      "matter_id": "albuquerqueNM_dd76a39ed4da311f",
+      "item_id": null,
+      "vote": "not_voting",
+      "motion_index": 0
+    }
+  ],
+  "expected": [
+    {
+      "item_id": "albuquerqueNM_508e31b7_153428",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 5
+      },
+      "member_count": 5
+    },
+    {
+      "item_id": "albuquerqueNM_508e31b7_153428",
+      "motion_index": 1,
+      "outcome": "FAIL",
+      "tally": {
+        "yes": 2,
+        "no": 3
+      },
+      "member_count": 5
+    },
+    {
+      "item_id": "albuquerqueNM_508e31b7_153428",
+      "motion_index": 2,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 4,
+        "no": 1
+      },
+      "member_count": 5
+    }
+  ],
+  "expected_motion_candidates": 3,
+  "review_note": "Amendment, failed referral, successful DO NOT PASS recommendation are separate motions."
+}

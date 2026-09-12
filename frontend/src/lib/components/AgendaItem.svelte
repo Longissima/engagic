@@ -209,7 +209,11 @@
 						</a>
 					{/if}
 					{#if voteInfo}
-						<VoteBadge tally={voteInfo.tally} outcome={voteInfo.outcome} size="small" />
+						{#each voteInfo.motions.filter(m => m.item_id === item.id || m.item_id === null) as motion}
+							<span title={motion.motion_text || `Motion ${motion.motion_index + 1}`}>
+								{motion.source === 'minutes' ? 'Minutes' : 'Vendor record'} · Motion {motion.motion_index + 1}: <VoteBadge tally={motion.tally} outcome={motion.outcome} size="small" />
+							</span>
+						{/each}
 					{/if}
 					{#if !hasSummary}
 						<span class="procedural-badge">No summary</span>

@@ -1,0 +1,398 @@
+{
+  "meeting": {
+    "meeting_id": "milwaukeeWI_86ae884a",
+    "content_sha256": "3ce152c072e1b77bbceeeaed85d4d84bc2a02c9fe77072d6e6b01033b4cf8be1",
+    "title": "LICENSES COMMITTEE",
+    "banana": "milwaukeeWI",
+    "date": "2026-07-31 08:45:00",
+    "extract_version": "2",
+    "bytes": 116819
+  },
+  "text_sha256": "8fc510ee565d798f257121fcb214f67b085cc565267c17568005f986c9c2392c",
+  "items": [
+    {
+      "id": "milwaukeeWI_86ae884a_494338",
+      "sequence": 9,
+      "agenda_number": null,
+      "title": "Untitled Item",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "milwaukeeWI_86ae884a_494170",
+      "sequence": 1,
+      "agenda_number": "1.",
+      "title": "Motion relating to the recommendations of the Licenses Committee relating to licenses.",
+      "matter_id": "milwaukeeWI_9b94560ca8b1e1a5",
+      "matter_file": "260462"
+    },
+    {
+      "id": "milwaukeeWI_86ae884a_494079",
+      "sequence": 2,
+      "agenda_number": null,
+      "title": "In the event that Common Council members who are not members of this committee attend this meeting, this meeting may also simultaneously constitute a meeting of the Common Council or any of the following committees:  Community and Economic Development, Finance and Personnel, Judiciary and Legislation, Licenses, Public Safety and Health, Public Works, Zoning, Neighborhoods & Development, and/or Steering and Rules.  Whether a simultaneous meeting is occurring depends on whether the presence of one or more of the Common Council member results in a quorum of the Common Council or any of the above committees, and, if there is a quorum of another committee, whether any agenda items listed above involve matters within that committee’s realm of authority.  In the event that a simultaneous meeting is occurring, no action other than information gathering will be taken at the simultaneous meeting.\r\n\r\nTimes for specific agenda items are estimations.  If items cannot be heard at their specified times, they will be heard as soon as practicable thereafter.",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "milwaukeeWI_86ae884a_494080",
+      "sequence": 3,
+      "agenda_number": null,
+      "title": "Upon reasonable notice, efforts will be made to accommodate the needs of persons with disabilities through sign language interpreters or auxiliary aids.  For assistance contact the Legislative Services ADA Coordinator at 286-2998, (FAX)286-3456, (TDD)286-2025 or by writing to Room 205, City Hall, 200 E. Wells Street, Milwaukee, WI  53202.",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "milwaukeeWI_86ae884a_494081",
+      "sequence": 4,
+      "agenda_number": null,
+      "title": "City Hall and the Zeidler Municipal Building are accessible by \"The Hop\" City Hall Stations, the MCTS Green Line, Connect 1, 14, 15, 18, 19, 30, 33, and 57 bus routes.  Visit https://www.ridemcts.com/ for more information.\r\n\r\nBike racks are available on Water Street, Market Street, and Broadway, and a Bublr Bike Share station is located on the northeast corner of Kilbourn Avenue and Water Street.\r\n\r\nLimited parking for persons attending meetings during normal business hours is available at reduced rates (5 hour limit) at the Associated Bank River Center on the southwest corner of Kilbourn Avenue and Water Street. You must present a copy of the meeting notice to the parking cashier.",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "milwaukeeWI_86ae884a_494082",
+      "sequence": 5,
+      "agenda_number": null,
+      "title": "Persons engaged in lobbying as defined in s. 305-43-4 of the Milwaukee Code are required to register with the City Clerk's License Division.  Lobbyists appearing before a Common Council committee are required to identify themselves as such.  More information is available at http://city.milwaukee.gov/Lobbying.",
+      "matter_id": null,
+      "matter_file": null
+    }
+  ],
+  "roster": [
+    {
+      "id": "milwaukeeWI_cm_021e0d0409f5a65a",
+      "name": "Elizabeth Hammer"
+    },
+    {
+      "id": "milwaukeeWI_cm_083ab3cd7736e4c2",
+      "name": "Bree Spencer"
+    },
+    {
+      "id": "milwaukeeWI_cm_0a6ee85196a410d2",
+      "name": "Janet Cleary"
+    },
+    {
+      "id": "milwaukeeWI_cm_0cc67ad74dda9e67",
+      "name": "Alex Bruzan"
+    },
+    {
+      "id": "milwaukeeWI_cm_1b19f912f8f88c23",
+      "name": "ALD. MOORE"
+    },
+    {
+      "id": "milwaukeeWI_cm_1ed448aeaf7c0a5a",
+      "name": "Vincent Bobot"
+    },
+    {
+      "id": "milwaukeeWI_cm_226d6d282d0ef2b1",
+      "name": "ALD. TAYLOR"
+    },
+    {
+      "id": "milwaukeeWI_cm_22a82fbd0e8c0998",
+      "name": "Marilyn Miller"
+    },
+    {
+      "id": "milwaukeeWI_cm_255b9f2c4f44b2ba",
+      "name": "Asiamarie Gilmore"
+    },
+    {
+      "id": "milwaukeeWI_cm_2cfd256a8a4b3cb9",
+      "name": "Steve Smith"
+    },
+    {
+      "id": "milwaukeeWI_cm_3045a07a3fb6803d",
+      "name": "Sarina Thao"
+    },
+    {
+      "id": "milwaukeeWI_cm_35c25f3cabeb9200",
+      "name": "Safiyah Osman"
+    },
+    {
+      "id": "milwaukeeWI_cm_3648b6cfb3eecd57",
+      "name": "ALD. STAMPER"
+    },
+    {
+      "id": "milwaukeeWI_cm_364b1716c5dcbb0d",
+      "name": "Ruben Burgos"
+    },
+    {
+      "id": "milwaukeeWI_cm_3796b0c74a64ccd8",
+      "name": "Jacqueline Juarez Lucas"
+    },
+    {
+      "id": "milwaukeeWI_cm_39451df6315a65fb",
+      "name": "Dana World-Patterson"
+    },
+    {
+      "id": "milwaukeeWI_cm_3b740abb6eb9128a",
+      "name": "Ann Pieper Eisenbrown"
+    },
+    {
+      "id": "milwaukeeWI_cm_3baf7d37e3e23fa3",
+      "name": "Linda Elmer"
+    },
+    {
+      "id": "milwaukeeWI_cm_439fb56c8d3a4fe9",
+      "name": "LaNelle Ramey"
+    },
+    {
+      "id": "milwaukeeWI_cm_44723e5d9aac6e5e",
+      "name": "Stephanie Bloomingdale"
+    },
+    {
+      "id": "milwaukeeWI_cm_44a80f9dc32155fe",
+      "name": "Jeff Spence"
+    },
+    {
+      "id": "milwaukeeWI_cm_44e46315c1e6780b",
+      "name": "Thaddeaus Hillard"
+    },
+    {
+      "id": "milwaukeeWI_cm_45f884dd411d99db",
+      "name": "Adalyn Chavez"
+    },
+    {
+      "id": "milwaukeeWI_cm_461f85697dace2bf",
+      "name": "Ranell Washington"
+    },
+    {
+      "id": "milwaukeeWI_cm_4c72e5a4fba49a59",
+      "name": "ALD. BAUMAN"
+    },
+    {
+      "id": "milwaukeeWI_cm_529a0da6b037ae54",
+      "name": "Clayborn Benson, III"
+    },
+    {
+      "id": "milwaukeeWI_cm_531cc8b6416e532a",
+      "name": "ALD. BROWER"
+    },
+    {
+      "id": "milwaukeeWI_cm_542f0d59eadc2ac7",
+      "name": "Allyson Nemec"
+    },
+    {
+      "id": "milwaukeeWI_cm_556b8929c879a0a8",
+      "name": "ALD. WESTMORELAND"
+    },
+    {
+      "id": "milwaukeeWI_cm_57cad05aeb6c721b",
+      "name": "ALD. DIMITRIJEVIC"
+    },
+    {
+      "id": "milwaukeeWI_cm_5a528bbe203d3644",
+      "name": "Francis Bock"
+    },
+    {
+      "id": "milwaukeeWI_cm_5c29aedb5df6455a",
+      "name": "ALD. PEREZ"
+    },
+    {
+      "id": "milwaukeeWI_cm_5d551400d3f6673a",
+      "name": "Patricia Keating Kahn"
+    },
+    {
+      "id": "milwaukeeWI_cm_63c28e5d90cd19f4",
+      "name": "Miriam Horwitz"
+    },
+    {
+      "id": "milwaukeeWI_cm_6d960577c57c1325",
+      "name": "Sally Peltz"
+    },
+    {
+      "id": "milwaukeeWI_cm_6f256a49f17b3a1f",
+      "name": "Matt Jarosz"
+    },
+    {
+      "id": "milwaukeeWI_cm_74c30d91ddb54b6a",
+      "name": "THE CHAIR"
+    },
+    {
+      "id": "milwaukeeWI_cm_76353c9cda5bda86",
+      "name": "Christopher Snyder"
+    },
+    {
+      "id": "milwaukeeWI_cm_768b0285f9c7f564",
+      "name": "Tarik Moody"
+    },
+    {
+      "id": "milwaukeeWI_cm_7cb5d013cebd7b4e",
+      "name": "ALD. A. PRATT"
+    },
+    {
+      "id": "milwaukeeWI_cm_80ab5342e4dafdd8",
+      "name": "ALD. JACKSON"
+    },
+    {
+      "id": "milwaukeeWI_cm_85e0b0081f9c88b6",
+      "name": "Esperanza Gutierrez"
+    },
+    {
+      "id": "milwaukeeWI_cm_8a7412ea2fc8fa67",
+      "name": "Aida El-Hajjar"
+    },
+    {
+      "id": "milwaukeeWI_cm_9dfd57db25eb237c",
+      "name": "Matthew O'Neill"
+    },
+    {
+      "id": "milwaukeeWI_cm_a9546691532773fd",
+      "name": "Catrina Crane"
+    },
+    {
+      "id": "milwaukeeWI_cm_b32e43f948479fdd",
+      "name": "Willie Smith"
+    },
+    {
+      "id": "milwaukeeWI_cm_b528e060bacf4663",
+      "name": "Reuben K. Harpole"
+    },
+    {
+      "id": "milwaukeeWI_cm_b5d3b134b6c98c35",
+      "name": "ALD. SPIKER"
+    },
+    {
+      "id": "milwaukeeWI_cm_b6badb27986fd463",
+      "name": "ALD. RAINEY"
+    },
+    {
+      "id": "milwaukeeWI_cm_b71ffcf03f92a536",
+      "name": "COMMON COUNCIL"
+    },
+    {
+      "id": "milwaukeeWI_cm_b8b2047f3aa3880e",
+      "name": "Kendrick Yandell"
+    },
+    {
+      "id": "milwaukeeWI_cm_bac749301573c9d3",
+      "name": "Svetlana Her"
+    },
+    {
+      "id": "milwaukeeWI_cm_be1cb29a0e483be6",
+      "name": "Ramon Evans"
+    },
+    {
+      "id": "milwaukeeWI_cm_c792f552287fdd99",
+      "name": "ALD. CHAMBERS JR."
+    },
+    {
+      "id": "milwaukeeWI_cm_cebc7eddfda887a1",
+      "name": "ALD. BURGELIS"
+    },
+    {
+      "id": "milwaukeeWI_cm_d33662711eefe1b3",
+      "name": "Arias Dinan"
+    },
+    {
+      "id": "milwaukeeWI_cm_d4c33e85da436602",
+      "name": "ALD. ZAMARRIPA"
+    },
+    {
+      "id": "milwaukeeWI_cm_d9978b48814f31cc",
+      "name": "Kalise Williams"
+    },
+    {
+      "id": "milwaukeeWI_cm_deacfb1724bb8224",
+      "name": "ALD. COGGS"
+    },
+    {
+      "id": "milwaukeeWI_cm_e475a18b3cd03948",
+      "name": "Mateo De La Cruz"
+    },
+    {
+      "id": "milwaukeeWI_cm_e7656efa4072e285",
+      "name": "Jesus Gonzalez"
+    },
+    {
+      "id": "milwaukeeWI_cm_e8ae84714adcbcf1",
+      "name": "Krissie Fung"
+    },
+    {
+      "id": "milwaukeeWI_cm_eb6518a7c6adfddf",
+      "name": "Nicholas Hans Robinson"
+    },
+    {
+      "id": "milwaukeeWI_cm_edf86a2e5a388dd1",
+      "name": "Jordan Morales"
+    },
+    {
+      "id": "milwaukeeWI_cm_fb3af7ff31fef9b7",
+      "name": "Heidi Wick Spoerl"
+    },
+    {
+      "id": "milwaukeeWI_cm_fe387b485af02671",
+      "name": "Corrine Caldwell"
+    }
+  ],
+  "api_votes": [
+    {
+      "council_member_id": "milwaukeeWI_cm_531cc8b6416e532a",
+      "matter_id": "milwaukeeWI_9b94560ca8b1e1a5",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "milwaukeeWI_cm_7cb5d013cebd7b4e",
+      "matter_id": "milwaukeeWI_9b94560ca8b1e1a5",
+      "item_id": null,
+      "vote": "abstain",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "milwaukeeWI_cm_80ab5342e4dafdd8",
+      "matter_id": "milwaukeeWI_9b94560ca8b1e1a5",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "milwaukeeWI_cm_cebc7eddfda887a1",
+      "matter_id": "milwaukeeWI_9b94560ca8b1e1a5",
+      "item_id": null,
+      "vote": "absent",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "milwaukeeWI_cm_d4c33e85da436602",
+      "matter_id": "milwaukeeWI_9b94560ca8b1e1a5",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    }
+  ],
+  "expected": [
+    {
+      "item_id": "milwaukeeWI_86ae884a_494170",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {},
+      "member_count": 0
+    },
+    {
+      "item_id": "milwaukeeWI_86ae884a_494170",
+      "motion_index": 1,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 4,
+        "no": 0,
+        "absent": 1
+      },
+      "member_count": 5
+    },
+    {
+      "item_id": "milwaukeeWI_86ae884a_494170",
+      "motion_index": 2,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 4,
+        "no": 0,
+        "absent": 1
+      },
+      "member_count": 5
+    }
+  ],
+  "expected_motion_candidates": 5,
+  "review_note": "Contradictory printed 3-1/category 3-0 withholds tally and voters; two unaligned motions retained internally."
+}

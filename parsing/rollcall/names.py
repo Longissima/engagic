@@ -12,7 +12,7 @@ _TITLE_RE = re.compile(
     r"ald(?:\.|erman|erwoman|erperson|erpersons)?|council\s*(?:members?|man|woman|ors?|persons?)|"
     r"councilmembers?|councilors?|commissioners?|supervisors?|trustees?|directors?|"
     r"(?:board|committee|commission|council|planning)\s+members?|members?|"
-    r"deputy\s+mayor|mayor\s+pro\s*[- ]?tem|mayor|acting\s+chair(?:person)?|"
+    r"vice\s+mayor|vice\s+president|deputy\s+mayor|mayor\s+pro\s*[- ]?tem|mayor|acting\s+chair(?:person)?|"
     r"president\s+pro\s*[- ]?tem|president|selectman|selectwoman|selectperson|"
     r"representative|senator|judge|dr|mr|mrs|ms|miss|hon)\.?\s+",
     re.IGNORECASE,

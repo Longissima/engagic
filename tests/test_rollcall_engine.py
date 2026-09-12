@@ -104,7 +104,8 @@ class TestEvidence:
     def test_to_separator_and_abstention_mention(self):
         assert find_evidence("RESULT: ADOPTED [12 TO 0]\nAYES: A, B")[0].tally == (12, 0, 0)
         ev = find_evidence("Motion Passed 5-0 with one abstention\nCommissioner Rafel abstained.")[0]
-        assert ev.tally == (5, 0, 1) and not ev.unanimous
+        assert ev.tally == (5, 0, 0) and not ev.unanimous
+        assert ev.qualifications  # retain the mention without inventing a numeric abstention
 
     def test_recorded_dissent_label_is_read(self):
         ev = find_evidence("RESULT: Approved\nAYES: Mayr, Bratt, Nerbun\nDEEMED NAY: Bach\n")[0]
@@ -180,22 +181,24 @@ class TestEngine:
         assert dict(second.member_votes)["Klarissa Peña"] == "NO"
         assert second.tally["yes"] == 2 and second.tally["no"] == 3
 
-    def test_unanimous_tally_attributes_against_attendance(self):
+    def test_unanimous_tally_does_not_invent_member_attribution(self):
         text = "Present: Rowen, Owens, Lee\n" + ALPHARETTA.replace("(6-0)", "(3-0)")
         parsed = parse_meeting(text, ALPHARETTA_ITEM, roster=[])
-        assert parsed.published and parsed.published[0].method == "unanimous"
-        assert sorted(parsed.published[0].member_votes) == [("Lee", "AYE"), ("Owens", "AYE"), ("Rowen", "AYE")]
+        assert parsed.published and parsed.published[0].method == "tally"
+        assert parsed.published[0].member_votes == []
+        assert parsed.published[0].tally == {"yes": 3, "no": 0}
 
     def test_split_tally_without_names_is_outcome_only(self):
         text = "Present: Rowen, Owens, Lee, Kim\n" + ALPHARETTA.replace("(6-0)", "(3-1)")
         parsed = parse_meeting(text, ALPHARETTA_ITEM, roster=[])
         assert parsed.published[0].method == "tally" and parsed.published[0].member_votes == []
 
-    def test_named_lists_seed_roster_when_document_is_the_only_source(self):
+    def test_repeated_surnames_without_roster_stay_unresolved(self):
         text = ALBUQUERQUE.split("a.    EC-26-176")[0].split("Attendance:")[0] + "a.    EC-26-176" + ALBUQUERQUE.split("a.    EC-26-176")[1]
         parsed = parse_meeting(text, self.ITEMS, roster=[])
-        assert parsed.roster_source == "named_lists"
-        assert [p.method for p in parsed.published] == ["named", "named"]
+        assert parsed.roster_source == "none"
+        assert [p.method for p in parsed.published] == ["tally", "tally"]
+        assert all(not p.member_votes for p in parsed.published)
 
     def test_bare_surname_merges_into_full_name(self):
         gz = Gazetteer(["Claudia Balducci", "Balducci", "Reagan Dunn"])
@@ -206,8 +209,11 @@ class TestEngine:
         head, tail = ALBUQUERQUE.split("a.    EC-26-176")
         text = head + "a.    EC-26-176" + tail.replace("Telles", "Nobody")
         parsed = parse_meeting(text, self.ITEMS, roster=[])
-        assert parsed.published == []
-        assert any("unresolved" in r for ab in parsed.abstained for r in ab.reasons)
+        assert parsed.published[0].outcome == "PASS"
+        assert len(parsed.published[0].member_votes) == 4
+        assert all("Nobody" not in n for p in parsed.published for n, _ in p.member_votes)
+        assert any(c['reason'] == 'unresolved_name' for o in parsed.observations for c in o.checks)
+        assert any("Nobody" in o.raw_text for o in parsed.observations)
 
 
 class TestGuards:
@@ -222,7 +228,7 @@ class TestGuards:
         )
         parsed = parse_meeting(text, self.ITEM, roster=[])
         assert parsed.published == []
-        assert any("membership" in r for ab in parsed.abstained for r in ab.reasons)
+        assert any("mover_outside_recorded_body" in r for ab in parsed.abstained for r in ab.reasons)
 
     def test_mover_on_the_roster_publishes(self):
         text = (
@@ -232,7 +238,8 @@ class TestGuards:
             "The motion carried unanimously.\n"
         )
         parsed = parse_meeting(text, self.ITEM, roster=[])
-        assert [p.method for p in parsed.published] == ["unanimous"]
+        assert [p.method for p in parsed.published] == ["outcome"]
+        assert parsed.published[0].member_votes == []
 
     def test_adjournment_motion_is_not_an_item_vote(self):
         text = (

@@ -358,6 +358,15 @@ class Vote:
     vote_date: Optional[datetime] = None  # Date of vote (usually meeting date)
     sequence: Optional[int] = None  # Order in roll call
     metadata: Optional[dict] = None  # Vendor-specific (motion_id, etc.)
+    item_id: Optional[str] = None
+    item_key: str = ""  # Original item identity survives a cleared item FK
+    motion_index: int = 0
+    motion_text: Optional[str] = None
+    source: str = "api"
+    content_sha256: Optional[str] = None
+    receipt: Optional[dict] = None
+    parse_run_id: Optional[str] = None
+    observation_ordinal: Optional[int] = None
     created_at: Optional[datetime] = None
 
     def to_dict(self) -> dict:

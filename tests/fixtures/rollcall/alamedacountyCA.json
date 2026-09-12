@@ -1,0 +1,73 @@
+{
+  "meeting": {
+    "meeting_id": "alamedacountyCA_0c954747",
+    "content_sha256": "4f0efaafb7cbed8b6d3917f77fd9c1f9f6784e797486dda0da805210ca513144",
+    "title": "Health Committee",
+    "banana": "alamedacountyCA",
+    "date": "2026-07-27 00:00:00",
+    "extract_version": "2",
+    "bytes": 286305
+  },
+  "text_sha256": "54278ac2ecc06f82d555b773d7d7a35d2469cf10e47c91d5538c8c30c243cb48",
+  "items": [
+    {
+      "id": "alamedacountyCA_0c954747_(2)",
+      "sequence": 1,
+      "agenda_number": "(2)",
+      "title": "Demonstrations that disrupt the meeting are prohibited.",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "alamedacountyCA_0c954747_i",
+      "sequence": 2,
+      "agenda_number": "I",
+      "title": "Initiatives, Alameda County Health Health, Healthy Schools and Communities Update",
+      "matter_id": "alamedacountyCA_6096da6175797d76",
+      "matter_file": null
+    }
+  ],
+  "roster": [
+    {
+      "id": "alamedacountyCA_cm_223bfebcf8045cee",
+      "name": "Tam"
+    },
+    {
+      "id": "alamedacountyCA_cm_2b14af6bda1ac542",
+      "name": "Haubert were"
+    },
+    {
+      "id": "alamedacountyCA_cm_3517f5ae31bf1ade",
+      "name": "Abstained"
+    },
+    {
+      "id": "alamedacountyCA_cm_46428a3e1f6e5d11",
+      "name": "Fortunato Bas"
+    },
+    {
+      "id": "alamedacountyCA_cm_5d0082f410b27d9f",
+      "name": "Miley"
+    },
+    {
+      "id": "alamedacountyCA_cm_8bf4fc4003d320d0",
+      "name": "Márquez"
+    }
+  ],
+  "api_votes": [],
+  "expected": [
+    {
+      "item_id": "alamedacountyCA_0c954747_i",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 2,
+        "no": 0,
+        "absent": 0,
+        "abstain": 0
+      },
+      "member_count": 2
+    }
+  ],
+  "expected_motion_candidates": 1,
+  "review_note": "Two-member named roll call; other unsupported motion language stays internal."
+}

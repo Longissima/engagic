@@ -95,3 +95,13 @@ async def get_random_meeting_with_items(db: Database = Depends(get_db)):
     except Exception:
         logger.exception("error getting random meeting with items")
         raise HTTPException(status_code=500, detail="Error retrieving meeting")
+
+
+@router.get("/meetings/{meeting_id}/minutes")
+async def get_meeting_minutes(meeting_id: str, db: Database = Depends(get_db)):
+    """Corpus references for all observed minutes revisions, newest first."""
+    from server.utils.validation import require_meeting
+    await require_meeting(db, meeting_id)
+    documents = await db.document_blobs.get_minutes_documents(meeting_id)
+    return {"success": True, "meeting_id": meeting_id, "documents": documents,
+            "current_content_sha256": documents[0]["content_sha256"] if documents else None}

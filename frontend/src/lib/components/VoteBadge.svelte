@@ -2,16 +2,18 @@
 	import type { VoteTally, VoteOutcome } from '$lib/api/types';
 
 	interface Props {
-		tally: VoteTally;
-		outcome?: VoteOutcome;
+		tally: VoteTally | null;
+		outcome?: VoteOutcome | null;
 		size?: 'small' | 'medium';
 		showDetails?: boolean;
 	}
 
 	let { tally, outcome, size = 'medium', showDetails = false }: Props = $props();
 
+	const estimate = $derived(!outcome && tally && ((tally.yes ?? 0) + (tally.no ?? 0) > 0)
+		? ((tally.yes ?? 0) > (tally.no ?? 0) ? 'Likely passed' : (tally.no ?? 0) > (tally.yes ?? 0) ? 'Likely failed' : 'Tied vote') : null);
 	const outcomeLabel = $derived.by(() => {
-		if (!outcome || outcome === 'no_vote' || outcome === 'unknown') return null;
+		if (!outcome || outcome === 'no_vote' || outcome === 'unknown') return estimate;
 		const labels: Record<string, string> = {
 			passed: 'Passed',
 			failed: 'Failed',
@@ -30,20 +32,20 @@
 		return 'neutral';
 	});
 
-	const tallyText = $derived(`${tally.yes ?? 0}-${tally.no ?? 0}`);
-	const hasVotes = $derived((tally.yes ?? 0) > 0 || (tally.no ?? 0) > 0);
+	const tallyText = $derived(`${tally?.yes ?? 0}-${tally?.no ?? 0}`);
+	const hasVotes = $derived((tally?.yes ?? 0) > 0 || (tally?.no ?? 0) > 0);
 </script>
 
-{#if hasVotes}
-	<span class="vote-badge {variant} {size}" title="Yes: {tally.yes ?? 0}, No: {tally.no ?? 0}{tally.abstain ? `, Abstain: ${tally.abstain}` : ''}{tally.absent ? `, Absent: ${tally.absent}` : ''}">
+{#if hasVotes || outcomeLabel}
+	<span class="vote-badge {variant} {size}" title={estimate ? 'Simple-majority estimate; the recorded outcome is unavailable.' : tally ? `Yes: ${tally.yes ?? 0}, No: ${tally.no ?? 0}${tally.abstain ? `, Abstain: ${tally.abstain}` : ''}${tally.absent ? `, Absent: ${tally.absent}` : ''}` : 'Numerical tally unavailable'}>
 		{#if outcomeLabel}
 			<span class="outcome">{outcomeLabel}</span>
 		{/if}
-		<span class="tally">{tallyText}</span>
-		{#if showDetails && (tally.abstain || tally.absent)}
+		{#if tally}<span class="tally">{tallyText}</span>{/if}
+		{#if showDetails && (tally?.abstain || tally?.absent)}
 			<span class="details">
-				{#if tally.abstain}
-					<span class="abstain">{tally.abstain}A</span>
+				{#if tally?.abstain}
+					<span class="abstain">{tally?.abstain}A</span>
 				{/if}
 			</span>
 		{/if}

@@ -358,8 +358,8 @@ export interface MatterTimelineAppearance {
 	topics?: string[];
 	committee?: string;
 	committee_id?: string;
-	vote_outcome?: VoteOutcome;
-	vote_tally?: VoteTally;
+	vote_outcome?: VoteOutcome | null;
+	vote_tally?: VoteTally | null;
 }
 
 export interface MatterTimelineResponse {
@@ -507,12 +507,17 @@ export type VoteValue = 'yes' | 'no' | 'abstain' | 'absent' | 'present' | 'recus
 export type VoteOutcome = 'passed' | 'failed' | 'tabled' | 'withdrawn' | 'referred' | 'amended' | 'unknown' | 'no_vote';
 
 export interface VoteTally {
-	yes: number;
-	no: number;
-	abstain: number;
-	absent: number;
+	yes?: number;
+	no?: number;
+	abstain?: number;
+	absent?: number;
+	recused?: number;
+	not_voting?: number;
+	other?: number;
 	present?: number;
 }
+
+export type VoteStatistics = VoteTally & Required<Pick<VoteTally, 'yes' | 'no' | 'abstain' | 'absent'>>;
 
 export interface Vote {
 	id: number;
@@ -524,6 +529,34 @@ export interface Vote {
 	sequence?: number;
 	metadata?: Record<string, unknown>;
 	created_at?: string;
+	item_id: string | null;
+	item_key: string;
+	motion_index: number;
+	motion_text: string | null;
+	source: 'api' | 'minutes';
+	content_sha256: string | null;
+	receipt: Record<string, unknown> | null;
+	parse_run_id?: string | null;
+	observation_ordinal?: number | null;
+}
+
+export interface MotionRecord {
+	item_id: string | null;
+	item_key: string;
+	matter_id: string;
+	meeting_id: string;
+	motion_index: number;
+	motion_text: string | null;
+	source: 'api' | 'minutes';
+	content_sha256: string | null;
+	receipt: Record<string, unknown> | null;
+	parse_run_id?: string | null;
+	observation_ordinal?: number | null;
+	method: string | null;
+	tally_basis?: string | null;
+	tally: VoteTally | null;
+	outcome: VoteOutcome | null;
+	votes: Vote[];
 }
 
 export interface MeetingVoteGroup {
@@ -532,9 +565,10 @@ export interface MeetingVoteGroup {
 	meeting_date?: string;
 	committee?: string;
 	committee_id?: string;
-	vote_outcome?: VoteOutcome;
-	vote_tally?: VoteTally;
-	computed_tally?: VoteTally;
+	vote_outcome?: VoteOutcome | null;
+	vote_tally?: VoteTally | null;
+	computed_tally?: VoteTally | null;
+	motions: MotionRecord[];
 	votes: Vote[];
 }
 
@@ -552,7 +586,9 @@ export interface MatterVotesResponse {
 	matter_title: string;
 	votes: Vote[];
 	votes_by_meeting?: MeetingVoteGroup[];
-	tally: VoteTally;
+	motions: MotionRecord[];
+	outcome: VoteOutcome | null;
+	tally: VoteTally | null;
 	outcomes: MatterVoteOutcome[];
 }
 
@@ -568,8 +604,9 @@ export interface MeetingVoteMatter {
 	matter_title: string;
 	matter_file?: string;
 	votes: Vote[];
-	tally: VoteTally;
-	outcome: VoteOutcome;
+	motions: MotionRecord[];
+	tally: VoteTally | null;
+	outcome: VoteOutcome | null;
 }
 
 export interface MeetingVotesResponse {
@@ -627,7 +664,7 @@ export interface VotingRecordResponse {
 	member: CouncilMember;
 	voting_record: VoteRecord[];
 	total: number;
-	statistics: VoteTally;
+	statistics: VoteStatistics;
 }
 
 // Committee types
@@ -670,8 +707,8 @@ export interface CommitteeVoteRecord {
 	meeting_id: string;
 	item_id: string;
 	appeared_at?: string;
-	vote_outcome?: VoteOutcome;
-	vote_tally?: VoteTally;
+	vote_outcome?: VoteOutcome | null;
+	vote_tally?: VoteTally | null;
 	matter_file?: string;
 	matter_title: string;
 }

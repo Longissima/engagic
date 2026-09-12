@@ -1,0 +1,462 @@
+{
+  "meeting": {
+    "meeting_id": "denverCO_f4a7c9b0",
+    "content_sha256": "cc9106924d0350da84e8fb09c7ae37bc280ad79573eb301d25566af66f042614",
+    "title": "Special Meeting Of The City Council",
+    "banana": "denverCO",
+    "date": "2026-08-05 09:30:00",
+    "extract_version": "2",
+    "bytes": 85482
+  },
+  "text_sha256": "5be716489be2f359b360774317763158fb90d0a1dc1854afb634869abfbc13f7",
+  "items": [
+    {
+      "id": "denverCO_f4a7c9b0_236432",
+      "sequence": 2,
+      "agenda_number": null,
+      "title": "ROLL CALL",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236435",
+      "sequence": 5,
+      "agenda_number": null,
+      "title": "PRESENTATIONS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236438",
+      "sequence": 8,
+      "agenda_number": null,
+      "title": "RESOLUTIONS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236439",
+      "sequence": 9,
+      "agenda_number": null,
+      "title": "City Council - Direct Files",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236440",
+      "sequence": 10,
+      "agenda_number": null,
+      "title": "A resolution declaring a vacancy in the office of an at-large Councilmember.\nDeclares a vacancy in the office of an at-large Councilmember seat B. Council President Romero Campbell approved direct filing this item on 7-30-2026.",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "matter_file": "26-1143"
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236433",
+      "sequence": 3,
+      "agenda_number": null,
+      "title": "APPROVAL OF THE MINUTES",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236552",
+      "sequence": 18,
+      "agenda_number": null,
+      "title": "page break",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236431",
+      "sequence": 1,
+      "agenda_number": null,
+      "title": "PLEDGE OF ALLEGIANCE",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236551",
+      "sequence": 19,
+      "agenda_number": null,
+      "title": "PROCLAMATIONS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236437",
+      "sequence": 7,
+      "agenda_number": null,
+      "title": "PROCLAMATIONS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236470",
+      "sequence": 14,
+      "agenda_number": null,
+      "title": "PRE-RECESS ANNOUNCEMENT",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236472",
+      "sequence": 15,
+      "agenda_number": null,
+      "title": "RECESS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236469",
+      "sequence": 13,
+      "agenda_number": null,
+      "title": "RECAP OF BILLS TO BE CALLED OUT",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236473",
+      "sequence": 16,
+      "agenda_number": null,
+      "title": "COUNCIL RECONVENES AND RESUMES ITS REGULAR SESSION",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236550",
+      "sequence": 17,
+      "agenda_number": null,
+      "title": "UNFINISHED BUSINESS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236474",
+      "sequence": 21,
+      "agenda_number": null,
+      "title": "PUBLIC HEARINGS - BILLS FOR FINAL CONSIDERATION",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236475",
+      "sequence": 22,
+      "agenda_number": null,
+      "title": "PRE-ADJOURNMENT ANNOUNCEMENT",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236477",
+      "sequence": 23,
+      "agenda_number": null,
+      "title": "ADJOURN",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236478",
+      "sequence": 24,
+      "agenda_number": null,
+      "title": "PENDING",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236515",
+      "sequence": 20,
+      "agenda_number": null,
+      "title": "A Proclamation Honoring Councilwoman Parady and Her Service to the People of Denver",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "matter_file": "26-1146"
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236434",
+      "sequence": 4,
+      "agenda_number": null,
+      "title": "COUNCIL ANNOUNCEMENTS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236436",
+      "sequence": 6,
+      "agenda_number": null,
+      "title": "COMMUNICATIONS",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236467",
+      "sequence": 11,
+      "agenda_number": null,
+      "title": "BILLS FOR INTRODUCTION",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236468",
+      "sequence": 12,
+      "agenda_number": null,
+      "title": "BILLS FOR FINAL CONSIDERATION",
+      "matter_id": null,
+      "matter_file": null
+    },
+    {
+      "id": "denverCO_f4a7c9b0_236598",
+      "sequence": 25,
+      "agenda_number": null,
+      "title": "Block Vote",
+      "matter_id": null,
+      "matter_file": null
+    }
+  ],
+  "roster": [
+    {
+      "id": "denverCO_cm_12a67e8c865edc76",
+      "name": "Amanda Sawyer"
+    },
+    {
+      "id": "denverCO_cm_145bdb9c570e63b4",
+      "name": "Paul Kashmann"
+    },
+    {
+      "id": "denverCO_cm_1f9c03fbdce8e608",
+      "name": "Darrell Watson"
+    },
+    {
+      "id": "denverCO_cm_20038a9c459d0fe7",
+      "name": "Diana Romero Campbell"
+    },
+    {
+      "id": "denverCO_cm_26b24c86e747943e",
+      "name": "Stacie Gilmore"
+    },
+    {
+      "id": "denverCO_cm_63268aeb4013e6e4",
+      "name": "Sarah Parady"
+    },
+    {
+      "id": "denverCO_cm_a06846da04058748",
+      "name": "Flor Alvidrez"
+    },
+    {
+      "id": "denverCO_cm_a6f23ba0f4d2a9d6",
+      "name": "Chris Hinds"
+    },
+    {
+      "id": "denverCO_cm_b0c588b5bef301de",
+      "name": "Amanda Sandoval"
+    },
+    {
+      "id": "denverCO_cm_bbedf2348225da7f",
+      "name": "Shontel Lewis"
+    },
+    {
+      "id": "denverCO_cm_da53f52627205753",
+      "name": "Jamie Torres"
+    },
+    {
+      "id": "denverCO_cm_e89d2b541d3a1862",
+      "name": "Kevin Flynn"
+    },
+    {
+      "id": "denverCO_cm_ee2f1ca4b4659389",
+      "name": "Serena Gonzales-Gutierrez"
+    }
+  ],
+  "api_votes": [
+    {
+      "council_member_id": "denverCO_cm_12a67e8c865edc76",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_145bdb9c570e63b4",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_1f9c03fbdce8e608",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_20038a9c459d0fe7",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_26b24c86e747943e",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_a06846da04058748",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_a6f23ba0f4d2a9d6",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_b0c588b5bef301de",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_bbedf2348225da7f",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_da53f52627205753",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_e89d2b541d3a1862",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_ee2f1ca4b4659389",
+      "matter_id": "denverCO_3ca3d2e5c11f1c06",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_12a67e8c865edc76",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_145bdb9c570e63b4",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_1f9c03fbdce8e608",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_20038a9c459d0fe7",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_26b24c86e747943e",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_a06846da04058748",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_a6f23ba0f4d2a9d6",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_b0c588b5bef301de",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_bbedf2348225da7f",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_da53f52627205753",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_e89d2b541d3a1862",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    },
+    {
+      "council_member_id": "denverCO_cm_ee2f1ca4b4659389",
+      "matter_id": "denverCO_b646d65bfe4710e0",
+      "item_id": null,
+      "vote": "yes",
+      "motion_index": 0
+    }
+  ],
+  "expected": [
+    {
+      "item_id": "denverCO_f4a7c9b0_236440",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 12,
+        "no": 0
+      },
+      "member_count": 12
+    },
+    {
+      "item_id": "denverCO_f4a7c9b0_236515",
+      "motion_index": 0,
+      "outcome": "PASS",
+      "tally": {
+        "yes": 12,
+        "no": 0
+      },
+      "member_count": 12
+    }
+  ],
+  "expected_motion_candidates": 3,
+  "review_note": "Wrapped Legistar motion text; en-bloc vote has no unique item and remains internal."
+}

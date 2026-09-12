@@ -1,22 +1,14 @@
-"""Vote Processor - Computes tallies and outcomes"""
+"""Compute recorded vote tallies without inferring a legal motion outcome."""
+from typing import Any, Dict, List
 
-from typing import List, Dict, Any
-
-from database.vote_utils import compute_vote_tally, determine_vote_outcome
+from database.vote_utils import compute_vote_tally
 
 
 class VoteProcessor:
-    """Processes votes and determines outcomes"""
-
     def process_votes(self, votes: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Process votes and return tally + outcome"""
-        tally = compute_vote_tally(votes)
-        return {"tally": tally, "outcome": determine_vote_outcome(tally)}
+        # Individual API ballots contain no recorded outcome. A majority is a
+        # display estimate, not evidence of quorum or the required threshold.
+        return {'tally': compute_vote_tally(votes), 'outcome': None}
 
     def compute_tally(self, votes: List[Dict[str, Any]]) -> Dict[str, int]:
-        """Compute vote tally without determining outcome"""
         return compute_vote_tally(votes)
-
-    def determine_outcome(self, tally: Dict[str, int]) -> str:
-        """Determine outcome from vote tally"""
-        return determine_vote_outcome(tally)

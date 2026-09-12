@@ -20,6 +20,19 @@ logger = get_logger(__name__).bind(component="document_blob_repository")
 class DocumentBlobRepository(BaseRepository):
     """Repository for document_blob / document_source corpus index rows."""
 
+    async def get_minutes_documents(self, meeting_id: str):
+        """Newest observed revision first, with corpus readiness and evidence keys."""
+        from corpus.store import COMPATIBLE_EXTRACT_VERSIONS
+        rows = await self._fetch("""
+            SELECT md.meeting_id, md.content_sha256, md.source_identity, md.ingested_at,
+                   b.original_key, b.text_key, b.extract_version, b.extract_method,
+                   COALESCE(b.text_key IS NOT NULL AND b.extract_version = ANY($2::text[]), false) AS text_ready
+            FROM minutes_documents md JOIN document_blob b USING (content_sha256)
+            WHERE md.meeting_id = $1
+            ORDER BY md.ingested_at DESC, md.content_sha256 DESC
+        """, meeting_id, list(COMPATIBLE_EXTRACT_VERSIONS))
+        return [dict(row) for row in rows]
+
     async def get_blob(self, content_sha256: str) -> Optional[Dict[str, Any]]:
         row = await self._fetchrow(
             "SELECT * FROM document_blob WHERE content_sha256 = $1",

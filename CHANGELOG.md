@@ -6,6 +6,33 @@ For architectural context, see CLAUDE.md and module READMEs.
 
 ---
 
+
+## [2026-09-12] Replayable minutes evidence and motion publication
+
+Migration 044 retains every published motion in `item_motions`, including
+motions without named voters. Votes now carry a durable original item key,
+so two items sharing a matter cannot overwrite one another and clearing an
+item foreign key preserves the evidence. Database triggers maintain member
+vote counts for every writer; migration repairs existing counts.
+
+Minutes publication now reconciles its complete current projection atomically,
+including an empty successful parse, and retracts superseded minutes-owned
+votes, motions, and appearance outcomes. It checks for changed document/item
+identity before writing and preserves API ownership. Read APIs use one snapshot
+for motion/vote bundles, expose provenance and motion groups, and report the
+last recorded motion's tally rather than adding separate roll calls together.
+Unknown tallies remain NULL. The frontend displays motions separately.
+
+An internal ledger retains exact text, immutable parser runs, unresolved evidence,
+claim-level checks, and publication lineage. Six pinned corpus documents provide
+an offline regression slice; saved runs can be inspected and replayed without
+refetching. API/minutes sources coexist and are compared internally. Outcome
+encoding requires an explicit result; majority estimates are display-only.
+
+A meeting minutes endpoint exposes revision hashes and corpus readiness.
+`docs/MOTION_DATA_CONTRACT.md` defines the Motioncount handoff and the migration,
+restart, and full reparse required to populate the new records.
+
 ## [2026-09-11] Minutes Supply On, Matter-File Parity Pass, Vote Grain Migration
 
 Votes existed only where a vendor API handed them over (Legistar `/Votes`,

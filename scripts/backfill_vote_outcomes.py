@@ -1,7 +1,7 @@
 """Backfill vote outcomes for historical data.
 
-Computes vote tallies and outcomes for matter_appearances that have votes
-in the votes table but missing outcome data.
+Backfills missing API tallies only when one motion is uniquely identifiable.
+Outcomes require an explicit source result; a majority is not stored as fact.
 
 Usage:
     uv run python scripts/backfill_vote_outcomes.py [--dry-run] [--limit N]
@@ -12,7 +12,7 @@ import asyncio
 
 from config import get_logger
 from database.db_postgres import Database
-from database.vote_utils import compute_vote_tally, determine_vote_outcome
+from database.vote_utils import compute_vote_tally
 
 logger = get_logger(__name__)
 
@@ -31,7 +31,8 @@ async def backfill_outcomes(dry_run: bool = False, limit: int | None = None) -> 
             query = """
                 SELECT DISTINCT ma.matter_id, ma.meeting_id, ma.item_id
                 FROM matter_appearances ma
-                WHERE ma.vote_outcome IS NULL
+                WHERE ma.vote_tally IS NULL
+                AND ma.vote_source IS DISTINCT FROM 'minutes'
                 AND EXISTS (
                     SELECT 1 FROM votes v
                     WHERE v.matter_id = ma.matter_id AND v.meeting_id = ma.meeting_id
@@ -62,37 +63,39 @@ async def backfill_outcomes(dry_run: bool = False, limit: int | None = None) -> 
                 # Get votes for this matter+meeting
                 votes = await conn.fetch(
                     """
-                    SELECT vote FROM votes
-                    WHERE matter_id = $1 AND meeting_id = $2
+                    SELECT vote, item_key, motion_index FROM votes v
+                    WHERE matter_id = $1 AND meeting_id = $2 AND source='api'
+                    AND (item_key=$3 OR (item_key='' AND 1=(
+                        SELECT count(*) FROM items i WHERE i.matter_id=$1 AND i.meeting_id=$2
+                    )))
                     """,
                     matter_id,
                     meeting_id,
+                    item_id,
                 )
 
-                if not votes:
+                if not votes or len({(v['item_key'],v['motion_index']) for v in votes}) != 1:
                     skipped += 1
                     continue
 
                 vote_list = [{"vote": v["vote"]} for v in votes]
                 tally = compute_vote_tally(vote_list)
-                outcome = determine_vote_outcome(tally)
 
                 if dry_run:
                     logger.info(
                         "would update",
                         matter_id=matter_id,
                         meeting_id=meeting_id,
-                        outcome=outcome,
                         tally=tally,
                     )
                 else:
                     await conn.execute(
                         """
                         UPDATE matter_appearances
-                        SET vote_outcome = $1, vote_tally = $2
-                        WHERE matter_id = $3 AND meeting_id = $4 AND item_id = $5
+                        SET vote_tally = $1, vote_source = 'api'
+                        WHERE matter_id = $2 AND meeting_id = $3 AND item_id = $4
+                          AND vote_tally IS NULL AND vote_source IS DISTINCT FROM 'minutes'
                         """,
-                        outcome,
                         tally,
                         matter_id,
                         meeting_id,
