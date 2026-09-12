@@ -98,3 +98,64 @@ reportMissingTypeStubs = false
 testpaths = ["tests"]
 pythonpath = ["."]
 timeout = 120
+
+[tool.ruff]
+# Vendored, generated, and non-Python trees. scripts/ stays in scope: one-off
+# tools are where nesting rots fastest and nobody notices.
+exclude = [".venv", ".cache", "frontend", "workers", "data", "logs", "munis"]
+
+[tool.ruff.lint]
+# PLR1702 (nesting depth) is preview-only in ruff 0.15. Enabling preview
+# silently widens the DEFAULT rule set from E4/E7/E9/F to ~1000 rules, so the
+# selection below must be explicit and explicit-preview-rules must stay on:
+# together they buy exactly one preview rule and nothing else.
+preview = true
+explicit-preview-rules = true
+select = [
+    "E4", "E7", "E9", "F",  # ruff's default set, restated because preview drops it
+    "C901",     # cyclomatic complexity
+    "PLR0911",  # too many return statements
+    "PLR0912",  # too many branches
+    "PLR0913",  # too many arguments
+    "PLR0915",  # too many statements
+    "PLR1702",  # too many nested blocks (preview)
+]
+
+# COMPLEXITY BUDGET (set 2026-09-12)
+#
+# These ceilings sit far above any style guide's default, on purpose. They are
+# pinned just above the current tail of the codebase so the gate is green-able
+# today and what remains is a finite backlog rather than 13,800 lines of noise.
+# Ratchet a number down when its backlog reaches zero. Never raise one to
+# admit a new function.
+#
+#   code      ceiling  backlog now   next ratchet
+#   C901         25        13          20 -> 43
+#   PLR0911       8         7           6 -> 28
+#   PLR0912      25        11          20 -> 39
+#   PLR0913       8        12           6 -> 39
+#   PLR0915      75        28          50 -> 88
+#   PLR1702       6         6           5 -> 41
+#
+# Nesting (PLR1702) is the number to trust. Cyclomatic complexity conflates two
+# unlike shapes: a flat fan of guard clauses (parsing/rollcall/observations.py
+# _validate, one branch per contract rule at depth 4) reads fine and should stay
+# fanned out, while the same score buried in eight levels of if/try does not.
+# When the two disagree, believe the depth.
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.lint.pylint]
+max-returns = 8
+max-branches = 25
+max-args = 8
+max-statements = 75
+max-nested-blocks = 6
+
+[tool.ruff.lint.per-file-ignores]
+# Test bodies are long and linear by nature; arrange/act/assert is not a
+# complexity smell, and bugs in tests surface as failing tests.
+"tests/**" = ["C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR1702"]
+# Intentional verbatim reference copy of the chunker, kept as documentation.
+# Not dead code, and not code to clean.
+"agenda_chunker_template.py" = ["C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR1702"]

@@ -285,6 +285,14 @@ async def process_one(db, corpus, audit, row, build, apply, counts, reasons):
         else:
             result = await corpus.lookup_extraction(row['content_sha256'])
             text = (result or {}).get('text')
+        if text and "\x00" in text:
+            # PDF extraction leaves NUL bytes in some Buffalo minutes. Postgres
+            # refuses them in a text column, so the audit save itself raised and
+            # the meeting disappeared with a log line and no failed run recorded.
+            # A NUL carries no content; drop it before the hash so the cleaned
+            # text is what we store and what the receipt offsets refer to.
+            counts['nul_bytes_stripped'] += 1
+            text = text.replace("\x00", "")
         if not text:
             counts['missing_text'] += 1
             if apply:

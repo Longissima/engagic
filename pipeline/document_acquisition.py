@@ -18,7 +18,7 @@ from config import config, get_logger
 from corpus.store import CorpusStore, sha256_hex
 from pipeline.document_artifacts import DocumentArtifact, make_artifact
 from pipeline.protocols import MetricsCollector, NullMetrics
-from pipeline.utils import attachment_identity
+from pipeline.utils import attachment_identity, canonical_fetch_url
 
 logger = get_logger(__name__).bind(component="document_acquisition")
 
@@ -76,13 +76,22 @@ class DocumentSourceAcquirer:
         banana: Optional[str] = None,
     ) -> DocumentArtifact:
         """Return a typed artifact, joining concurrent work for this identity."""
+        # Resolve viewer-only routes to the URL that serves bytes before
+        # anything keys off it. Done here rather than at each call site so
+        # every caller -- sync, processing, backfills, replays -- gets the
+        # document instead of a portal's JavaScript shell, and so the corpus
+        # keys the bytes under the URL they actually came from. Pin the
+        # caller's URL as requested_url first: it stays the durable
+        # human-facing link on the artifact even though we fetch elsewhere.
+        requested_url = requested_url or source_url
+        source_url = canonical_fetch_url(source_url)
         identity = attachment_identity(source_url)
         task = self._tasks.get(identity)
         joined_existing = task is not None
         if task is None:
             task = asyncio.create_task(
                 self._acquire_once(
-                    requested_url=requested_url or source_url,
+                    requested_url=requested_url,
                     source_url=source_url,
                     banana=banana,
                 )
@@ -104,9 +113,8 @@ class DocumentSourceAcquirer:
                 )
             self._record_metric("singleflight_join", artifact, 0.0)
 
-        effective_requested_url = requested_url or source_url
-        if artifact.requested_url != effective_requested_url:
-            return replace(artifact, requested_url=effective_requested_url)
+        if artifact.requested_url != requested_url:
+            return replace(artifact, requested_url=requested_url)
         return artifact
 
     def _release(

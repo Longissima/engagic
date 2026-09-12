@@ -50,6 +50,45 @@ _MATTER_NO_WORK_REASONS = frozenset(
 _SIGNED_URL_MARKERS = frozenset({"sig", "x-amz-signature", "signature", "awsaccesskeyid"})
 
 
+# Viewer routes that serve a UI, not the document. A CivicClerk portal agenda
+# URL renders the file inside the portal's single-page app; fetched directly it
+# returns 1,289 bytes of HTML whose only text is "You need to enable JavaScript
+# to run this app.", and PyMuPDF opens that happily as a 1-page document rather
+# than failing, so nothing downstream notices. The trailing path segment is the
+# same fileId the API's GetMeetingFileStream takes (both are built from
+# doc["fileId"] in the CivicClerk adapter), so the rewrite is exact and needs no
+# network round-trip. The portal URL stays the durable human-facing link; only
+# the bytes come from elsewhere.
+#
+# Attachments have a sibling portal shape (/files/attachment/{id}) that is NOT
+# handled here: their API URLs are SAS-signed and expire, so they must go
+# through pipeline.url_refresh, which re-signs against a live agenda fetch.
+_CC_PORTAL_AGENDA_RE = re.compile(
+    r"^(https://[^./]+)\.portal\.civicclerk\.com/event/\d+/files/agenda/(\d+)/?$",
+    re.IGNORECASE,
+)
+
+
+def canonical_fetch_url(url: str) -> str:
+    """Return the URL that actually serves this document's bytes.
+
+    Identity-preserving for everything it does not recognize, so it is safe to
+    apply at the acquisition boundary to every source. Callers keep the
+    original as the artifact's requested_url; the returned URL is what gets
+    fetched and what the corpus keys the bytes under.
+    """
+    if not url:
+        return url
+    match = _CC_PORTAL_AGENDA_RE.match(url)
+    if match:
+        host, file_id = match.group(1), match.group(2)
+        return (
+            f"{host}.api.civicclerk.com"
+            f"/v1/Meetings/GetMeetingFileStream(fileId={file_id},plainText=false)"
+        )
+    return url
+
+
 def attachment_identity(url: str) -> str:
     """Stable identity for an attachment URL across re-scrapes.
 

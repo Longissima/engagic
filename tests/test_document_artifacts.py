@@ -15,6 +15,7 @@ from analysis.analyzer_async import AsyncAnalyzer
 from corpus.store import CorpusOriginal, sha256_hex
 from parsing.pdf import PdfExtractor
 from parsing.subprocess_guard import GuardCrashed
+from pipeline.utils import canonical_fetch_url
 from pipeline.document_artifacts import (
     DocumentArtifact,
     DocumentFormat,
@@ -849,3 +850,73 @@ def test_cancelled_download_releases_capacity(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(analyzer.acquire_document_async('https://example.test/a.pdf'))
     assert memory_budget._reserved_bytes == 0
+
+
+def test_civicclerk_portal_agenda_url_maps_to_the_api_file_stream():
+    portal = "https://elcerritoca.portal.civicclerk.com/event/1349/files/agenda/3682"
+    assert canonical_fetch_url(portal) == (
+        "https://elcerritoca.api.civicclerk.com"
+        "/v1/Meetings/GetMeetingFileStream(fileId=3682,plainText=false)"
+    )
+    # Trailing slash is the same route.
+    assert canonical_fetch_url(portal + "/") == canonical_fetch_url(portal)
+    # Attachments keep their portal URL: their API URLs are SAS-signed and
+    # expire, so pipeline.url_refresh re-signs them instead.
+    attachment = "https://elcerritoca.portal.civicclerk.com/event/1349/files/attachment/77"
+    assert canonical_fetch_url(attachment) == attachment
+    # Everything unrecognized passes through untouched.
+    for url in (
+        "",
+        "https://example.test/View.ashx?ID=9&GUID=abc",
+        "https://x.api.civicclerk.com/v1/Meetings/GetMeetingFileStream(fileId=5,plainText=false)",
+        "https://portal.civicclerk.com/event/1/files/agenda/2",
+    ):
+        assert canonical_fetch_url(url) == url
+
+
+def test_acquire_fetches_the_api_url_but_keeps_the_portal_url_as_requested(monkeypatch):
+    """A portal agenda URL must never become the corpus identity.
+
+    Fetched directly it returns the portal's JavaScript shell, which PyMuPDF
+    opens as a valid 1-page document -- so without the rewrite the shell is
+    archived as the meeting's original and nothing reports a failure.
+    """
+    portal = "https://tollesonaz.portal.civicclerk.com/event/278/files/agenda/963"
+    api = (
+        "https://tollesonaz.api.civicclerk.com"
+        "/v1/Meetings/GetMeetingFileStream(fileId=963,plainText=false)"
+    )
+    data = b"%PDF-1.7 real agenda"
+
+    class Corpus:
+        def __init__(self):
+            self.looked_up = []
+            self.archives = []
+
+        async def get_original_artifact_by_identity(self, source_url):
+            self.looked_up.append(source_url)
+            return None
+
+        async def archive_original(self, content_sha256, **kwargs):
+            self.archives.append((content_sha256, kwargs.get("source_url")))
+            return True
+
+        async def record_sighting(self, *args, **kwargs):
+            return None
+
+        async def lookup_extraction(self, content_sha256):
+            return None
+
+    corpus = Corpus()
+    session = _Session([_Response(data, content_type="application/pdf")])
+    analyzer = AsyncAnalyzer(enable_llm=False)
+    _configure_http(monkeypatch, analyzer, session, corpus)
+
+    artifact = asyncio.run(analyzer.acquire_document_async(portal, banana="tollesonAZ"))
+
+    assert [url for url, _ in session.requests] == [api]
+    assert corpus.looked_up == [api]
+    assert corpus.archives == [(sha256_hex(data), api)]
+    assert artifact.source_url == api
+    assert artifact.requested_url == portal
+    assert artifact.data == data
