@@ -96,7 +96,6 @@ UPSERT_APPEARANCE_SQL = """
     ON CONFLICT (matter_id, meeting_id, item_id) DO UPDATE SET
         vote_outcome = EXCLUDED.vote_outcome, vote_tally = EXCLUDED.vote_tally,
         vote_source = 'minutes'
-    WHERE matter_appearances.vote_source IS DISTINCT FROM 'api'
 """
 
 

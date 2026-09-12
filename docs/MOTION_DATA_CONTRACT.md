@@ -188,3 +188,17 @@ record the identity matches; ambiguous identities and duplicate attributions
 are withheld. Comparisons distinguish incomplete roll calls from differing
 ballot values. See [the bounded identity review](MINUTES_IDENTITY_REVIEW.md) for
 rules, reviewed source examples and regression commands.
+
+### Minutes preference and motion semantics
+
+Public motion groups now prefer confirmed minutes for an item; remaining API-only
+groups carry `selection_basis: api_fallback_no_confirmed_minutes`. Member voting
+history and topic profiles use the same preference so duplicate API/minutes rows
+do not inflate the displayed record. Raw `votes` remains a source-separated audit
+store: downstream SQL consumers must apply this preference themselves and must
+not sum both sources. `get_motion_groups(include_api_comparison=True)` retains both
+sources for internal inspection.
+
+`outcome` describes the motion itself. A successful motion to deny is passed;
+`DENIED` alone describes the subject and does not establish motion failure. See
+[the saved-minutes review](MINUTES_SEMANTICS_REVIEW.md).

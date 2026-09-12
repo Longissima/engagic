@@ -3236,3 +3236,9 @@ Track future milestones in VISION.md.
 - Retain OCR-pending page numbers and serve available partial text with explicit completeness metadata; label partial inputs during summarization.
 - Select the current source revision before checking attachment backfill readiness, and use origin-validation ordering for minutes ingestion.
 - Expose current minutes readiness and older text availability separately. Migration 045 adds one nullable page-list column; no extraction history or corpus-wide reprocessing.
+
+### Minutes-first vote readers and semantic corrections
+
+- Prefer confirmed minutes per item in public motion groups, member history, and topic profiles; retain explicit API fallback and internal comparisons.
+- Preserve motion success independently of a denied application/appeal, and remove historical denial prose from motion outcomes.
+- Recover district-prefixed/vertical member lists, `Recuse:` categories, and compact count lines; reject dates as tallies and unparseable lists as zero votes.

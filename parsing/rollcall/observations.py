@@ -90,9 +90,11 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
     from parsing.rollcall.engine import ItemVotes, _is_heading, _membership_ok
     obs.item_id = item.get('id') if item else None
     obs.interpretation = {'item': item, 'alignment': rung, 'motion_index': motion_index,
-                          'raw_outcome': ev.outcome, 'unanimous': ev.unanimous, 'members': []}
+                          'raw_outcome': ev.outcome, 'subject_disposition': ev.disposition, 'unanimous': ev.unanimous, 'members': []}
     if not item:
         _check(obs, 'alignment', 'withheld', 'no_unique_item')
+    elif 'reported_committee_action' in ev.qualifications:
+        _check(obs, 'alignment', 'withheld', 'reported_committee_action')
     elif ev.procedural or _is_heading(str(item.get('title') or '')):
         _check(obs, 'alignment', 'withheld', 'procedural_or_heading')
     elif attendance.present and gazetteer.canonical and not _membership_ok(ev.movers, gazetteer, attendance.present):
@@ -223,7 +225,7 @@ def observe_meeting(text, items, roster, dialect=None):
                           'motion', asdict(ev))
         prior = prior_by_item.get(item['id']) if item else None
         summary = False
-        if prior and ev.outcome and ev.outcome == prior[0].outcome:
+        if prior and (ev.outcome == prior[0].outcome or ev.disposition == 'denied'):
             previous, previous_obs, previous_index = prior
             labeled = bool(re.match(r'RESULT\s*:', ev.result_text, re.I))
             bare = bool(re.fullmatch(r'(?:Adopted|Approved|Passed)\.?', ev.result_text, re.I))
@@ -236,7 +238,19 @@ def observe_meeting(text, items, roster, dialect=None):
                              for s in ev.sections if s.value == 'NO')
             summary = (0 < distance < 700 and labeled and previous.tally is not None
                        and previous.tally[:2] == (section_yes, section_no)) or (0 < distance < 160 and bare)
+            if ev.disposition == 'denied':
+                summary = summary or (0 < distance < 350 and labeled and previous.unanimous
+                                      and section_yes > 0 and section_no == 0)
+                if summary:
+                    ev.outcome = previous.outcome
+                    if ev.tally is None:
+                        ev.tally = previous.tally
         if summary:
+            # The receipt must include the narrative that establishes the
+            # motion outcome as well as its repeated result box.
+            obs.start = min(obs.start, prior[1].start)
+            obs.end = max(obs.end, prior[1].end)
+            obs.raw_text = text[obs.start:obs.end]
             index = prior[2]
             prior[1].interpretation['superseded_by_summary'] = ordinal
             prior[1].publication = None

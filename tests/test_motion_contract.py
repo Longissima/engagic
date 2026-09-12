@@ -220,8 +220,9 @@ async def test_item_deletion_preserves_evidence_and_motion_identity(database):
     assert await conn.fetchval('SELECT count(*) FROM votes') == 5
     assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 3
     groups = await repo.get_motion_groups(meeting_id='meeting')
-    assert len(groups) == 3
-    assert {m['item_id'] for m in groups} == {'item', 'item2', None}
+    assert len(groups) == 2
+    assert {m['item_id'] for m in groups} == {'item', 'item2'}
+    assert len(await repo.get_motion_groups(meeting_id='meeting', include_api_comparison=True)) == 3
 
 
 @pytest.mark.asyncio
@@ -333,10 +334,16 @@ async def test_source_rows_do_not_collide_at_same_item_motion(database):
     await repo.record_vote('alice','matter','meeting','yes',item_id='item',conn=conn)
     await persist_meeting(conn,ROW,published(motion()),ROSTER)
     groups = await repo.get_motion_groups(meeting_id='meeting')
-    assert {g['source'] for g in groups} == {'api','minutes'}
-    assert len(groups) == 2
+    assert [g['source'] for g in groups] == ['minutes']
+    assert groups[0]['selection_basis'] == 'minutes'
+    comparison = await repo.get_motion_groups(meeting_id='meeting', include_api_comparison=True)
+    assert {g['source'] for g in comparison} == {'api','minutes'}
+    assert len(comparison) == 2
+    history = await repo.get_member_voting_record('alice')
+    assert history and all(v['source'] == 'minutes' for v in history)
     await persist_meeting(conn,ROW,{},ROSTER)
     assert await conn.fetchval('SELECT source FROM votes') == 'api'
+    assert (await repo.get_motion_groups(meeting_id='meeting'))[0]['selection_basis'] == 'api_fallback_no_confirmed_minutes'
 
 
 @pytest.mark.asyncio
@@ -502,3 +509,16 @@ async def test_corpus_readiness_uses_current_revision_and_exposes_older_text(dat
     # A genuine origin validation can make previously seen bytes current again.
     await conn.execute("UPDATE document_source SET last_validated_at='2026-09-12' WHERE content_sha256='sha'")
     assert len(await conn.fetch(READY_IDENTITIES_SQL, ['url'], ['1', '2'])) == 1
+
+
+@pytest.mark.asyncio
+async def test_minutes_own_appearance_outcome_over_api(database):
+    from database.repositories_async.matters import MatterRepository
+    conn, pool = database
+    await conn.execute("""INSERT INTO matter_appearances(matter_id,meeting_id,item_id,vote_outcome,vote_source)
+        VALUES ('matter','meeting','item','failed','api')""")
+    await persist_meeting(conn, ROW, published(motion(outcome="passed")), ROSTER)
+    row = await conn.fetchrow('SELECT vote_outcome,vote_source FROM matter_appearances')
+    assert dict(row) == {'vote_outcome':'passed', 'vote_source':'minutes'}
+    await MatterRepository(pool).update_appearance_outcome('matter','meeting','item','failed',{'yes':0,'no':2},conn=conn)
+    assert dict(await conn.fetchrow('SELECT vote_outcome,vote_source FROM matter_appearances')) == dict(row)

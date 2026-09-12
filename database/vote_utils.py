@@ -32,7 +32,7 @@ def compute_vote_tally(votes: List[Dict]) -> Dict[str, int]:
     return tally
 
 
-def group_motions(votes, motions):
+def group_motions(votes, motions, *, prefer_minutes=False):
     """Join individual votes to motions without inventing tally-only voters.
 
     Legacy API votes have no motion record and are grouped at their stored
@@ -68,7 +68,19 @@ def group_motions(votes, motions):
         if k not in recorded:
             motion["tally"] = compute_vote_tally(motion["votes"])
             motion["outcome"] = None  # Individual API votes do not encode a recorded outcome.
-    return sorted(groups.values(), key=lambda m: (
+    selected = list(groups.values())
+    if prefer_minutes:
+        minutes_items = {(m["meeting_id"], m["matter_id"], m.get("item_key") or m.get("item_id"))
+                         for m in selected if m.get("source") == "minutes"}
+        minutes_matters = {(meeting, matter) for meeting, matter, _ in minutes_items}
+        selected = [m for m in selected if m.get("source") == "minutes" or not (
+            (m["meeting_id"], m["matter_id"], m.get("item_key") or m.get("item_id")) in minutes_items
+            or (not (m.get("item_key") or m.get("item_id"))
+                and (m["meeting_id"], m["matter_id"]) in minutes_matters))]
+        for motion in selected:
+            motion["selection_basis"] = ("minutes" if motion.get("source") == "minutes"
+                                         else "api_fallback_no_confirmed_minutes")
+    return sorted(selected, key=lambda m: (
         m.get("vote_date") or "", m["meeting_id"],
         m.get("item_sequence") if m.get("item_sequence") is not None else -1,
         m.get("item_id") or "", m["motion_index"], m["matter_id"], m.get("source") == "minutes",

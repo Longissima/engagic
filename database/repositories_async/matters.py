@@ -785,6 +785,7 @@ class MatterRepository(BaseRepository):
                 UPDATE matter_appearances
                 SET vote_outcome = $1, vote_tally = $2, vote_source = 'api'
                 WHERE matter_id = $3 AND meeting_id = $4 AND item_id = $5
+                  AND vote_source IS DISTINCT FROM 'minutes'
                 """,
                 vote_outcome,
                 vote_tally,

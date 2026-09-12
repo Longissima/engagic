@@ -105,7 +105,9 @@ def compare_api(parsed, api_votes, items, roster):
                 incomplete = any(c['status']=='withheld' and c['field'] in ('member','members','tally')
                                  and c['reason'] not in ('not_established','unanimity_does_not_identify_motion_participants')
                                  for c in obs.checks)
-                if not ours or any(n is None for n, _ in ours | theirs):
+                if not ours and not obs.interpretation.get('members'):
+                    comparison = {'status': 'not_comparable', 'reason': 'minutes_do_not_name_voters'}
+                elif not ours or any(n is None for n, _ in ours | theirs):
                     comparison = {'status': 'not_comparable', 'reason': 'unresolved_minutes_members'}
                 elif incomplete:
                     comparison = {'status': 'not_comparable', 'reason': 'incomplete_minutes_rollcall',
@@ -123,5 +125,7 @@ def compare_api(parsed, api_votes, items, roster):
                         'minutes_only': sorted(ours - theirs), 'api_only': sorted(theirs - ours)}
             if comparison['status'] == 'disagreement':
                 comparison['difference_kind'] = ('api_reports_only_not_voting'
-                    if api and all(v['vote']=='not_voting' for v in api) else 'ballot_values_differ')
+                    if api and all(v['vote']=='not_voting' for v in api) else
+                    'api_differences_only_not_voting' if comparison.get('api_only')
+                    and all(v=='not_voting' for _,v in comparison['api_only']) else 'ballot_values_differ')
             obs.interpretation['api_comparison'] = comparison

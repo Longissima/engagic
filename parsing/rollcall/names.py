@@ -8,12 +8,13 @@ from typing import List
 # purpose: a stripped title never harms resolution, a retained one breaks it.
 _TITLE_RE = re.compile(
     r"^\s*(?:"
+    r"district\s+(?:[IVX]+|\d+)\s+supervisor|"
     r"vice[-\s]?chair(?:person|woman|man)?|chair(?:person|woman|man)?|"
     r"ald(?:\.|erman|erwoman|erperson|erpersons)?|council\s*(?:members?|man|woman|ors?|persons?)|"
     r"councilmembers?|councilors?|commissioners?|supervisors?|trustees?|directors?|"
     r"(?:board|committee|commission|council|planning)\s+members?|members?|"
     r"vice\s+mayor|vice\s+president|deputy\s+mayor|mayor\s+pro\s*[- ]?tem|mayor|acting\s+chair(?:person)?|"
-    r"president\s+pro\s*[- ]?tem|president|selectman|selectwoman|selectperson|"
+    r"president\s+pro\s*[- ]?tem(?:pore)?|president|selectman|selectwoman|selectperson|"
     r"representative|senator|judge|dr|mr|mrs|ms|miss|hon)\.?\s+",
     re.IGNORECASE,
 )

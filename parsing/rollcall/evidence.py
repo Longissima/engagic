@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from parsing.rollcall.names import split_names
+from parsing.rollcall.names import split_names, clean_name, looks_like_name
 
 CATEGORY_CANON = {
     "for": "AYE", "aye": "AYE", "ayes": "AYE", "yes": "AYE", "yea": "AYE", "yeas": "AYE",
@@ -30,7 +30,7 @@ CATEGORY_CANON = {
     "against": "NO", "nay": "NO", "nays": "NO", "no": "NO", "noes": "NO", "opposed": "NO",
     "abstain": "ABSTAIN", "abstained": "ABSTAIN", "abstaining": "ABSTAIN",
     "abstention": "ABSTAIN", "abstentions": "ABSTAIN",
-    "not present": "ABSENT", "absent": "ABSENT", "excused": "EXCUSED", "recused": "RECUSED", "recusal": "RECUSED",
+    "not present": "ABSENT", "absent": "ABSENT", "excused": "EXCUSED", "recuse": "RECUSED", "recused": "RECUSED", "recusal": "RECUSED",
     "present": "PRESENT", "not voting": "NONVOTING",
     # Recorded dissent that the clerk formats as its own label. Missing these
     # publishes a unanimous vote over a dissent, the one error that matters most.
@@ -40,7 +40,7 @@ CATEGORY_CANON = {
 }
 _CATEGORY_WORDS = "|".join(sorted((re.escape(k) for k in CATEGORY_CANON), key=len, reverse=True))
 CATEGORY_LINE_RE = re.compile(
-    rf"^[ \t]*(?P<cat>{_CATEGORY_WORDS})(?:\s*[:,]\s*|\s+(?=\d))(?:(?P<count>\d+)\s*(?:[-–]\s*|$))?(?P<rest>.*)$",
+    rf"^[ \t]*(?P<cat>{_CATEGORY_WORDS})(?:\s*[:,–-]\s*|\s+(?=\d))(?:(?P<count>\d+)\s*(?:[-–]\s*|$))?(?P<rest>.*)$",
     re.IGNORECASE,
 )
 _TRAILING_COUNT_RE = re.compile(
@@ -48,6 +48,8 @@ _TRAILING_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _ANY_LABEL_RE = re.compile(r"^[ \t]*[A-Za-z][A-Za-z /-]{0,35}:\s*")
+_INLINE_LABEL_SPLIT_RE = re.compile(rf",\s*(?=(?:{_CATEGORY_WORDS})\s*[:–-])", re.I)
+_INLINE_COUNT_RE = re.compile(rf"(?P<cat>{_CATEGORY_WORDS})\s+(?P<count>\d+)\b", re.I)
 _BARE_COUNT_RE = re.compile(r"^\s*(\d+)\s*[-–]?\s*$")
 _NONE_RE = re.compile(r"^\s*\(?\s*(?:none|nil|n/a|-|0)\s*\)?\s*\.?\s*$", re.IGNORECASE)
 
@@ -55,7 +57,7 @@ RESULT_RE = re.compile(
     r"(?P<result>"
     r"(?:the\s+)?motion\s+(?:to\s+\w+\s+)?(?:carried|passed|prevailed|failed|was\s+(?:approved|adopted|defeated|denied)|(?:was\s+)?approved|(?:was\s+)?adopted|(?:was\s+)?denied)"
     r"|(?:carried|passed|failed|prevailed)\s+by\s+the\s*following\s*vote"
-    r"|(?:this|the)\s+\w+\s+was\s+(?:adopted|approved|passed|placed\s+on\s+file|referred|held|denied)"
+    r"|(?:this|the)\s+(?:item|matter|resolution|ordinance|motion)\s+was\s+(?:adopted|approved|passed|placed\s+on\s+file|referred|held|denied)"
     r"|vote[sd]?\s*[:\-–]?\s*\d{1,2}\s*[-–/]\s*\d{1,2}"
     # "Motion/second to approve by Commissioners Fuller/McCord carried 6-0":
     # the result word is nowhere near the word motion, the tally is the anchor.
@@ -99,7 +101,8 @@ _MOVED_SUFFIX_RE = re.compile(
     r"\b(?P<name>[A-Z][A-Za-z'\u2019-]+(?:\s+[A-Z][A-Za-z'\u2019-]+){0,2})\s+(?:moved|seconded)\b"
 )
 _PROCEDURAL_MOTION_RE = re.compile(
-    r"\bto\s+(?:adjourn|recess|reconvene|return\s+to\s+open\s+session|go\s+into\s+(?:closed|executive)\s+session)\b"
+    r"\bto\s+(?:adjourn|recess|reconvene|return\s+to\s+open\s+session|(?:go|convene|enter)\s+into\s+(?:closed|executive)\s+session)\b"
+    r"|\bconvene\s+into\s+(?:closed|executive)\s+session\b"
     r"|\bthe\s+(?:meeting|board|committee|council)\s+be\s+adjourned\b|\badjournment\b",
     re.IGNORECASE,
 )
@@ -113,7 +116,7 @@ _UNANIMOUS_RE = re.compile(
     re.IGNORECASE,
 )
 _TALLY_CONTEXT_RE = re.compile(
-    r"(?:vote[sd]?|voting|carried|passed|prevailed|failed|motion|approved|adopted|denied|unanimously|result|\(|\[)\s*[:,]?\s*$",
+    r"(?:vote[sd]?\s+(?:of\s+)?|vote[sd]?|voting|carried|passed|prevailed|failed|motion|approved|adopted|denied|unanimously|result|\(|\[)\s*[:,]?\s*$",
     re.IGNORECASE,
 )
 
@@ -139,6 +142,7 @@ class Evidence:
     source_start: int = 0
     source_end: int = 0
     qualifications: List[str] = field(default_factory=list)
+    disposition: Optional[str] = None  # Subject disposition is not a motion outcome.
     procedural: bool = False               # a motion to adjourn, recess, reconvene
 
     @property
@@ -150,6 +154,13 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
     sections: List[Section] = []
     i = start
     while i < min(len(lines), start + limit):
+        inline = list(_INLINE_COUNT_RE.finditer(lines[i]))
+        if len(inline) > 1 and not _INLINE_COUNT_RE.sub("", lines[i]).strip(" ,.;\t"):
+            if not sections:
+                sections.extend(Section(CATEGORY_CANON[m['cat'].lower()], [], int(m['count']),
+                                        lines[i], m['cat']) for m in inline)
+            i += 1
+            continue
         m = CATEGORY_LINE_RE.match(lines[i])
         if not m:
             if RESULT_RE.search(lines[i]):
@@ -164,7 +175,7 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
         stated = int(m.group("count")) if m.group("count") else None
         blob_parts = [m.group("rest").strip()]
         j = i + 1
-        while j < len(lines) and j < i + 6:
+        while j < len(lines) and j < i + 30:
             nxt = lines[j]
             if _ANY_LABEL_RE.match(nxt) or CATEGORY_LINE_RE.match(nxt) or RESULT_RE.search(nxt) or nxt.strip() == "":
                 break
@@ -176,15 +187,30 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
             blob_parts.append(nxt.strip())
             j += 1
         blob = " ".join(p for p in blob_parts if p)
+        inline_parts = _INLINE_LABEL_SPLIT_RE.split(blob)
+        blob = inline_parts[0]
         tc = _TRAILING_COUNT_RE.search(blob)
         if tc:
             stated = int(tc.group("count")) if stated is None else stated
             blob = blob[:tc.start()]
-        names = [] if _NONE_RE.match(blob or "") else split_names(blob)
+        vertical = [clean_name(part) for part in blob_parts if part]
+        if (len(inline_parts) == 1 and len(vertical) > 1 and not re.search(r"[,;]", blob)
+                and all(looks_like_name(name) for name in vertical)
+                and any(clean_name(part) != part for part in blob_parts if part)):
+            names = vertical
+        else:
+            names = [] if _NONE_RE.match(blob or "") else split_names(blob)
         if stated is None and not names:
-            stated = 0
+            if not blob or _NONE_RE.match(blob):
+                stated = 0
+            else:
+                # Unreadable category content is not a recorded zero.
+                i = j
+                continue
         sections.append(Section(value=value, names=names, stated=stated,
                                 raw_text="\n".join(lines[i:j]), raw_label=m.group("cat")))
+        if len(inline_parts) > 1:
+            sections.extend(_parse_sections(inline_parts[1:], 0, len(inline_parts) - 1))
         i = j
     return sections
 
@@ -194,7 +220,7 @@ def _tally_near(lines: List[str], idx: int, result_text: str) -> Optional[Tuple[
     for text in candidates:
         for m in TALLY_RE.finditer(text):
             before = text[:m.start()]
-            if _TALLY_CONTEXT_RE.search(before) or text is result_text:
+            if _TALLY_CONTEXT_RE.search(before):
                 yes, no = int(m.group("yes")), int(m.group("no"))
                 third = int(m.group("third")) if m.group("third") else 0
                 if yes + no + third <= 60:
@@ -217,18 +243,29 @@ def find_evidence(block: str) -> List[Evidence]:
             result_text = m.group("result")
             window = " ".join(lines[idx:idx + 2])
             outcome = None
-            if _FAIL_RE.search(result_text):
+            disposition = "denied" if re.search(r"\bdenied\b", result_text, re.I) else None
+            if disposition:
+                # A denied application/appeal may be the result of a successful
+                # motion to deny. Only an explicitly denied *motion* fails.
+                if re.search(r"\bmotion\s+(?:was\s+)?denied\b", result_text, re.I):
+                    outcome = "FAIL"
+            elif _FAIL_RE.search(result_text):
                 outcome = "FAIL"
             elif _PASS_RE.search(result_text):
                 outcome = "PASS"
             ev = Evidence(
                 result_text=re.sub(r"\s+", " ", line.strip())[:300],
                 outcome=outcome,
+                disposition=disposition,
                 offset=offsets[idx] + m.start(),
                 source_start=offsets[max(0, idx - 8)],
                 source_end=offsets[min(len(lines)-1, idx + 20)] + len(lines[min(len(lines)-1, idx + 20)]),
                 unanimous=bool(_UNANIMOUS_RE.search(window)),
             )
+            if (re.match(r"(?:this|the)\s+(?:resolution|ordinance|item|matter)\s+was", result_text, re.I)
+                    and re.match(r"\s+by\s+the\s+[A-Z][^.!?]{1,100}\b(?:Committee|Commission)\b",
+                                 line[m.end():] + " " + " ".join(lines[idx + 1:idx + 3]))):
+                ev.qualifications.append('reported_committee_action')
             ev.sections = _parse_sections(lines, idx + 1, 14)
             if not ev.sections and idx > 0:
                 # Alameda County prints the lists before "Motion passed 2/0"

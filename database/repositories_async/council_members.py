@@ -1131,6 +1131,12 @@ class CouncilMemberRepository(BaseRepository):
             FROM votes v
             JOIN city_matters m ON v.matter_id = m.id
             WHERE v.council_member_id = $1
+              AND (v.source = 'minutes' OR NOT EXISTS (
+                  SELECT 1 FROM item_motions im
+                  WHERE im.source = 'minutes' AND im.meeting_id = v.meeting_id
+                    AND im.matter_id = v.matter_id
+                    AND (v.item_key IS NULL OR im.item_id = v.item_key)
+              ))
             ORDER BY v.vote_date DESC NULLS LAST
             LIMIT $2
             """,
@@ -1179,6 +1185,12 @@ class CouncilMemberRepository(BaseRepository):
                 WHERE i.matter_id = v.matter_id
             ) t ON TRUE
             WHERE v.council_member_id = $1
+              AND (v.source = 'minutes' OR NOT EXISTS (
+                  SELECT 1 FROM item_motions im
+                  WHERE im.source = 'minutes' AND im.meeting_id = v.meeting_id
+                    AND im.matter_id = v.matter_id
+                    AND (v.item_key IS NULL OR im.item_id = v.item_key)
+              ))
             GROUP BY t.topic, v.vote
             ORDER BY t.topic
             """,
@@ -1218,8 +1230,11 @@ class CouncilMemberRepository(BaseRepository):
         """, matter_id, meeting_id)
         return [dict(row) for row in rows]
 
-    async def get_motion_groups(self, *, matter_id=None, meeting_id=None) -> List[Dict]:
-        """Read both halves of the projection in one database snapshot."""
+    async def get_motion_groups(self, *, matter_id=None, meeting_id=None, include_api_comparison=False) -> List[Dict]:
+        """Prefer confirmed minutes per item; keep API-only fallback explicit.
+
+        include_api_comparison retains both sources for internal inspection.
+        """
         from database.vote_utils import group_motions
         if matter_id is None and meeting_id is None:
             raise ValueError("A matter or meeting is required")
@@ -1236,7 +1251,8 @@ class CouncilMemberRepository(BaseRepository):
                       AND ($2::text IS NULL OR im.meeting_id = $2)
                 ) motion) AS motions
         """, matter_id, meeting_id)
-        return group_motions(row["votes"] or [], row["motions"] or [])
+        return group_motions(row["votes"] or [], row["motions"] or [],
+                             prefer_minutes=not include_api_comparison)
 
     async def get_vote_tally_for_matter(self, matter_id: str, meeting_id=None) -> Optional[Dict[str, int]]:
         """Tally of the last recorded motion; None when no tally is known."""
