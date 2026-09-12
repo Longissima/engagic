@@ -160,7 +160,13 @@ UPSERT_MOTION_SQL = """
 """
 
 
-async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=None, final_indices=None, expected_items=None) -> bool:
+REFERRER_SQL = """
+    UPDATE matter_appearances SET reported_referrer = $3
+    WHERE meeting_id = $1 AND item_id = $2
+"""
+
+
+async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=None, final_indices=None, expected_items=None, referrals=()) -> bool:
     """Atomically replace a successfully parsed minutes projection, even empty.
 
     Missing corpus text and parser exceptions never call this function. API
@@ -255,6 +261,8 @@ async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=
                 WHERE v.council_member_id = cm.id))
             WHERE cm.id = ANY($1::text[])
         """, sorted(member_ids))
+        for item_id, body in referrals:
+            await conn.execute(REFERRER_SQL, row["meeting_id"], item_id, body)
         if run_id:
             await conn.execute("""INSERT INTO minutes_publications(meeting_id,run_id) VALUES($1,$2)
                 ON CONFLICT(meeting_id) DO UPDATE SET run_id=EXCLUDED.run_id,published_at=CURRENT_TIMESTAMP""",
@@ -352,7 +360,8 @@ async def process_one(db, corpus, audit, row, build, apply, counts, reasons):
                 await conn.fetchval('SELECT id FROM meetings WHERE id=$1 FOR UPDATE',row['meeting_id'])
                 run_id = await audit.save_run(conn,row,text,build,inputs,parsed)
                 written = await persist_meeting(conn,row,published,roster,list(to_create.values()),
-                                               run_id=run_id,final_indices=final_indices,expected_items=items)
+                                               run_id=run_id,final_indices=final_indices,expected_items=items,
+                                               referrals=parsed.referrals)
         counts['meetings_written' if written else 'changed_during_parse'] += 1
     except Exception as exc:
         counts['failed'] += 1

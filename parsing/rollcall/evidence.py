@@ -48,7 +48,7 @@ _TRAILING_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _ANY_LABEL_RE = re.compile(r"^[ \t]*[A-Za-z][A-Za-z /-]{0,35}:\s*")
-_INLINE_LABEL_SPLIT_RE = re.compile(rf",\s*(?=(?:{_CATEGORY_WORDS})\s*[:–-])", re.I)
+_INLINE_LABEL_SPLIT_RE = re.compile(rf"[,.]\s*(?=(?:{_CATEGORY_WORDS})\s*[:–-])", re.I)
 _INLINE_COUNT_RE = re.compile(rf"(?P<cat>{_CATEGORY_WORDS})\s+(?P<count>\d+)\b", re.I)
 _BARE_COUNT_RE = re.compile(r"^\s*(\d+)\s*[-–]?\s*$")
 _NONE_RE = re.compile(r"^\s*\(?\s*(?:none|nil|n/a|-|0)\s*\)?\s*\.?\s*$", re.IGNORECASE)
@@ -79,7 +79,8 @@ RESULT_RE = re.compile(
     # A bare disposition on its own line, closing an Ayes/Nays/Abstain block
     # (Clinton Township). Anchored to the line start so the word cannot be
     # picked out of running prose.
-    r"|^[ \t]*(?:passed|failed|adopted|approved|denied|carried)[ \t]*\.?[ \t]*$"
+    r"|^[ \t]*(?:passed|failed|adopted|approved|denied|carried|ratified|defeated)"
+    r"[ \t]*\.?(?:[ \t]*$|(?=[ \t]+(?i:moved|motion|second)\b))"
     r"|result\s*:\s*(?:passed|failed|adopted|approved|denied|carried)"
     # "unanimous" only counts beside a vote word; "the unanimous request of
     # the Board" is prose, not a roll call.

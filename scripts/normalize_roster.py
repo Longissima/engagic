@@ -142,6 +142,13 @@ ROSTER_SQL = """
     WHERE ($1::text IS NULL OR cm.banana = $1)
     ORDER BY cm.banana, cm.id
 """
+REFERRERS_SQL = """
+    SELECT a.matter_id, a.reported_referrer, m.banana
+    FROM matter_appearances a
+    JOIN city_matters m ON m.id = a.matter_id
+    WHERE a.reported_referrer IS NOT NULL
+      AND ($1::text IS NULL OR m.banana = $1)
+"""
 REPORTED_BODIES_SQL = """
     SELECT im.item_id, im.motion_index, im.source, im.reported_body, m.banana
     FROM item_motions im
@@ -258,6 +265,7 @@ async def main() -> int:
             body_rows = [dict(r) for r in await conn.fetch(BODY_VOTES_SQL, args.banana)]
             sponsorships = [dict(r) for r in await conn.fetch(SPONSORSHIPS_SQL, args.banana)]
             reported = [dict(r) for r in await conn.fetch(REPORTED_BODIES_SQL, args.banana)]
+            referrers = [dict(r) for r in await conn.fetch(REFERRERS_SQL, args.banana)]
 
         by_city: Dict[str, List[dict]] = defaultdict(list)
         member_banana: Dict[str, str] = {}
@@ -364,7 +372,20 @@ async def main() -> int:
             motion_rows.append((r["item_id"], r["motion_index"], r["source"],
                                 "recommender", body_id(banana, folded)))
         counts["motion_actors"] = len(motion_rows)
+        # A referral is the matter's journey: this body sent it here. Same body
+        # key as everywhere else, so a committee that refers and also sponsors is
+        # one entity.
+        for r in referrers:
+            banana = r["banana"]
+            name = body_of(r["reported_referrer"]) or r["reported_referrer"]
+            folded = fold(name)
+            entry = body_rows.setdefault((banana, folded),
+                                         {"name": name, "venue": False, "actor": False})
+            entry["actor"] = True
+            matter_actors.setdefault((r["matter_id"], "referrer", None, body_id(banana, folded)),
+                                     {"is_primary": False, "order": None})
         counts["matter_actors"] = len(matter_actors)
+        counts["matter_actors_referrer"] = sum(1 for k in matter_actors if k[1] == "referrer")
         counts["matter_actors_body"] = sum(1 for k in matter_actors if k[3])
 
         counts["bodies"] = len(body_rows)
@@ -374,7 +395,8 @@ async def main() -> int:
         print(f"member_bodies rows     {counts['member_body_rows']}")
         print(f"motion_actors          {counts['motion_actors']} (recommending bodies)")
         print(f"matter_actors          {counts['matter_actors']}"
-              f"  (body sponsors: {counts['matter_actors_body']})")
+              f"  (body sponsors: {counts['matter_actors_body']},"
+              f" referrers: {counts['matter_actors_referrer']})")
         for k, v in sorted(counts.items()):
             if k.startswith("sponsorship_unattributable"):
                 print(f"  unattributable {k.split(':')[1]:<10} {v}")
