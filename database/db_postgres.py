@@ -198,6 +198,60 @@ class Database:
             await conn.execute(userland_schema_path.read_text())
         logger.info("userland schema initialized")
 
+    # Tables the sync/process pipeline bulk-writes. Autovacuum is reactive: it
+    # waits for a fraction of the table to change, so right after a batch load
+    # the planner is still working from pre-load statistics. On 2026-09-12
+    # `items` had 824,569 rows while the planner believed 15,393 -- a 54x error
+    # that mis-plans every query touching it, in this codebase and in readers.
+    ANALYZE_AFTER_SYNC = ("items", "meetings", "city_matters", "item_topics", "matter_topics")
+
+    # Processing writes more than sync does: sync lands the shape, processing
+    # fills in summaries, matters, appearances and the vote record. Same
+    # reasoning as ANALYZE_AFTER_SYNC -- autovacuum is reactive and lags a bulk
+    # load, so readers plan against pre-run statistics until it catches up.
+    ANALYZE_AFTER_PROCESS = (
+        "items",
+        "meetings",
+        "city_matters",
+        "matter_appearances",
+        "votes",
+        "item_motions",
+        "item_topics",
+        "matter_topics",
+        "meeting_topics",
+    )
+
+    async def refresh_planner_statistics(
+        self, tables: Optional[tuple[str, ...]] = None
+    ) -> list[str]:
+        """ANALYZE the bulk-written tables so the planner sees what was loaded.
+
+        Statistics only; no table data is touched. ANALYZE samples rather than
+        reading everything, takes a SHARE UPDATE EXCLUSIVE lock (readers and
+        writers are unaffected), and cannot run inside a transaction -- hence the
+        bare execute on an autocommit connection.
+
+        Never raises: a stale planner is a slow query, but a sync that fails
+        because it could not refresh statistics is a broken pipeline.
+        """
+        analyzed: list[str] = []
+        for table in tables or self.ANALYZE_AFTER_SYNC:
+            if not table.replace("_", "").isalnum():  # identifier, never interpolated blindly
+                logger.warning(f"refusing to ANALYZE suspicious identifier: {table!r}")
+                continue
+            try:
+                async with self.pool.acquire() as conn:
+                    exists = await conn.fetchval("SELECT to_regclass($1)", table)
+                    if exists is None:
+                        continue
+                    await conn.execute(f"ANALYZE {table}")
+                analyzed.append(table)
+            except Exception as exc:
+                logger.warning(f"ANALYZE {table} failed: {exc}")
+        if analyzed:
+            logger.info(f"refreshed planner statistics: {', '.join(analyzed)}")
+        return analyzed
+
     async def get_stats(self) -> dict:
         """Get database statistics for monitoring.
 

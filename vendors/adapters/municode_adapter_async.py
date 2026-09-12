@@ -71,6 +71,20 @@ class _CurlCffiResponse:
         return self._resp.content
 
 
+# The subdomain serves both a REST API and a Drupal listing, and they disagree
+# about minutes: Los Gatos exposes them in details.json under MinutesLinks, while
+# Columbus omits them from the API entirely and publishes them only in the
+# listing's minutes column. Both routes are consulted rather than choosing one
+# per city, because the page's links carry the API's own MeetingID
+# (/meeting/2984/cg_meeting_minutes._08-11-2026.pdf), so the two can be keyed
+# together without switching mode -- switching changes vendor_id from a numeric
+# id to a GUID and orphans every meeting already stored under the other mode.
+_DRUPAL_MINUTES_CELL_RE = re.compile(
+    r'<td[^>]*views-field-field-minutes[^>]*>(.*?)</td>', re.S | re.I
+)
+_DRUPAL_MEETING_ID_RE = re.compile(r'/meeting/(\d+)/')
+
+
 def _first_document_url(links: Any, fields: tuple) -> Optional[str]:
     """First usable URL in a details.json link list, PDF field preferred."""
     if not isinstance(links, list):
@@ -104,6 +118,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         self._proxy: Optional[str] = None
         self._curl_session = None
         self._tunnel_down = False
+        self._drupal_minutes_cache: Optional[Dict[str, str]] = None
 
         # Check config for this slug (try slug directly, then uppercase variant)
         slug_config = self._all_config.get(self.slug, self._all_config.get(self.slug.upper(), {}))
@@ -140,6 +155,37 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
 
         # Load site-specific config
         self._site_config = slug_config
+
+    async def _drupal_minutes_by_meeting_id(self) -> Dict[str, str]:
+        """MeetingID -> minutes URL from the subdomain's Drupal listing.
+
+        Fetched at most once per adapter instance, and only when the API has
+        already come back without minutes, so a city whose API carries them
+        (Los Gatos) never pays for this request.
+        """
+        if self._drupal_minutes_cache is not None:
+            return self._drupal_minutes_cache
+        self._drupal_minutes_cache = {}
+        if self._is_publish_page or self._is_drupal:
+            return self._drupal_minutes_cache
+        try:
+            response = await self._get(self.base_url + "/")
+            html = await response.text() if response is not None else ""
+        except Exception as exc:
+            logger.debug("drupal minutes listing unavailable", slug=self.slug, error=str(exc))
+            return self._drupal_minutes_cache
+        for cell in _DRUPAL_MINUTES_CELL_RE.findall(html or ""):
+            href = re.search(r'href="([^"]+)"', cell)
+            if not href:
+                continue
+            url = href.group(1)
+            found = _DRUPAL_MEETING_ID_RE.search(url)
+            if found:
+                self._drupal_minutes_cache.setdefault(
+                    found.group(1), urljoin(self.base_url, url))
+        logger.info("drupal minutes listing parsed", slug=self.slug,
+                    found=len(self._drupal_minutes_cache))
+        return self._drupal_minutes_cache
 
     def _detect_publish_page_mode(self, slug: str) -> bool:
         """Detect if slug is a city code for PublishPage vs subdomain slug.
@@ -1078,6 +1124,10 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
                 detail.get("MinutesLinksHtml"),
                 ("MinutesLinksHtmlURL", "HtmlURL"),
             )
+        if not minutes_url and meeting_id:
+            # The API has no minutes for this city; the Drupal listing on the
+            # same host may. Keyed on the API's own MeetingID, so no mode switch.
+            minutes_url = (await self._drupal_minutes_by_meeting_id()).get(str(meeting_id))
         if minutes_url:
             result["minutes_url"] = minutes_url
 

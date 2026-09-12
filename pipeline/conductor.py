@@ -357,6 +357,11 @@ class Conductor:
                 else await self.fetcher.sync_cities(city_bananas)
             )
             outbox_published = await self.processor.publish_due_outbox(city_bananas)
+            # Refresh planner statistics while the load is fresh. Autovacuum is
+            # reactive and lags a bulk insert, so without this every reader plans
+            # against pre-sync row counts until it catches up.
+            if any(result.items_stored for result in results):
+                await self.db.refresh_planner_statistics()
             succeeded = sum(result.status is SyncStatus.COMPLETED for result in results)
             failed = sum(result.status is SyncStatus.FAILED for result in results)
             cancelled = sum(
@@ -528,6 +533,16 @@ class Conductor:
                 bananas=city_bananas,
                 continuous=False,
                 command="process-cli",
+            )
+
+        # Symmetric with run_sync_cycle: refresh planner statistics while the
+        # load is fresh. `./run.sh process` is the heavier writer of the two --
+        # it fills in summaries, matters, appearances and votes -- and until
+        # this was here nothing on the process path ever ANALYZEd, so every
+        # reader planned against pre-run statistics until autovacuum reacted.
+        if stats.get("items_processed") or stats.get("batch_queue_completed"):
+            await self.db.refresh_planner_statistics(
+                self.db.ANALYZE_AFTER_PROCESS
             )
 
         by_banana = stats.get("by_banana", {})

@@ -1,0 +1,15 @@
+-- items is the widest-churn table we have: 824k rows, and a single bulk sync
+-- rewrites tens of thousands of them. The global autovacuum_analyze_scale_factor
+-- of 0.1 means autoanalyze does not fire until 10% of the table (~82k rows) has
+-- changed, so between syncs the planner works from a snapshot that can be two
+-- or three loads old.
+--
+-- run_sync_cycle already ANALYZEs items explicitly when a sync stores items
+-- (see Database.ANALYZE_AFTER_SYNC). This covers the paths that do not go
+-- through that cycle -- backfills, the minutes/votes program, manual repair
+-- scripts -- by letting autoanalyze react at 2% (~16k rows) instead of 10%.
+--
+-- Statistics only. No data is touched and no lock is held beyond the catalog
+-- update; ANALYZE itself takes SHARE UPDATE EXCLUSIVE, which readers and
+-- writers are unaffected by.
+ALTER TABLE items SET (autovacuum_analyze_scale_factor = 0.02);
