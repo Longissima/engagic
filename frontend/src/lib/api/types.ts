@@ -229,9 +229,19 @@ export interface PlatformMetrics {
 		committees: number;
 		council_members: number;
 		committee_assignments: number;
+		minutes_documents: number;
 	};
 	accountability: {
+		// `votes` counts individual ballots; `motions` counts the questions
+		// voted on. `minutes_votes` are roll calls parsed from minutes PDFs,
+		// each carrying an exact source text span, unlike vendor API votes.
 		votes: number;
+		motions: number;
+		divided_motions: number;
+		meetings_with_votes: number;
+		minutes_votes: number;
+		votes_with_receipt: number;
+		vote_receipt_rate: number;
 		sponsorships: number;
 		cities_with_votes: number;
 		officials_with_votes: number;

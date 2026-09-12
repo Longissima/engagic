@@ -80,6 +80,17 @@ FALLBACK_SQL = """
     WHERE banana = $1 AND date = $2 AND minutes_url IS NULL
 """
 
+# Some listings carry only a calendar date where the stored row has a real
+# instant (Municode's Drupal table gives midnight), so an exact-instant match can
+# never succeed and the minutes are discarded as time drift. Matching the day
+# keeps the guard that matters -- exactly one unfilled candidate whose title
+# agrees -- because a wrong link is worse than a missing one, and it is the
+# uniqueness check rather than the clock that prevents a swap.
+FALLBACK_DAY_SQL = """
+    SELECT id, title FROM meetings
+    WHERE banana = $1 AND date::date = $2::date AND minutes_url IS NULL
+"""
+
 # Dry-run diagnostics only: every meeting the city holds at that instant,
 # filled or not, so a miss can be told apart from an already-filled row and
 # from a genuinely unsynced meeting.
@@ -139,7 +150,7 @@ def vendor_streams(city_row) -> list[tuple[str, str]]:
 
 async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) -> dict:
     banana = city_row["banana"]
-    counts = {"fetched": 0, "with_minutes": 0, "would_fill": 0, "filled": 0,
+    counts = {"fetched": 0, "with_minutes": 0, "would_fill": 0, "filled": 0, "id_fallback_day": 0,
               "enqueued": 0, "already_set": 0,
               "id_miss": 0, "id_fallback": 0, "fetch_failed": 0,
               "miss_no_meeting_that_day": 0, "miss_time_drift": 0, "miss_title_disagrees": 0, "miss_ambiguous": 0,
@@ -272,6 +283,15 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                             row for row in await conn.fetch(FALLBACK_SQL, banana, meeting_date)
                             if titles_agree(title, row["title"])
                         ]
+                        if len(fallback) != 1:
+                            # Same calendar day rather than the same instant.
+                            fallback = [
+                                row for row in await conn.fetch(
+                                    FALLBACK_DAY_SQL, banana, meeting_date)
+                                if titles_agree(title, row["title"])
+                            ]
+                            if len(fallback) == 1:
+                                counts["id_fallback_day"] += 1
                         if len(fallback) == 1:
                             meeting_id = fallback[0]["id"]
                             meeting = await db.meetings.get_meeting(

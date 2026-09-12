@@ -238,12 +238,21 @@ class Database:
     # trends, and the analytics-page rollups from that shared projection.
     _PLATFORM_METRICS_CONTENT = """
         WITH
+            -- Eight COMPLETE weeks, ending with the last one that finished.
+            -- The current week is excluded: plotting a 2-day bucket beside
+            -- 7-day buckets reads as a cliff in every sparkline. window_start
+            -- is also what the weekly filters below use, so no row can land
+            -- inside the filter but outside the series and be silently dropped.
             weeks AS (
                 SELECT generate_series(
-                    date_trunc('week', NOW() - INTERVAL '7 weeks'),
-                    date_trunc('week', NOW()),
+                    date_trunc('week', NOW()) - INTERVAL '8 weeks',
+                    date_trunc('week', NOW()) - INTERVAL '1 week',
                     INTERVAL '1 week'
                 ) AS week_start
+            ),
+            window_bounds AS (
+                SELECT date_trunc('week', NOW()) - INTERVAL '8 weeks' AS window_start,
+                       date_trunc('week', NOW()) AS window_end
             ),
             matter_flags AS MATERIALIZED (
                 SELECT
@@ -291,8 +300,8 @@ class Database:
             ),
             item_weekly AS (
                 SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-                FROM item_flags
-                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                FROM item_flags, window_bounds
+                WHERE created_at >= window_start AND created_at < window_end
                 GROUP BY 1
             ),
             matter_rollup AS (
@@ -306,8 +315,8 @@ class Database:
             ),
             matter_weekly AS (
                 SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-                FROM matter_flags
-                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                FROM matter_flags, window_bounds
+                WHERE created_at >= window_start AND created_at < window_end
                 GROUP BY 1
             ),
             meeting_flags AS MATERIALIZED (
@@ -342,22 +351,27 @@ class Database:
                     COUNT(*) FILTER (
                         WHERE created_at >= NOW() - INTERVAL '30 days'
                     ) AS meetings_30d,
+                    -- meetings.date holds scheduled future meetings, so an
+                    -- unbounded ">= NOW() - 30 days" counts everything ahead of
+                    -- us too, and disagrees with the sparkline beside it (which
+                    -- cannot plot future weeks).
                     COUNT(*) FILTER (
                         WHERE date >= NOW() - INTERVAL '30 days'
+                          AND date <= NOW()
                           AND has_content
                     ) AS meeting_summaries_30d
                 FROM meeting_flags
             ),
             meeting_weekly AS (
                 SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-                FROM meeting_flags
-                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                FROM meeting_flags, window_bounds
+                WHERE created_at >= window_start AND created_at < window_end
                 GROUP BY 1
             ),
             summary_weekly AS (
                 SELECT date_trunc('week', date) AS wk, COUNT(*) AS cnt
-                FROM meeting_flags
-                WHERE date >= NOW() - INTERVAL '8 weeks' AND has_content
+                FROM meeting_flags, window_bounds
+                WHERE date >= window_start AND date < window_end AND has_content
                 GROUP BY 1
             ),
             active_bananas AS (
@@ -409,17 +423,23 @@ class Database:
                     COUNT(*) FILTER (
                         WHERE fu.banana IS NOT NULL
                     ) AS frequently_updated,
+                    -- Every population figure carries the same geom filter as
+                    -- total_pop. Without it the numerators drew from a wider
+                    -- set than their own denominator and could exceed it.
+                    -- Note only type='city' rows carry a population at all:
+                    -- counties and school districts are NULL, so these are
+                    -- city-resident counts, not total reach.
                     COALESCE(SUM(j.population) FILTER (
-                        WHERE fu.banana IS NOT NULL
+                        WHERE fu.banana IS NOT NULL AND j.geom IS NOT NULL
                     ), 0) AS frequently_updated_pop,
                     COALESCE(SUM(j.population) FILTER (
                         WHERE j.geom IS NOT NULL
                     ), 0) AS total_pop,
                     COALESCE(SUM(j.population) FILTER (
-                        WHERE ab.banana IS NOT NULL
+                        WHERE ab.banana IS NOT NULL AND j.geom IS NOT NULL
                     ), 0) AS pop_with_data,
                     COALESCE(SUM(j.population) FILTER (
-                        WHERE lb.banana IS NOT NULL
+                        WHERE lb.banana IS NOT NULL AND j.geom IS NOT NULL
                     ), 0) AS pop_with_summaries
                 FROM jurisdictions j
                 LEFT JOIN active_bananas ab ON ab.banana = j.banana
@@ -459,7 +479,8 @@ class Database:
             (SELECT COUNT(*) FROM committees) AS committees,
             (SELECT COUNT(*) FROM council_members) AS council_members,
             (SELECT COUNT(*) FROM committee_members) AS committee_assignments,
-            (SELECT COUNT(*) FROM sponsorships) AS sponsorships
+            (SELECT COUNT(*) FROM sponsorships) AS sponsorships,
+            (SELECT COUNT(*) FROM minutes_documents) AS minutes_documents
     """
 
     # Votes use their own compact projection so the total, growth, city ranking,
@@ -468,13 +489,42 @@ class Database:
         WITH
             weeks AS (
                 SELECT generate_series(
-                    date_trunc('week', NOW() - INTERVAL '7 weeks'),
-                    date_trunc('week', NOW()),
+                    date_trunc('week', NOW()) - INTERVAL '8 weeks',
+                    date_trunc('week', NOW()) - INTERVAL '1 week',
                     INTERVAL '1 week'
                 ) AS week_start
             ),
+            window_bounds AS (
+                SELECT date_trunc('week', NOW()) - INTERVAL '8 weeks' AS window_start,
+                       date_trunc('week', NOW()) AS window_end
+            ),
+            -- A row here is one official's ballot on one motion. The grain is
+            -- per-source: API votes key on matter_id (item_id is NULL for all
+            -- of them), minutes-derived votes key on item_id. COALESCE picks
+            -- whichever the row has so a motion counts once either way.
+            -- item_key is '' rather than NULL on API rows, so it must not be
+            -- part of any distinct count -- it would collapse unrelated
+            -- ballots together.
             vote_flags AS MATERIALIZED (
-                SELECT council_member_id, created_at FROM votes
+                SELECT council_member_id, created_at, meeting_id, motion_index,
+                       source, receipt, vote,
+                       COALESCE(item_id::TEXT, matter_id::TEXT) AS subject
+                FROM votes
+            ),
+            -- One row per motion, with its nay count, so "divided" is a
+            -- property of the motion rather than of a single ballot.
+            motion_rollup AS (
+                SELECT
+                    COUNT(*) AS motions,
+                    COUNT(*) FILTER (WHERE nays > 0) AS divided_motions
+                FROM (
+                    SELECT meeting_id, subject, motion_index,
+                           COUNT(*) FILTER (
+                               WHERE LOWER(vote) IN ('no', 'nay', 'against')
+                           ) AS nays
+                    FROM vote_flags
+                    GROUP BY 1, 2, 3
+                ) m
             ),
             vote_rollup AS (
                 SELECT
@@ -482,6 +532,13 @@ class Database:
                     COUNT(DISTINCT SPLIT_PART(council_member_id, '_', 1))
                         AS cities_with_votes,
                     COUNT(DISTINCT council_member_id) AS officials_with_votes,
+                    COUNT(DISTINCT meeting_id) AS meetings_with_votes,
+                    -- Minutes-derived ballots are the roll calls we parsed out
+                    -- of a minutes PDF ourselves; each carries an exact source
+                    -- text span in `receipt`. Vendor API votes carry none, so
+                    -- this is the share of the record a reader can verify.
+                    COUNT(*) FILTER (WHERE source = 'minutes') AS minutes_votes,
+                    COUNT(*) FILTER (WHERE receipt IS NOT NULL) AS votes_with_receipt,
                     COUNT(*) FILTER (
                         WHERE created_at >= NOW() - INTERVAL '30 days'
                     ) AS votes_30d
@@ -489,8 +546,8 @@ class Database:
             ),
             vote_weekly AS (
                 SELECT date_trunc('week', created_at) AS wk, COUNT(*) AS cnt
-                FROM vote_flags
-                WHERE created_at >= NOW() - INTERVAL '8 weeks'
+                FROM vote_flags, window_bounds
+                WHERE created_at >= window_start AND created_at < window_end
                 GROUP BY 1
             ),
             vote_by_city AS (
@@ -505,6 +562,7 @@ class Database:
             )
         SELECT
             vr.*,
+            mr.*,
             (
                 SELECT ARRAY_AGG(COALESCE(vw.cnt, 0) ORDER BY w.week_start)
                 FROM weeks w LEFT JOIN vote_weekly vw ON vw.wk = w.week_start
@@ -521,6 +579,7 @@ class Database:
                 FROM vote_by_city
             ) AS votes_by_city
         FROM vote_rollup vr
+        CROSS JOIN motion_rollup mr
     """
 
     async def _fetchrow_on_own_connection(self, query: str) -> asyncpg.Record:
@@ -562,6 +621,12 @@ class Database:
                 metrics['item_summary_rate'] = round(metrics['summarized_items'] / metrics['items_analyzed'] * 100, 1)
             else:
                 metrics['item_summary_rate'] = 0
+
+            # Share of the vote record a reader can check against source text.
+            if metrics['votes'] > 0:
+                metrics['vote_receipt_rate'] = round(metrics['votes_with_receipt'] / metrics['votes'] * 100, 1)
+            else:
+                metrics['vote_receipt_rate'] = 0
 
             metrics['trends'] = {
                 'meetings': metrics.pop('meeting_trend'),

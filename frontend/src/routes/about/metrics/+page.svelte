@@ -6,6 +6,13 @@
 
 	let { data }: { data: PageData } = $props();
 	let activeView: 'overview' | 'coverage' = $state('overview');
+
+	// `cities_covered` is every row in `jurisdictions` -- cities, counties AND
+	// school districts -- so it cannot be the denominator of a card titled
+	// "Cities". Use the typed breakdown the endpoint already returns, the same
+	// way /about/general does.
+	const byTypeTotal = $derived(data.analytics?.real_metrics.by_type?.total ?? null);
+	const jurisdictionsCovered = $derived(data.analytics?.real_metrics.cities_covered ?? 0);
 	let cityCoverage = $state<CityCoverageResponse | null>(null);
 	let coverageLoading = $state(false);
 	let coverageError = $state(false);
@@ -213,14 +220,15 @@
 					<div class="stat-numbers-split">
 						<span class="number-primary">{formatNumber(data.analytics.real_metrics.frequently_updated_cities)}</span>
 						<span class="number-separator">/</span>
-						<span class="number-secondary">{formatNumber(data.analytics.real_metrics.cities_covered)}</span>
+						<span class="number-secondary">{formatNumber(jurisdictionsCovered)}</span>
 					</div>
-					<div class="stat-title">Frequently Updated Cities</div>
+					<div class="stat-title">Frequently Updated Jurisdictions</div>
 					<div class="stat-description">
-						{#if data.analytics.real_metrics.frequently_updated_population > 0}
-							{formatPopulation(data.analytics.real_metrics.frequently_updated_population)}
+						{#if byTypeTotal}
+							{formatNumber(byTypeTotal.city)} cities, {formatNumber(byTypeTotal.county)} counties,
+							{formatNumber(byTypeTotal.school_district)} school districts
 						{:else}
-							Cities with 7+ meetings with summaries
+							7+ meetings with summaries
 						{/if}
 					</div>
 				</div>
@@ -236,7 +244,7 @@
 					{:else}
 						<div class="stat-description">
 							{#if data.analytics.real_metrics.population_with_data > 0}
-								{formatPopulation(data.analytics.real_metrics.population_with_data)}
+								{formatPopulation(data.analytics.real_metrics.population_with_data)} in covered cities
 							{:else}
 								City council sessions monitored
 							{/if}
@@ -262,7 +270,7 @@
 					<div class="stat-title">Unique Summaries</div>
 					<div class="stat-description">
 						{#if data.analytics.real_metrics.population_with_summaries > 0}
-							{formatPopulation(data.analytics.real_metrics.population_with_summaries)} with summaries
+							{formatPopulation(data.analytics.real_metrics.population_with_summaries)} in cities with summaries
 						{:else}
 							Across {formatNumber(data.analytics.real_metrics.meetings_with_items)} item-level meetings
 						{/if}
@@ -309,15 +317,39 @@
 				<div class="cards-grid">
 					<div class="stats-card highlight-card">
 						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.votes)}</div>
-						<div class="stat-title">Votes Recorded</div>
+						<div class="stat-title">Ballots Recorded</div>
 						{#if data.platformMetrics.trends.votes}
 							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
 								<path d={sparklinePath(data.platformMetrics.trends.votes)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
 							</svg>
 							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.votes_30d)}</div>
 						{:else}
-							<div class="stat-description">Individual voting records captured</div>
+							<div class="stat-description">One official's vote on one motion</div>
 						{/if}
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.motions)}</div>
+						<div class="stat-title">Motions Decided</div>
+						<div class="stat-description">
+							{formatNumber(data.platformMetrics.accountability.divided_motions)} were not unanimous
+						</div>
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.votes_with_receipt)}</div>
+						<div class="stat-title">Ballots with a Receipt</div>
+						<div class="stat-description">
+							{data.platformMetrics.accountability.vote_receipt_rate}% quote the exact minutes text
+						</div>
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.minutes_documents)}</div>
+						<div class="stat-title">Minutes Parsed</div>
+						<div class="stat-description">
+							Roll calls read from {formatNumber(data.platformMetrics.accountability.meetings_with_votes)} meetings
+						</div>
 					</div>
 
 					<div class="stats-card">
@@ -328,14 +360,10 @@
 
 					<div class="stats-card">
 						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.cities_with_votes)}</div>
-						<div class="stat-title">Cities with Vote Data</div>
-						<div class="stat-description">Full voting record coverage</div>
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.officials_with_votes)}</div>
-						<div class="stat-title">Officials Tracked</div>
-						<div class="stat-description">Individual voting records on file</div>
+						<div class="stat-title">Jurisdictions with Vote Data</div>
+						<div class="stat-description">
+							{formatNumber(data.platformMetrics.accountability.officials_with_votes)} officials on the record
+						</div>
 					</div>
 				</div>
 			</section>

@@ -301,6 +301,7 @@ async def get_platform_metrics(db: Database = Depends(get_db)):
                 "committees": metrics["committees"],
                 "council_members": metrics["council_members"],
                 "committee_assignments": metrics["committee_assignments"],
+                "minutes_documents": metrics["minutes_documents"],
             },
             "accountability": {
                 "votes": metrics["votes"],
@@ -308,6 +309,18 @@ async def get_platform_metrics(db: Database = Depends(get_db)):
                 "cities_with_votes": metrics["cities_with_votes"],
                 "officials_with_votes": metrics["officials_with_votes"],
                 "votes_by_city": metrics["votes_by_city"],
+                # Vote-record shape, post-041. A "vote" is one official's
+                # ballot; a "motion" is the question they were voting on.
+                # minutes_votes are roll calls we parsed out of a minutes PDF
+                # ourselves, and every one carries an exact source text span
+                # in `receipt` -- vendor API votes carry none, so the receipt
+                # rate is the share of the record a reader can verify.
+                "motions": metrics["motions"],
+                "divided_motions": metrics["divided_motions"],
+                "meetings_with_votes": metrics["meetings_with_votes"],
+                "minutes_votes": metrics["minutes_votes"],
+                "votes_with_receipt": metrics["votes_with_receipt"],
+                "vote_receipt_rate": metrics["vote_receipt_rate"],
             },
             "processing": {
                 "summarized_meetings": metrics["summarized_meetings"],
@@ -323,6 +336,8 @@ async def get_platform_metrics(db: Database = Depends(get_db)):
                 "matters_30d": metrics["matters_30d"],
                 "votes_30d": metrics["votes_30d"],
                 # Summarized meetings whose date fell in the last 30 days.
+                # Bounded at both ends: meetings.date holds scheduled future
+                # meetings, which an open-ended window would sweep in.
                 "meeting_summaries_30d": metrics["meeting_summaries_30d"],
             },
             "trends": metrics["trends"],
