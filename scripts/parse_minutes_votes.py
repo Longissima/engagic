@@ -358,10 +358,20 @@ async def process_one(db, corpus, audit, row, build, apply, counts, reasons):
         counts['failed'] += 1
         logger.exception('minutes interpretation failed',meeting_id=row['meeting_id'])
         if apply:
-            async with db.pool.acquire() as conn:
-                async with conn.transaction():
-                    await audit.save_run(conn,row,text,build,inputs,parsed,status='failed',
-                        error={'type':type(exc).__name__,'message':str(exc)[:2000]})
+            # Recording the failure must not be able to cause one. A NUL byte in
+            # the text made this write raise out of the handler and kill the
+            # worker, which asyncio.gather then propagated, ending a 8,000-meeting
+            # run at 1,088; a connection left mid-operation by the first failure
+            # did the same at 3,789 with an asyncpg InternalClientError. One
+            # unreadable meeting is not a reason to abandon the rest.
+            try:
+                async with db.pool.acquire() as conn:
+                    async with conn.transaction():
+                        await audit.save_run(conn,row,text,build,inputs,parsed,status='failed',
+                            error={'type':type(exc).__name__,'message':str(exc)[:2000]})
+            except Exception:
+                counts['failed_unrecorded'] += 1
+                logger.exception('could not record the failure',meeting_id=row['meeting_id'])
 
 
 async def main() -> int:
@@ -396,7 +406,13 @@ async def main() -> int:
         async def worker():
             while not queue.empty():
                 row = queue.get_nowait()
-                await process_one(db,corpus,audit,row,build,args.apply,counts,reasons)
+                try:
+                    await process_one(db,corpus,audit,row,build,args.apply,counts,reasons)
+                except Exception:
+                    # process_one already records what it can; a worker that dies
+                    # here takes every remaining meeting with it.
+                    counts['worker_errors'] += 1
+                    logger.exception('worker error',meeting_id=row['meeting_id'])
                 queue.task_done()
                 if (len(rows)-queue.qsize()) % 100 == 0:
                     logger.info('minutes progress',remaining=queue.qsize(),**counts)

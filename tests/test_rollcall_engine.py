@@ -339,6 +339,44 @@ class TestGuards:
         # "Council Member, District 1" must not create a person named "Council".
         assert not any(n in ('Council', 'District', 'Member') for n in a.present)
 
+    def test_a_committee_recommendation_and_the_council_vote_are_both_recorded(self):
+        """Two bodies act on one item and each action is its own motion.
+
+        The commission's 5-2 recommendation and the council's 6-1 adoption are
+        separate motions with separate outcomes, and only the sentence that names
+        the commission credits it -- applying the credit to the whole item block
+        attributed the council's own vote to the commission.
+        """
+        from parsing.rollcall.engine import parse_meeting
+        items = [dict(id='i', title='ZON26-001 General Plan Amendment', agenda_number='3.',
+                      sequence=1, matter_id='m', matter_file=None)]
+        parsed = parse_meeting(
+            '3. ZON26-001 General Plan Amendment\n'
+            'At its June 24th meeting, the Planning Commission voted 5-2 to recommend '
+            'denial of the general plan amendment.\n'
+            'Councilmember Smith moved to approve. Seconded by Councilmember Jones.\n'
+            'Motion carried 6-1.\n', items, ['Smith', 'Jones'])
+        assert [(p.outcome, p.tally, p.reported_body) for p in parsed.published] == [
+            ('PASS', {'yes': 5, 'no': 2}, 'Planning Commission'),
+            ('PASS', {'yes': 6, 'no': 1}, None)]
+
+    def test_a_recommendation_carries_with_its_subject_disposition(self):
+        """"voted 5-2 to recommend denial" is a passed motion, denial its subject.
+
+        The clerk states in words that the body voted to recommend, so this is not
+        the arithmetic inference the gate refuses; and a denial as subject must not
+        mute that stated result, which is the mirror of "RESULT: DENIED" alone
+        leaving the outcome unknown.
+        """
+        from parsing.rollcall.evidence import find_evidence
+        ev = find_evidence('the Planning Commission voted 5-2 to recommend denial of the amendment.')[0]
+        assert ev.outcome == 'PASS' and ev.disposition == 'denied'
+        assert find_evidence('The Finance Committee voted unanimously to recommend approval.')[0].outcome == 'PASS'
+        # A bare disposition still establishes no outcome, and an explicitly
+        # denied motion still fails.
+        assert find_evidence('RESULT: DENIED')[0].outcome is None
+        assert find_evidence('The motion was denied.')[0].outcome == 'FAIL'
+
     def test_accented_surname_is_captured_whole_as_a_mover(self):
         """The mover classes were ASCII: "Lomelí" captured as "Lomel".
 

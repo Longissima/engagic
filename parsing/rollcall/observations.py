@@ -197,6 +197,18 @@ def observe_meeting(text, items, roster, dialect=None):
     result = MeetingParse(attendance=attendance, items_total=len(items))
     anchors = anchor_items(text, items)
     item_blocks = blocks(text, anchors)
+    for block in item_blocks:
+        item = block.get('item') or {}
+        item_id = item.get('id') if isinstance(item, dict) else None
+        if not item_id:
+            continue
+        named = {body for body in (
+            find_evidence.__globals__['_reported_body'](sentence.group(0))
+            for sentence in re.finditer(r"[^.!?]{0,220}[.!?]", text[block['start']:block['end']])
+        ) if body}
+        # One unambiguous body only: a block naming two has no single referrer.
+        if len(named) == 1:
+            result.referrals.append((item_id, named.pop()))
     result.items_anchored = len(anchors)
     known_names = set(roster) | {clean_name(n) for n in attendance.present + attendance.absent
                                if len(fold(clean_name(n)).split()) >= 2}

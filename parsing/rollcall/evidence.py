@@ -66,6 +66,12 @@ RESULT_RE = re.compile(
     r"(?:the\s+)?motion\s+(?:to\s+\w+\s+)?(?:carried|passed|prevailed|failed|was\s+(?:approved|adopted|defeated|denied)|(?:was\s+)?approved|(?:was\s+)?adopted|(?:was\s+)?denied)"
     r"|(?:carried|passed|failed|prevailed)\s+by\s+the\s*following\s*vote"
     r"|(?:this|the)\s+(?:item|matter|resolution|ordinance|motion)\s+was\s+(?:adopted|approved|passed|placed\s+on\s+file|referred|held|denied)"
+    r"|vote[sd]?\s+(?:\d{1,2}\s*[-–/]\s*\d{1,2}\s+|unanimously\s+)?to\s+"
+    r"(?:recommend|approve|adopt|deny|denial|grant|forward|refer|table|continue)\w*"
+    # What was recommended is the subject disposition and must stay inside the
+    # match, or "voted 5-2 to recommend denial" records a passed motion with no
+    # record of what it recommended.
+    r"(?:\s+(?:of\s+|for\s+)?(?:denial|approval|adoption|rejection|dismissal|passage|deny|approve))?"
     r"|vote[sd]?\s*[:\-–]?\s*\d{1,2}\s*[-–/]\s*\d{1,2}"
     # "Motion/second to approve by Commissioners Fuller/McCord carried 6-0":
     # the result word is nowhere near the word motion, the tally is the anchor.
@@ -83,7 +89,11 @@ RESULT_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _FAIL_RE = re.compile(r"\b(?:failed|defeated|denied|did\s+not\s+(?:carry|pass))\b", re.IGNORECASE)
-_PASS_RE = re.compile(r"\b(?:carried|passed|prevailed|approved|adopted)\b", re.IGNORECASE)
+_PASS_RE = re.compile(
+    r"\b(?:carried|passed|prevailed|approved|adopted)\b"
+    # "voted to recommend X" is the body stating it took the action.
+    r"|\bvote[sd]?\s+(?:\d{1,2}\s*[-–/]\s*\d{1,2}\s+|unanimously\s+)?to\s+\w+",
+    re.IGNORECASE)
 TALLY_RE = re.compile(
     # The trailing guard rejects a longer number or a decimal continuation
     # ("6-0.5"), but a sentence-ending period is not one ("carried 5-0.").
@@ -327,12 +337,16 @@ def find_evidence(block: str) -> List[Evidence]:
             result_text = m.group("result")
             window = " ".join(lines[idx:idx + 2])
             outcome = None
-            disposition = "denied" if re.search(r"\bdenied\b", result_text, re.I) else None
+            disposition = "denied" if re.search(r"\bdeni(?:ed|al)\b", result_text, re.I) else None
             if disposition:
                 # A denied application/appeal may be the result of a successful
-                # motion to deny. Only an explicitly denied *motion* fails.
+                # motion to deny. Only an explicitly denied *motion* fails -- and
+                # a stated result still stands: "voted 5-2 to recommend denial"
+                # is a recommendation that carried, with denial as its subject.
                 if re.search(r"\bmotion\s+(?:was\s+)?denied\b", result_text, re.I):
                     outcome = "FAIL"
+                elif _PASS_RE.search(result_text):
+                    outcome = "PASS"
             elif _FAIL_RE.search(result_text):
                 outcome = "FAIL"
             elif _PASS_RE.search(result_text):

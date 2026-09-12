@@ -101,6 +101,11 @@ class MeetingParse:
     roster_source: str = "none"
     procedural_skipped: int = 0
     observations: List[Any] = field(default_factory=list)
+    # (item_id, body) where an item's narrative credits another body without a
+    # motion of its own here. A referral belongs to the matter's journey, not to
+    # any motion in this meeting: crediting every motion in the block attributed
+    # the council's own vote to the committee that had merely recommended.
+    referrals: List[Tuple[str, str]] = field(default_factory=list)
 
 
 # An agenda "item" that is really a section heading ("OLD BUSINESS:",
