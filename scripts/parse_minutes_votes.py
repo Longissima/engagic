@@ -161,7 +161,8 @@ UPSERT_MOTION_SQL = """
 
 
 REFERRER_SQL = """
-    UPDATE matter_appearances SET reported_referrer = $3
+    UPDATE matter_appearances SET reported_referrer = $3,
+        referrer_receipt = $4, referrer_parse_run_id = $5
     WHERE meeting_id = $1 AND item_id = $2
 """
 
@@ -191,7 +192,7 @@ async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=
             if pub.item_id not in current_items or current_items[pub.item_id] not in (None, pub.matter_id):
                 return False
         old_members = await conn.fetch(
-            "SELECT DISTINCT council_member_id FROM votes WHERE meeting_id = $1 AND source = 'minutes'",
+            "SELECT DISTINCT council_member_id FROM votes WHERE meeting_id = $1",
             row["meeting_id"],
         )
         member_ids = {r["council_member_id"] for r in old_members}
@@ -209,6 +210,11 @@ async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=
         await conn.execute("""
             UPDATE matter_appearances SET vote_outcome = NULL, vote_tally = NULL, vote_source = NULL
             WHERE meeting_id = $1 AND vote_source = 'minutes'
+        """, row["meeting_id"])
+        await conn.execute("""
+            UPDATE matter_appearances SET reported_referrer = NULL,
+                referrer_receipt = NULL, referrer_parse_run_id = NULL
+            WHERE meeting_id = $1 AND reported_referrer IS NOT NULL
         """, row["meeting_id"])
         vote_keys, motion_keys = [], []
         final = {}
@@ -261,8 +267,8 @@ async def persist_meeting(conn, row, published, roster, to_create=(), *, run_id=
                 WHERE v.council_member_id = cm.id))
             WHERE cm.id = ANY($1::text[])
         """, sorted(member_ids))
-        for item_id, body in referrals:
-            await conn.execute(REFERRER_SQL, row["meeting_id"], item_id, body)
+        for item_id, body, receipt in referrals:
+            await conn.execute(REFERRER_SQL, row["meeting_id"], item_id, body, receipt, run_id)
         if run_id:
             await conn.execute("""INSERT INTO minutes_publications(meeting_id,run_id) VALUES($1,$2)
                 ON CONFLICT(meeting_id) DO UPDATE SET run_id=EXCLUDED.run_id,published_at=CURRENT_TIMESTAMP""",
@@ -361,7 +367,12 @@ async def process_one(db, corpus, audit, row, build, apply, counts, reasons):
                 run_id = await audit.save_run(conn,row,text,build,inputs,parsed)
                 written = await persist_meeting(conn,row,published,roster,list(to_create.values()),
                                                run_id=run_id,final_indices=final_indices,expected_items=items,
-                                               referrals=parsed.referrals)
+                                               referrals=[(item_id, body, {
+                                                   'sha256': row['content_sha256'], 'text_sha256': text_sha,
+                                                   'extract_version': row['extract_version'],
+                                                   'unit': 'unicode_codepoint',
+                                                   **parsed.referral_receipts[item_id],
+                                               }) for item_id, body in parsed.referrals])
         counts['meetings_written' if written else 'changed_during_parse'] += 1
     except Exception as exc:
         counts['failed'] += 1

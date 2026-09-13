@@ -12,7 +12,7 @@ import re
 
 from parsing.rollcall.align import anchor_items, blocks
 from parsing.rollcall.attendance import parse_attendance
-from parsing.rollcall.evidence import Evidence, Section, find_evidence
+from parsing.rollcall.evidence import Evidence, Section, find_evidence, reported_body, sentence_spans
 from parsing.rollcall.names import clean_name, fold
 from parsing.rollcall.spike import load_spike_parser, norm_file
 
@@ -95,7 +95,7 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
                           'reported_body': ev.reported_body, 'unanimous': ev.unanimous, 'members': []}
     if not item:
         _check(obs, 'alignment', 'withheld', 'no_unique_item')
-    elif ev.reported_body and not ev.sections and not ev.movers:
+    elif ev.reported_body and not (ev.sections or ev.movers or ev.tally or ev.outcome):
         # A bare mention with no roll call and nobody moving is prose about another
         # body, not a recorded action: "per the recommendation of the X Committee".
         _check(obs, 'alignment', 'withheld', 'reported_committee_action')
@@ -191,24 +191,31 @@ def _validate(obs, ev, item, rung, motion_index, gazetteer, known_names, attenda
     return pub
 
 
+def _collect_referrals(result, text, item_blocks):
+    """Retain one unambiguous source body and its exact supporting sentence."""
+    for block in item_blocks:
+        item = block.get('item') or {}
+        item_id = item.get('id') if isinstance(item, dict) else None
+        if not item_id:
+            continue
+        mentions = [(body, block['start'] + start, block['start'] + end)
+                    for start, end in sentence_spans(text[block['start']:block['end']])
+                    if (body := reported_body(text[block['start'] + start:block['start'] + end]))]
+        named = {body for body, _, _ in mentions}
+        if len(named) == 1:
+            body = named.pop()
+            result.referrals.append((item_id, body))
+            _, start, end = next(m for m in mentions if m[0] == body)
+            result.referral_receipts[item_id] = {'start': start, 'end': end}
+
+
 def observe_meeting(text, items, roster, dialect=None):
     from parsing.rollcall.engine import Gazetteer, MeetingParse, Abstention
     attendance = parse_attendance(text)
     result = MeetingParse(attendance=attendance, items_total=len(items))
     anchors = anchor_items(text, items)
     item_blocks = blocks(text, anchors)
-    for block in item_blocks:
-        item = block.get('item') or {}
-        item_id = item.get('id') if isinstance(item, dict) else None
-        if not item_id:
-            continue
-        named = {body for body in (
-            find_evidence.__globals__['_reported_body'](sentence.group(0))
-            for sentence in re.finditer(r"[^.!?]{0,220}[.!?]", text[block['start']:block['end']])
-        ) if body}
-        # One unambiguous body only: a block naming two has no single referrer.
-        if len(named) == 1:
-            result.referrals.append((item_id, named.pop()))
+    _collect_referrals(result, text, item_blocks)
     result.items_anchored = len(anchors)
     known_names = set(roster) | {clean_name(n) for n in attendance.present + attendance.absent
                                if len(fold(clean_name(n)).split()) >= 2}

@@ -66,6 +66,8 @@ CREATE TABLE schema_migrations (
 | 037 | items_summary_updated_cursor | Add the `(summary_updated_at, id)` item index used by Motioncount incremental summary discovery. |
 | 038 | processing_observability | Version filter decisions, retain append-only ingest-path audits, and record corpus extraction outcomes. |
 | 039 | chunk_audit_root_backfill | Promote winning-run quality, morphology, and profile to the queryable chunk root. |
+| 052 | minutes_preference | Shared minutes-first selection and statement triggers that maintain public vote counts across every writer. |
+| 053 | referrer_lineage | Source receipts and parse-run lineage for replaceable minutes referrers. |
 
 ## Guidelines
 

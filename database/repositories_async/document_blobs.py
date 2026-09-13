@@ -155,6 +155,28 @@ class DocumentBlobRepository(BaseRepository):
             banana,
         )
 
+    async def record_source_alias(
+        self, content_sha256: str, source_identity: str, alias_identity: str,
+        banana: Optional[str] = None,
+    ) -> None:
+        """Alias a known revision using its actual origin-validation clocks."""
+        await self._execute("""
+            INSERT INTO document_source (
+                content_sha256, source_identity, banana, last_seen, last_observed_at,
+                last_validated_at, last_validation_attempt_at
+            )
+            SELECT content_sha256, $3, COALESCE($4, banana), last_seen, CURRENT_TIMESTAMP,
+                   last_validated_at, last_validation_attempt_at
+            FROM document_source WHERE content_sha256=$1 AND source_identity=$2
+            ON CONFLICT (content_sha256, source_identity) DO UPDATE SET
+                banana = COALESCE(document_source.banana, EXCLUDED.banana),
+                last_seen = GREATEST(document_source.last_seen, EXCLUDED.last_seen),
+                last_observed_at = CURRENT_TIMESTAMP,
+                last_validated_at = GREATEST(document_source.last_validated_at, EXCLUDED.last_validated_at),
+                last_validation_attempt_at = GREATEST(document_source.last_validation_attempt_at,
+                                                     EXCLUDED.last_validation_attempt_at)
+        """, content_sha256, source_identity, alias_identity, banana)
+
     async def record_source_validation(
         self,
         content_sha256: str,

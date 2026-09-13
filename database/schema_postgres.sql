@@ -168,6 +168,9 @@ CREATE TABLE IF NOT EXISTS matter_appearances (
     vote_outcome TEXT CHECK (vote_outcome IS NULL OR vote_outcome IN ('passed', 'failed', 'tabled', 'withdrawn', 'referred', 'amended', 'unknown', 'no_vote')),
     vote_tally JSONB,  -- {yes: N, no: N, abstain: N, absent: N}
     vote_source TEXT CHECK (vote_source IN ('api', 'minutes')),
+    reported_referrer TEXT,
+    referrer_receipt JSONB,
+    referrer_parse_run_id TEXT,
     committee_id TEXT,  -- FK to committees for relational queries
     sequence INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1147,6 +1150,7 @@ CREATE TABLE IF NOT EXISTS item_motions (
     receipt JSONB,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     tally_basis TEXT,
+    reported_body TEXT,
     parse_run_id TEXT,
     observation_ordinal INTEGER,
     FOREIGN KEY (parse_run_id, observation_ordinal) REFERENCES minutes_observations(run_id, ordinal),
@@ -1181,25 +1185,251 @@ DROP TRIGGER IF EXISTS votes_preserve_item_key ON votes;
 CREATE TRIGGER votes_preserve_item_key
     BEFORE INSERT OR UPDATE OF item_id ON votes
     FOR EACH ROW EXECUTE FUNCTION preserve_vote_item_key();
--- Counts cover direct writes and relationship moves as well as repository calls.
-CREATE OR REPLACE FUNCTION maintain_vote_count() RETURNS trigger LANGUAGE plpgsql AS $$
+-- Minutes own the public projection whenever a confirmed motion exists.
+-- API evidence remains stored, and becomes visible again on retraction.
+CREATE OR REPLACE FUNCTION vote_is_preferred(
+    evidence_source text, evidence_meeting text, evidence_matter text, evidence_item text
+) RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT evidence_source = 'minutes' OR NOT EXISTS (
+        SELECT 1 FROM item_motions im
+        WHERE im.source = 'minutes'
+          AND im.meeting_id = evidence_meeting AND im.matter_id = evidence_matter
+          AND (COALESCE(evidence_item, '') = '' OR im.item_id = evidence_item)
+    );
+$$;
+CREATE INDEX IF NOT EXISTS idx_minutes_motion_preference
+    ON item_motions(meeting_id, matter_id, item_id) WHERE source = 'minutes';
+
+CREATE OR REPLACE FUNCTION recount_member_votes(member_ids text[])
+RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    IF TG_OP = 'UPDATE' AND OLD.council_member_id = NEW.council_member_id THEN
-        RETURN NULL;
+    PERFORM id FROM council_members WHERE id = ANY(member_ids) ORDER BY id FOR UPDATE;
+    UPDATE council_members cm SET vote_count = (
+        SELECT count(*) FROM votes v WHERE v.council_member_id = cm.id
+        AND vote_is_preferred(v.source, v.meeting_id, v.matter_id, v.item_key)
+    ), updated_at = CURRENT_TIMESTAMP WHERE cm.id = ANY(member_ids);
+END;
+$$;
+
+-- Statement transition tables cover inserts, corrections, deletes, cascades,
+-- and source changes. Motion changes also affect API-only members.
+CREATE OR REPLACE FUNCTION maintain_preferred_vote_counts()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    affected text[] := ARRAY[]::text[];
+    additional text[] := ARRAY[]::text[];
+BEGIN
+    IF TG_TABLE_NAME = 'votes' THEN
+        IF TG_OP <> 'DELETE' THEN
+            SELECT array_agg(DISTINCT council_member_id) INTO affected FROM new_count_rows;
+        END IF;
+        IF TG_OP <> 'INSERT' THEN
+            SELECT array_agg(DISTINCT council_member_id) INTO additional FROM old_count_rows;
+        END IF;
+    ELSE
+        IF TG_OP <> 'DELETE' THEN
+            SELECT array_agg(DISTINCT v.council_member_id) INTO affected
+            FROM votes v JOIN new_count_rows n
+              ON n.meeting_id = v.meeting_id AND n.matter_id = v.matter_id;
+        END IF;
+        IF TG_OP <> 'INSERT' THEN
+            SELECT array_agg(DISTINCT v.council_member_id) INTO additional
+            FROM votes v JOIN old_count_rows o
+              ON o.meeting_id = v.meeting_id AND o.matter_id = v.matter_id;
+        END IF;
     END IF;
-    IF TG_OP IN ('DELETE', 'UPDATE') THEN
-        UPDATE council_members SET vote_count = vote_count - 1,
-            updated_at = CURRENT_TIMESTAMP WHERE id = OLD.council_member_id;
-    END IF;
-    IF TG_OP IN ('INSERT', 'UPDATE') THEN
-        UPDATE council_members SET vote_count = vote_count + 1,
-            last_seen = GREATEST(last_seen, NEW.vote_date), updated_at = CURRENT_TIMESTAMP
-        WHERE id = NEW.council_member_id;
+    PERFORM recount_member_votes(COALESCE(affected, ARRAY[]::text[]) || COALESCE(additional, ARRAY[]::text[]));
+    IF TG_TABLE_NAME = 'votes' AND TG_OP <> 'DELETE' THEN
+        UPDATE council_members cm SET last_seen = GREATEST(cm.last_seen, n.last_vote)
+        FROM (SELECT council_member_id, max(vote_date) AS last_vote
+              FROM new_count_rows GROUP BY council_member_id) n
+        WHERE cm.id = n.council_member_id;
     END IF;
     RETURN NULL;
 END;
 $$;
 DROP TRIGGER IF EXISTS votes_maintain_member_count ON votes;
-CREATE TRIGGER votes_maintain_member_count
-    AFTER INSERT OR DELETE OR UPDATE OF council_member_id ON votes
-    FOR EACH ROW EXECUTE FUNCTION maintain_vote_count();
+DROP FUNCTION IF EXISTS maintain_vote_count();
+DROP TRIGGER IF EXISTS votes_count_insert ON votes;
+CREATE TRIGGER votes_count_insert AFTER INSERT ON votes
+    REFERENCING NEW TABLE AS new_count_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION maintain_preferred_vote_counts();
+DROP TRIGGER IF EXISTS votes_count_update ON votes;
+CREATE TRIGGER votes_count_update AFTER UPDATE ON votes
+    REFERENCING OLD TABLE AS old_count_rows NEW TABLE AS new_count_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION maintain_preferred_vote_counts();
+DROP TRIGGER IF EXISTS votes_count_delete ON votes;
+CREATE TRIGGER votes_count_delete AFTER DELETE ON votes
+    REFERENCING OLD TABLE AS old_count_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION maintain_preferred_vote_counts();
+DROP TRIGGER IF EXISTS motions_count_insert ON item_motions;
+CREATE TRIGGER motions_count_insert AFTER INSERT ON item_motions
+    REFERENCING NEW TABLE AS new_count_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION maintain_preferred_vote_counts();
+DROP TRIGGER IF EXISTS motions_count_update ON item_motions;
+CREATE TRIGGER motions_count_update AFTER UPDATE ON item_motions
+    REFERENCING OLD TABLE AS old_count_rows NEW TABLE AS new_count_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION maintain_preferred_vote_counts();
+DROP TRIGGER IF EXISTS motions_count_delete ON item_motions;
+CREATE TRIGGER motions_count_delete AFTER DELETE ON item_motions
+    REFERENCING OLD TABLE AS old_count_rows FOR EACH STATEMENT
+    EXECUTE FUNCTION maintain_preferred_vote_counts();
+SELECT recount_member_votes(array_agg(id)) FROM council_members;
+
+-- Roster normalization as a separate derived layer. The raw table is not altered.
+--
+-- council_members.name stays exactly what the minutes printed, including
+-- "ALD. BAUMAN" and "District Attorney", and no column of that table is written
+-- by normalization -- not even updated_at. Derived values live here instead, so
+-- which half is authoritative is a question about which table you read, not a
+-- question about which column and what its comment says.
+--
+-- Everything below is recomputable from council_members.name, votes and
+-- meetings.title by scripts/normalize_roster.py. Dropping it loses nothing.
+
+CREATE TABLE IF NOT EXISTS council_member_profiles (
+    council_member_id TEXT PRIMARY KEY REFERENCES council_members(id) ON DELETE CASCADE,
+    -- The label to show. clean_name already strips the title and the gazetteer
+    -- already applies it when resolving, so the stored label was the only thing
+    -- still carrying one.
+    display_name      TEXT NOT NULL,
+    -- Which rows are one person. A bare-surname row ("McNeill") and a full-name
+    -- row ("Sean McNeill") are the same member; ingestion creates a row per
+    -- distinct printed spelling, so these accumulate.
+    person_key        TEXT,
+    -- False for a staff role or parse artifact captured as a member. Such rows
+    -- are flagged, never deleted: the row is evidence of what the document said
+    -- and its id may already be referenced by votes.
+    is_person         BOOLEAN NOT NULL,
+    derived_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_member_profiles_person_key
+    ON council_member_profiles(person_key) WHERE person_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_member_profiles_not_person
+    ON council_member_profiles(council_member_id) WHERE is_person IS FALSE;
+
+COMMENT ON TABLE council_member_profiles IS
+    'Derived labels and clustering over council_members. Raw names are never '
+    'edited; recomputed in full by scripts/normalize_roster.py.';
+
+-- A member's votes belong to a body, not to a city. Wauwatosa's minutes include
+-- the Milwaukee Metro Fire Rescue Board of Directors, whose directors are also
+-- genuine Wauwatosa officials: the motions are real and belong to that board,
+-- not to the Common Council, so a city-wide vote_count sums two offices.
+-- meetings.title already records which body sat, so membership is derivable and
+-- no row needs inventing or discarding.
+CREATE TABLE IF NOT EXISTS member_bodies (
+    council_member_id TEXT NOT NULL REFERENCES council_members(id) ON DELETE CASCADE,
+    body              TEXT NOT NULL,
+    vote_count        INTEGER NOT NULL DEFAULT 0,
+    first_vote        DATE,
+    last_vote         DATE,
+    derived_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (council_member_id, body)
+);
+CREATE INDEX IF NOT EXISTS idx_member_bodies_body ON member_bodies(body);
+
+COMMENT ON TABLE member_bodies IS
+    'Derived: which bodies a member is recorded voting in, and how often. '
+    'Recomputed from votes joined to meetings.title by scripts/normalize_roster.py.';
+
+-- A body acts, not only hosts. Formalizes what the pipeline already produces.
+--
+-- 460 rows in council_members are not people, and they already hold 9,242
+-- sponsorships and 1,020 votes: Jacksonville's "Land Use & Zoning Committee"
+-- sponsors 378 matters, Napa's "Board of Supervisors" 366, Madison's "BOARD OF
+-- PUBLIC WORKS" 188. A committee recommending or sponsoring at the council level
+-- is real and already recorded -- as a fake person. This gives it somewhere to be.
+--
+-- Derived layer again: the raw rows stay exactly as captured, and everything here
+-- is recomputable by scripts/normalize_roster.py.
+
+-- Which kind of actor a raw roster row actually names. "Not a person" conflated
+-- four things that need different handling: a body can move and sponsor, a bare
+-- role is a person the minutes declined to name, an artifact is a parse failure.
+ALTER TABLE council_member_profiles
+    ADD COLUMN IF NOT EXISTS actor_kind TEXT
+        CHECK (actor_kind IN ('person', 'body', 'role', 'artifact'));
+
+CREATE TABLE IF NOT EXISTS bodies (
+    id          TEXT PRIMARY KEY,
+    banana      TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    -- A body observed only as an actor has no meetings of its own in our corpus;
+    -- one observed only as a venue has never been recorded acting. Both are real.
+    seen_as_venue BOOLEAN NOT NULL DEFAULT FALSE,
+    seen_as_actor BOOLEAN NOT NULL DEFAULT FALSE,
+    derived_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (banana, name)
+);
+CREATE INDEX IF NOT EXISTS idx_bodies_banana ON bodies(banana);
+
+COMMENT ON TABLE bodies IS
+    'Deliberative bodies, derived from meetings.title (as venue) and from roster '
+    'rows that name a body rather than a person (as actor).';
+
+-- Who moved, seconded, sponsored or recommended. One motion can carry a mover, a
+-- seconder and a recommending committee at once, so this is a join and not
+-- columns on item_motions. The actor is a person or a body, never both.
+CREATE TABLE IF NOT EXISTS motion_actors (
+    item_id      TEXT NOT NULL,
+    motion_index SMALLINT NOT NULL,
+    source       TEXT NOT NULL,
+    role         TEXT NOT NULL CHECK (role IN ('mover', 'seconder', 'sponsor', 'recommender')),
+    person_id    TEXT REFERENCES council_members(id) ON DELETE CASCADE,
+    body_id      TEXT REFERENCES bodies(id) ON DELETE CASCADE,
+    derived_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((person_id IS NULL) <> (body_id IS NULL)),
+    FOREIGN KEY (item_id, motion_index, source)
+        REFERENCES item_motions(item_id, motion_index, source) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_motion_actors
+    ON motion_actors(item_id, motion_index, source, role,
+                     COALESCE(person_id, ''), COALESCE(body_id, ''));
+CREATE INDEX IF NOT EXISTS idx_motion_actors_person ON motion_actors(person_id) WHERE person_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_motion_actors_body ON motion_actors(body_id) WHERE body_id IS NOT NULL;
+
+COMMENT ON TABLE motion_actors IS
+    'Who acted on a motion and in what role. A recommending committee is an actor '
+    'here rather than a withheld observation; see reported_committee_action.';
+
+-- Who sponsors a matter, when the sponsor is a body rather than a person.
+--
+-- sponsorships is keyed council_member_id, so the 6,308 rows where a committee
+-- sponsors a matter are stored as a fake person: Jacksonville's "Land Use &
+-- Zoning Committee" holds 378, Napa's "Board of Supervisors" 366. motion_actors
+-- cannot hold them -- it is keyed (item_id, motion_index) and a matter sponsored
+-- at introduction has no motion to hang on. This is the matter-level equivalent.
+--
+-- Derived: sponsorships stays exactly as captured and is still the raw record.
+
+CREATE TABLE IF NOT EXISTS matter_actors (
+    matter_id   TEXT NOT NULL REFERENCES city_matters(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL CHECK (role IN ('sponsor', 'co_sponsor', 'requester', 'referrer')),
+    person_id   TEXT REFERENCES council_members(id) ON DELETE CASCADE,
+    body_id     TEXT REFERENCES bodies(id) ON DELETE CASCADE,
+    -- Retained from the raw sponsorship so ordering and primacy survive the move.
+    is_primary  BOOLEAN NOT NULL DEFAULT FALSE,
+    actor_order INTEGER,
+    derived_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK ((person_id IS NULL) <> (body_id IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_matter_actors
+    ON matter_actors(matter_id, role, COALESCE(person_id, ''), COALESCE(body_id, ''));
+CREATE INDEX IF NOT EXISTS idx_matter_actors_person ON matter_actors(person_id) WHERE person_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_matter_actors_body ON matter_actors(body_id) WHERE body_id IS NOT NULL;
+
+COMMENT ON TABLE matter_actors IS
+    'Derived from sponsorships: the same sponsorship expressed with the actor it '
+    'actually names, a person or a body. A role-only sponsor ("Mayor") and a parse '
+    'artifact are excluded -- neither identifies an actor to attribute to.';
+
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conrelid = 'matter_appearances'::regclass
+                     AND conname = 'matter_appearances_referrer_parse_run_id_fkey') THEN
+        ALTER TABLE matter_appearances ADD CONSTRAINT matter_appearances_referrer_parse_run_id_fkey
+            FOREIGN KEY (referrer_parse_run_id) REFERENCES minutes_parse_runs(id);
+    END IF;
+END $$;
+ALTER TABLE items SET (autovacuum_analyze_scale_factor = 0.02);

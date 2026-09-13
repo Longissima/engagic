@@ -563,6 +563,8 @@ export interface MotionRecord {
 	parse_run_id?: string | null;
 	observation_ordinal?: number | null;
 	method: string | null;
+	reported_body?: string | null;
+	selection_basis?: 'minutes' | 'api_fallback_no_confirmed_minutes';
 	tally_basis?: string | null;
 	tally: VoteTally | null;
 	outcome: VoteOutcome | null;

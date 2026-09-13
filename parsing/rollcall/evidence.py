@@ -134,13 +134,13 @@ _BODY_NAME = (r"(?:[A-Z][\w'\-]*|of|and|for|the|&)"
               r"(?:\s+(?:[A-Z][\w'\-]*|of|and|for|the|&)){0,7}"
               r"\s+(?:Committee|Commission|Board|Authority)")
 _REPORTED_BODY_RE = re.compile(
-    # "recommended by the X Committee", "referred to the X Commission"
-    r"(?:\brecommended\s+by|\breferred\s+to|\b(?:on|per)\s+the\s+recommendation\s+of"
+    # "recommended by the X Committee", "referred by the X Commission"
+    r"(?:\brecommended\s+by|\breferred\s+by|\b(?:on|per)\s+the\s+recommendation\s+of"
     r"|\b(?:adopted|approved|passed|denied)\s+by)"
     rf"\s+(?:the\s+)?(?P<body>{_BODY_NAME})\b"
     # "the X Committee voted 5-2 to recommend denial", "X Board introduced"
     rf"|\b(?P<body2>{_BODY_NAME})\s+(?:unanimously\s+)?(?:voted[^.]{{0,40}}?\s+to\s+)?"
-    r"(?:recommend\w*|moved|introduced|sponsored|submitted)\b",
+    r"(?:recommend\w*|referred|moved|introduced|sponsored|submitted)\b",
 )
 _ANAPHORIC_BODY_RE = re.compile(
     r"^(?:the\s+)?(?:committee|commission|board|council|authority)$", re.IGNORECASE
@@ -285,7 +285,7 @@ def _parse_sections(lines: List[str], start: int, limit: int) -> List[Section]:
     return sections
 
 
-def _reported_body(context: str) -> Optional[str]:
+def reported_body(context: str) -> Optional[str]:
     """The body the minutes credit with acting, or None when it is this one."""
     match = _REPORTED_BODY_RE.search(context)
     if not match:
@@ -295,6 +295,22 @@ def _reported_body(context: str) -> Optional[str]:
     if _ANAPHORIC_BODY_RE.match(name):
         return None
     return name or None
+
+
+
+def sentence_spans(text: str):
+    """Source spans for sentences, preserving wrapped lines and title abbreviations."""
+    start = 0
+    for match in re.finditer(r"[.!?;](?=\s|$)", text):
+        prefix = text[start:match.start()]
+        if match.group() == "." and re.search(
+            r"\b(?:(?i:Mr|Mrs|Ms|Dr|Ald|Hon|No|St)|[A-Z])$", prefix
+        ):
+            continue
+        yield start, match.end()
+        start = match.end()
+    if start < len(text):
+        yield start, len(text)
 
 
 def _orient_tally(tally, outcome, context):
@@ -333,6 +349,7 @@ def find_evidence(block: str) -> List[Evidence]:
         offsets.append(pos)
         pos += len(line)
     found: List[Evidence] = []
+    sentences = list(sentence_spans(block))
     for idx, line in enumerate(lines):
         for m in RESULT_RE.finditer(line):
             result_text = m.group("result")
@@ -368,8 +385,9 @@ def find_evidence(block: str) -> List[Evidence]:
             # vote to the commission is the mis-attribution the withhold existed
             # to prevent. A bare mention is a fact about the matter's referral,
             # not about any motion here.
-            ev.reported_body = _reported_body(
-                line + " " + " ".join(lines[idx + 1:idx + 3]))
+            sentence = next((block[start:end] for start, end in sentences
+                             if start <= ev.offset < end), line)
+            ev.reported_body = reported_body(sentence)
             if ev.reported_body:
                 ev.qualifications.append('reported_committee_action')
             ev.sections = _parse_sections(lines, idx + 1, 14)

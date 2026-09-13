@@ -272,6 +272,7 @@
 							{#each meetingVotes.motions as motion}
 								<div class="vote-list">
 									<p>{motion.source === 'minutes' ? 'Minutes' : 'Vendor record'}: {motion.motion_text || `Motion ${motion.motion_index + 1}`}</p>
+									{#if motion.reported_body}<p>Reported action by {motion.reported_body}</p>{/if}
 									<VoteBadge tally={motion.tally} outcome={motion.outcome} size="small" />
 									{#if !motion.votes.length}<p>Individual votes are unavailable.</p>{/if}
 									{#each motion.votes as vote (vote.id)}

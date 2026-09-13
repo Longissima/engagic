@@ -408,6 +408,17 @@ class CorpusStore:
         original = await self.get_original_artifact_by_identity(source_url)
         return original.data if original else None
 
+    async def record_alias(
+        self, content_sha256: str, source_url: str, alias_url: str, banana: Optional[str] = None
+    ) -> None:
+        """Persist a fetch rewrite without turning a cache read into validation."""
+        try:
+            await self.blobs.record_source_alias(
+                content_sha256, attachment_identity(source_url), attachment_identity(alias_url), banana
+            )
+        except Exception as exc:
+            logger.warning("corpus alias record failed", sha=content_sha256[:16], error=str(exc))
+
     async def record_sighting(
         self, content_sha256: str, source_url: Optional[str], banana: Optional[str] = None
     ) -> None:

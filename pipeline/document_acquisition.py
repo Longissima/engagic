@@ -113,6 +113,13 @@ class DocumentSourceAcquirer:
                 )
             self._record_metric("singleflight_join", artifact, 0.0)
 
+        # Preserve the caller's durable identity when a known portal route is
+        # fetched through its API. Existing attachment readers use this alias.
+        if canonical_fetch_url(requested_url) != requested_url and artifact.corpus_persisted:
+            corpus = self._corpus_getter()
+            if corpus is not None:
+                await corpus.record_alias(artifact.content_sha256, source_url, requested_url, banana)
+
         if artifact.requested_url != requested_url:
             return replace(artifact, requested_url=requested_url)
         return artifact

@@ -99,10 +99,12 @@ candidate prevents promoting an earlier result to the final scalar field.
 `vote_source` marks ownership (`minutes`, `api`, or NULL for legacy/unknown).
 API-owned appearance values remain separate from minutes motion records.
 
-`council_members.vote_count` counts stored individual vote rows, including
-separate API/minutes evidence. It is not a deduplicated count of real-world
-ballots across sources. Database triggers maintain it for every writer;
-repository code must not increment it separately. Migration 044 repairs counts.
+`council_members.vote_count` counts the public minutes-preferred ballot projection.
+Any confirmed minutes motion suppresses API evidence for that item (or the
+meeting/matter when the API has no item identity), including tally/outcome-only
+minutes. Raw votes remain source-separated. Database statement triggers maintain
+counts for vote and motion changes using `vote_is_preferred`; repository recounts
+and body counts use the same policy. Migration 052 repairs existing counters.
 
 ## Minutes discovery and receipts
 
@@ -216,28 +218,29 @@ groups carry `selection_basis: api_fallback_no_confirmed_minutes`.
 `get_motion_groups(include_api_comparison=True)` retains both sources for
 internal inspection.
 
-The preference answers two questions at two grains, and they do not have the
-same answer.
+Minutes take precedence whenever a confirmed minutes motion exists, whether it
+names voters, reports a tally, or records only an outcome. API ballots for that
+item remain in the audit store but do not supplement the public minutes record.
+When the API lacks item identity, the preference is scoped to meeting and matter.
+Retraction of the last minutes motion restores the API fallback.
 
-At **outcome grain** minutes always win, enforced by `vote_source` on
-`matter_appearances`: a minutes motion that records only "passed" still states
-the outcome better than the API does, and a later API refresh cannot overwrite it.
+The SQL function `vote_is_preferred` defines this choice for member history,
+topic profiles, counters, body counts, and public metrics. Python motion bundles
+apply the same item/matter selection. `votes.item_key` uses `''` for missing item
+identity; it is never NULL. Metrics include motion-only records and call a vote
+divided only when both yes and no are recorded.
 
-At **ballot grain** -- member voting history, the topic profile, and the
-denormalized `council_members.vote_count` -- the preference exists only to remove
-a duplicate, so it yields to minutes exactly where minutes recorded a competing
-ballot: `item_motions.method = 'named'`, the one method that carries per-member
-votes. A tally- or outcome-only minutes motion names nobody, duplicates no
-ballot, and must not suppress an API ballot; doing so deletes the only record
-that a member voted at all. The predicate is defined once, as
-`council_members.MINUTES_PREFERRED_VOTE`, and every ballot-grain reader composes
-it -- including the counter update in `scripts/parse_minutes_votes.py`, which
-runs last and therefore owns the final value.
+Referrers identify the source of a referral, never the recipient of “referred
+to”. Publication replaces `reported_referrer`, `referrer_receipt`, and
+`referrer_parse_run_id` together. A successful empty reparse clears them; source
+text and prior parse runs remain available. Run normalization after publication
+to refresh the derived actor tables.
 
-Raw `votes` remains a source-separated audit store: a consumer writing its own
-SQL must compose `MINUTES_PREFERRED_VOTE` rather than restate it, and must not
-sum both sources. Note the sentinel: `votes.item_key` is `NOT NULL DEFAULT ''`,
-so "no item identity" is `''` and an `IS NULL` test against it is unreachable.
+Apply migrations 052 and 053 with writers stopped, then restart on this code.
+Reparse saved minutes and rerun roster normalization to refresh attribution and
+its derived tables. The CivicClerk repair can recover previously purged mappings
+from meeting/attachment references and the failure ledger; it now verifies
+replacement text and the portal alias before removing any remaining shell map.
 
 `outcome` describes the motion itself. A successful motion to deny is passed;
 `DENIED` alone describes the subject and does not establish motion failure. See

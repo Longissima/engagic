@@ -28,31 +28,11 @@ from config import get_logger
 logger = get_logger(__name__).bind(component="council_member_repository")
 
 
-# Ballot-grain minutes preference, for the readers that count or list one
-# member's votes. Its only job is to remove a duplicate, so it yields to
-# minutes exactly where minutes recorded a competing ballot: method='named'
-# is the one method that carries per-member votes (outcome and tally motions
-# record an outcome and name nobody). A minutes motion that names nobody
-# duplicates no ballot, and suppressing an API ballot under it would delete
-# evidence rather than deduplicate it -- 13,115 rows in production.
-# Outcome grain is a separate question with the opposite answer: minutes
-# always win there, enforced on matter_appearances.vote_source.
-#
-# One definition, three readers -- member history, topic profile, and the
-# denormalized vote_count -- because the first two were hand-copied and both
-# copies were dead: votes.item_key is NOT NULL DEFAULT '' (migration 044), so
-# '' and not NULL is the "no item identity" sentinel, and an IS NULL test
-# there is unreachable by schema. A preference that never fires reads both
-# sources while reporting that it read one. Requires votes aliased as `v`.
-# Confidence 9/10: sentinel is schema-guaranteed, method/ballot correlation
-# is 6261/6261 in production, suppression set measured read-only.
-MINUTES_PREFERRED_VOTE = """(v.source = 'minutes' OR NOT EXISTS (
-                  SELECT 1 FROM item_motions im
-                  WHERE im.source = 'minutes' AND im.method = 'named'
-                    AND im.meeting_id = v.meeting_id
-                    AND im.matter_id = v.matter_id
-                    AND (v.item_key = '' OR im.item_id = v.item_key)
-              ))"""
+# Shared with database triggers, metrics and body counts. Confirmed minutes
+# own the item projection even when they name no voters; API rows remain audit
+# evidence and are public only where no minutes motion exists.
+MINUTES_PREFERRED_VOTE = "vote_is_preferred(v.source, v.meeting_id, v.matter_id, v.item_key)"
+
 
 
 class CouncilMemberRepository(BaseRepository):
@@ -113,10 +93,9 @@ class CouncilMemberRepository(BaseRepository):
     ) -> None:
         """Replace both denormalized counters from retained relationships.
 
-        The only writer of sponsorship_count and vote_count. The minutes
-        publisher calls this rather than counting again: two implementations of
-        one counter means the later writer silently wins, which is how
-        vote_count kept reporting the undeduplicated total.
+        Votes and motions also maintain vote_count through database triggers.
+        Both use vote_is_preferred, so direct writers and reconciliations count
+        the same public projection.
         """
         ordered_ids = sorted(member_ids)
         if not ordered_ids:

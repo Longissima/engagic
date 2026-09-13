@@ -12,17 +12,13 @@ pipeline.utils.canonical_fetch_url now rewrites that route to the API's
 GetMeetingFileStream at the acquisition boundary, so fetches are correct going
 forward. This script repairs what was already stored:
 
-  1. purge    -- drop the document_source rows that map an agenda identity to a
-                 shell blob. Those rows are the only thing that makes the shell
-                 resolvable; without them the identity simply has no archive.
-  2. backfill -- re-acquire each meeting's agenda through the analyzer, which
-                 now fetches the API URL and archives under that identity.
-  3. verify   -- confirm the API identity resolves to a PDF blob carrying text.
+  1. discover -- recover URLs from meetings, attachments, source mappings and
+                 the failure ledger, including mappings purged by older runs
+  2. backfill -- fetch the canonical API URL and persist its portal alias
+  3. verify   -- remove stale shell mappings only after a replacement is ready
 
-The shell blobs themselves are left in place. They are shared, content-addressed
-rows referenced by nothing else once the mappings are gone, and deleting them
-would orphan R2 objects for no gain -- consistent with the rule that a wrong
-source is de-preferred by a read, never erased.
+The original shell blobs remain as historical evidence. Failed and interrupted
+work remains discoverable independently of document_source mappings.
 
 Usage:
     uv run python scripts/backfill_civicclerk_portal_agendas.py --dry-run
@@ -43,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from analysis.analyzer_async import AsyncAnalyzer
 from config import get_logger
 from database.db_postgres import Database
+from corpus.store import COMPATIBLE_EXTRACT_VERSIONS
 from exceptions import DocumentDownloadError, ExtractionError
 from parsing.memory_budget import MemoryAdmissionTimeout
 from pipeline.utils import canonical_fetch_url
@@ -57,39 +54,55 @@ logger = get_logger(__name__).bind(component="backfill_cc_portal_agendas")
 
 PORTAL_AGENDA_LIKE = "%portal.civicclerk.com/event/%/files/agenda/%"
 
-# One row per poisoned identity. A portal URL can front several meetings only
-# if the same fileId is reused, so DISTINCT keeps the unit of work the fetch,
-# not the meeting.
+# Include original references: the earlier purge has already removed some
+# mappings. A failed repair must not remove its own durable discovery input.
 CANDIDATES_SQL = """
-    SELECT DISTINCT ds.source_identity AS url, ds.banana
-    FROM document_source ds
-    JOIN document_blob b USING (content_sha256)
-    WHERE ds.source_identity ILIKE $1
-      AND b.content_type LIKE 'text/html%'
-    ORDER BY ds.banana, ds.source_identity
+    WITH urls AS (
+        SELECT source_identity AS url, banana FROM document_source
+        WHERE source_identity ILIKE $1
+        UNION
+        SELECT agenda_url, banana FROM meetings WHERE agenda_url ILIKE $1
+        UNION
+        SELECT packet_url, banana FROM meetings WHERE packet_url ILIKE $1
+        UNION
+        SELECT a->>'url', m.banana FROM items i JOIN meetings m ON m.id=i.meeting_id
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(i.attachments)='array' THEN i.attachments ELSE '[]'::jsonb END) a
+        WHERE a->>'url' ILIKE $1
+        UNION
+        SELECT source_identity, banana FROM document_ingest_failure
+        WHERE source_identity ILIKE $1
+    )
+    SELECT DISTINCT ON (u.url) u.url, u.banana FROM urls u
+    LEFT JOIN LATERAL (
+        SELECT b.* FROM document_source ds JOIN document_blob b USING(content_sha256)
+        WHERE ds.source_identity = u.url
+        ORDER BY ds.last_validated_at DESC NULLS LAST, ds.first_seen DESC LIMIT 1
+    ) revision ON true
+    WHERE revision.content_type IS DISTINCT FROM 'application/pdf'
+       OR revision.text_key IS NULL OR revision.extract_version IS NULL
+       OR revision.extract_version <> ALL($2::text[])
+       OR COALESCE(cardinality(revision.ocr_pending_pages), 0) > 0
+       OR COALESCE(revision.extract_method, '') LIKE '%-partial'
+    ORDER BY u.url, u.banana NULLS LAST
 """
 
-# Scoped to the identities this run will actually re-acquire, so a --limit run
-# never strips an archive it is not going to replace.
 PURGE_SQL = """
-    DELETE FROM document_source ds
-    USING document_blob b
+    DELETE FROM document_source ds USING document_blob b
     WHERE ds.content_sha256 = b.content_sha256
       AND ds.source_identity = ANY($1::text[])
       AND b.content_type LIKE 'text/html%'
 """
-
-# Repaired means: the API identity this portal URL resolves to now points at a
-# PDF blob with extracted text. Checking the blob (not just the fetch) is what
-# distinguishes a real repair from a download that never persisted.
 VERIFY_SQL = """
-    SELECT EXISTS (
-        SELECT 1 FROM document_source ds
-        JOIN document_blob b USING (content_sha256)
+    SELECT COALESCE((
+        SELECT b.content_type = 'application/pdf' AND b.text_key IS NOT NULL
+           AND b.extract_version = ANY($2::text[])
+           AND COALESCE(cardinality(b.ocr_pending_pages), 0) = 0
+           AND COALESCE(b.extract_method, '') NOT LIKE '%-partial'
+        FROM document_source ds JOIN document_blob b USING(content_sha256)
         WHERE ds.source_identity = $1
-          AND b.content_type = 'application/pdf'
-          AND b.text_key IS NOT NULL
-    )
+        ORDER BY ds.last_validated_at DESC NULLS LAST, ds.first_seen DESC LIMIT 1
+    ), false)
 """
 
 MAX_REQUEUES = 5
@@ -118,12 +131,10 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
     """Returns False when the candidate should go back on the queue."""
     started = time.monotonic()
     try:
-        # Deliberately passes the PORTAL url: the rewrite under test lives at
-        # the acquisition boundary, so this exercises the production path
-        # rather than a shortcut around it.
-        result = await analyzer.extract_document_async(candidate.url, banana=candidate.banana)
+        # Acquisition resolves the portal URL and persists both URL identities.
+        result = await analyzer.extract_document_async(candidate.url, banana=candidate.banana, retry_incomplete=True)
         async with db.pool.acquire() as conn:
-            repaired = await conn.fetchval(VERIFY_SQL, candidate.api_url)
+            repaired = await conn.fetchval(VERIFY_SQL, candidate.api_url, list(COMPATIBLE_EXTRACT_VERSIONS))
         if not repaired:
             counts["failed_persist"] += 1
             logger.warning(
@@ -132,6 +143,12 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
                 document_format=result.get("document_format"),
             )
             return True
+        async with db.pool.acquire() as conn:
+            async with conn.transaction():
+                if not args.skip_purge:
+                    await conn.execute(PURGE_SQL, [candidate.url])
+                if not await conn.fetchval(VERIFY_SQL, candidate.url, list(COMPATIBLE_EXTRACT_VERSIONS)):
+                    raise ExtractionError("Portal alias is not ready", document_url=candidate.url)
         await clear_failure(db, candidate.url)
         counts["repaired"] += 1
         logger.info(
@@ -217,33 +234,31 @@ async def main() -> int:
                         help="re-acquire only; leave the shell mappings in place")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if min(args.limit, args.concurrency, args.max_failures, args.failure_retry_days, args.progress_every) < 1:
+        parser.error("limits, concurrency and retry intervals must be positive")
 
     db = await Database.create()
     counts: Dict[str, int] = defaultdict(int)
     try:
         async with db.pool.acquire() as conn:
-            rows = await conn.fetch(CANDIDATES_SQL, PORTAL_AGENDA_LIKE)
+            rows = await conn.fetch(CANDIDATES_SQL, PORTAL_AGENDA_LIKE, list(COMPATIBLE_EXTRACT_VERSIONS))
 
         wanted = {b.strip() for b in args.banana.split(",")} if args.banana else None
         todo = [
             Candidate(r["url"], r["banana"])
             for r in rows
-            if wanted is None or r["banana"] in wanted
+            if (wanted is None or r["banana"] in wanted)
+            and canonical_fetch_url(r["url"]) != r["url"]
         ][: args.limit]
         jurisdictions = len({c.banana for c in todo})
-        print(f"{len(todo)} poisoned agenda identities across {jurisdictions} jurisdictions")
+        print(f"{len(todo)} agenda identities needing repair across {jurisdictions} jurisdictions")
 
         if args.dry_run:
             for candidate in todo[:10]:
-                print(f"  {candidate.banana:22} {candidate.url}")
+                print(f"  {candidate.banana or 'unknown':22} {candidate.url}")
                 print(f"  {'':22} -> {candidate.api_url}")
-            print(f"  ... would purge {len(todo)} document_source rows, then re-acquire each")
+            print(f"  ... would re-acquire {len(todo)} documents, then remove verified shell mappings")
             return 0
-
-        if not args.skip_purge:
-            async with db.pool.acquire() as conn:
-                status = await conn.execute(PURGE_SQL, [c.url for c in todo])
-            print(f"purged shell mappings: {status}")
 
         analyzer = AsyncAnalyzer(enable_llm=False)
         try:
@@ -259,7 +274,7 @@ async def main() -> int:
             )
         print(f"\ndone: {dict(counts)}")
         print(f"shell mappings remaining: {left}")
-        return 0 if not counts["failed_persist"] else 1
+        return int(any(value for key, value in counts.items() if key.startswith("failed_")))
     finally:
         await db.close()
 

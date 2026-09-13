@@ -55,7 +55,9 @@ SOURCE_STATE_SQL = """
             AND b.text_key IS NOT NULL
             AND b.extract_version = ANY($2::text[])
         ) AS corpus_ready,
-        s.last_seen <= CURRENT_TIMESTAMP - make_interval(days => $3) AS recheck_due
+        (COALESCE(cardinality(b.ocr_pending_pages), 0) > 0
+         OR COALESCE(b.extract_method, '') LIKE '%-partial') AS extraction_incomplete,
+        COALESCE(s.last_validated_at, s.first_seen) <= CURRENT_TIMESTAMP - make_interval(days => $3) AS recheck_due
     FROM document_source s
     JOIN document_blob b USING (content_sha256)
     WHERE s.source_identity = ANY($1::text[])
@@ -165,19 +167,21 @@ def select_candidates(
             counts["unsupported_url"] += 1
             continue
 
+        state = states.get(identity)
         failure = failure_states.get(identity)
         if failure:
-            if failure["permanent"]:
+            # Older ingestion marked partial OCR permanent. The available text
+            # proves this is repairable extraction work; keep its retry delay.
+            if failure["permanent"] and not (state and state.get("extraction_incomplete")):
                 counts["permanent_failure"] += 1
                 continue
             if not failure["retry_due"]:
                 counts["failure_backoff"] += 1
                 continue
 
-        state = states.get(identity)
         if state is None:
             reason = "new"
-        elif not state["corpus_ready"]:
+        elif not state["corpus_ready"] or state.get("extraction_incomplete"):
             reason = "incomplete"
         elif state["recheck_due"]:
             reason = "revision_recheck"
@@ -282,6 +286,17 @@ async def clear_failure(db, identity: str) -> None:
         )
 
 
+async def record_ingest_result(db, result, identity, source_url, banana):
+    """Keep readable partial text while scheduling another OCR attempt."""
+    if result.get("extraction_incomplete"):
+        await record_failure(db, identity=identity, source_url=source_url,
+            banana=banana, stage="extract",
+            error=ExtractionError("OCR pages still pending", document_url=identity),
+            max_failures=UNBOUNDED_FAILURE_ATTEMPTS, retry_days=1)
+    else:
+        await clear_failure(db, identity)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days-back", type=int, default=120,
@@ -331,7 +346,7 @@ async def main() -> int:
         # the older version "not ready" left 177 of them unlinked.
         relinked = 0
         async with db.pool.acquire() as conn:
-            for r in rows:
+            for r in ([] if args.dry_run else rows):
                 state = states.get(attachment_identity(r["minutes_url"]))
                 if state and state["corpus_ready"] and state.get("content_sha256"):
                     status = await conn.execute(
@@ -391,8 +406,8 @@ async def main() -> int:
             row, identity, reason = candidate
             async with sem:
                 try:
-                    result = await analyzer.extract_pdf_async(
-                        row["minutes_url"], banana=row["banana"]
+                    result = await analyzer.extract_document_async(
+                        row["minutes_url"], banana=row["banana"], retry_incomplete=True
                     )
                     content_sha256 = result.get("content_sha256")
                     if (
@@ -425,7 +440,7 @@ async def main() -> int:
                         await conn.execute(
                             LINK_SQL, row["id"], content_sha256, identity
                         )
-                    await clear_failure(db, identity)
+                    await record_ingest_result(db, result, identity, row["minutes_url"], row["banana"])
                     counts["ingested"] += 1
                     logger.info(
                         "minutes ingested",

@@ -106,6 +106,7 @@ class MeetingParse:
     # any motion in this meeting: crediting every motion in the block attributed
     # the council's own vote to the committee that had merely recommended.
     referrals: List[Tuple[str, str]] = field(default_factory=list)
+    referral_receipts: Dict[str, dict] = field(default_factory=dict)
 
 
 # An agenda "item" that is really a section heading ("OLD BUSINESS:",

@@ -330,9 +330,9 @@
 
 					<div class="stats-card">
 						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.motions)}</div>
-						<div class="stat-title">Motions Decided</div>
+						<div class="stat-title">Motions Recorded</div>
 						<div class="stat-description">
-							{formatNumber(data.platformMetrics.accountability.divided_motions)} were not unanimous
+							{formatNumber(data.platformMetrics.accountability.divided_motions)} had both yes and no votes
 						</div>
 					</div>
 

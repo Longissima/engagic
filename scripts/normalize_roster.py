@@ -52,6 +52,7 @@ import hashlib
 
 from config import get_logger
 from database.db_postgres import Database
+from database.repositories_async.council_members import MINUTES_PREFERRED_VOTE
 from parsing.rollcall.engine import Gazetteer
 from parsing.rollcall.names import clean_name, fold
 
@@ -78,7 +79,8 @@ _BARE_ROLE_RE = re.compile(
     r"^(?:(?:vice|deputy|acting|interim|assistant)\s+)?"
     r"(?:mayor|chair(?:person|man|woman)?|president|councilmember|councilman|councilwoman|"
     r"councilor|commissioner|supervisor|trustee|alderman|alderwoman|alderperson|alder|"
-    r"city\s+manager|city\s+attorney|city\s+clerk|clerk\s+of\s+council|clerk|attorney|"
+    r"(?:council|board|commission|committee)\s+(?:president|chair(?:person|man|woman)?)|"
+    r"district\s+attorney|superintendent|city\s+manager|city\s+attorney|city\s+clerk|clerk\s+of\s+council|clerk|attorney|"
     r"administrator|manager|director|treasurer|auditor|sheriff|staff|applicant|petitioner)"
     r"(?:\s+pro\s*[- ]?tem(?:pore)?)?$",
     re.IGNORECASE,
@@ -163,16 +165,19 @@ SPONSORSHIPS_SQL = """
     JOIN council_members cm ON cm.id = s.council_member_id
     WHERE ($1::text IS NULL OR cm.banana = $1)
 """
-BODY_VOTES_SQL = """
-    SELECT v.council_member_id, m.title AS body,
+BODY_VOTES_SQL = f"""
+    SELECT v.council_member_id, COALESCE(im.reported_body, m.title) AS body,
            count(*)::int AS vote_count,
            min(v.vote_date)::date AS first_vote,
            max(v.vote_date)::date AS last_vote
     FROM votes v
     JOIN meetings m ON m.id = v.meeting_id
     JOIN council_members cm ON cm.id = v.council_member_id
+    LEFT JOIN item_motions im ON im.item_id=v.item_key AND im.meeting_id=v.meeting_id
+        AND im.matter_id=v.matter_id AND im.motion_index=v.motion_index AND im.source=v.source
     WHERE ($1::text IS NULL OR cm.banana = $1)
-    GROUP BY v.council_member_id, m.title
+      AND {MINUTES_PREFERRED_VOTE}
+    GROUP BY v.council_member_id, COALESCE(im.reported_body, m.title)
 """
 
 

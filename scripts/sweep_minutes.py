@@ -74,21 +74,21 @@ MEETING_STATE_SQL = """
 # The stored id hashes vendor_id + date + title as they were at sync time; a
 # listing that later appended "* Special Start Time" to the title regenerates
 # a different id (20% of a 2026-09-11 sweep). Same city, same start datetime,
-# still unfilled, exactly one row: that is the meeting.
+# exactly one row, including already-filled meetings: that is the candidate.
 FALLBACK_SQL = """
     SELECT id, title FROM meetings
-    WHERE banana = $1 AND date = $2 AND minutes_url IS NULL
+    WHERE banana = $1 AND date = $2
 """
 
 # Some listings carry only a calendar date where the stored row has a real
 # instant (Municode's Drupal table gives midnight), so an exact-instant match can
 # never succeed and the minutes are discarded as time drift. Matching the day
-# keeps the guard that matters -- exactly one unfilled candidate whose title
-# agrees -- because a wrong link is worse than a missing one, and it is the
-# uniqueness check rather than the clock that prevents a swap.
+# requires one matching body and session across ALL meetings on the day.
+# Already-filled meetings participate in identity resolution before the writer
+# checks whether a fill is needed.
 FALLBACK_DAY_SQL = """
     SELECT id, title FROM meetings
-    WHERE banana = $1 AND date::date = $2::date AND minutes_url IS NULL
+    WHERE banana = $1 AND date::date = $2::date
 """
 
 # Dry-run diagnostics only: every meeting the city holds at that instant,
@@ -102,12 +102,12 @@ FALLBACK_DIAGNOSTIC_SQL = """
 
 _TITLE_WORD_RE = re.compile(r"[A-Za-z]{3,}")
 _TITLE_NOISE = {
-    "meeting", "meetings", "regular", "special", "city", "county", "town",
-    "village", "board", "committee", "commission", "council", "session",
-    "the", "and", "of", "for", "adjourned", "rescheduled", "cancelled",
-    "canceled", "start", "time", "times", "note", "revised", "amended",
-    "continued", "reconvened", "rescheduled",
+    "meeting", "meetings", "session", "the", "and", "of", "for",
+    "start", "time", "times", "note", "revised", "amended", "rescheduled",
 }
+_START_TIME_NOTE = re.compile(r"\b(?:special|revised|amended)?\s*start\s+time\b", re.I)
+_SESSION_WORDS = {"regular", "special", "emergency", "adjourned", "joint", "closed", "executive"}
+
 
 
 def title_key(title: str) -> frozenset:
@@ -118,7 +118,7 @@ def title_key(title: str) -> frozenset:
     added qualifiers while still separating two different bodies meeting at
     the same instant.
     """
-    words = {w.lower() for w in _TITLE_WORD_RE.findall(title or "")}
+    words = {w.lower() for w in _TITLE_WORD_RE.findall(_START_TIME_NOTE.sub("", title or ""))}
     return frozenset(words - _TITLE_NOISE)
 
 
@@ -132,11 +132,14 @@ def titles_agree(listing: str, stored: str) -> bool:
     exists to prevent.
     """
     a, b = title_key(listing), title_key(stored)
-    if not a and not b:
-        return True
     if not a or not b:
         return False
-    return a <= b or b <= a
+    # A missing regular marker is ordinary portal variation. Other session
+    # qualifiers identify distinct sittings and must agree exactly.
+    if (a & (_SESSION_WORDS - {'regular'})) != (b & (_SESSION_WORDS - {'regular'})):
+        return False
+    return (a - {'regular'}) == (b - {'regular'})
+
 
 
 def vendor_streams(city_row) -> list[tuple[str, str]]:
@@ -274,7 +277,7 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                         meeting_id, conn=conn, lock_for_update=True
                     )
                     if meeting is None and meeting_date is not None:
-                        # Same city, same instant, still unfilled, exactly one
+                        # Same city, same instant, filled or unfilled, exactly one
                         # candidate, and the titles must agree on their body
                         # words. Without the title check two committees
                         # meeting at the same time could swap minutes, and a
@@ -283,7 +286,7 @@ async def sweep_city(db, parse_date, city_row, days_back: int, dry_run: bool) ->
                             row for row in await conn.fetch(FALLBACK_SQL, banana, meeting_date)
                             if titles_agree(title, row["title"])
                         ]
-                        if len(fallback) != 1:
+                        if not fallback:
                             # Same calendar day rather than the same instant.
                             fallback = [
                                 row for row in await conn.fetch(

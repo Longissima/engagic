@@ -46,7 +46,7 @@ from parsing.memory_budget import MemoryAdmissionTimeout
 from pipeline.url_refresh import refresh_attachment_urls
 from pipeline.utils import attachment_identity
 from scripts.ingest_minutes import (
-    clear_failure,
+    record_ingest_result,
     failure_attempt_limit,
     failure_error_text,
     record_failure,
@@ -72,7 +72,7 @@ CANDIDATES_SQL = """
       AND ($6::text IS NULL OR j.state = $6)
       AND NOT EXISTS (
           SELECT 1 FROM (
-              SELECT b.text_key, b.extract_version
+              SELECT b.text_key, b.extract_version, b.extract_method, b.ocr_pending_pages
               FROM document_source s JOIN document_blob b USING (content_sha256)
               WHERE s.source_identity = a->>'url'
               ORDER BY s.last_validated_at DESC NULLS LAST, s.first_seen DESC
@@ -80,6 +80,8 @@ CANDIDATES_SQL = """
           ) b
           WHERE b.text_key IS NOT NULL
             AND b.extract_version = ANY($5::text[])
+            AND COALESCE(cardinality(b.ocr_pending_pages), 0) = 0
+            AND COALESCE(b.extract_method, '') NOT LIKE '%-partial'
       )
     ORDER BY m.date DESC, i.id
 """
@@ -87,13 +89,15 @@ CANDIDATES_SQL = """
 # Same readiness rule motioncount applies: current text at this identity.
 READY_IDENTITIES_SQL = """
     WITH current_revision AS (
-        SELECT DISTINCT ON (s.source_identity) s.source_identity, b.text_key, b.extract_version
+        SELECT DISTINCT ON (s.source_identity) s.source_identity, b.text_key, b.extract_version, b.extract_method, b.ocr_pending_pages
         FROM document_source s JOIN document_blob b USING (content_sha256)
         WHERE s.source_identity = ANY($1::text[])
         ORDER BY s.source_identity, s.last_validated_at DESC NULLS LAST, s.first_seen DESC
     )
     SELECT source_identity FROM current_revision
     WHERE text_key IS NOT NULL AND extract_version = ANY($2::text[])
+      AND COALESCE(cardinality(ocr_pending_pages), 0) = 0
+      AND COALESCE(extract_method, '') NOT LIKE '%-partial'
 """
 
 FAILURE_STATE_SQL = """
@@ -239,7 +243,7 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
     identity = candidate.identity
     started = time.monotonic()
     try:
-        result = await analyzer.extract_document_async(url, banana=candidate.banana)
+        result = await analyzer.extract_document_async(url, banana=candidate.banana, retry_incomplete=True)
         content_sha256 = result.get("content_sha256")
         ready = False
         if content_sha256 and result.get("corpus_persisted"):
@@ -253,7 +257,7 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
                 content_sha256=(content_sha256 or "")[:16],
             )
             return True
-        await clear_failure(db, identity)
+        await record_ingest_result(db, result, identity, url, candidate.banana)
         counts["ingested"] += 1
         logger.info(
             "attachment ingested",

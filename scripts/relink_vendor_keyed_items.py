@@ -13,14 +13,10 @@ matter_file=derived); matter_file wins over matter_id there, which is exactly
 what the sync funnel now does on every pass, so this only brings history in
 line with what the next sync would do anyway.
 
-Per target matter, in one transaction:
-  1. create the city_matters row if absent, seeded from the newest source
-     matter (title, canonical summary, topics, attachments, metadata) so no
-     summary is lost and nothing is re-summarized
-  2. move items, matter_appearances, deliberations
-  3. copy sponsorships, votes, matter_topics with ON CONFLICT DO NOTHING
-  4. delete source matters that no longer own any item (cascades clean the
-     leftover child rows)
+Per target, move only the items still matching the plan and their keyed evidence.
+Whole-source relationships move only when the plan assigns every source item to
+one target. Ambiguous or conflicting evidence stays on its original matter.
+Sponsorships for retained items are reconciled through the repository.
 
 Usage:
     uv run scripts/relink_vendor_keyed_items.py            # dry run
@@ -37,6 +33,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from config import get_logger
 from database.db_postgres import Database
 from database.id_generation import generate_matter_id
+from database.repositories_async.council_members import CouncilMemberRepository
 from parsing.identifiers import extract_identifier
 
 logger = get_logger(__name__).bind(component="relink_vendor_keyed")
@@ -80,55 +77,80 @@ CREATE_SQL = """
 MOVE_ITEMS_SQL = """
     UPDATE items SET matter_id = $1, matter_file = $2,
            matter_type = COALESCE(matter_type, $3)
-    WHERE id = ANY($4::text[]) AND matter_file IS NULL
+    WHERE id = ANY($4::text[]) AND matter_file IS NULL AND matter_id = ANY($5::text[])
     RETURNING id
 """
 MOVE_APPEARANCES_SQL = """
-    UPDATE matter_appearances SET matter_id = $1
-    WHERE item_id = ANY($2::text[]) AND matter_id <> $1
+    UPDATE matter_appearances a SET matter_id = $1
+    WHERE a.item_id = ANY($2::text[]) AND a.matter_id <> $1
+      AND NOT EXISTS (SELECT 1 FROM matter_appearances existing
+          WHERE existing.matter_id=$1 AND existing.meeting_id=a.meeting_id AND existing.item_id=a.item_id)
+      AND NOT EXISTS (SELECT 1 FROM matter_appearances other
+          WHERE other.item_id=a.item_id AND other.meeting_id=a.meeting_id
+            AND other.matter_id<>a.matter_id)
 """
 MOVE_MOTIONS_SQL = "UPDATE item_motions SET matter_id = $1 WHERE item_id = ANY($2::text[])"
 MOVE_DELIBERATIONS_SQL = "UPDATE deliberations SET matter_id = $1 WHERE matter_id = ANY($2::text[])"
 COPY_SPONSORSHIPS_SQL = """
     INSERT INTO sponsorships (council_member_id, matter_id, is_primary, sponsor_order)
-    SELECT council_member_id, $1::text, is_primary, sponsor_order
-    FROM sponsorships WHERE matter_id = ANY($2::text[])
-    ON CONFLICT (council_member_id, matter_id) DO NOTHING
+    SELECT council_member_id, $1::text, bool_or(is_primary), min(sponsor_order)
+    FROM sponsorships WHERE matter_id = ANY($2::text[]) GROUP BY council_member_id
+    ON CONFLICT (council_member_id, matter_id) DO UPDATE SET
+        is_primary = sponsorships.is_primary OR EXCLUDED.is_primary,
+        sponsor_order = LEAST(sponsorships.sponsor_order, EXCLUDED.sponsor_order)
 """
-COPY_VOTES_SQL = """
-    INSERT INTO votes (council_member_id, matter_id, meeting_id, vote, vote_date, sequence, metadata,
-                       item_id, item_key, motion_index, motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal)
-    SELECT council_member_id, $1::text, meeting_id, vote, vote_date, sequence, metadata,
-           item_id, item_key, motion_index, motion_text, source, content_sha256, receipt, parse_run_id, observation_ordinal
-    FROM votes WHERE matter_id = ANY($2::text[])
-    ON CONFLICT (council_member_id, matter_id, meeting_id, item_key, motion_index, source) DO NOTHING
+MOVE_VOTES_SQL = """
+    UPDATE votes v SET matter_id = $1
+    WHERE v.matter_id = ANY($2::text[])
+      AND (v.item_key = ANY($3::text[])
+           OR (v.item_key = '' AND v.matter_id = ANY($4::text[])))
+      AND NOT EXISTS (
+          SELECT 1 FROM votes existing WHERE existing.matter_id = $1
+            AND existing.council_member_id = v.council_member_id
+            AND existing.meeting_id = v.meeting_id AND existing.item_key = v.item_key
+            AND existing.motion_index = v.motion_index AND existing.source = v.source
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM votes other WHERE other.id <> v.id AND other.matter_id = ANY($2::text[])
+            AND (other.item_key = ANY($3::text[])
+                 OR (other.item_key = '' AND other.matter_id = ANY($4::text[])))
+            AND other.council_member_id=v.council_member_id AND other.meeting_id=v.meeting_id
+            AND other.item_key=v.item_key AND other.motion_index=v.motion_index AND other.source=v.source
+      )
+"""
+CREATE_FROM_ITEM_SQL = """
+    INSERT INTO city_matters (id, banana, matter_file, matter_type, title,
+        canonical_summary, canonical_topics, attachments, first_seen, last_seen)
+    SELECT $1, m.banana, $2, COALESCE($3, i.matter_type), i.title,
+           i.summary, i.topics, i.attachments, m.date, m.date
+    FROM items i JOIN meetings m ON m.id = i.meeting_id WHERE i.id = $4
+    ON CONFLICT (id) DO NOTHING
 """
 COPY_TOPICS_SQL = """
     INSERT INTO matter_topics (matter_id, topic)
     SELECT $1::text, topic FROM matter_topics WHERE matter_id = ANY($2::text[])
     ON CONFLICT DO NOTHING
 """
-# Every live FK onto city_matters is ON DELETE SET NULL (the schema file says
-# CASCADE) and the child columns are NOT NULL, so an emptied parent cannot be
-# deleted until its copied child rows are gone.
-DELETE_EMPTY_CHILDREN_SQL = [
-    f"""
-    DELETE FROM {table} c
-    WHERE c.matter_id = ANY($1::text[])
-      AND NOT EXISTS (SELECT 1 FROM items i WHERE i.matter_id = c.matter_id)
-    """
-    for table in ("matter_topics", "sponsorships", "votes", "matter_appearances", "deliberations")
-]
+# Do not cascade away ambiguous unkeyed history or unresolved collisions.
 DELETE_EMPTY_SQL = """
-    DELETE FROM city_matters cm
-    WHERE cm.id = ANY($1::text[])
+    DELETE FROM city_matters cm WHERE cm.id = ANY($1::text[])
       AND NOT EXISTS (SELECT 1 FROM items i WHERE i.matter_id = cm.id)
+      AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.matter_id = cm.id)
+      AND NOT EXISTS (SELECT 1 FROM item_motions im WHERE im.matter_id = cm.id)
+      AND NOT EXISTS (SELECT 1 FROM matter_appearances a WHERE a.matter_id = cm.id)
+      AND NOT EXISTS (SELECT 1 FROM sponsorships s WHERE s.matter_id = cm.id)
+      AND NOT EXISTS (SELECT 1 FROM deliberations d WHERE d.matter_id = cm.id)
+      AND NOT EXISTS (SELECT 1 FROM matter_topics t WHERE t.matter_id = cm.id)
     RETURNING cm.id
 """
 RECOUNT_SQL = """
-    UPDATE city_matters cm SET appearance_count = sub.n
-    FROM (SELECT matter_id, count(DISTINCT meeting_id) n FROM items WHERE matter_id = $1 GROUP BY 1) sub
-    WHERE cm.id = sub.matter_id
+    UPDATE city_matters cm SET appearance_count = (
+        SELECT count(DISTINCT meeting_id) FROM items WHERE matter_id = cm.id
+    ), first_seen = COALESCE((SELECT min(m.date) FROM items i JOIN meetings m ON m.id=i.meeting_id
+                              WHERE i.matter_id=cm.id), first_seen),
+       last_seen = COALESCE((SELECT max(m.date) FROM items i JOIN meetings m ON m.id=i.meeting_id
+                             WHERE i.matter_id=cm.id), last_seen)
+    WHERE cm.id = ANY($1::text[])
 """
 
 
@@ -139,6 +161,7 @@ class Target:
     items: List[str] = field(default_factory=list)
     sources: Set[str] = field(default_factory=set)
     meetings: Set[str] = field(default_factory=set)
+    whole_sources: Set[str] = field(default_factory=set)
 
 
 async def plan(db, banana) -> Tuple[int, Dict[Tuple[str, str], Target]]:
@@ -158,28 +181,70 @@ async def plan(db, banana) -> Tuple[int, Dict[Tuple[str, str], Target]]:
         group.items.append(row["id"])
         group.sources.add(row["matter_id"])
         group.meetings.add(row["meeting_id"])
+    sources = sorted({source for group in groups.values() for source in group.sources})
+    async with db.pool.acquire() as conn:
+        ownership = await conn.fetch("SELECT matter_id, array_agg(id) AS ids FROM items "
+                                     "WHERE matter_id = ANY($1::text[]) GROUP BY matter_id", sources)
+    source_items = {r['matter_id']: set(r['ids']) for r in ownership}
+    for group in groups.values():
+        group.whole_sources = {source for source in group.sources
+                               if source_items.get(source) and source_items[source] <= set(group.items)}
     return len(rows), groups
 
 
-async def apply_group(conn, target: str, group: Target) -> int:
+async def apply_group(conn, target: str, group: Target, members: CouncilMemberRepository) -> int:
     sources = sorted(group.sources)
     async with conn.transaction():
+        # Use the same meeting locks as sync and minutes publication.
+        await conn.fetch("SELECT id FROM meetings WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE",
+                         sorted(group.meetings))
         seeds = await conn.fetch(SEED_SQL, sources)
         if not seeds:
             return 0
-        await conn.execute(CREATE_SQL, target, seeds[0]["id"], group.matter_file, group.matter_type)
-        moved = await conn.fetch(MOVE_ITEMS_SQL, target, group.matter_file, group.matter_type, group.items)
-        await conn.execute(MOVE_MOTIONS_SQL, target, group.items)
-        await conn.execute(MOVE_APPEARANCES_SQL, target, group.items)
-        await conn.execute(MOVE_DELIBERATIONS_SQL, target, sources)
-        await conn.execute(COPY_SPONSORSHIPS_SQL, target, sources)
-        await conn.execute(COPY_VOTES_SQL, target, sources)
-        await conn.execute(COPY_TOPICS_SQL, target, sources)
-        for statement in DELETE_EMPTY_CHILDREN_SQL:
-            await conn.execute(statement, sources)
-        await conn.fetch(DELETE_EMPTY_SQL, sources)
-        await conn.execute(RECOUNT_SQL, target)
-    return len(moved)
+        await conn.fetch("SELECT id FROM city_matters WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE",
+                         sorted(sources + [target]))
+        await members._lock_attribution_scope(seeds[0]['banana'], conn)
+        eligible = await conn.fetch("""
+            SELECT i.id, i.matter_id FROM items i JOIN meetings m ON m.id=i.meeting_id
+            WHERE i.id = ANY($1::text[]) AND i.matter_id = ANY($2::text[]) AND i.matter_file IS NULL
+            ORDER BY m.date DESC NULLS LAST, i.id FOR UPDATE OF i
+        """, group.items, sources)
+        if not eligible:
+            return 0
+        eligible_ids = [r['id'] for r in eligible]
+        # Only a whole-source move can reuse an aggregate source summary.
+        owners = await conn.fetch("SELECT matter_id, array_agg(id) AS ids FROM items "
+                                  "WHERE matter_id=ANY($1::text[]) GROUP BY matter_id", sources)
+        whole = sorted(r['matter_id'] for r in owners if r['matter_id'] in group.whole_sources
+                       and set(r['ids']) <= set(eligible_ids))
+        seed = next((r for r in seeds if r['id'] in whole), None)
+        if seed:
+            await conn.execute(CREATE_SQL, target, seed['id'], group.matter_file, group.matter_type)
+        else:
+            await conn.execute(CREATE_FROM_ITEM_SQL, target, group.matter_file, group.matter_type, eligible_ids[0])
+        moved = await conn.fetch(MOVE_ITEMS_SQL, target, group.matter_file, group.matter_type, eligible_ids, sources)
+        moved_ids = [r['id'] for r in moved]
+        await conn.execute(MOVE_MOTIONS_SQL, target, moved_ids)
+        await conn.execute(MOVE_APPEARANCES_SQL, target, moved_ids)
+        await conn.execute(MOVE_VOTES_SQL, target, sources, moved_ids, whole)
+        await conn.execute(MOVE_DELIBERATIONS_SQL, target, whole)
+        await conn.execute(COPY_TOPICS_SQL, target, whole)
+        await conn.execute("""INSERT INTO matter_topics(matter_id, topic)
+            SELECT $1, topic FROM item_topics WHERE item_id = ANY($2::text[])
+            ON CONFLICT DO NOTHING""", target, moved_ids)
+        # Reconcile aggregates only where items still establish their identity.
+        retained = await conn.fetch("SELECT DISTINCT matter_id FROM items WHERE matter_id=ANY($1::text[])", sources)
+        await members.reconcile_matter_sponsorships(banana=seeds[0]['banana'],
+            affected_matter_ids=[target] + [r['matter_id'] for r in retained], conn=conn)
+        # Preserve legacy sponsorships on an unambiguously moved whole source.
+        await conn.execute(COPY_SPONSORSHIPS_SQL, target, whole)
+        affected = await conn.fetch("SELECT DISTINCT council_member_id FROM sponsorships WHERE matter_id=ANY($1::text[])", whole + [target])
+        await conn.execute("DELETE FROM sponsorships WHERE matter_id=ANY($1::text[])", whole)
+        await conn.execute("DELETE FROM matter_topics WHERE matter_id=ANY($1::text[])", whole)
+        await members.recompute_attribution_counts({r['council_member_id'] for r in affected}, conn)
+        await conn.execute(RECOUNT_SQL, sources + [target])
+        await conn.fetch(DELETE_EMPTY_SQL, whole)
+    return len(moved_ids)
 
 
 async def main() -> None:
@@ -217,7 +282,7 @@ async def main() -> None:
         moved_total = 0
         async with db.pool.acquire() as conn:
             for n, ((_, target), g) in enumerate(groups.items(), 1):
-                moved_total += await apply_group(conn, target, g)
+                moved_total += await apply_group(conn, target, g, db.council_members)
                 if n % 500 == 0:
                     logger.info("progress", groups_done=n, items_moved=moved_total)
         logger.info("relink complete", items_moved=moved_total, target_matters=len(groups))

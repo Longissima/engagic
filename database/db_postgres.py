@@ -28,6 +28,7 @@ from database.repositories_async import (
     PipelineLifecycleRepository,
     SearchRepository,
 )
+from database.repositories_async.council_members import MINUTES_PREFERRED_VOTE
 from database.repositories_async.deliberation import DeliberationRepository
 from database.repositories_async.engagement import EngagementRepository
 from database.repositories_async.feedback import FeedbackRepository
@@ -539,7 +540,7 @@ class Database:
 
     # Votes use their own compact projection so the total, growth, city ranking,
     # and weekly sparkline need one pass over votes instead of four.
-    _PLATFORM_METRICS_VOTES = """
+    _PLATFORM_METRICS_VOTES = f"""
         WITH
             weeks AS (
                 SELECT generate_series(
@@ -552,33 +553,36 @@ class Database:
                 SELECT date_trunc('week', NOW()) - INTERVAL '8 weeks' AS window_start,
                        date_trunc('week', NOW()) AS window_end
             ),
-            -- A row here is one official's ballot on one motion. The grain is
-            -- per-source: API votes key on matter_id (item_id is NULL for all
-            -- of them), minutes-derived votes key on item_id. COALESCE picks
-            -- whichever the row has so a motion counts once either way.
-            -- item_key is '' rather than NULL on API rows, so it must not be
-            -- part of any distinct count -- it would collapse unrelated
-            -- ballots together.
             vote_flags AS MATERIALIZED (
-                SELECT council_member_id, created_at, meeting_id, motion_index,
-                       source, receipt, vote,
-                       COALESCE(item_id::TEXT, matter_id::TEXT) AS subject
-                FROM votes
+                SELECT v.council_member_id, v.created_at, v.meeting_id,
+                       v.matter_id, v.item_key, v.motion_index,
+                       v.source, v.receipt, v.vote
+                FROM votes v WHERE {MINUTES_PREFERRED_VOTE}
             ),
-            -- One row per motion, with its nay count, so "divided" is a
-            -- property of the motion rather than of a single ballot.
+            selected_motions AS (
+                SELECT im.meeting_id, im.matter_id, im.item_id AS item_key,
+                       im.motion_index, im.source,
+                       COALESCE((im.tally->>'yes')::int, 0) AS ayes,
+                       COALESCE((im.tally->>'no')::int, 0) AS nays
+                FROM item_motions im
+                WHERE vote_is_preferred(im.source, im.meeting_id, im.matter_id, im.item_id)
+                UNION ALL
+                SELECT v.meeting_id, v.matter_id, v.item_key, v.motion_index, v.source,
+                       count(*) FILTER (WHERE lower(v.vote) IN ('yes', 'aye', 'yea'))::int,
+                       count(*) FILTER (WHERE lower(v.vote) IN ('no', 'nay', 'against'))::int
+                FROM vote_flags v
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM item_motions im
+                    WHERE im.meeting_id = v.meeting_id AND im.matter_id = v.matter_id
+                      AND im.item_id = v.item_key AND im.motion_index = v.motion_index
+                      AND im.source = v.source
+                )
+                GROUP BY v.meeting_id, v.matter_id, v.item_key, v.motion_index, v.source
+            ),
             motion_rollup AS (
-                SELECT
-                    COUNT(*) AS motions,
-                    COUNT(*) FILTER (WHERE nays > 0) AS divided_motions
-                FROM (
-                    SELECT meeting_id, subject, motion_index,
-                           COUNT(*) FILTER (
-                               WHERE LOWER(vote) IN ('no', 'nay', 'against')
-                           ) AS nays
-                    FROM vote_flags
-                    GROUP BY 1, 2, 3
-                ) m
+                SELECT count(*) AS motions,
+                       count(*) FILTER (WHERE ayes > 0 AND nays > 0) AS divided_motions
+                FROM selected_motions
             ),
             vote_rollup AS (
                 SELECT
