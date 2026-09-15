@@ -9,7 +9,6 @@ Item-level adapter that extracts structured agenda items with:
 - Hierarchical item flattening (sections -> leaf items)
 """
 
-import asyncio
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
@@ -83,6 +82,14 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             elif isinstance(meeting, dict):
                 results.append(meeting)
 
+        failures = [m for m in processed_meetings if isinstance(m, Exception)]
+        if failures:
+            # Let FetchResult and the fetcher's retry loop handle an incomplete pass.
+            # Never publish a successful partial snapshot after an API failure.
+            raise RuntimeError(
+                f"CivicClerk failed {len(failures)} of {len(events)} events: "
+                f"{type(failures[0]).__name__}: {failures[0]}"
+            ) from failures[0]
         return results
 
     async def _fetch_all_events(self, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
@@ -198,6 +205,7 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
 
         if items:
             result["items"] = items
+            result["authoritative_item_source"] = "civicclerk_api"
             # Also include agenda URL for reference
             agenda_doc = next(
                 (doc for doc in event.get("publishedFiles", [])
@@ -210,6 +218,13 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
                     or self._build_packet_url(agenda_doc)
                 )
         else:
+            logger.info(
+                "no usable structured agenda; trying published documents",
+                vendor="civicclerk", slug=self.slug, event_id=event_id,
+                agenda_id=agenda_id, has_agenda=has_agenda,
+            )
+            # Only a successful empty/placeholder response reaches this fallback.
+            # Request and parsing failures propagate to the fetcher's retry loop.
             # No usable structured items — try chunking published PDFs.
             # Strategy: agenda PDF first (for hyperlinked attachments),
             # then the full packet (for TOC-based body text extraction).
@@ -292,7 +307,9 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             response = await self._get(url, headers=headers)
             data = await response.json()
 
-            raw_items = data.get("items", [])
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise ValueError("CivicClerk meeting response has no valid items list")
+            raw_items = data["items"]
 
             # Flatten hierarchy and process items
             items = self._flatten_items(raw_items, event_id, agenda_id)
@@ -314,9 +331,12 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
                 vendor="civicclerk",
                 slug=self.slug,
                 agenda_id=agenda_id,
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__,
             )
-            return []
+            raise RuntimeError(
+                f"CivicClerk agenda {agenda_id} request/parsing failed: {type(e).__name__}: {e}"
+            ) from e
 
     def _flatten_items(
         self,

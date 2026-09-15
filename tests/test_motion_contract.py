@@ -48,7 +48,7 @@ CREATE TABLE document_blob (content_sha256 text PRIMARY KEY, original_key text,
 
 
 @pytest_asyncio.fixture
-async def database():
+async def database(request):
     if not DSN:
         pytest.skip('ENGAGIC_TEST_DATABASE_URL must name an isolated database')
     schema = 'motion_test_' + uuid.uuid4().hex
@@ -59,9 +59,13 @@ async def database():
         await conn.execute(f'SET search_path TO "{schema}"')
         await conn.execute(SCHEMA)
         migrations = Path(__file__).resolve().parents[1] / 'database/migrations'
-        for name in ('040_minutes_documents.sql', '041_votes_motion_grain.sql',
-                     '043_votes_motion_grain_phase2.sql', '044_item_motions.sql',
-                     '049_reported_body.sql'):
+        names = ['040_minutes_documents.sql', '041_votes_motion_grain.sql',
+                 '043_votes_motion_grain_phase2.sql', '044_item_motions.sql',
+                 '049_reported_body.sql']
+        if getattr(request, 'param', None) != 'legacy':
+            names += ['050_reported_referrer.sql', '052_minutes_preference.sql',
+                      '053_referrer_lineage.sql']
+        for name in names:
             await conn.execute((migrations / name).read_text())
         await conn.set_type_codec('jsonb', schema='pg_catalog', encoder=json.dumps, decoder=json.loads)
         await conn.execute("""
@@ -224,7 +228,7 @@ async def test_item_deletion_preserves_evidence_and_motion_identity(database):
     await conn.execute("DELETE FROM items WHERE id IN ('item', 'item2')")
     assert await conn.fetchval('SELECT count(*) FROM item_motions') == 2
     assert await conn.fetchval('SELECT count(*) FROM votes') == 5
-    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 3
+    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 2
     groups = await repo.get_motion_groups(meeting_id='meeting')
     assert len(groups) == 2
     assert {m['item_id'] for m in groups} == {'item', 'item2'}
@@ -278,16 +282,16 @@ async def test_matter_api_exposes_a_motion_without_any_individual_votes(database
 
 
 @pytest.mark.asyncio
-async def test_relink_copy_preserves_detached_item_keys_and_counts(database):
-    from scripts.relink_vendor_keyed_items import COPY_VOTES_SQL
+async def test_relink_move_preserves_detached_item_keys_and_counts(database):
+    from scripts.relink_vendor_keyed_items import MOVE_VOTES_SQL
     conn, _ = database
     await persist_meeting(conn, ROW, published(motion(), motion(item_id='item2')), ROSTER)
     await conn.execute("DELETE FROM items")
     await conn.execute("INSERT INTO city_matters(id) VALUES ('new-matter')")
-    await conn.execute(COPY_VOTES_SQL, 'new-matter', ['matter'])
+    await conn.execute(MOVE_VOTES_SQL, 'new-matter', ['matter'], ['item', 'item2'], [])
     rows = await conn.fetch("SELECT item_key FROM votes WHERE matter_id='new-matter'")
     assert len(rows) == 4 and {r['item_key'] for r in rows} == {'item', 'item2'}
-    await conn.execute("DELETE FROM votes WHERE matter_id='matter'")
+    assert await conn.fetchval("SELECT count(*) FROM votes WHERE matter_id='matter'") == 0
     assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 2
 
 
@@ -303,6 +307,7 @@ async def test_rollback_refuses_to_discard_motion_evidence(database):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("database", ["legacy"], indirect=True)
 async def test_upgrade_repairs_existing_counts_and_marks_minutes_ownership(database):
     conn, _ = database
     migrations = Path(__file__).resolve().parents[1] / 'database/migrations'
@@ -516,6 +521,11 @@ async def test_corpus_readiness_uses_current_revision_and_exposes_older_text(dat
     assert response['fallback_used'] is False
     # A genuine origin validation can make previously seen bytes current again.
     await conn.execute("UPDATE document_source SET last_validated_at='2026-09-12' WHERE content_sha256='sha'")
+    # Revalidation does not complete pending OCR.
+    assert await conn.fetch(READY_IDENTITIES_SQL, ['url'], ['1', '2']) == []
+    state = await conn.fetchrow(SOURCE_STATE_SQL, ['url'], ['1', '2'], 7)
+    assert state['content_sha256'] == 'sha' and state['extraction_incomplete']
+    await conn.execute("UPDATE document_blob SET extract_method='pymupdf', ocr_pending_pages='{}' WHERE content_sha256='sha'")
     assert len(await conn.fetch(READY_IDENTITIES_SQL, ['url'], ['1', '2'])) == 1
 
 
@@ -563,14 +573,8 @@ async def test_ballot_preference_reaches_api_votes_with_no_item_identity(databas
 
 
 @pytest.mark.asyncio
-async def test_minutes_that_name_nobody_do_not_delete_an_api_ballot(database):
-    """Deduplication only removes a duplicate.
-
-    A tally- or outcome-only minutes motion records an outcome and names no
-    voter, so it competes with nothing at ballot grain. Yielding to it would
-    erase the only record that a member voted at all. Outcome grain still
-    prefers minutes; that is asserted separately on matter_appearances.
-    """
+async def test_outcome_only_minutes_hide_api_ballots_until_retraction(database):
+    """Minutes own the public projection while raw API evidence survives."""
     conn, pool = database
     repo = CouncilMemberRepository(pool)
     await repo.record_vote('alice', 'matter', 'meeting', 'yes', conn=conn)
@@ -578,6 +582,54 @@ async def test_minutes_that_name_nobody_do_not_delete_an_api_ballot(database):
         motion(method='outcome', votes=[], tally={}, outcome='passed')), ROSTER)
 
     history = await repo.get_member_voting_record('alice')
-    assert [v['source'] for v in history] == ['api']
-    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 1
+    assert history == []
+    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 0
+    assert await conn.fetchval("SELECT count(*) FROM votes WHERE source='api'") == 1
     assert await conn.fetchval('SELECT vote_source FROM matter_appearances') == 'minutes'
+    await persist_meeting(conn, ROW, {}, ROSTER)
+    assert [v['source'] for v in await repo.get_member_voting_record('alice')] == ['api']
+    assert await conn.fetchval("SELECT vote_count FROM council_members WHERE id='alice'") == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_motion_and_vote_changes_maintain_preferred_counts(database):
+    """Direct SQL must maintain counters without a repository recount."""
+    conn, _ = database
+    await conn.execute("""INSERT INTO votes(council_member_id,matter_id,meeting_id,vote,source)
+        VALUES ('alice','matter','meeting','yes','api'), ('bob','matter','meeting','no','api')""")
+    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members')) == {'alice': 1, 'bob': 1}
+    await conn.execute("""INSERT INTO item_motions(item_id,motion_index,source,matter_id,meeting_id,method,outcome,motion_text)
+        VALUES ('item',0,'minutes','matter','meeting','outcome','passed','Motion passed')""")
+    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members')) == {'alice': 0, 'bob': 0}
+    await conn.execute("UPDATE item_motions SET source='api'")
+    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members')) == {'alice': 1, 'bob': 1}
+    await conn.execute("UPDATE item_motions SET source='minutes'")
+    assert await conn.fetchval('SELECT sum(vote_count) FROM council_members') == 0
+    await conn.execute('DELETE FROM item_motions')
+    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members')) == {'alice': 1, 'bob': 1}
+    await conn.execute("UPDATE votes SET council_member_id='alice', motion_index=1 WHERE council_member_id='bob'")
+    assert dict(await conn.fetch('SELECT id,vote_count FROM council_members')) == {'alice': 2, 'bob': 0}
+    await conn.execute('DELETE FROM votes')
+    assert await conn.fetchval('SELECT sum(vote_count) FROM council_members') == 0
+
+
+@pytest.mark.asyncio
+async def test_portal_alias_retains_origin_validation_clocks(database):
+    conn, pool = database
+    await conn.execute("""CREATE TABLE document_source (
+        content_sha256 text, source_identity text, banana text,
+        last_seen timestamp, last_observed_at timestamp,
+        last_validated_at timestamp, last_validation_attempt_at timestamp,
+        PRIMARY KEY(content_sha256,source_identity));
+        INSERT INTO document_source VALUES ('sha','api','testCA',
+            '2026-01-01','2026-01-01','2026-01-01','2026-01-02');""")
+    repo = DocumentBlobRepository(pool)
+    await repo.record_source_alias('sha', 'api', 'portal', 'testCA')
+    first = dict(await conn.fetchrow("SELECT * FROM document_source WHERE source_identity='portal'"))
+    assert first['last_validated_at'] == datetime(2026, 1, 1)
+    assert first['last_validation_attempt_at'] == datetime(2026, 1, 2)
+    assert first['last_observed_at'] > first['last_validated_at']
+    await conn.execute("UPDATE document_source SET last_validated_at='2026-02-01' WHERE source_identity='api'")
+    await repo.record_source_alias('sha', 'api', 'portal', 'testCA')
+    assert await conn.fetchval("SELECT last_validated_at FROM document_source WHERE source_identity='portal'") == datetime(2026, 2, 1)
+    assert await conn.fetchval('SELECT count(*) FROM document_source') == 2

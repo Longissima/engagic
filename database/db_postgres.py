@@ -314,6 +314,8 @@ class Database:
                     id,
                     banana,
                     created_at,
+                    CASE WHEN jsonb_typeof(attachments) = 'array'
+                        THEN jsonb_array_length(attachments) ELSE 0 END AS attachment_count,
                     canonical_summary IS NOT NULL
                         AND canonical_summary != '' AS has_content
                 FROM city_matters
@@ -321,6 +323,8 @@ class Database:
             item_flags AS MATERIALIZED (
                 SELECT
                     i.meeting_id,
+                    CASE WHEN jsonb_typeof(i.attachments) = 'array'
+                        THEN jsonb_array_length(i.attachments) ELSE 0 END AS attachment_count,
                     i.created_at,
                     i.matter_id IS NULL AS is_standalone,
                     i.summary IS NOT NULL AS has_summary,
@@ -343,6 +347,7 @@ class Database:
             item_rollup AS (
                 SELECT
                     COUNT(*) AS agenda_items,
+                    COALESCE(SUM(attachment_count), 0)::bigint AS item_attachments,
                     COUNT(*) FILTER (WHERE has_summary) AS summarized_items,
                     COUNT(*) FILTER (WHERE has_filter) AS filtered_items,
                     COUNT(*) FILTER (
@@ -362,6 +367,7 @@ class Database:
             matter_rollup AS (
                 SELECT
                     COUNT(*) AS matters,
+                    COALESCE(SUM(attachment_count), 0)::bigint AS matter_attachments,
                     COUNT(*) FILTER (WHERE has_content) AS matters_with_summary,
                     COUNT(*) FILTER (
                         WHERE created_at >= NOW() - INTERVAL '30 days'
@@ -535,7 +541,30 @@ class Database:
             (SELECT COUNT(*) FROM council_members) AS council_members,
             (SELECT COUNT(*) FROM committee_members) AS committee_assignments,
             (SELECT COUNT(*) FROM sponsorships) AS sponsorships,
-            (SELECT COUNT(*) FROM minutes_documents) AS minutes_documents
+            (SELECT COUNT(*) FROM minutes_documents) AS minutes_documents,
+            corpus.*
+        FROM (
+            SELECT COUNT(*) AS corpus_documents,
+                   COUNT(*) FILTER (WHERE text_key IS NOT NULL) AS corpus_text_documents,
+                   -- Extraction path, not a claim about the document's origin:
+                   -- mixed PDFs belong to OCR; partial/unknown paths stay unclassified.
+                   COUNT(*) FILTER (
+                       WHERE text_key IS NOT NULL AND extract_method IN (
+                           'pymupdf', 'python-docx', 'antiword', 'striprtf',
+                           'python-pptx', 'openpyxl'
+                       ) AND COALESCE(ocr_page_count, 0) = 0
+                       AND COALESCE(cardinality(ocr_pending_pages), 0) = 0
+                   ) AS corpus_native_documents,
+                   COUNT(*) FILTER (
+                       WHERE text_key IS NOT NULL AND ocr_page_count > 0
+                   ) AS corpus_ocr_documents,
+                   COALESCE(SUM(ocr_page_count), 0)::bigint AS corpus_ocr_pages,
+                   COUNT(*) FILTER (WHERE page_count IS NOT NULL) AS corpus_documents_with_pages,
+                   COALESCE(SUM(page_count), 0)::bigint AS corpus_pages,
+                   COALESCE(SUM(bytes) FILTER (WHERE original_key IS NOT NULL), 0)::bigint
+                       AS corpus_archived_bytes
+            FROM document_blob
+        ) corpus
     """
 
     # Votes use their own compact projection so the total, growth, city ranking,

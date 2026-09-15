@@ -40,3 +40,12 @@ def is_garbled_text_layer(text: str) -> bool:
         and letter_or_digit_ratio < 0.35
         and extended_letter_ratio >= 0.35
     )
+
+
+def has_excessive_layout_padding(text: str) -> bool:
+    """Detect pathological coordinate sorting, not normal table spacing."""
+    return (
+        len(text) > 2000
+        and text.count(' ') / len(text) > 0.85
+        and max((len(line) for line in text.splitlines()), default=0) > 2000
+    )

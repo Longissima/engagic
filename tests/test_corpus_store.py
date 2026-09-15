@@ -343,7 +343,7 @@ def test_clean_v1_extraction_remains_compatible_but_garbled_v1_repairs_lazily():
         "\x9c:w3¬:9 Ö9R\x9c:8¬wÔÖ\x8e\x9cÖR\x8b9S " * 80
     ).encode()
     assert run(store.lookup_extraction(SHA)) is None
-    assert EXTRACT_VERSION == "2"
+    assert EXTRACT_VERSION == "3"
 
 
 def test_partial_ocr_extraction_is_retryable_and_can_be_replaced():
@@ -437,3 +437,14 @@ def test_sha256_hex_is_content_identity():
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_legacy_layout_padding_is_reextracted_but_clean_text_stays_cached():
+    store, repo = make_store()
+    run(store.archive_original(SHA, byte_count=len(PDF_BYTES), data=PDF_BYTES))
+    run(store.persist_extraction(SHA, {"success": True, "text": "Readable budget memo. " * 100, "method": "pymupdf", "page_count": 2, "ocr_pages": 0}))
+    for version in ("1", "2"):
+        repo.blobs[SHA]["extract_version"] = version
+        assert run(store.lookup_extraction(SHA)) is not None
+    store.r2.objects["text/" + SHA + ".txt"] = ("Budget" + " " * 10000 + "memo").encode()
+    assert run(store.lookup_extraction(SHA)) is None

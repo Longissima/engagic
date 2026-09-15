@@ -327,7 +327,10 @@ def _orient_tally(tally, outcome, context):
 
 
 def _tally_near(lines: List[str], idx: int, result_text: str) -> Optional[Tuple[int, int, int]]:
-    candidates = [result_text] + lines[idx:idx + 2]
+    candidates = [result_text]
+    # A following result starts another motion; its tally cannot fill this one.
+    if idx + 1 < len(lines) and not RESULT_RE.search(lines[idx + 1]):
+        candidates.append(lines[idx + 1])
     for text in candidates:
         for m in TALLY_RE.finditer(text):
             before = text[:m.start()]
@@ -337,6 +340,19 @@ def _tally_near(lines: List[str], idx: int, result_text: str) -> Optional[Tuple[
                 if yes + no + third <= 60:
                     return yes, no, third
     return None
+
+
+def _reported_continuation(previous: Evidence, current: Evidence, block: str, sentences) -> bool:
+    """An immediately following 'The motion ...' sentence reports the same action."""
+    if not previous.reported_body or current.reported_body:
+        return False
+    if (previous.outcome != current.outcome
+            or (previous.tally and current.tally and previous.tally != current.tally)):
+        return False
+    end = next((end for start, end in sentences if start <= previous.offset < end), None)
+    return (end is not None and end <= current.offset
+            and not block[end:current.offset].strip()
+            and re.match(r"the\s+motion\b", block[current.offset:], re.I) is not None)
 
 
 def find_evidence(block: str) -> List[Evidence]:
@@ -389,27 +405,42 @@ def find_evidence(block: str) -> List[Evidence]:
                              if start <= ev.offset < end), line)
             ev.reported_body = reported_body(sentence)
             if ev.reported_body:
+                window = sentence
+                ev.unanimous = bool(_UNANIMOUS_RE.search(sentence))
                 ev.qualifications.append('reported_committee_action')
             ev.sections = _parse_sections(lines, idx + 1, 14)
-            if not ev.sections and idx > 0:
+            if not ev.sections and idx > 0 and not ev.reported_body:
                 # Alameda County prints the lists before "Motion passed 2/0"
                 prior = _parse_sections(lines, max(0, idx - 8), 8)
                 if prior and all(s.value != "PRESENT" for s in prior):
                     ev.sections = prior
             # Look back a few lines: the motion sentence usually precedes
             # the result, and both sit inside the same passage.
-            context = " ".join(lines[max(0, idx - 4):idx + 2])
+            context = sentence if ev.reported_body else " ".join(lines[max(0, idx - 4):idx + 2])
             ev.movers = [m.group("name") for m in _MOVER_RE.finditer(context)]
             ev.movers += [m.group("name") for m in _MOVED_SUFFIX_RE.finditer(context)]
             ev.procedural = bool(_PROCEDURAL_MOTION_RE.search(context))
-            ev.tally = _orient_tally(_tally_near(lines, idx, line), outcome,
-                                     " ".join(lines[idx:idx + 3]))
+            tally = (_tally_near([sentence], 0, sentence) if ev.reported_body
+                     else _tally_near(lines, idx, line))
+            ev.tally = _orient_tally(tally, outcome,
+                                     sentence if ev.reported_body else " ".join(lines[idx:idx + 3]))
             # "Motion Passed 5-0 with one abstention": somebody present did
             # not vote aye, so attendance arithmetic cannot name the ayes.
             if _ABSTENTION_MENTION_RE.search(window):
                 ev.unanimous = False
             if _ABSTENTION_MENTION_RE.search(window):
                 ev.qualifications.append(window)
+            if found and _reported_continuation(found[-1], ev, block, sentences):
+                previous = found.pop()
+                ev.reported_body = previous.reported_body
+                ev.disposition = previous.disposition
+                ev.tally = ev.tally or previous.tally
+                ev.sections = ev.sections or previous.sections
+                ev.result_text = previous.result_text + " " + ev.result_text
+                ev.offset = previous.offset
+                ev.source_start = min(previous.source_start, ev.source_start)
+                ev.movers = previous.movers or ev.movers
+                ev.qualifications = previous.qualifications + ev.qualifications
             found.append(ev)
             break
     return found

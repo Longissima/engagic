@@ -34,6 +34,7 @@ class MetricsDatabaseStub(Database):
             self.calls["votes"] += 1
             return {
                 "votes": 30,
+                "votes_with_receipt": 12,
                 "vote_trend": [5] * 8,
                 "votes_by_city": [{"city": "example", "votes": 30, "voters": 2}],
             }
@@ -52,6 +53,7 @@ async def test_platform_metrics_single_flight_and_cache():
 
     assert first is second is third
     assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1}
+    assert first["vote_receipt_rate"] == 40.0
     assert first["meeting_summary_rate"] == 40.0
     assert first["item_summary_rate"] == 60.0
     assert first["trends"] == {

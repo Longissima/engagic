@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 
-ITEM_FILTER_VERSION = "ifv1"
+ITEM_FILTER_VERSION = "ifv2"
 ATTACHMENT_FILTER_VERSION = "afv1"
 
 
@@ -75,6 +75,11 @@ PROCEDURAL_PATTERNS = [
     r'\brecess\b',  # Meeting recess (\b prevents matching "recession")
     r'moment of silence',
     r'public comment',  # The period itself, not the content
+    # Agenda footers sometimes become item titles when extracted from PDFs.
+    # Match direct attendee instructions, not proposals about participation/accessibility.
+    r'^to\s+speak\s+on\s+an\s+agenda\s+item,?\s+please\s+approach\s+the\s+podium\b',
+    r'^if\s+your\s+issue\s+is\s+not\s+a\s+topic\s+on\s+the\s+agenda,?\s+please\s+approach\s+the\s+podium\b',
+    r'^if\s+you\s+require\s+accommodations?\s+for\s+this\s+meeting\b',
     r'^communications?\s*$',  # Standalone "Communications" agenda section -- not "Telecommunications Agreement"
     r'^public communications?\s*$',
     r'communications? from\s+the\s+public',  # Public comment routing; substantive senders (mayor, manager, council, staff, board) fall through to summarization

@@ -259,6 +259,17 @@ export interface PlatformMetrics {
 		meeting_summary_rate: number;
 		item_summary_rate: number;
 	};
+	corpus?: {
+		attachments: number;
+		documents: number;
+		text_documents: number;
+		native_documents: number;
+		ocr_documents: number;
+		ocr_pages: number;
+		documents_with_pages: number;
+		pages: number;
+		archived_bytes: number;
+	};
 	growth: {
 		meetings_30d: number;
 		items_30d: number;

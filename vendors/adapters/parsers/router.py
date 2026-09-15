@@ -17,6 +17,7 @@ Engines:
 """
 
 import time
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -45,6 +46,7 @@ OPEN_FAILED = "open_failed"        # fitz cannot open the file
 ENCRYPTED = "encrypted"            # password-protected
 NO_TEXT_LAYER = "no_text_layer"    # scanned/image-only, nothing to anchor on
 NO_ITEMS = "no_items"              # parsed fine, no item structure found
+NUMERIC_TABLE = "numeric_table_rows"  # assessment/financial rows misread as headings
 DEGENERATE = "degenerate_single_item"  # one item swallowed a long document
 ENGINE_ERROR = "engine_error"      # chunker raised
 TIMEOUT = "timeout"                # guard killed a wedged/runaway chunk (set by dispatch)
@@ -265,6 +267,20 @@ class ChunkResult:
 # means the engine found no boundaries and returned everything as one blob.
 DEGENERATE_MIN_PAGES = 10
 DEGENERATE_MIN_BODY_CHARS = 50_000
+
+
+def _is_numeric_table(items: List[Dict[str, Any]]) -> bool:
+    """Reject a result dominated by numeric rows, without banning decimal headings."""
+    if len(items) < 10:
+        return False
+    numeric_rows = 0
+    for item in items:
+        title = item.get("title") or ""
+        digits = sum(c.isdigit() for c in title)
+        letters = sum(c.isalpha() for c in title)
+        if digits >= 8 and digits > 4 * max(letters, 1) and not re.search(r"[^\W\d_]{3}", title):
+            numeric_rows += 1
+    return numeric_rows / len(items) >= 0.8
 
 
 def _is_degenerate(items: List[Dict[str, Any]], profile: Optional[PdfProfile]) -> bool:
@@ -593,6 +609,11 @@ def chunk_pdf(
             duration_ms=elapsed_ms,
         )
         result.attempts.append(attempt)
+
+        if items and _is_numeric_table(items):
+            attempt.failure_reason = NUMERIC_TABLE
+            logger.info("chunk rung rejected numeric table rows", rung=rung, item_count=len(items))
+            continue
 
         if items and _is_degenerate(items, result.profile):
             # A junk bookmark tree (file-stem codes, structure tags leaked

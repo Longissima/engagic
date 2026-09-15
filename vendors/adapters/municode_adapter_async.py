@@ -119,6 +119,7 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         self._curl_session = None
         self._tunnel_down = False
         self._drupal_minutes_cache: Optional[Dict[str, str]] = None
+        self._drupal_minutes_lock = asyncio.Lock()
 
         # Check config for this slug (try slug directly, then uppercase variant)
         slug_config = self._all_config.get(self.slug, self._all_config.get(self.slug.upper(), {}))
@@ -163,17 +164,23 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
         already come back without minutes, so a city whose API carries them
         (Los Gatos) never pays for this request.
         """
-        if self._drupal_minutes_cache is not None:
+        async with self._drupal_minutes_lock:
+            if self._drupal_minutes_cache is None:
+                # Publish only a completed listing. Cancellation leaves it unset
+                # so the next waiter can retry instead of reading a partial cache.
+                self._drupal_minutes_cache = await self._load_drupal_minutes()
             return self._drupal_minutes_cache
-        self._drupal_minutes_cache = {}
+
+    async def _load_drupal_minutes(self) -> Dict[str, str]:
+        minutes: Dict[str, str] = {}
         if self._is_publish_page or self._is_drupal:
-            return self._drupal_minutes_cache
+            return minutes
         try:
             response = await self._get(self.base_url + "/")
             html = await response.text() if response is not None else ""
         except Exception as exc:
             logger.debug("drupal minutes listing unavailable", slug=self.slug, error=str(exc))
-            return self._drupal_minutes_cache
+            return minutes
         for cell in _DRUPAL_MINUTES_CELL_RE.findall(html or ""):
             href = re.search(r'href="([^"]+)"', cell)
             if not href:
@@ -181,11 +188,11 @@ class AsyncMunicodeAdapter(AsyncBaseAdapter):
             url = href.group(1)
             found = _DRUPAL_MEETING_ID_RE.search(url)
             if found:
-                self._drupal_minutes_cache.setdefault(
+                minutes.setdefault(
                     found.group(1), urljoin(self.base_url, url))
         logger.info("drupal minutes listing parsed", slug=self.slug,
-                    found=len(self._drupal_minutes_cache))
-        return self._drupal_minutes_cache
+                    found=len(minutes))
+        return minutes
 
     def _detect_publish_page_mode(self, slug: str) -> bool:
         """Detect if slug is a city code for PublishPage vs subdomain slug.

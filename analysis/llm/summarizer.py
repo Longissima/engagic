@@ -137,7 +137,8 @@ class Summarizer:
         # characterizations, and internal-conflict reconciliation;
         # v3.3: model swap to GLM-5.3-flash, privacy floor for private
         # individuals' names and home addresses, sentence budget enforced).
-        self.prompts_version = "v3.3"
+        # v3.4: explicit jurisdiction/body context and attachment availability.
+        self.prompts_version = "v3.4"
 
         if prompts_path is None:
             # Load from package resources (works in installed packages)

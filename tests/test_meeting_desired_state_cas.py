@@ -1,3 +1,4 @@
+from unittest.mock import AsyncMock
 """Meeting writes fence same-version queue re-owners at the commit boundary."""
 
 from contextlib import AbstractAsyncContextManager
@@ -430,7 +431,7 @@ async def test_bare_item_gets_explicit_no_content_disposition():
             "item_id": "item-cas",
             "filter_reason": "no_content",
             "filter_rule_id": "system:no_content",
-            "filter_version": "ifv1",
+            "filter_version": "ifv2",
             "filter_source": "meeting_processor",
         }
     ]
@@ -466,7 +467,7 @@ async def test_itemless_meeting_completes_as_owned_no_content():
     processor = Processor.__new__(Processor)
     processor.db = cast(
         Any,
-        SimpleNamespace(meetings=Meetings(), items=Items()),
+        SimpleNamespace(meetings=Meetings(), items=Items(), jurisdictions=SimpleNamespace(get_city=AsyncMock(return_value=None))),
     )
     processor.analyzer = cast(Any, object())
 
@@ -679,7 +680,7 @@ async def test_packet_completion_requires_summary_and_preserves_participation():
     processor = Processor.__new__(Processor)
     processor.db = cast(
         Any,
-        SimpleNamespace(meetings=Meetings(), items=Items()),
+        SimpleNamespace(meetings=Meetings(), items=Items(), jurisdictions=SimpleNamespace(get_city=AsyncMock(return_value=None))),
     )
     processor.analyzer = cast(Any, Analyzer())
 

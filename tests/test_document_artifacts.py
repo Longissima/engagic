@@ -875,7 +875,7 @@ def test_civicclerk_portal_agenda_url_maps_to_the_api_file_stream():
 
 
 def test_acquire_fetches_the_api_url_but_keeps_the_portal_url_as_requested(monkeypatch):
-    """A portal agenda URL must never become the corpus identity.
+    """Fetch the API bytes and retain the portal identity as an alias.
 
     Fetched directly it returns the portal's JavaScript shell, which PyMuPDF
     opens as a valid 1-page document -- so without the rewrite the shell is
@@ -892,6 +892,7 @@ def test_acquire_fetches_the_api_url_but_keeps_the_portal_url_as_requested(monke
         def __init__(self):
             self.looked_up = []
             self.archives = []
+            self.aliases = []
 
         async def get_original_artifact_by_identity(self, source_url):
             self.looked_up.append(source_url)
@@ -900,6 +901,9 @@ def test_acquire_fetches_the_api_url_but_keeps_the_portal_url_as_requested(monke
         async def archive_original(self, content_sha256, **kwargs):
             self.archives.append((content_sha256, kwargs.get("source_url")))
             return True
+
+        async def record_alias(self, *args):
+            self.aliases.append(args)
 
         async def record_sighting(self, *args, **kwargs):
             return None
@@ -917,6 +921,7 @@ def test_acquire_fetches_the_api_url_but_keeps_the_portal_url_as_requested(monke
     assert [url for url, _ in session.requests] == [api]
     assert corpus.looked_up == [api]
     assert corpus.archives == [(sha256_hex(data), api)]
+    assert corpus.aliases == [(sha256_hex(data), api, portal, "tollesonAZ")]
     assert artifact.source_url == api
     assert artifact.requested_url == portal
     assert artifact.data == data

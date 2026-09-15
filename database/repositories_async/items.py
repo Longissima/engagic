@@ -90,6 +90,58 @@ class ItemRepository(BaseRepository):
         """Public wrapper for item deduplication. Call before store_agenda_items."""
         return self._dedupe_items_by_matter(items)
 
+    async def retire_chunked_items(
+        self, meeting_id: str, current_ids: List[str], *, conn: Connection
+    ) -> int:
+        """Replace a previously chunked meeting with a complete native snapshot.
+
+        Caller holds meeting and affected matter locks and publishes new desired
+        work in this transaction. Archive removed rows and their related evidence
+        in the existing ingest journal before FK cascades remove obsolete work.
+        """
+        if not current_ids or not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM meeting_ingest_audits "
+            "WHERE meeting_id=$1 AND source_path='chunked_pdf')", meeting_id
+        ):
+            return 0
+        stale = await conn.fetch(
+            "SELECT * FROM items WHERE meeting_id=$1 AND NOT(id=ANY($2::text[])) "
+            "ORDER BY id FOR UPDATE", meeting_id, current_ids
+        )
+        if not stale:
+            return 0
+        stale_ids = [row["id"] for row in stale]
+        # Capture all item-linked records, including evidence retained by SET NULL.
+        tables = await conn.fetch(
+            "SELECT table_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND column_name='item_id' "
+            "ORDER BY table_name"
+        )
+        related = defaultdict(dict)
+        for table in tables:
+            name = table["table_name"]
+            quoted = '"' + name.replace('"', '""') + '"'
+            rows = await conn.fetch(
+                f"SELECT to_jsonb(t) AS snapshot FROM {quoted} t WHERE item_id=ANY($1::text[])", stale_ids
+            )
+            for row in rows:
+                snapshot = row["snapshot"]
+                related[snapshot["item_id"]].setdefault(name, []).append(snapshot)
+        # The deployed item_revisions table may still cascade on item deletion.
+        # Ingest history is independent of item lifetimes, so retain the full
+        # snapshot there (including prior revisions) before removing any rows.
+        await conn.execute(
+            "INSERT INTO meeting_ingest_audits(meeting_id,banana,vendor,source_path,item_count,audit) "
+            "SELECT m.id,m.banana,'civicclerk','superseded_items',$4, "
+            "jsonb_build_object('replacement_source','civicclerk_api', "
+            "'retired_items',(SELECT jsonb_agg(to_jsonb(i)) FROM items i WHERE id=ANY($2::text[])), "
+            "'related',$3::jsonb) FROM meetings m WHERE m.id=$1",
+            meeting_id, stale_ids, dict(related), len(stale_ids),
+        )
+        await conn.execute("DELETE FROM items WHERE id=ANY($1::text[])", stale_ids)
+        logger.info("retired superseded chunked items", meeting_id=meeting_id, count=len(stale_ids))
+        return len(stale_ids)
+
     async def store_agenda_items(
         self, meeting_id: str, items: List[AgendaItem], conn: Optional[Connection] = None
     ) -> int:

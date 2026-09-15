@@ -30,7 +30,7 @@ from PIL import Image
 
 from config import get_logger
 from exceptions import ExtractionError
-from parsing.text_quality import is_garbled_text_layer
+from parsing.text_quality import is_garbled_text_layer, has_excessive_layout_padding
 
 logger = get_logger(__name__).bind(component="parser")
 
@@ -530,6 +530,16 @@ def count_redline_evidence(
     }
 
 
+def _extract_plain_page_text(page: fitz.Page) -> str:
+    text = cast(str, page.get_text(sort=True))
+    if has_excessive_layout_padding(text):
+        native = cast(str, page.get_text(sort=False))
+        if len(native.strip()) >= 200 and len(text) > 3 * len(native):
+            logger.info("using native text order after excessive layout padding")
+            return native
+    return text
+
+
 def _extract_text_with_formatting(page: fitz.Page, page_num: int) -> str:
     """
     Extract text from page with legislative formatting tags.
@@ -541,7 +551,7 @@ def _extract_text_with_formatting(page: fitz.Page, page_num: int) -> str:
     lines = _detect_horizontal_lines(page)
     if not lines:
         # No mark lines on this page, return plain text
-        return cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
+        return _extract_plain_page_text(page)  # type: ignore[attr-defined]
 
     page_runs, _, _ = _page_mark_runs(page, detected_lines=lines)
 
@@ -953,7 +963,7 @@ class PdfExtractor:
                 if use_formatting:
                     page_text = _extract_text_with_formatting(page, page_num + 1)
                 else:
-                    page_text = cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
+                    page_text = _extract_plain_page_text(page)  # type: ignore[attr-defined]
             except (RuntimeError, MemoryError) as exc:
                 # A readable fallback cannot prove that deleted language was
                 # preserved as deleted. Keep its text, but never certify it.
@@ -965,7 +975,7 @@ class PdfExtractor:
                     error_type=type(exc).__name__,
                 )
                 try:
-                    page_text = cast(str, page.get_text(sort=True))  # type: ignore[attr-defined]
+                    page_text = _extract_plain_page_text(page)  # type: ignore[attr-defined]
                 except (RuntimeError, MemoryError) as retry_exc:
                     logger.warning(
                         "[PyMuPDF] page unreadable, marking partial",

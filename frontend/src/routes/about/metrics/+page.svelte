@@ -46,13 +46,10 @@
 		return num.toLocaleString();
 	}
 
-	function formatPopulation(num: number): string {
-		if (num >= 1000000) {
-			return (num / 1000000).toFixed(1) + 'M people';
-		} else if (num >= 1000) {
-			return Math.round(num / 1000) + 'K people';
-		}
-		return num.toLocaleString() + ' people';
+	function formatBytes(bytes: number): string {
+		const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+		const unit = bytes > 0 ? Math.min(Math.floor(Math.log10(bytes) / 3), units.length - 1) : 0;
+		return `${(bytes / 1000 ** unit).toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`;
 	}
 
 	function formatGrowth(num: number): string {
@@ -243,11 +240,7 @@
 						<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meetings_30d)}</div>
 					{:else}
 						<div class="stat-description">
-							{#if data.analytics.real_metrics.population_with_data > 0}
-								{formatPopulation(data.analytics.real_metrics.population_with_data)} in covered cities
-							{:else}
-								City council sessions monitored
-							{/if}
+							Council, committee, and board meetings
 						</div>
 					{/if}
 				</div>
@@ -269,11 +262,7 @@
 					<div class="number-primary">{formatNumber(data.analytics.real_metrics.unique_item_summaries)}</div>
 					<div class="stat-title">Unique Summaries</div>
 					<div class="stat-description">
-						{#if data.analytics.real_metrics.population_with_summaries > 0}
-							{formatPopulation(data.analytics.real_metrics.population_with_summaries)} in cities with summaries
-						{:else}
-							Across {formatNumber(data.analytics.real_metrics.meetings_with_items)} item-level meetings
-						{/if}
+						Across {formatNumber(data.analytics.real_metrics.meetings_with_items)} item-level meetings
 					</div>
 				</div>
 			</div>
@@ -305,9 +294,9 @@
 					</div>
 
 					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.content.matter_appearances)}</div>
-						<div class="stat-title">Matter Appearances</div>
-						<div class="stat-description">Items tracked across meetings</div>
+						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.sponsorships)}</div>
+						<div class="stat-title">Sponsorships</div>
+						<div class="stat-description">Legislation authorship tracked</div>
 					</div>
 				</div>
 			</section>
@@ -318,6 +307,7 @@
 					<div class="stats-card highlight-card">
 						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.votes)}</div>
 						<div class="stat-title">Ballots Recorded</div>
+						<div class="stat-description">{formatNumber(data.platformMetrics.accountability.votes_with_receipt)} with source quotes ({data.platformMetrics.accountability.vote_receipt_rate}%)</div>
 						{#if data.platformMetrics.trends.votes}
 							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
 								<path d={sparklinePath(data.platformMetrics.trends.votes)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
@@ -337,25 +327,11 @@
 					</div>
 
 					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.votes_with_receipt)}</div>
-						<div class="stat-title">Ballots with a Receipt</div>
+						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.meetings_with_votes)}</div>
+						<div class="stat-title">Meetings with Votes</div>
 						<div class="stat-description">
-							{data.platformMetrics.accountability.vote_receipt_rate}% quote the exact minutes text
+							Meetings with recorded roll calls
 						</div>
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.minutes_documents)}</div>
-						<div class="stat-title">Minutes Parsed</div>
-						<div class="stat-description">
-							Roll calls read from {formatNumber(data.platformMetrics.accountability.meetings_with_votes)} meetings
-						</div>
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.sponsorships)}</div>
-						<div class="stat-title">Sponsorships</div>
-						<div class="stat-description">Legislation authorship tracked</div>
 					</div>
 
 					<div class="stats-card">
@@ -369,12 +345,12 @@
 			</section>
 
 			<section class="metrics-section">
-				<h2 class="primary-heading">AI Processing</h2>
+				<h2 class="primary-heading">Processing</h2>
 				<div class="cards-grid">
 					<div class="stats-card highlight-card">
 						<div class="number-primary">{formatNumber(data.platformMetrics.processing.summarized_items)}</div>
-						<div class="stat-title">Substantive Items</div>
-						<div class="stat-description">Identified from {formatNumber(data.platformMetrics.processing.items_analyzed)} analyzed</div>
+						<div class="stat-title">Items Summarized</div>
+						<div class="stat-description">{data.platformMetrics.processing.item_summary_rate}% of {formatNumber(data.platformMetrics.processing.items_analyzed)} analyzed items</div>
 					</div>
 
 					<div class="stats-card">
@@ -391,11 +367,9 @@
 					</div>
 
 					<div class="stats-card">
-						<div class="stat-numbers-split">
-							<span class="number-primary">{data.platformMetrics.processing.item_summary_rate}%</span>
-						</div>
-						<div class="stat-title">Substantive Rate</div>
-						<div class="stat-description">Of analyzed items require AI summaries</div>
+						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.minutes_documents)}</div>
+						<div class="stat-title">Minutes Parsed</div>
+						<div class="stat-description">Minutes documents processed for roll calls</div>
 					</div>
 
 					<div class="stats-card">
@@ -412,6 +386,36 @@
 					</div>
 				</div>
 			</section>
+			{#if data.platformMetrics.corpus}
+			<section class="metrics-section">
+				<h2 class="primary-heading">Document Corpus</h2>
+				<div class="cards-grid">
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(data.platformMetrics.corpus.attachments)}</div>
+						<div class="stat-title">Attachment Entries</div>
+						<div class="stat-description">Listed on agenda items and matters; includes repeated references</div>
+					</div>
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(data.platformMetrics.corpus.documents)}</div>
+						<div class="stat-title">Unique Documents</div>
+						<div class="stat-description">
+							{formatNumber(data.platformMetrics.corpus.native_documents)} native text · {formatNumber(data.platformMetrics.corpus.ocr_documents)} used OCR
+						</div>
+						<div class="stat-description">OCR includes mixed text/scanned files; unclassified files excluded from the split</div>
+					</div>
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(data.platformMetrics.corpus.pages)}</div>
+						<div class="stat-title">Document Pages</div>
+						<div class="stat-description">{formatNumber(data.platformMetrics.corpus.ocr_pages)} OCR pages · {formatNumber(data.platformMetrics.corpus.documents_with_pages)} documents with page counts</div>
+					</div>
+					<div class="stats-card">
+						<div class="number-primary">{formatBytes(data.platformMetrics.corpus.archived_bytes)}</div>
+						<div class="stat-title">Archived Source Size</div>
+						<div class="stat-description">Original files, counted once per unique document</div>
+					</div>
+				</div>
+			</section>
+			{/if}
 		{/if}
 
 		{#if !data.analytics && !data.platformMetrics}

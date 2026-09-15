@@ -28,16 +28,16 @@ from config import config, get_logger
 from corpus.r2 import R2Client
 from database.repositories_async.document_blobs import DocumentBlobRepository
 from pipeline.utils import attachment_identity
-from parsing.text_quality import is_garbled_text_layer
+from parsing.text_quality import is_garbled_text_layer, has_excessive_layout_padding
 
 logger = get_logger(__name__).bind(component="corpus")
 
 # Provenance tag stamped on every extraction this code writes. Bump when the
 # extractor materially changes (Tesseract -> VLM OCR, Layout adoption):
-# lookup_extraction treats rows from other versions as misses, so re-extraction
-# happens lazily exactly where documents are touched again.
-EXTRACT_VERSION = "2"
-COMPATIBLE_EXTRACT_VERSIONS = frozenset({"1", EXTRACT_VERSION})
+# Compatible older extractions remain usable unless a known corruption is found.
+# Version 3 repairs excessive padding introduced by PDF coordinate sorting.
+EXTRACT_VERSION = "3"
+COMPATIBLE_EXTRACT_VERSIONS = frozenset({"1", "2", EXTRACT_VERSION})
 
 _ORIGINAL_PREFIX = "originals/"
 _TEXT_PREFIX = "text/"
@@ -331,6 +331,9 @@ class CorpusStore:
                 return None
 
             text = text_bytes.decode("utf-8", errors="replace")
+            if extract_version != EXTRACT_VERSION and has_excessive_layout_padding(text):
+                logger.info("legacy corpus extraction requires text-order repair", sha=content_sha256[:16])
+                return None
             # Version 2 adds broken-font/CMap repair. Keep serving every clean
             # v1 extraction so this targeted upgrade does not force a corpus-
             # wide re-extraction; only demonstrably garbled legacy text misses.

@@ -287,6 +287,39 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         except (ValueError, AttributeError):
             return True
 
+    def _attach_supplemental_documents(self, meetings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """An explicitly item-labelled document is a source, not another meeting.
+
+        Only fold it when date, body and meeting title identify one parent.
+        Ambiguous/orphan entries stay intact rather than losing their document.
+        """
+        marker = re.compile(r"^(.+?)\s*\(Item\s+\d+[A-Za-z]?\s*[-–—:]\s*.+\)\s*$", re.I)
+
+        def title_key(title):
+            title = re.sub(r"\b(?:city commission|city council|regular|meeting|agenda)\b", "", title, flags=re.I)
+            return re.sub(r"[^a-z0-9]", "", title.lower())
+
+        parents = [m for m in meetings if not marker.match(m.get("title", ""))]
+        retained = []
+        for meeting in meetings:
+            match = marker.match(meeting.get("title", ""))
+            if not match:
+                retained.append(meeting)
+                continue
+            candidates = [p for p in parents
+                          if p.get("start") and p.get("start") == meeting.get("start")
+                          and p.get("body_name") == meeting.get("body_name")
+                          and title_key(p.get("title", "")) == title_key(match[1])]
+            if len(candidates) != 1 or not meeting.get("packet_url"):
+                retained.append(meeting)
+                continue
+            parent = candidates[0]
+            sources = parent.setdefault("agenda_sources", [])
+            if not any(s.get("url") == meeting["packet_url"] for s in sources):
+                sources.append({"type": "supplemental", "url": meeting["packet_url"],
+                                "label": meeting["title"]})
+        return retained
+
     def _dedupe_by_date(self, meetings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Dedupe meetings, keeping one per logical meeting.
 
@@ -343,7 +376,7 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                     chosen["minutes_url"] = other["minutes_url"]
             else:
                 by_key[key] = meeting
-        return list(by_key.values())
+        return self._attach_supplemental_documents(list(by_key.values()))
 
     def _extract_meeting_links(
         self, soup: BeautifulSoup, base_url: str

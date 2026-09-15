@@ -41,6 +41,7 @@ from analysis.topics.normalizer import get_normalizer
 from parsing.participation import parse_participation_info
 from config import config, get_logger
 from pipeline.protocols import MetricsCollector, NullMetrics
+from analysis.llm.civic_context import civic_context, attachment_inventory
 from pipeline.filters import (
     ITEM_FILTER_VERSION,
     FilterDecision,
@@ -1883,6 +1884,15 @@ class Processor:
             "items_failed": city.get("items_failed", 0),
         }
 
+    async def _summary_context(self, meeting, jurisdiction=None):
+        if jurisdiction is None and meeting is not None:
+            jurisdiction = await self.db.jurisdictions.get_city(meeting.banana)
+        committee = None
+        committee_id = getattr(meeting, "committee_id", None)
+        if committee_id:
+            committee = await self.db.committees.get_committee_by_id(committee_id)
+        return civic_context(jurisdiction, meeting, committee)
+
     async def _process_single_item(self, item, banana: Optional[str] = None):
         """Process a single agenda item. Returns dict with success/summary/topics or None.
 
@@ -1950,7 +1960,9 @@ class Processor:
                 context={"item_id": item.id, "item_title": item.title[:100]}
             )
 
-        combined_text = "\n\n".join(item_parts)
+        meeting = await self.db.meetings.get_meeting(item.meeting_id)
+        context = await self._summary_context(meeting)
+        combined_text = context + "\n\n" + attachment_inventory(item.attachments) + "\n\n" + "\n\n".join(item_parts)
 
         batch_request = [{
             "item_id": item.id,
@@ -3041,6 +3053,7 @@ class Processor:
                     "packet_url": meeting.packet_url,
                     "city_banana": meeting.banana,
                     "meeting_name": meeting.title,
+                    "civic_context": await self._summary_context(meeting),
                     "meeting_date": meeting.date.isoformat() if meeting.date else None,
                     "meeting_id": meeting.id,
                 }
@@ -3301,6 +3314,7 @@ class Processor:
         last_sequence: Optional[int],
         city_has_participation: bool = False,
         shared_context_chars: int = 0,
+        civic_context_text: str = "",
     ) -> tuple[List[Dict], Dict, List[str]]:
         """Build batch requests from cached documents."""
         batch_requests = []
@@ -3395,6 +3409,13 @@ class Processor:
                         parsed = item_participation.model_dump(exclude_none=True)
                         filtered = filter_participation_for_city(parsed, city_has_participation)
                         participation_data.update(filtered)
+
+                context_note = civic_context_text + "\n\n" + attachment_inventory(item.attachments)
+                combined_text = context_note + "\n\n" + combined_text
+                source_documents.insert(0, {
+                    "name": "Application context and attachment inventory",
+                    "text": context_note, "document_format": "text",
+                })
 
                 batch_requests.append({
                     "item_id": item.id,
@@ -3761,6 +3782,7 @@ class Processor:
                 need_processing, document_cache, item_attachments, shared_urls,
                 participation_data, first_sequence, last_sequence,
                 city_has_participation, len(shared_context or ""),
+                civic_context_text=await self._summary_context(meeting, city),
             )
 
             if batch_requests and use_batch:

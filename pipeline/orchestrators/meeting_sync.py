@@ -271,7 +271,8 @@ class MeetingSyncOrchestrator:
             items_data = meeting_dict.get("items")
             if items_data:
                 agenda_items = await self._process_agenda_items(
-                    items_data, meeting_obj, stats
+                    items_data, meeting_obj, stats,
+                    prefer_native_ids=meeting_dict.get("authoritative_item_source") == "civicclerk_api",
                 )
 
                 # Dedupe items by matter_id early - before any DB operations that use item IDs
@@ -344,6 +345,10 @@ class MeetingSyncOrchestrator:
                         # Note: we no longer null out matter_id for skipped items
                         # Skipped items still get Matter records (for FK), just no queue jobs
 
+                        if meeting_dict.get("authoritative_item_source") == "civicclerk_api":
+                            await self.db.items.retire_chunked_items(
+                                meeting_obj.id, [item.id for item in agenda_items], conn=conn
+                            )
                         stored_count = await self.db.items.store_agenda_items(
                             meeting_obj.id, agenda_items, conn=conn
                         )
@@ -622,6 +627,8 @@ class MeetingSyncOrchestrator:
         items_data: List[Dict[str, Any]],
         stored_meeting: Meeting,
         stats: MeetingStoreStats,
+        *,
+        prefer_native_ids: bool = False,
     ) -> List[AgendaItem]:
         """Build AgendaItem list, preserving existing summaries."""
         existing_items = await self.db.items.get_agenda_items(stored_meeting.id)
@@ -692,7 +699,8 @@ class MeetingSyncOrchestrator:
             )
             legacy_matches = existing_by_semantic.get(semantic_key, [])
             if (
-                len(legacy_matches) == 1
+                not prefer_native_ids
+                and len(legacy_matches) == 1
                 and legacy_matches[0].id not in claimed_existing_ids
             ):
                 item_id = legacy_matches[0].id

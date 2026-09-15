@@ -152,8 +152,17 @@ def anchor_items(text: str, items: Sequence[Any]) -> List[Anchor]:
 # approve the agenda) but rarely survive as agenda items. Any of them closes
 # the block that precedes it, so its motion is credited to nothing rather
 # than to the last substantive item.
+# The gap between optional item numbering and the keyword is horizontal only.
+# It was \s*, which crosses newlines -- so with MULTILINE the engine started at
+# every blank line, let \s* swallow the whole run, failed the alternation, then
+# backtracked a character at a time retrying it: O(n^2) in the length of a
+# blank-line run. 8k blank lines took 5.9s, 32k took over a minute, and one
+# 3.26MB St. Louis County minutes file (stlouiscountyMO_7b479af8) held a single
+# parse_minutes_votes worker at 100% CPU for two hours on 2026-09-13. Crossing
+# lines was never intended either: it let "1." on one line match "ADJOURN"
+# fifty lines below.
 _BREAK_RE = re.compile(
-    r"^[ \t]*(?:\d+\.?|[A-Z]\.|[IVX]+\.|[a-z]\.)?\s*(?:"
+    r"^[ \t]*(?:\d+\.?|[A-Z]\.|[IVX]+\.|[a-z]\.)?[ \t]*(?:"
     r"ADJOURN(?:MENT)?\b|Meeting adjourned|The meeting (?:was )?adjourned|NEXT MEETING\b|"
     r"RECONVENE\b|CLOSED SESSION\b|EXECUTIVE SESSION\b|RECESS\b|"
     r"APPROVAL OF (?:THE )?(?:AGENDA|MINUTES)\b|CALL TO ORDER\b|ROLL CALL\b|PLEDGE\b|"

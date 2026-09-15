@@ -1,6 +1,7 @@
 """Small saved-minutes regression bucket for motion semantics and list formats."""
 import hashlib
 import json
+import pytest
 from pathlib import Path
 
 from parsing.rollcall.engine import parse_meeting, Gazetteer
@@ -81,13 +82,48 @@ def test_inline_empty_categories_are_not_people():
         ('AYE', ['Alice Jones', 'Bob Smith'], None), ('NO', [], 0), ('ABSTAIN', [], 0)]
 
 
-def test_reported_committee_approval_does_not_become_council_motion():
-    text = '''1. Housing resolution
-The resolution was approved by the Budget and Finance
-Committee.
+@pytest.mark.parametrize("committee", ["Budget and Finance Committee", "Budget and Finance\nCommittee"])
+def test_reported_committee_approval_keeps_its_own_evidence(committee):
+    text = f"""1. Housing resolution
+The resolution was approved by the {committee}.
 Motion carried 5-0.
-'''
+"""
+    parsed = parse_meeting(text, [dict(id='i', title='Housing resolution', agenda_number='1.', sequence=1)], [])
+    assert len(parsed.published) == 2
+    reported, council = parsed.published
+    assert reported.reported_body == 'Budget and Finance Committee'
+    assert reported.outcome == 'PASS'
+    assert reported.tally == {} and reported.member_votes == []
+    assert council.reported_body is None
+    assert council.tally == {'yes': 5, 'no': 0}
+
+
+def test_reported_committee_keeps_its_explicit_tally():
+    evidence = find_evidence('The Planning Commission voted 3-2 to recommend approval.\nMotion carried 5-0.')
+    assert [(ev.reported_body, ev.tally) for ev in evidence] == [
+        ('Planning Commission', (3, 2, 0)), (None, (5, 0, 0))]
+
+
+def test_reported_committee_does_not_borrow_previous_council_rollcall():
+    evidence = find_evidence("""Motion carried 2-0.
+Ayes: Alice Jones, Bob Smith
+The resolution was approved by the Planning Commission.
+""")
+    committee = next(ev for ev in evidence if ev.reported_body)
+    assert committee.sections == [] and committee.tally is None
+
+
+@pytest.mark.parametrize("action", ["approval", "denial"])
+def test_reported_motion_continuation_keeps_one_motion_and_its_tally(action):
+    text = f"""1. Housing resolution
+On a motion by Commissioner Dube, seconded by Commissioner Ramirez, the
+Planning Commission voted to recommend {action} of Special Use Permit
+#2026-00019. The motion carried on a vote of 6-0.
+"""
     parsed = parse_meeting(text, [dict(id='i', title='Housing resolution', agenda_number='1.', sequence=1)], [])
     assert len(parsed.published) == 1
-    assert parsed.published[0].tally == {'yes': 5, 'no': 0}
-    assert any(c['reason']=='reported_committee_action' for o in parsed.observations for c in o.checks)
+    motion = parsed.published[0]
+    assert motion.reported_body == 'Planning Commission'
+    assert motion.tally == {'yes': 6, 'no': 0}
+    assert motion.outcome == 'PASS'
+    assert parsed.observations[motion.observation_index].interpretation['subject_disposition'] == ('denied' if action == 'denial' else None)

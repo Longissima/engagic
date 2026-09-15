@@ -330,6 +330,18 @@ async def get_platform_metrics(db: Database = Depends(get_db)):
                 "meeting_summary_rate": metrics["meeting_summary_rate"],
                 "item_summary_rate": metrics["item_summary_rate"],
             },
+            "corpus": {
+                # Attachment entries may repeat across items and canonical matters.
+                "attachments": metrics["item_attachments"] + metrics["matter_attachments"],
+                "documents": metrics["corpus_documents"],
+                "text_documents": metrics["corpus_text_documents"],
+                "native_documents": metrics["corpus_native_documents"],
+                "ocr_documents": metrics["corpus_ocr_documents"],
+                "ocr_pages": metrics["corpus_ocr_pages"],
+                "documents_with_pages": metrics["corpus_documents_with_pages"],
+                "pages": metrics["corpus_pages"],
+                "archived_bytes": metrics["corpus_archived_bytes"],
+            },
             "growth": {
                 "meetings_30d": metrics["meetings_30d"],
                 "items_30d": metrics["items_30d"],

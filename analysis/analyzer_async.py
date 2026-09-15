@@ -675,7 +675,8 @@ class AsyncAnalyzer:
         try:
             # Process the agenda (returns summary, method, participation)
             summary, method, participation = await self.process_agenda_async(
-                packet_url, banana=meeting_data.get("city_banana")
+                packet_url, banana=meeting_data.get("city_banana"),
+                civic_context_text=meeting_data.get("civic_context", "")
             )
 
             processing_time = time.time() - start_time
@@ -709,7 +710,7 @@ class AsyncAnalyzer:
                 "cached": False,
             }
 
-    async def process_agenda_async(self, url: str, banana: Optional[str] = None) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+    async def process_agenda_async(self, url: str, banana: Optional[str] = None, civic_context_text: str = "") -> Tuple[str, str, Optional[Dict[str, Any]]]:
         """
         Process agenda using PyMuPDF + Gemini (async, fail fast approach).
 
@@ -741,8 +742,9 @@ class AsyncAnalyzer:
 
                 prepared = await summarizer.prepare_document_input(
                     kind="meeting",
-                    text=extracted_text,
+                    text=civic_context_text + "\n\n" + extracted_text,
                     documents=[
+                        {"name": "Application context", "text": civic_context_text, "document_format": "text"},
                         {
                             "name": result.get("source_url") or url,
                             "text": extracted_text,
