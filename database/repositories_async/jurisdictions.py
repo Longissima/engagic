@@ -55,11 +55,12 @@ class JurisdictionRepository(BaseRepository):
     - Last sync timestamp queries
     """
 
-    async def add_city(self, city: Jurisdiction) -> None:
+    async def add_city(self, city: Jurisdiction, *, geometry: Optional[bytes] = None) -> None:
         """Add a jurisdiction to the database
 
         Args:
             city: Jurisdiction object with banana, name, state, vendor, slug
+            geometry: Optional boundary, written in the same transaction.
 
         Raises:
             asyncpg.UniqueViolationError: If jurisdiction already exists
@@ -67,8 +68,8 @@ class JurisdictionRepository(BaseRepository):
         async with self.transaction() as conn:
             await conn.execute(
                 """
-                INSERT INTO jurisdictions (banana, name, state, vendor, slug, extra_vendors, type, county_banana, status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO jurisdictions (banana, name, state, vendor, slug, extra_vendors, type, county_banana, status, population, geom)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 """,
                 city.banana,
                 city.name,
@@ -79,11 +80,13 @@ class JurisdictionRepository(BaseRepository):
                 city.type,
                 city.county_banana,
                 city.status or "active",
+                city.population,
+                geometry,
             )
 
             # Insert zipcodes (batch for efficiency)
             if city.zipcodes:
-                zipcode_records = [(city.banana, z, False) for z in city.zipcodes]
+                zipcode_records = [(city.banana, z, i == 0) for i, z in enumerate(city.zipcodes)]
                 await conn.executemany(
                     """
                     INSERT INTO zipcodes (banana, zipcode, is_primary)

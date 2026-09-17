@@ -547,7 +547,7 @@ class Database:
             SELECT COUNT(*) AS corpus_documents,
                    COUNT(*) FILTER (WHERE text_key IS NOT NULL) AS corpus_text_documents,
                    -- Extraction path, not a claim about the document's origin:
-                   -- mixed PDFs belong to OCR; partial/unknown paths stay unclassified.
+                   -- mixed PDFs belong to OCR; incomplete native paths stay unclassified.
                    COUNT(*) FILTER (
                        WHERE text_key IS NOT NULL AND extract_method IN (
                            'pymupdf', 'python-docx', 'antiword', 'striprtf',

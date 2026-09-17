@@ -133,6 +133,7 @@ class CorpusStore:
         content_type: Optional[str] = None,
         etag: Optional[str] = None,
         last_modified: Optional[str] = None,
+        max_original_bytes: Optional[int] = None,
     ) -> bool:
         """Stage 1's archive step: ensure these bytes exist in the corpus.
 
@@ -146,9 +147,9 @@ class CorpusStore:
             if data is None and file_obj is None:
                 raise ValueError("archive_original needs data or file_obj")
 
-            if byte_count > config.CORPUS_MAX_ORIGINAL_BYTES:
+            if byte_count > (config.CORPUS_MAX_ORIGINAL_BYTES if max_original_bytes is None else max_original_bytes):
                 # Still index the blob (hash, size, sources) so dedup works;
-                # the REST endpoint can't carry the object itself.
+                # this caller's configured upload allowance was exceeded.
                 logger.warning(
                     "original exceeds corpus upload cap, indexing without archive",
                     sha=content_sha256[:16],

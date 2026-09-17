@@ -212,7 +212,7 @@ Root crontab (`sudo crontab -l`) has 14 active jobs:
 | Daily 7 AM UTC | Minutes to votes (`scripts/parse_minutes_votes.py --apply --days-back 200`) |
 
 **Minutes supply** (scheduled 2026-09-11; built 2026-08-04): the daemon's resync
-window is 14 days but minutes are approved 2-4 weeks post-meeting, so
+window is 28 days back and 28 days forward. Minutes can arrive later, so
 `scripts/sweep_minutes.py` re-fetches listings with a 120-day back-window and
 fills only `meetings.minutes_url` (listing or API metadata; ProudCity and
 CivicPlus may make one meeting-page request per candidate, WP Events queries

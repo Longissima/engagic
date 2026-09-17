@@ -255,7 +255,7 @@ class AsyncCivicEngageAdapter(AsyncBaseAdapter):
                     meeting["minutes_url"] = candidates[0]
 
     async def _fetch_meetings_impl(
-        self, days_back: int = 14, days_forward: int = 28
+        self, days_back: int = 28, days_forward: int = 28
     ) -> List[Dict[str, Any]]:
         """Fetch agendas from CivicEngage Archive Center.
 

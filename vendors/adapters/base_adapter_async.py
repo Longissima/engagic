@@ -104,8 +104,11 @@ class AsyncBaseAdapter:
         # produced the bytes. None is fine -- provenance degrades, tee still works.
         self.banana: Optional[str] = None
         self.metrics = cast(MetricsCollector, metrics or NullMetrics())
+        self._originals_only = False
+        self._archive_discovery_errors = []
         self._document_acquirer = DocumentSourceAcquirer(
             self._load_document_response,
+            stream_loader=self._get,
             fetch_errors=(VendorHTTPError,),
             corpus_getter=lambda: get_corpus(),
             metrics=self.metrics,
@@ -641,6 +644,9 @@ class AsyncBaseAdapter:
         and extracts embedded links (e.g. staff report cover sheets that link
         to the actual contracts/exhibits on Legistar S3).
         """
+        if self._originals_only:
+            return []
+
         text_fallback: List[Dict[str, Any]] = []
         if agenda_url:
             result = await self._chunk_packet_pdf(agenda_url, vendor_id, ladder="agenda")
@@ -685,7 +691,7 @@ class AsyncBaseAdapter:
         Routing policy lives in router.LADDERS; every rung attempt and any
         terminal failure reason ends up in the result's audit trail.
         """
-        if self._minutes_discovery_only:
+        if self._minutes_discovery_only or self._originals_only:
             # Defense in depth for sweep dry-runs: even if an adapter's
             # metadata-only branch regresses, discovery can never tee bytes to
             # the corpus or invoke a parser.
@@ -796,7 +802,7 @@ class AsyncBaseAdapter:
         ladder: str = "auto",
     ) -> ChunkResult:
         """Download a PDF and run the chunker cascade. Returns full ChunkResult."""
-        if self._minutes_discovery_only:
+        if self._minutes_discovery_only or self._originals_only:
             return ChunkResult(failure_reason=DEFERRED, ladder=ladder)
 
         try:
@@ -1066,7 +1072,7 @@ class AsyncBaseAdapter:
 
         return items
 
-    async def fetch_meetings(self, days_back: int = 14, days_forward: int = 28) -> FetchResult:
+    async def fetch_meetings(self, days_back: int = 28, days_forward: int = 28) -> FetchResult:
         """Fetch meetings, validate, return FetchResult.
 
         Returns FetchResult with success=True for valid results (even if empty).
@@ -1077,6 +1083,16 @@ class AsyncBaseAdapter:
             self._chunk_audits = {}
             self._html_audits = {}
             meetings = await self._fetch_meetings_impl(days_back, days_forward)
+            if self._originals_only:
+                for meeting in meetings:
+                    # Preserve every directly listed source before normal item
+                    # validation/filtering; never traverse a document's links.
+                    meeting["archive_documents"] = [
+                        {**att, "vendor_item_id": item.get("vendor_item_id")}
+                        for item in meeting.get("items", [])
+                        for att in item.get("attachments", [])
+                        if isinstance(att, dict) and att.get("url")
+                    ]
             valid: List[Dict[str, Any]] = []
             for index, meeting in enumerate(meetings):
                 try:
@@ -1106,9 +1122,9 @@ class AsyncBaseAdapter:
             # that was fetched but entirely rejected at the schema boundary is
             # different: reporting success would mark the city synced while
             # silently discarding every candidate.
-            if meetings and not valid:
+            if meetings and (not valid or (self._originals_only and len(valid) != len(meetings))):
                 error = (
-                    f"All {len(meetings)} fetched meeting candidate(s) failed "
+                    f"{len(meetings) - len(valid)} fetched meeting candidate(s) failed "
                     "schema validation"
                 )
                 logger.error(

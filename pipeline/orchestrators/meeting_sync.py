@@ -1,6 +1,7 @@
 """Meeting Sync Orchestrator - Coordinates meeting storage workflow."""
 
 import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -191,6 +192,74 @@ class MeetingSyncOrchestrator:
         self.enqueue_decider = EnqueueDecider()
         self.matter_enqueue_decider = MatterEnqueueDecider()
         self.vote_processor = VoteProcessor()
+
+    async def archive_meeting(self, meeting_dict, city, adapter, *, max_bytes=2 * 1024**3):
+        """Persist stage-one originals and a replayable meeting manifest.
+
+        Uses the same adapter transport/acquirer and corpus as ordinary sync.
+        The manifest retains native items; domain rows, summaries, matter
+        tracking, activation and processing queues are deliberately untouched.
+        """
+        from corpus.store import get_corpus
+        from pipeline.utils import attachment_identity
+
+        corpus = get_corpus()
+        if corpus is None:
+            raise RuntimeError("Archival requires the corpus")
+        meeting_id = generate_meeting_id(
+            banana=city.banana, vendor_id=str(meeting_dict["vendor_id"]),
+            date=self._parse_meeting_date(meeting_dict),
+            title=meeting_dict.get("title") or "Meeting",
+        )
+        sources = []
+        for role in ("agenda_url", "packet_url", "minutes_url"):
+            if meeting_dict.get(role):
+                sources.append({"url": meeting_dict[role], "role": role})
+        sources.extend(meeting_dict.get("agenda_sources") or [])
+        sources.extend(meeting_dict.get("archive_documents") or [])
+        for item in meeting_dict.get("items") or []:
+            for att in item.get("attachments") or []:
+                sources.append({**att, "role": "attachment",
+                                "vendor_item_id": item.get("vendor_item_id")})
+        receipts = {}
+        for source in sources:
+            url = source.get("url")
+            if not url:
+                continue
+            identity = attachment_identity(url)
+            if identity in receipts:
+                continue
+            try:
+                receipt = await adapter._document_acquirer.archive(
+                    url, banana=city.banana, max_bytes=max_bytes)
+                receipts[identity] = {"url": url, "status": "archived", **receipt}
+            except Exception as exc:
+                receipts[identity] = {"url": url, "status": "failed",
+                                      "error": str(exc), "error_type": type(exc).__name__}
+                logger.warning("original archival failed", banana=city.banana,
+                               meeting_id=meeting_id, url=url[:160], error=str(exc))
+        manifest = {
+            "version": 1, "meeting_id": meeting_id, "banana": city.banana,
+            "vendor": adapter.vendor, "slug": adapter.slug,
+            "meeting": meeting_dict, "documents": receipts,
+        }
+        payload = json.dumps(manifest, sort_keys=True, ensure_ascii=False).encode()
+        sha = hashlib.sha256(payload).hexdigest()
+        source_url = f"engagic://meeting-archive/{adapter.vendor}/{adapter.slug}/{meeting_id}"
+        if not await corpus.archive_original(
+            sha, byte_count=len(payload), data=payload, source_url=source_url,
+            banana=city.banana, content_type="application/json",
+        ):
+            raise RuntimeError("Meeting manifest could not be archived")
+        failed = sum(d["status"] == "failed" for d in receipts.values())
+        return {
+            "meeting_id": meeting_id, "manifest_sha256": sha,
+            "manifest_source": source_url, "documents": len(receipts),
+            "failed": failed, "no_documents": not receipts,
+            "success": failed == 0,
+            "bytes": sum(d.get("bytes", 0) for d in receipts.values()),
+            "reused": sum(d.get("reused", False) for d in receipts.values()),
+        }
 
     async def sync_meeting(
         self,

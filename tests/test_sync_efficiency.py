@@ -673,3 +673,16 @@ def test_watchlist_partition_batches_and_deduplicates_in_input_order():
     assert db.jurisdictions.calls == [
         ("bananas", ["literalCA", "missingCA", "sharedCA"])
     ]
+
+
+@pytest.mark.parametrize("window, expected", [({}, (28, 28)), ({"days_back": 60, "days_forward": 0}, (60, 0))])
+def test_sync_window_defaults_and_explicit_override(window, expected):
+    class WindowAdapter(AsyncBaseAdapter):
+        async def _fetch_meetings_impl(self, days_back, days_forward):
+            self.requested_window = (days_back, days_forward)
+            return []
+
+    adapter = WindowAdapter("test-city", "test-vendor")
+    result = asyncio.run(adapter.fetch_meetings(**window))
+    assert result.success
+    assert adapter.requested_window == expected

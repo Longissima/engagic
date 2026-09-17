@@ -344,6 +344,34 @@ def test_sub_attachment_resolution_singleflights_fresh_corpus(monkeypatch):
     assert lookups == 1
 
 
+
+
+def test_reduced_recovery_skips_formatting_and_keeps_text_unverified(
+    tmp_path, monkeypatch,
+):
+    from vendors.adapters.parsers import router
+
+    original_extractor = router.PdfExtractor
+
+    class FormattingCrashExtractor(original_extractor):
+        def extract_from_path(self, path):
+            if self.detect_legislative_formatting:
+                raise AssertionError("Recovery re-entered crashing formatting analysis")
+            return super().extract_from_path(path)
+
+    monkeypatch.setattr(router, "PdfExtractor", FormattingCrashExtractor)
+    path = tmp_path / "agenda.pdf"
+    path.write_bytes(make_pdf_bytes(2))
+    result = router.recover_pdf_text(str(path))
+    assert "Ordinance 2026-14" in result.extraction["text"]
+    assert result.extraction["formatting_unverified"] is True
+    assert result.extraction["ocr_pending_pages"] == [1, 2]
+    assert result.extraction["ocr_pending"] == 2
+    assert result.extraction["method"] == "pymupdf-partial"
+    # Text-derived boundaries on unverified pages must not become trusted items.
+    assert not result.items
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

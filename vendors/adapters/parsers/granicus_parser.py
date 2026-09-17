@@ -68,8 +68,12 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
                 if tr.find('td', class_=['listItem', 'listedItem'])
             )
 
+    # Responsive Granicus listings (e.g. Houston METRO) use list rows
+    # and div cells rather than a table; the document links are unchanged.
+    rows.extend(soup.select('li.table-row:not(.table-row--head)'))
+
     for row in rows:
-        cells = row.find_all('td', class_=['listItem', 'listedItem'])
+        cells = row.select('td.listItem, td.listedItem, :scope > div.table-cell')
         if len(cells) < 2:
             continue
 
@@ -213,6 +217,8 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
             kept_by_id[eid] = m
         deduped.append(m)
 
+    deduped = _dedupe_audio_descriptions(deduped)
+
     logger.debug(
         "parsed viewpublisher listing",
         vendor="granicus",
@@ -221,6 +227,50 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
     )
 
     return deduped
+
+
+
+_AUDIO_DESCRIPTION_SUFFIX = re.compile(r"\s*\(audio description\)\s*$", re.I)
+_TITLE_MEETING_DATE = re.compile(
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|"
+    r"November|December)\s+\d{1,2},\s+\d{4}\b", re.I,
+)
+
+
+def _dedupe_audio_descriptions(
+    meetings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Prefer standard clips over paired accessible reuploads before date filtering.
+
+    Match dated titles rather than upload timestamps: accessible recordings can
+    arrive days later. Undated titles require the same calendar day. Keep lone
+    accessible recordings, audio-only sessions, and ambiguous standard matches.
+    """
+    def key(meeting: Dict[str, Any]) -> tuple[str, str]:
+        title = _AUDIO_DESCRIPTION_SUFFIX.sub("", meeting.get("title", ""))
+        title = " ".join(title.split()).casefold()
+        day = "" if _TITLE_MEETING_DATE.search(title) else meeting.get("start", "")[:10]
+        return title, day
+
+    standard: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for meeting in meetings:
+        if not _AUDIO_DESCRIPTION_SUFFIX.search(meeting.get("title", "")):
+            standard.setdefault(key(meeting), []).append(meeting)
+
+    kept = []
+    for meeting in meetings:
+        matches = standard.get(key(meeting), [])
+        if (
+            _AUDIO_DESCRIPTION_SUFFIX.search(meeting.get("title", ""))
+            and len(matches) == 1
+        ):
+            canonical = matches[0]
+            for field in ("minutes_url", "packet_url"):
+                if meeting.get(field) and not canonical.get(field):
+                    canonical[field] = meeting[field]
+            continue
+        kept.append(meeting)
+    return kept
 
 
 def _parse_granicus_date(date_text: str) -> Optional[str]:

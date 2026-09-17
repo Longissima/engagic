@@ -445,14 +445,27 @@ def _apply_ocr_shape_policy(result: ChunkResult) -> None:
 def recover_pdf_text(pdf_path: str, ladder: str = "auto") -> ChunkResult:
     """Reduced text-only recovery after a native cascade child crash.
 
-    This deliberately avoids PDF profiling, link traversal, TOC parsing, and
-    both full agenda engines.  It can therefore salvage complete corpus text
-    (and simple numbered items) when a malformed structure crashes the normal
-    cascade.  It remains subprocess-guarded by the caller.
+    This avoids PDF profiling, link traversal, TOC parsing, redline geometry,
+    and both full agenda engines. It salvages corpus text for later verification
+    when the normal cascade crashes, without certifying legislative formatting
+    or text-derived item boundaries. It remains subprocess-guarded by the caller.
     """
     result = ChunkResult(ladder=ladder)
     try:
-        result.extraction = PdfExtractor(ocr_enabled=False).extract_from_path(pdf_path)
+        # The normal pass may have crashed inside redline geometry analysis.
+        # Re-entering that analysis is not a reduced recovery (La Verne's
+        # 2026-09-09 planning packet exhausted the guard and crashed twice).
+        result.extraction = PdfExtractor(
+            ocr_enabled=False, detect_legislative_formatting=False,
+        ).extract_from_path(pdf_path)
+        # Plain text cannot certify whether language was added or deleted.
+        # Keep the salvage, but require verification of every page through
+        # the existing incomplete-extraction contract before it is trusted.
+        page_count = int(result.extraction.get("page_count") or 0)
+        result.extraction["formatting_unverified"] = True
+        result.extraction["ocr_pending_pages"] = list(range(1, page_count + 1))
+        result.extraction["ocr_pending"] = page_count
+        result.extraction["method"] = "pymupdf-partial"
     except Exception as e:
         result.failure_reason = ENGINE_ERROR
         result.attempts.append(Attempt(

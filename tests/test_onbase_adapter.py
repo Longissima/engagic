@@ -179,3 +179,29 @@ async def test_onbase_keeps_successful_enrichment_when_later_requests_fail() -> 
     assert results[0]["attachments"][0]["name"] == "Good attachment"
     assert results[1]["attachments"][0]["name"] == "Good attachment"
     assert len(results) == len(items)
+
+
+def test_responsive_listing_uses_name_and_time_and_keeps_unpublished_meetings():
+    adapter = AsyncOnBaseAdapter("friscoTX")
+    html = '''<table>
+      <tr data-meeting-id="1681">
+        <td data-sortable-type="mtgName">ST BOD</td>
+        <td data-sortable-type="mtgTime">9/2/2026 2:00:00 PM</td>
+        <td><a href="/SamTrans/Meetings/ViewMeeting?id=1681&amp;doctype=1">Agenda</a>
+        <a href="/SamTrans/Meetings/ViewMeeting?id=1681&amp;doctype=1">Agenda</a>
+        <a href="/SamTrans/Documents/DownloadFile/minutes.pdf?meetingId=1681&amp;documentType=2">Minutes</a></td>
+      </tr>
+      <tr data-meeting-id="1682">
+        <td data-sortable-type="mtgName">ST BOD</td>
+        <td data-sortable-type="mtgTime">10/7/2026 2:00:00 PM</td>
+        <td>No agenda yet</td>
+      </tr>
+    </table>'''
+    meetings = adapter._parse_meeting_listing(html)
+    assert len(meetings) == 2
+    assert meetings[0]['title'] == 'ST BOD'
+    assert meetings[0]['date'] == datetime(2026, 9, 2, 14)
+    assert meetings[0]['has_agenda'] is True
+    assert 'minutes.pdf' in meetings[0]['minutes_url']
+    assert meetings[1]['date'] == datetime(2026, 10, 7, 14)
+    assert meetings[1]['has_agenda'] is False

@@ -47,3 +47,13 @@ Last updated: 2026-03-28. Total jurisdictions: 959.
 - `sbc.txt` - SBC office locations (18)
 - `notable-unprocessed.txt` - High-value cities to onboard (62)
 - `test-small.txt` - Quick validation set (2)
+
+## September 17 expansion
+
+`new-jurisdictions-2026-09-17.txt` is the consolidated list of all 111 jurisdictions
+from the regional expansion: 103 additions and 8 existing jurisdictions with
+source or extraction repairs. It includes agency batches 7, 8, and 9.
+
+```bash
+./run.sh sync @munis/new-jurisdictions-2026-09-17.txt
+```

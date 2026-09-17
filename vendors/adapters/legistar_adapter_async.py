@@ -5,7 +5,7 @@ API-first with HTML fallback. Cities: Seattle WA, NYC, Cambridge MA, and many ot
 """
 
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 import json
 from json import JSONDecodeError
@@ -129,12 +129,51 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         self.base_url = f"https://webapi.legistar.com/v1/{self.slug}"
         self.prefer_aada = self.slug in _PREFER_AADA_SLUGS
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
+    async def fetch_meetings(self, days_back=28, days_forward=28, *, start=None, end=None, originals_only=False):
+        """Use the normal sync path with an optional explicit [start, end) range.
+
+        Explicit boundaries are naive local calendar dates at midnight.
+        Adapter instances, like normal sync instances, must not be shared
+        between concurrent fetches.
+        """
+        if (start is None) != (end is None):
+            raise ValueError("Provide both start and end")
+        if start is not None:
+            start, end = datetime.fromisoformat(str(start)), datetime.fromisoformat(str(end))
+            if start.tzinfo or end.tzinfo or start.time() != datetime.min.time() or end.time() != datetime.min.time() or start >= end:
+                raise ValueError("Use increasing, timezone-free midnight date boundaries")
+        self._originals_only = originals_only
+        self._archive_discovery_errors = []
+        self._explicit_range = (start, end) if start is not None else None
+        try:
+            result = await super().fetch_meetings(days_back, days_forward)
+            if originals_only and self._archive_discovery_errors:
+                result.success = False
+                result.error = "; ".join(self._archive_discovery_errors[:10])
+                result.error_type = "IncompleteDocumentDiscovery"
+            return result
+        finally:
+            self._explicit_range = None
+            self._originals_only = False
+
+    def _date_range(self, days_back, days_forward):
+        explicit = getattr(self, "_explicit_range", None)
+        if explicit:
+            # Existing row processors use an inclusive comparison.
+            return explicit[0], explicit[1] - timedelta(microseconds=1)
+        return super()._date_range(days_back, days_forward)
+
+    def _history_error(self, message):
+        return VendorParsingError(message, vendor=self.vendor, city_slug=self.slug)
+
+    async def _fetch_meetings_impl(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings via API, falling back to HTML if needed."""
         meetings = []
         try:
             logger.info("legistar using API", slug=self.slug)
             meetings = await self._fetch_meetings_api(days_back, days_forward)
+        except VendorParsingError:
+            return await self._fetch_meetings_html(days_back, days_forward)
         except (VendorHTTPError, aiohttp.ClientError) as e:
             # Fall back to HTML for client errors (API disabled) and server errors (API broken)
             if isinstance(e, VendorHTTPError) and e.status_code in [400, 403, 404, 500, 502, 503]:
@@ -188,7 +227,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             return meetings
         try:
             html_meetings = await self._fetch_meetings_html(days_back, days_forward)
-        except (VendorHTTPError, aiohttp.ClientError) as e:
+        except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
             logger.debug("legistar html minutes merge skipped", slug=self.slug, error=str(e))
             return meetings
         by_id = {
@@ -274,14 +313,14 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             return True
         return False
 
-    async def _fetch_meetings_api(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_api(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from Legistar Web API."""
         # Build date range
         start_date_dt, end_date_dt = self._date_range(days_back, days_forward)
 
         # Format dates for OData filter
         start_date = start_date_dt.strftime("%Y-%m-%d")
-        end_date = end_date_dt.strftime("%Y-%m-%d")
+        end_date = (getattr(self, "_explicit_range", None) or (None, end_date_dt))[1].strftime("%Y-%m-%d")
 
         # Build OData filter
         filter_str = (
@@ -291,7 +330,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         # API parameters
         params = {
             "$filter": filter_str,
-            "$orderby": "EventDate desc",
+            "$orderby": "EventDate desc,EventId desc",
             "$top": 1000,  # API max
         }
 
@@ -301,31 +340,29 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
 
         # Fetch events from API
         url = f"{self.base_url}/Events"
-        response = await self._get(url, params=params)
-
-        # Parse response (JSON or XML)
-        content_type = response.headers.get('content-type', '').lower()
-
-        if 'json' in content_type:
-            events = await response.json()
-        elif 'xml' in content_type:
-            # Parse XML response
-            text = await response.text()
-            events = self._parse_xml_events(text)
-        else:
-            # Unknown content type - read text first to avoid stream consumption issues
+        events = []
+        seen = set()
+        offset = 0
+        while True:
+            response = await self._get(url, params={**params, "$skip": offset})
             text = await response.text()
             try:
-                events = json.loads(text)
+                page = json.loads(text)
             except (JSONDecodeError, ValueError):
-                events = self._parse_xml_events(text)
-
-        if not isinstance(events, list):
-            raise VendorParsingError(
-                f"Expected list from Legistar API at {url}, got {type(events).__name__}",
-                vendor=self.vendor,
-                city_slug=self.slug
-            )
+                root = ET.fromstring(text)
+                if not root.tag.endswith("feed"):
+                    raise self._history_error("Unexpected Legistar events response")
+                page = self._parse_xml_events(text)
+            if not isinstance(page, list):
+                raise self._history_error("Expected a list of Legistar events")
+            ids = [str(e.get("EventId", "")) for e in page]
+            if any(not i for i in ids) or len(set(ids)) != len(ids) or seen.intersection(ids):
+                raise self._history_error("Legistar events pagination repeated or omitted identities")
+            seen.update(ids)
+            events.extend(page)
+            if len(page) < params["$top"]:
+                break
+            offset += len(page)
 
         # Some APIs (Nashville) ignore server filters - filter client-side
         filtered_events = []
@@ -333,7 +370,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             event_date_str = event.get("EventDate")
             if event_date_str:
                 try:
-                    event_date = datetime.fromisoformat(event_date_str.replace("Z", "+00:00"))
+                    event_date = datetime.fromisoformat(event_date_str.replace("Z", "+00:00")).replace(tzinfo=None)
                     if start_date_dt <= event_date <= end_date_dt:
                         filtered_events.append(event)
                 except (ValueError, TypeError):
@@ -511,6 +548,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 text = await response.text()
                 event_items = self._parse_xml_event_items(text)
 
+            if self._originals_only and len(event_items) >= 1000:
+                raise self._history_error("EventItems reached the API cap; discovery is incomplete")
             # Process items concurrently (each may fetch matter metadata/attachments)
             item_tasks = []
             for item_data in event_items:
@@ -522,6 +561,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             items = []
             for idx, item in enumerate(processed_items):
                 if isinstance(item, Exception):
+                    if self._originals_only:
+                        self._archive_discovery_errors.append(str(item))
                     logger.warning("item processing failed", event_id=event_id, item_index=idx, error=str(item))
                 elif isinstance(item, dict):
                     items.append(item)
@@ -529,6 +570,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             return items
 
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
+            if self._originals_only:
+                self._archive_discovery_errors.append(str(e))
             logger.warning("failed to fetch event items from API", event_id=event_id, error=str(e))
             return []
 
@@ -593,6 +636,13 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 item["matter_file"] = matter_file
             if agenda_number:
                 item["agenda_number"] = agenda_number
+
+            if self._originals_only:
+                if matter_id:
+                    item["attachments"] = await self._fetch_matter_attachments_async(matter_id)
+                if item_data.get("EventItemMatterType"):
+                    item["matter_type"] = item_data["EventItemMatterType"]
+                return item
 
             # Fetch matter metadata, attachments, and votes concurrently
             # Votes keyed by event_item_id, metadata/attachments by matter_id
@@ -790,6 +840,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 text = await response.text()
                 raw_attachments = self._parse_xml_attachments(text)
 
+            if self._originals_only and len(raw_attachments) >= 1000:
+                raise self._history_error("Matter attachments reached the API cap; discovery is incomplete")
             attachments = []
             for att in raw_attachments:
                 name = (att.get("MatterAttachmentName") or "").strip()
@@ -817,6 +869,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             return attachments
 
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
+            if self._originals_only:
+                self._archive_discovery_errors.append(str(e))
             logger.debug("failed to fetch matter attachments", matter_id=matter_id, error=str(e))
             return []
 
@@ -983,8 +1037,65 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             logger.warning("XML parsing error for sponsors", error=str(e))
             return []
 
-    async def _widen_calendar(self, url: str, html: str) -> Optional[str]:
-        """Re-request the calendar with its year filter set to All Years.
+    async def _calendar_pages(self, url, html):
+        """Walk RadGrid pages using each response's fresh ASP.NET form state."""
+        seen = set()
+        rows = []
+        upcoming = []
+        while True:
+            soup = await asyncio.to_thread(self._parse_html, html)
+            grid = soup.find("table", id=lambda value: value and "gridCalendar" in value)
+            if not seen and grid:
+                upcoming_grid = soup.find("table", id=lambda value: value and "gridUpcomingMeetings" in value)
+                if upcoming_grid:
+                    upcoming = upcoming_grid.find_all("tr", class_=["rgRow", "rgAltRow"])
+            scope = grid or soup
+            page = scope.find_all("tr", class_=["rgRow", "rgAltRow"])
+            signature = tuple(str(row) for row in page)
+            if signature in seen:
+                raise self._history_error("Legistar calendar pagination did not advance")
+            seen.add(signature)
+            rows.extend(page)
+            info = scope.select_one(".rgInfoPart")
+            counts = re.search(r"Page\s+(\d+)\s+of\s+(\d+).*?items\s+[\d,]+\s+to\s+[\d,]+\s+of\s+([\d,]+)", info.get_text(" ", strip=True), re.I) if info else None
+            if counts and int(counts[1]) == int(counts[2]):
+                if len(rows) != int(counts[3].replace(",", "")):
+                    raise self._history_error("Calendar row count does not match its published total")
+                return upcoming + rows
+            next_button = scope.select_one(".rgPageNext")
+            if next_button is None and counts:
+                next_button = next((a for a in scope.select(".rgNumPart a") if a.get_text(strip=True) == str(int(counts[1]) + 1)), None)
+            if next_button is None or next_button.has_attr("disabled") or next_button.get("aria-disabled") == "true" or "rgPageNextDisabled" in next_button.get("class", []):
+                if counts and int(counts[1]) < int(counts[2]):
+                    raise self._history_error("Calendar reports more pages without a usable next control")
+                return upcoming + rows
+            fields = {n.get("name"): n.get("value", "") for n in soup.select("input[type=hidden][name]")}
+            if not fields.get("__VIEWSTATE"):
+                raise self._history_error("Calendar pager has no ASP.NET state")
+            action = (next_button.get("href", "") + " " + next_button.get("onclick", ""))
+            match = re.search(r"__doPostBack\('([^']+)',\s*'([^']*)'\)", action)
+            if match:
+                fields.update(__EVENTTARGET=match[1], __EVENTARGUMENT=match[2])
+            elif next_button.get("name"):
+                name = next_button["name"]
+                if next_button.get("type") == "image":
+                    fields.update({name + ".x": "1", name + ".y": "1"})
+                else:
+                    fields[name] = next_button.get("value", "")
+            else:
+                raise self._history_error("Unrecognized Legistar calendar next-page control")
+            selection = soup.find("input", attrs={"name": _YEARS_CONTROL})
+            if selection:
+                value = selection.get("value", "")
+                fields[_YEARS_CONTROL] = value
+                fields[_YEARS_CONTROL.replace("$", "_") + "_ClientState"] = json.dumps(
+                    {"logEntries": [], "value": value, "text": value, "enabled": True,
+                     "checkedIndices": [], "checkedItemsTextOverflows": False})
+            response = await self._post(url, data=fields, headers={"Referer": url})
+            html = await response.text()
+
+    async def _widen_calendar(self, url: str, html: str, selection: str = _ALL_YEARS) -> Optional[str]:
+        """Select a specific year or All Years through the existing calendar form.
 
         InSite's Calendar.aspx defaults to a narrow view -- often the current
         month -- so a back-window of any size reads the same handful of rows.
@@ -992,19 +1103,20 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         widening means replaying the page's own form. San Jose goes from a
         default view to 159 meeting rows this way.
 
-        Only for genuine back-windows: a routine sync looks back two weeks and
-        should not pull a megabyte per city. Returns None on any failure, so
-        the caller keeps the narrow page rather than losing the city.
+        Only for wide or explicit windows: a routine sync looks back 28 days and
+        should not pull a megabyte per city. Returns None when the selection cannot be verified; the caller must
+        not interpret the narrow page as complete historical coverage.
         """
-        fields = {name: _hidden_field(html, name) for name in _ASP_STATE_FIELDS}
+        soup = self._parse_html(html)
+        fields = {n.get("name"): n.get("value", "") for n in soup.select("input[type=hidden][name]")}
         if not fields.get("__VIEWSTATE"):
             return None
         fields.update({
             "__EVENTTARGET": _YEARS_CONTROL,
             "__EVENTARGUMENT": "",
-            _YEARS_CONTROL: _ALL_YEARS,
+            _YEARS_CONTROL: selection,
             f"{_YEARS_CONTROL.replace('$', '_')}_ClientState": json.dumps(
-                {"logEntries": [], "value": _ALL_YEARS, "text": _ALL_YEARS,
+                {"logEntries": [], "value": selection, "text": selection,
                  "enabled": True, "checkedIndices": [], "checkedItemsTextOverflows": False}
             ),
         })
@@ -1018,7 +1130,9 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         except (VendorHTTPError, aiohttp.ClientError) as e:
             logger.debug("legistar calendar widening failed", slug=self.slug, error=str(e))
             return None
-        if len(widened) <= len(html):
+        parsed = self._parse_html(widened)
+        selected = parsed.find("input", attrs={"name": _YEARS_CONTROL})
+        if not selected or selected.get("value") != selection:
             return None
         logger.info(
             "legistar calendar widened",
@@ -1028,7 +1142,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         )
         return widened
 
-    async def _fetch_meetings_html(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_html(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings by scraping HTML calendar (fallback)."""
         # Try common Legistar calendar URL patterns
         calendar_urls = [
@@ -1042,8 +1156,22 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             try:
                 response = await self._get(url)
                 html = await response.text()
-                if days_back > WIDE_CALENDAR_DAYS:
-                    html = await self._widen_calendar(url, html) or html
+                explicit = getattr(self, "_explicit_range", None)
+                calendar_rows = None
+                if explicit:
+                    calendar_rows = []
+                    last_year = (explicit[1] - timedelta(microseconds=1)).year
+                    for year in range(explicit[0].year, last_year + 1):
+                        selected = await self._widen_calendar(url, html, str(year))
+                        if selected is None:
+                            raise self._history_error(f"Unable to confirm calendar year {year}")
+                        calendar_rows.extend(await self._calendar_pages(url, selected))
+                        html = selected
+                elif days_back > WIDE_CALENDAR_DAYS:
+                    widened = await self._widen_calendar(url, html)
+                    if widened is None:
+                        raise self._history_error("Unable to confirm All Years calendar selection")
+                    html = widened
                 # Parse HTML in thread pool (BeautifulSoup is CPU-bound)
                 soup = await asyncio.to_thread(self._parse_html, html)
                 calendar_url = url
@@ -1055,7 +1183,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
 
         if not soup or not calendar_url:
             logger.error("could not find HTML calendar at any known URL", slug=self.slug)
-            return []
+            raise self._history_error("No usable Legistar calendar")
 
         # Extract base URL for building absolute URLs
         html_base_url = calendar_url.rsplit('/', 1)[0]
@@ -1064,7 +1192,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         start_date, end_date = self._date_range(days_back, days_forward)
 
         # Find meeting rows in RadGrid calendar table
-        meeting_rows = soup.find_all("tr", class_=["rgRow", "rgAltRow"])
+        meeting_rows = calendar_rows if calendar_rows is not None else await self._calendar_pages(calendar_url, html)
 
         if not meeting_rows:
             logger.warning("no meeting rows found in HTML calendar", slug=self.slug)
@@ -1085,6 +1213,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
 
         processed_meetings = await self._bounded_gather(meeting_tasks, max_concurrent=5, return_exceptions=True)
 
+        if getattr(self, "_explicit_range", None) and any(isinstance(m, Exception) for m in processed_meetings):
+            raise self._history_error("One or more historical meeting detail requests failed")
         # Filter out None, errors, and duplicates (calendar has upcoming + all sections)
         seen_ids = set()
         meetings = []
@@ -1348,6 +1478,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                     substantive_items.append(item)
 
             # Fetch attachments for substantive items concurrently
+            if self._originals_only:
+                substantive_items = items
             if substantive_items:
                 attachment_tasks = [
                     self._fetch_item_attachments_async(item, base_url)
@@ -1356,6 +1488,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 attachment_results = await self._bounded_gather(attachment_tasks, max_concurrent=5, return_exceptions=True)
 
                 for item, attachments in zip(substantive_items, attachment_results):
+                    if isinstance(attachments, Exception) and self._originals_only:
+                        self._archive_discovery_errors.append(str(attachments))
                     if isinstance(attachments, list) and attachments:
                         item['attachments'] = attachments
 
@@ -1372,6 +1506,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                         break
 
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
+            if self._originals_only:
+                self._archive_discovery_errors.append(str(e))
             logger.debug("detail page unavailable", slug=self.slug, meeting_id=meeting_id, error=str(e))
 
         meeting_data: Dict[str, Any] = {
@@ -1423,6 +1559,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                 item_count=len(items),
             )
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
+            if self._originals_only:
+                self._archive_discovery_errors.append(str(e))
             logger.debug("AADA page unavailable", slug=self.slug, meeting_id=meeting_id, error=str(e))
 
         meeting_data: Dict[str, Any] = {
@@ -1479,11 +1617,14 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             )
 
             # Filter to include at most one Leg Ver attachment
-            attachments = self._filter_leg_ver_attachments(attachments)
+            if not self._originals_only:
+                attachments = self._filter_leg_ver_attachments(attachments)
 
             return attachments
 
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
+            if self._originals_only:
+                self._archive_discovery_errors.append(str(e))
             logger.warning("failed to fetch item attachments", slug=self.slug, item_id=item.get('item_id'), error=str(e))
             return []
 
@@ -1629,7 +1770,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             url = f"{self.base_url}/OfficeRecords"
 
             # Filter to current memberships only (EndDate >= today)
-            from datetime import datetime
+            from datetime import datetime, timedelta
             today = datetime.now().strftime("%Y-%m-%d")
 
             params: Dict[str, Any] = {"$top": 1000}

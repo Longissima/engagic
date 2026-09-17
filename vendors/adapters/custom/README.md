@@ -62,7 +62,7 @@ class AsyncCityNameAdapter(AsyncBaseAdapter):
         super().__init__(city_slug, vendor="cityname")
         self.base_url = "https://city.gov"
 
-    async def fetch_meetings(self, days_back: int = 14, days_forward: int = 14):
+    async def fetch_meetings(self, days_back: int = 28, days_forward: int = 28):
         """Fetch and parse meetings (async)"""
         response = await self._get(f"{self.base_url}/meetings")
         html = await response.text()

@@ -102,7 +102,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         super().__init__(city_slug, vendor="escribe", metrics=metrics)
         self.base_url = f"https://{self.slug}.escribemeetings.com"
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings via calendar API with item-level extraction."""
         start_date, end_date = self._date_range(days_back, days_forward)
 
@@ -240,6 +240,21 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
                         break
                     elif doc.get("Type") == "Agenda" and not packet_url:
                         packet_url = doc.get("Url")
+            # Some portals publish standalone agendas as AdditionalDocuments
+            # while HasAgenda remains false. Only accept an explicit agenda
+            # label, never cancellation notices, minutes, or public comments.
+            if not packet_url:
+                for doc in doc_links:
+                    if not isinstance(doc, dict) or doc.get("Type") != "AdditionalDocuments":
+                        continue
+                    label = (doc.get("Title") or doc.get("Name") or "").strip()
+                    if (
+                        str(doc.get("Format", "")).lower() == ".pdf"
+                        and re.fullmatch(r"(?:revised\s+)?agenda(?:\s+packet)?(?:\s*\(pdf\))?(?:\.pdf)?", label, re.I)
+                        and doc.get("Url")
+                    ):
+                        packet_url = doc["Url"]
+                        break
             if packet_url and not packet_url.startswith("http"):
                 packet_url = urljoin(self.base_url, packet_url)
 

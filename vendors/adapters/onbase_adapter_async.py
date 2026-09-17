@@ -118,7 +118,7 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
             site_count=len(self.site_urls)
         )
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from all configured OnBase sites."""
         start_date, end_date = self._date_range(days_back, days_forward)
 
@@ -268,6 +268,39 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
                 seen_ids.add(meeting_id)
             except (json.JSONDecodeError, KeyError):
                 continue
+
+        # SamTrans-style responsive tables put the name and full local time
+        # in sortable cells; document links are only labeled "Agenda".
+        if not meetings:
+            soup = BeautifulSoup(html, "html.parser")
+            for row in soup.select("tr[data-meeting-id]"):
+                meeting_id = string_attr(row, "data-meeting-id")
+                name = row.select_one('[data-sortable-type="mtgName"]')
+                time = row.select_one('[data-sortable-type="mtgTime"]')
+                if not meeting_id.isdigit() or meeting_id in seen_ids or not name or not time:
+                    continue
+                title = name.get_text(" ", strip=True)
+                date_text = " ".join(time.get_text(" ", strip=True).split())
+                meeting_date = None
+                for fmt in ("%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p", "%m/%d/%Y"):
+                    try:
+                        meeting_date = datetime.strptime(date_text, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if not title or meeting_date is None:
+                    continue
+                meeting = {"id": meeting_id, "title": title, "date": meeting_date,
+                           "has_agenda": False}
+                for link in row.select("a[href]"):
+                    href = string_attr(link, "href")
+                    query = parse_qs(urlparse(href).query)
+                    if "ViewMeeting" in href and query.get("id") == [meeting_id]:
+                        if query.get("doctype", ["1"]) == ["1"]:
+                            meeting["url"] = href
+                            meeting["has_agenda"] = True
+                meetings.append(meeting)
+                seen_ids.add(meeting_id)
 
         # Method 2: Extract from static HTML links (fallback)
         if not meetings:

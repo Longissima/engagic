@@ -222,6 +222,7 @@
 					<div class="stat-title">Frequently Updated Jurisdictions</div>
 					<div class="stat-description">
 						{#if byTypeTotal}
+							7+ summarized meetings; total coverage spans
 							{formatNumber(byTypeTotal.city)} cities, {formatNumber(byTypeTotal.county)} counties,
 							{formatNumber(byTypeTotal.school_district)} school districts
 						{:else}

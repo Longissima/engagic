@@ -357,3 +357,46 @@ class TestMatterWorkGate:
         )
         assert normalize_body_text("Recess") == ""
         assert normalize_body_text(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_standalone_agenda_uses_pdf_fallback_without_html_agenda(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    adapter = AsyncEscribeAdapter("pub-portofsandiego")
+    meeting = {
+        "ID": "37b04821-b694-409d-9037-6d4b2ddd0086",
+        "MeetingName": "Environmental Advisory Committee",
+        "StartDate": "2026/09/16 09:30:00",
+        "Url": "",
+        "HasAgenda": False,
+        "MeetingDocumentLink": [{
+            "Type": "AdditionalDocuments", "Title": "Agenda",
+            "Format": ".pdf", "Url": "/FileStream.ashx?DocumentId=3709",
+        }],
+    }
+    response = SimpleNamespace(json=AsyncMock(return_value={"d": [meeting]}))
+    monkeypatch.setattr(adapter, "_post", AsyncMock(return_value=response))
+    pdf = AsyncMock(return_value=[{"title": "Approve environmental work plan"}])
+    monkeypatch.setattr(adapter, "_parse_packet_pdf", pdf)
+    html = AsyncMock()
+    monkeypatch.setattr(adapter, "_fetch_meeting_details", html)
+    result = await adapter._fetch_meetings_impl()
+    assert result[0]["items"] == pdf.return_value
+    pdf.assert_awaited_once_with(
+        "https://pub-portofsandiego.escribemeetings.com/FileStream.ashx?DocumentId=3709",
+        result[0]["vendor_id"],
+    )
+    html.assert_not_awaited()
+
+
+@pytest.mark.parametrize("label", ["Cancellation Notice", "Minutes", "Public Comments", "Agenda Cover Page", "Agenda en Espanol"])
+def test_additional_documents_do_not_become_agendas(label):
+    adapter = AsyncEscribeAdapter("pub-test")
+    result = adapter._parse_calendar_meeting({
+        "ID": "test", "MeetingName": "Board", "StartDate": "2026/09/16 09:30:00",
+        "MeetingDocumentLink": [{"Type": "AdditionalDocuments", "Title": label,
+                                 "Format": ".pdf", "Url": "/document.pdf"}],
+    })
+    assert result["packet_url"] is None

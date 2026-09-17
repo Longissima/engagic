@@ -132,7 +132,7 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
             return None
         return min(candidates, key=lambda doc: _MINUTES_FORMAT_RANK.get(doc.get("compileOutputType"), 9))
 
-    async def _fetch_meetings_impl(self, days_back: int = 14, days_forward: int = 28) -> List[Dict[str, Any]]:
+    async def _fetch_meetings_impl(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from PrimeGov API (upcoming + archived concurrently)."""
         start_date, end_date = self._date_range(days_back, days_forward)
 
