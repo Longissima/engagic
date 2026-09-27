@@ -12,6 +12,7 @@ Handles two patterns:
 """
 
 import re
+from urllib.parse import urlparse
 from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup
 from parsing.participation import parse_participation_info
@@ -290,6 +291,14 @@ def _extract_boulder_pattern_item(table, soup: BeautifulSoup, sequence: int) -> 
     return item_dict
 
 
+def is_document_link(href: str) -> bool:
+    """Recognize native download routes, excluding preview viewers."""
+    path = urlparse(href).path.lower()
+    return ("historyattachment" in path
+            or path.startswith(("/meeting/document/", "/meeting/attachment/"))
+            or path == "/meetings/sectionattachment")
+
+
 def _extract_attachments(contents_div, item_id: str) -> List[Dict[str, Any]]:
     """Extract attachment links from item_contents div."""
     attachments = []
@@ -299,6 +308,13 @@ def _extract_attachments(contents_div, item_id: str) -> List[Dict[str, Any]]:
 
     for link in links:
         href = link['href']
+
+        if is_document_link(href) and 'historyattachment' not in href.lower():
+            attachments.append({
+                'name': link.get_text(strip=True) or f"Attachment {len(attachments) + 1}",
+                'url': href,
+            })
+            continue
 
         # Look for attachment API endpoint
         if 'historyattachment' in href.lower():

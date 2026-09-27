@@ -6,12 +6,13 @@ Cities using PrimeGov: Palo Alto CA, Mountain View CA, Sunnyvale CA, and many ot
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, cast
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
+from bs4 import BeautifulSoup
 import re
 import asyncio
 import aiohttp
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
-from vendors.adapters.parsers.primegov_parser import parse_html_agenda
+from vendors.adapters.parsers.primegov_parser import parse_html_agenda, is_document_link
 from pipeline.protocols import MetricsCollector
 
 
@@ -46,10 +47,12 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
     """Async adapter for cities using PrimeGov platform."""
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    ORIGINALS_ARCHIVE_SUPPORTED = True
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="primegov", metrics=metrics)
         self.base_url = f"https://{self.slug}.primegov.com"
+        self._archive_year_cache = None
 
     def _build_packet_url(self, doc: Dict[str, Any]) -> str:
         """Build compiled packet URL from document metadata."""
@@ -147,6 +150,8 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         unique_meetings = []
         for meeting in all_meetings:
             meeting_id = meeting.get("id")
+            if self._originals_only and meeting_id is None:
+                raise ValueError("PrimeGov meeting has no ID")
             if meeting_id not in seen_ids:
                 seen_ids.add(meeting_id)
                 unique_meetings.append(meeting)
@@ -163,6 +168,8 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         for meeting in unique_meetings:
             date_str = meeting.get("dateTime", "")
             if not date_str:
+                if self._originals_only:
+                    raise ValueError(f"PrimeGov meeting {meeting.get('id')} has no date")
                 continue
 
             try:
@@ -171,6 +178,8 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
                 if start_date <= meeting_date <= end_date:
                     meetings_in_range.append(meeting)
             except (ValueError, AttributeError):
+                if self._originals_only:
+                    raise
                 logger.debug(
                     "failed to parse date, including anyway",
                     slug=self.slug,
@@ -202,17 +211,23 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         """Fetch upcoming meetings from API"""
         try:
             response = await self._get(url)
-            return await response.json()
+            rows = await response.json()
+            self._validate_listing(rows)
+            return rows
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if self._originals_only:
+                raise
             logger.error("failed to fetch upcoming meetings", vendor="primegov", slug=self.slug, error=str(e))
             return []
         except ValueError as e:
+            if self._originals_only:
+                raise
             logger.error("invalid json from upcoming meetings", vendor="primegov", slug=self.slug, error=str(e))
             return []
 
     async def _fetch_archived_meetings(self, start_date: datetime, today: datetime) -> List[Dict[str, Any]]:
         """Fetch archived meetings for relevant years."""
-        years_to_fetch = set([start_date.year, today.year])
+        years_to_fetch = range(start_date.year, today.year + 1)
         archived_meetings = []
         tasks = []
         for year in years_to_fetch:
@@ -232,22 +247,122 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
 
         return archived_meetings
 
+    def _validate_listing(self, rows):
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("PrimeGov listing is not an array of meetings")
+        if self._originals_only:
+            ids = [row.get("id") for row in rows]
+            if any(value is None for value in ids) or len(set(ids)) != len(ids):
+                raise ValueError("PrimeGov listing has missing or repeated meeting IDs")
+
     async def _fetch_archived_year(self, url: str, year: int) -> List[Dict[str, Any]]:
-        """Fetch archived meetings for a single year"""
+        """Fetch an annual listing; reuse it across adjacent archival windows."""
+        if self._originals_only and self._archive_year_cache is not None:
+            cached_year, rows = self._archive_year_cache
+            if cached_year == year:
+                return rows
         try:
             response = await self._get(url)
-            return await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            rows = await response.json()
+            self._validate_listing(rows)
+            if self._originals_only:
+                for row in rows:
+                    stamp = datetime.fromisoformat(row["dateTime"].replace("Z", "+00:00"))
+                    if stamp.year != year:
+                        raise ValueError(f"PrimeGov ignored archive year {year}")
+                self._archive_year_cache = (year, rows)
+            return rows
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            if self._originals_only:
+                raise
             logger.error("failed to fetch archived meetings", vendor="primegov", slug=self.slug, year=year, error=str(e))
             return []
-        except ValueError as e:
-            logger.error("invalid json from archived meetings", vendor="primegov", slug=self.slug, year=year, error=str(e))
-            return []
+
+    async def _archive_document_listing(self, meeting, result):
+        """Choose agenda + attachments OR a packet, retaining raw candidates."""
+        documents = meeting.get("documentList") or []
+        if not isinstance(documents, list):
+            raise ValueError("PrimeGov documentList is not an array")
+        published = []
+        for doc in documents:
+            if not isinstance(doc, dict):
+                raise ValueError("PrimeGov document is not an object")
+            if doc.get("publishStatus", 1) != 1:
+                continue
+            if not doc.get("link") and (not doc.get("templateId") or not doc.get("compileOutputType")):
+                raise ValueError("PrimeGov published document lacks template/format ID")
+            published.append(doc)
+        result["source_metadata"] = meeting
+        result["archive_documents"] = []
+        agenda_docs = self._find_agenda_docs(published)
+        if any(kind != "packet" for _, kind in agenda_docs):
+            agenda_docs = [(doc, kind) for doc, kind in agenda_docs if kind != "packet"]
+
+        async def discover(doc, agenda_type):
+            url = f"{self.base_url}/Portal/Meeting?{urlencode({'meetingTemplateId': doc['templateId']})}"
+            return url, await self.fetch_html_agenda_items_async(url)
+
+        discovered = await self._bounded_gather(
+            [discover(doc, kind) for doc, kind in agenda_docs],
+            max_concurrent=5, return_exceptions=False)
+        items = []
+        attachments = []
+        for url, data in discovered:
+            attachments.extend(data.get("archive_documents", []))
+            for item in data.get("items", []):
+                attachments.extend(item.get("attachments", []))
+                items.append(item)
+        result["items"] = list({item["vendor_item_id"]: item for item in items}.values())
+        if attachments:
+            result["archive_selection"] = "html_agenda_and_attachments"
+            result["agenda_url"] = discovered[0][0]
+            result["archive_documents"] = [
+                {"url": url, "role": "html_agenda"} for url, _ in discovered
+            ] + attachments
+            return result
+
+        # No individually discoverable attachments: prefer the full packet.
+        # Keep one published representation per template (PDF before DOCX/HTML).
+        def document_url(doc):
+            if doc.get("link"):
+                return urljoin(self.base_url, doc["link"])
+            if str(doc.get("compileOutputType")) == "3":
+                # Compiled HTML is a viewer shell; retain the actual agenda.
+                return f"{self.base_url}/Portal/Meeting?{urlencode({'meetingTemplateId': doc['templateId']})}"
+            return self._build_packet_url(doc)
+
+        def one_per_template(docs):
+            selected = {}
+            for doc in sorted(docs, key=lambda d: _MINUTES_FORMAT_RANK.get(d.get("compileOutputType"), 9)):
+                selected.setdefault(doc.get("templateId") or doc.get("link"), doc)
+            return list(selected.values())
+
+        content_docs = [doc for doc in published
+                        if not _MINUTES_TEMPLATE_RE.search(doc.get("templateName") or "")]
+        packets = [doc for doc in content_docs if "packet" in (doc.get("templateName") or "").lower()]
+        agendas = [doc for doc in content_docs if "agenda" in (doc.get("templateName") or "").lower()]
+        if packets:
+            chosen = one_per_template(packets)
+            result["archive_selection"] = "packet"
+            result["packet_url"] = document_url(chosen[0])
+        elif agendas:
+            chosen = one_per_template(agendas)
+            result["archive_selection"] = "agenda"
+            result["agenda_url"] = document_url(chosen[0])
+        else:
+            chosen = one_per_template(content_docs)
+            result["archive_selection"] = "published_documents_fallback"
+        result["archive_documents"] = [
+            {"url": document_url(doc), "role": result["archive_selection"],
+             "name": doc.get("templateName"), "vendor_document": doc}
+            for doc in chosen
+        ]
+        return result
 
     async def _process_meeting(self, meeting: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Process a single meeting, fetching all agenda types in parallel."""
         title = meeting.get("title", "")
-        if " - SAP" in title:
+        if " - SAP" in title and not self._originals_only:
             return None
 
         date_time = meeting.get("dateTime", "")
@@ -273,9 +388,16 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         minutes_doc = self._find_minutes_doc(meeting.get("documentList", []))
         if minutes_doc:
             result["minutes_url"] = self._build_packet_url(minutes_doc)
+            if self._originals_only and str(minutes_doc.get("compileOutputType")) == "3":
+                result["minutes_url"] = f"{self.base_url}/Portal/Meeting?{urlencode({'meetingTemplateId': minutes_doc['templateId']})}"
 
         if self._minutes_discovery_only:
             return result
+
+        if self._originals_only:
+            if meeting_status:
+                result["meeting_status"] = meeting_status
+            return await self._archive_document_listing(meeting, result)
 
         agenda_docs = self._find_agenda_docs(meeting.get("documentList", []))
 
@@ -397,6 +519,16 @@ class AsyncPrimeGovAdapter(AsyncBaseAdapter):
         html = await response.text()
         parsed = await asyncio.to_thread(parse_html_agenda, html)
 
+
+        if self._originals_only:
+            # Attachment links can sit outside recognized/retained item rows.
+            soup = BeautifulSoup(html, "html.parser")
+            parsed["archive_documents"] = [
+                {"url": urljoin(html_url, str(link["href"])),
+                 "name": link.get_text(" ", strip=True), "role": "attachment"}
+                for link in soup.find_all("a", href=True)
+                if is_document_link(str(link["href"]))
+            ]
 
         total_attachments = 0
         for item in parsed['items']:

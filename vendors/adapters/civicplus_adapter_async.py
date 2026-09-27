@@ -22,7 +22,7 @@ import hashlib
 import tempfile
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
-from urllib.parse import urlparse, urljoin, parse_qs
+from urllib.parse import urlparse, urljoin, parse_qs, parse_qsl, urlencode, urlunparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -38,9 +38,13 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
     """Async adapter for cities using CivicPlus CMS (often with external agenda systems)"""
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    ORIGINALS_ARCHIVE_SUPPORTED = True
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         super().__init__(city_slug, vendor="civicplus", metrics=metrics)
+        self._history_year_cache = {}
+        self._history_root = None
+        self._archive_html = {}
         self._site_config = self._load_site_config()
         domain_override = self._site_config.get("domain")
         self.base_url = f"https://{domain_override}" if domain_override else None
@@ -199,13 +203,145 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         self._update_site_config({"failed": True, "failed_at": datetime.now(timezone.utc).isoformat()})
         return None
 
+    async def _historical_meeting_links(self, soup, agenda_url, start_date, end_date):
+        """Use AgendaCenter's own category/year endpoint and existing row parser.
+
+        Each response contains the complete annual category table. Unknown paging
+        controls fail explicitly rather than turning a partial table into coverage.
+        Cache parsed years only during archival; normal sync always sees revisions.
+        """
+        # Preserve the proven current-year normal sync path. Only historical
+        # ranges (or originals mode) need category/year enumeration.
+        if (not self._originals_only and not getattr(self, '_explicit_range', None)
+                and start_date.year == end_date.year == datetime.now().year):
+            return self._extract_meeting_links(soup, agenda_url)
+        categories = {}
+        for checkbox in soup.select('input[name="chkCategoryID"]'):
+            value = checkbox.get('value', '')
+            if value.isdigit():
+                label = checkbox.find_parent('label')
+                categories[int(value)] = label.get_text(' ', strip=True) if label else value
+        for section in soup.select('div.listing, div.category'):
+            heading = section.find(['h3', 'h2'])
+            for match in re.finditer(r'changeYear\(\s*\d{4}\s*,\s*(\d+)', str(section)):
+                categories.setdefault(int(match[1]), heading.get_text(' ', strip=True) if heading else match[1])
+        if not categories:
+            if self._originals_only or getattr(self, '_explicit_range', None):
+                raise ValueError('Historical CivicPlus discovery requires an AgendaCenter category listing')
+            return self._extract_meeting_links(soup, agenda_url)
+
+        links = []
+        for category, body in sorted(categories.items()):
+            section = soup.find(id=f'section{category}')
+            current = section.select_one('.years .current') if section else None
+            current_year = current.get_text(strip=True) if current else None
+            for year in range(start_date.year, end_date.year + 1):
+                key = (agenda_url, category, year)
+                cached = self._history_year_cache.get(key) if self._originals_only else None
+                if cached is not None:
+                    links.extend(cached)
+                    continue
+                if section is not None and current_year == str(year):
+                    year_soup = BeautifulSoup(str(section), 'html.parser')
+                else:
+                    response = await self._post(
+                        urljoin(agenda_url, '/AgendaCenter/UpdateCategoryList'),
+                        data={'year': str(year), 'catID': str(category), 'startDate': '',
+                              'endDate': '', 'term': '', 'prevVersionScreen': 'false'},
+                        headers={'X-Requested-With': 'XMLHttpRequest', 'Referer': agenda_url},
+                    )
+                    year_soup = BeautifulSoup(await response.text(), 'html.parser')
+                if not year_soup.find(id=f'section{category}') or not year_soup.find(id=f'table{category}'):
+                    raise ValueError(f'Unrecognized CivicPlus history response: category={category}, year={year}')
+                for pager in year_soup.select('.pagination, .pager, [class*="Pager"], [class*="paging"]'):
+                    if pager.select('a[href], button, select'):
+                        raise ValueError(f'Untraversed CivicPlus history pagination: category={category}, year={year}')
+                rows = year_soup.select('tr.catAgendaRow')
+                for row in rows:
+                    dated = row.find('a', href=re.compile(r'/ViewFile/(?:Agenda|Minutes)/'))
+                    parsed_date = self._extract_date_from_url(dated['href']) if dated else None
+                    if parsed_date is None or parsed_date.year != year:
+                        raise ValueError(f'Unconfirmed CivicPlus row year: category={category}, requested={year}')
+                # The response is a section fragment; wrap it so the same normal
+                # row parser retains body attribution, downloads and minutes.
+                wrapper = year_soup.new_tag('div', attrs={'class': 'listing'})
+                heading = year_soup.new_tag('h2'); heading.string = body
+                wrapper.append(heading)
+                for child in list(year_soup.contents):
+                    wrapper.append(child.extract())
+                year_soup.append(wrapper)
+                parsed = self._extract_meeting_links(year_soup, agenda_url)
+                if self._originals_only and len(parsed) != len(rows):
+                    raise ValueError(f'Incomplete CivicPlus category rows: {len(parsed)}/{len(rows)}, category={category}, year={year}')
+                if self._originals_only:
+                    self._history_year_cache[key] = parsed
+                logger.info('civicplus historical category listed', slug=self.slug,
+                            category=category, year=year, rows=len(rows))
+                links.extend(parsed)
+        return links
+
+    def _pair_archive_packets(self, meetings):
+        """Pair unambiguous same-date agenda/packet categories, retaining identity."""
+        groups = {}
+        for meeting in meetings:
+            body = re.sub(r"\s+(?:agendas?|packets?)$", "", meeting.get('body_name') or '', flags=re.I).strip().casefold()
+            if body:
+                groups.setdefault((meeting.get('start'), body), []).append(meeting)
+        removed = set()
+        for group in groups.values():
+            packets = [m for m in group if re.search(r"\bpackets?$", m.get('body_name') or '', re.I)]
+            agendas = [m for m in group if re.search(r"\bagendas?$", m.get('body_name') or '', re.I)]
+            if len(group) != 2 or len(packets) != 1 or len(agendas) != 1:
+                continue  # Multiple sessions or revisions need explicit source evidence.
+            agenda, packet = agendas[0], packets[0]
+            agenda['published_documents'] = agenda.get('published_documents', []) + packet.get('published_documents', [])
+            agenda['related_listing_rows'] = [packet.get('raw_listing_row')]
+            agenda['related_vendor_ids'] = [packet['vendor_id']]
+            if not agenda.get('minutes_url') and packet.get('minutes_url'):
+                agenda['minutes_url'] = packet['minutes_url']
+            removed.add(id(packet))
+        return [meeting for meeting in meetings if id(meeting) not in removed]
+
+    async def _select_archive_documents(self, meeting):
+        """Keep HTML + native attachments, otherwise a packet or agenda original."""
+        original_url = meeting.get('packet_url')
+        if original_url and '/ViewFile/Agenda/' in original_url:
+            parsed = urlparse(original_url)
+            original_url = urlunparse(parsed._replace(query=urlencode([
+                (key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                if key.lower() != 'html'
+            ])))
+        items = []
+        if original_url and '/ViewFile/Agenda/' in original_url:
+            items = await self._try_html_agenda(original_url, meeting.get('vendor_id'))
+        catalog = explode_document_catalog(items) if items else None
+        packet = (catalog or {}).get('packet_url') or self._detect_monolithic_packet(items)
+        native_items = (catalog or {}).get('items', items)
+        native_items = [item for item in native_items if not self._is_packet_item(item)]
+        documents = meeting.get('published_documents', [])
+        packet = packet or next((d['url'] for d in documents if d['role'] == 'packet'), None)
+        meeting['archive_documents'] = [d for d in documents if d['role'] in {'supplemental', 'minutes'}]
+        if native_items and any(i.get('attachments') for i in native_items) and not self._detect_monolithic_packet(items):
+            meeting['items'] = native_items
+            meeting['agenda_url'] = original_url.split('?')[0] + '?html=true'
+            meeting.pop('packet_url', None)
+            meeting['archive_selection'] = 'html_and_attachments'
+        else:
+            meeting['items'] = [{**i, 'attachments': []} for i in native_items]
+            meeting['packet_url'] = packet or original_url
+            meeting['archive_selection'] = 'full_packet' if packet else 'agenda_document'
+        if meeting.get('vendor_id') in self._archive_html:
+            meeting['raw_agenda_html'] = self._archive_html.pop(meeting['vendor_id'])
+
     async def _fetch_meetings_impl(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Scrape AgendaCenter HTML and filter meetings by date range."""
         start_date, end_date = self._date_range(days_back, days_forward)
 
-        agenda_url = await self._find_agenda_url()
+        agenda_url = self._history_root[0] if self._originals_only and self._history_root else await self._find_agenda_url()
 
         if not agenda_url:
+            if self._originals_only:
+                raise ValueError('No CivicPlus historical agenda listing discovered')
             logger.error(
                 "no agenda page found - cannot fetch meetings",
                 vendor="civicplus",
@@ -214,10 +350,15 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             return []
 
         try:
-            response = await self._get(agenda_url)
-            html = await response.text()
+            if self._originals_only and self._history_root:
+                html = self._history_root[1]
+            else:
+                response = await self._get(agenda_url)
+                html = await response.text()
+                if self._originals_only:
+                    self._history_root = (agenda_url, html)
             soup = await asyncio.to_thread(BeautifulSoup, html, 'html.parser')
-            meeting_links = self._extract_meeting_links(soup, agenda_url)
+            meeting_links = await self._historical_meeting_links(soup, agenda_url, start_date, end_date)
 
             logger.info(
                 "found meeting links",
@@ -230,7 +371,7 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             for link_data in meeting_links:
                 if self._minutes_discovery_only and not link_data.get("minutes_url"):
                     continue
-                if '/ViewFile/Agenda/' in link_data['url']:
+                if '/ViewFile/Agenda/' in link_data['url'] or (self._originals_only and '/ViewFile/Minutes/' in link_data['url']):
                     meeting = self._create_meeting_from_viewfile_link(link_data)
                     if meeting and self._is_meeting_in_range(meeting, start_date, end_date):
                         results.append(meeting)
@@ -245,9 +386,19 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
             # Dedupe by date - keep the last one (packet is typically uploaded after agenda)
             deduped = self._dedupe_by_date(results)
+            if self._originals_only:
+                deduped = self._pair_archive_packets(deduped)
 
             # Try to parse packet PDFs for structured items
-            if not self._minutes_discovery_only:
+            if self._originals_only:
+                pending = iter(deduped)
+                async def select_worker():
+                    for meeting in pending:
+                        await self._select_archive_documents(meeting)
+                async with asyncio.TaskGroup() as group:
+                    for _ in range(min(3, len(deduped))):
+                        group.create_task(select_worker())
+            elif not self._minutes_discovery_only:
                 pdf_tasks = [
                     self._try_parse_packet_items(meeting)
                     for meeting in deduped
@@ -270,6 +421,8 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             return deduped
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if self._originals_only:
+                raise
             logger.error("failed to fetch meetings", vendor="civicplus", slug=self.slug, error=str(e))
             return []
 
@@ -279,12 +432,16 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
         """Check if meeting date is within range. Includes meetings with unparseable dates."""
         meeting_start = meeting.get("start")
         if not meeting_start:
+            if self._originals_only:
+                raise ValueError('Historical CivicPlus meeting has no date')
             return True
 
         try:
             meeting_date = datetime.fromisoformat(meeting_start)
             return start_date <= meeting_date <= end_date
         except (ValueError, AttributeError):
+            if self._originals_only:
+                raise
             return True
 
     def _attach_supplemental_documents(self, meetings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -374,6 +531,9 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 other = meeting if chosen is existing else existing
                 if other.get("minutes_url") and not chosen.get("minutes_url"):
                     chosen["minutes_url"] = other["minutes_url"]
+                if self._originals_only:
+                    chosen['published_documents'] = list({d['url']: d for d in
+                        chosen.get('published_documents', []) + other.get('published_documents', [])}.values())
             else:
                 by_key[key] = meeting
         return self._attach_supplemental_documents(list(by_key.values()))
@@ -413,7 +573,7 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
                 # Skip notice-only categories -- these are announcements,
                 # not meetings with agendas worth summarizing.
-                if body_name and re.search(
+                if not self._originals_only and body_name and re.search(
                     r"public\s+notice|notice\s+of\s+(?:quorum|posting)|"
                     r"legal\s+notice|press\s+release",
                     body_name, re.IGNORECASE
@@ -427,6 +587,8 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                         continue
                     p = td.find("p")
                     link = p.find("a", href=True) if p else None
+                    if not link and self._originals_only:
+                        link = row.find('a', href=re.compile(r'/ViewFile/(?:Agenda|Minutes)/'))
                     if not link:
                         continue
 
@@ -450,6 +612,19 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                     )
                     if minutes_link:
                         entry["minutes_url"] = urljoin(base_url, minutes_link["href"])
+                    if self._originals_only:
+                        entry['raw_listing_row'] = str(row)
+                        entry['published_documents'] = []
+                        for doc in row.find_all('a', href=True):
+                            href = doc['href']
+                            if not re.search(r'/ViewFile/(?:Agenda|Minutes|Item)/|/DocumentCenter/(?:View|Home/View)/', href, re.I):
+                                continue
+                            label = doc.get_text(' ', strip=True)
+                            role = ('minutes' if '/ViewFile/Minutes/' in href else
+                                    'supplemental' if doc is not link and re.search(r'supplement|addend', label, re.I) else
+                                    'packet' if 'packet=true' in href.lower() or re.fullmatch(r'(?:agenda |full |meeting )?packet', label, re.I) or re.search(r'\bpackets?$', body_name or '', re.I) else
+                                    'agenda' if '/ViewFile/Agenda/' in href else 'supplemental')
+                            entry['published_documents'].append({'url': urljoin(base_url, href), 'role': role, 'label': label})
                     links.append(entry)
 
             if links:
@@ -530,6 +705,9 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             "packet_url": url,
         }
 
+        if self._originals_only:
+            result['raw_listing_row'] = link_data.get('raw_listing_row')
+            result['published_documents'] = link_data.get('published_documents', [])
         if meeting_status:
             result["meeting_status"] = meeting_status
 
@@ -852,13 +1030,21 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             html_url = base_viewfile + '?html=true'
 
             response = await self._get(html_url)
-            html = await response.text()
+            if 'application/pdf' in response.headers.get('Content-Type', '').lower():
+                response.release()
+                return []  # Some tenants serve their PDF even for ?html=true.
+            try:
+                html = await response.text()
+            except UnicodeDecodeError:
+                return []  # A native binary document, not a structured HTML agenda.
 
             # Verify we got an HTML agenda (not an error page or redirect)
             if '<div id="divItems"' not in html and 'class="item level' not in html:
                 logger.debug("html agenda not found", vendor="civicplus", slug=self.slug, vendor_id=vendor_id)
                 return []
 
+            if self._originals_only:
+                self._archive_html[vendor_id] = html
             parsed = await asyncio.to_thread(parse_civicplus_html, html, self.base_url or "")
             items = parsed.get("items", [])
 
@@ -878,6 +1064,8 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
             return items
 
         except Exception as e:
+            if self._originals_only and not (isinstance(e, VendorHTTPError) and e.status_code in {400, 404, 410}):
+                raise
             logger.debug(
                 "html agenda parse failed",
                 vendor="civicplus",
@@ -892,11 +1080,14 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
 
         Mutates meeting dict in-place if items are found.
         """
-        # For ViewFile URLs, use the bare URL (no query params) for the PDF
+        # Drop only the HTML-view selector. Published packet=true links can
+        # be the only working download, and must retain their query parameters.
+        pdf_url = packet_url
         if '/ViewFile/Agenda/' in packet_url:
-            pdf_url = packet_url.split('?')[0]
-        else:
-            pdf_url = packet_url
+            parsed = urlparse(packet_url)
+            query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                     if key.lower() != "html"]
+            pdf_url = urlunparse(parsed._replace(query=urlencode(query)))
 
         items = await self._parse_packet_pdf(pdf_url, vendor_id)
         if items:

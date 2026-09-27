@@ -1,0 +1,199 @@
+# 148 jurisdictions from regional-body and Motioncount onboarding, 2026-09-17.
+# Includes 140 new entries and 8 existing jurisdictions with source or extraction repairs.
+# Format: banana # type | full name
+
+# AZ
+capAZ # water_district | Central Arizona Water Conservation District
+pimacountyAZ # county | Pima County
+
+# CA
+3ceCA # utility | Central Coast Community Energy
+actransitCA # transit | Alameda-Contra Costa Transit District
+acwdCA # water_district | Alameda County Water District
+bartCA # transit | San Francisco Bay Area Rapid Transit District
+buttecountyCA # county | Butte County
+caltrainCA # transit | Peninsula Corridor Joint Powers Board
+ccwdCA # water_district | Contra Costa Water District
+centralsanCA # water_reclamation_district | Central Contra Costa Sanitary District
+chinodesalterCA # water_district | Chino Basin Desalter Authority
+cucamongavalleywaterCA # water_district | Cucamonga Valley Water District
+cvwdCA # water_district | Coachella Valley Water District
+eastbayparksCA # park_district | East Bay Regional Park District
+helixwaterCA # water_district | Helix Water District
+hidesertwaterCA # water_district | Hi-Desert Water District
+iidCA # utility | Imperial Irrigation District
+ladwpCA # utility | Los Angeles Department of Water and Power
+lametroCA # transit | Los Angeles County Metropolitan Transportation Authority
+lawaCA # airport_authority | Los Angeles World Airports
+lossanCA # transit | LOSSAN Rail Corridor Agency
+marinwaterCA # water_district | Marin Municipal Water District
+mcagCA # regional_planning_agency | Merced County Association of Governments
+mercedirrigationCA # utility | Merced Irrigation District
+midCA # utility | Modesto Irrigation District
+mtcCA # regional_planning_agency | Metropolitan Transportation Commission
+mwdCA # water_district | Metropolitan Water District of Southern California
+nidCA # water_district | Nevada Irrigation District
+ocsanCA # water_reclamation_district | Orange County Sanitation District
+octaCA # transit | Orange County Transportation Authority
+pceCA # utility | Peninsula Clean Energy
+portoflongbeachCA # port | Port of Long Beach
+portofoaklandCA # port | Port of Oakland
+portofsandiegoCA # port | San Diego Unified Port District
+portsanluisCA # port | Port San Luis Harbor District
+ranchowaterCA # water_district | Rancho California Water District
+sacogCA # regional_planning_agency | Sacramento Area Council of Governments
+samtransCA # transit | San Mateo County Transit District
+sandagCA # regional_planning_agency | San Diego Association of Governments
+sbceraCA # retirement_system | San Bernardino County Employees' Retirement Association
+sbctaCA # transit | San Bernardino County Transportation Authority
+sbmwdCA # water_district | San Bernardino Municipal Water Department
+scvhabitatCA # conservation_district | Santa Clara Valley Habitat Agency
+sdapcdCA # air_quality_board | San Diego County Air Pollution Control District
+sfidCA # water_district | Santa Fe Irrigation District
+sjcogCA # regional_planning_agency | San Joaquin Council of Governments
+smctaCA # transit | San Mateo County Transportation Authority
+smudCA # utility | Sacramento Municipal Utility District
+smwdCA # water_district | Santa Margarita Water District
+southcoastwaterCA # water_district | South Coast Water District
+svbgsaCA # water_management_district | Salinas Valley Basin Groundwater Sustainability Agency
+sweetwaterauthorityCA # water_district | Sweetwater Authority
+valleywaterCA # water_district | Santa Clara Valley Water District
+vtaCA # transit | Santa Clara Valley Transportation Authority
+westernwaterCA # water_district | Western Municipal Water District
+yorbalindawaterCA # water_district | Yorba Linda Water District
+
+# CO
+acwwaCO # utility | Arapahoe County Water and Wastewater Authority
+apchaCO # housing_authority | Aspen/Pitkin County Housing Authority
+brightonuraCO # redevelopment_authority | Brighton Urban Renewal Authority
+
+# FL
+portcanaveralFL # port | Canaveral Port Authority
+sfwmdFL # water_management_district | South Florida Water Management District
+swapalmbeachFL # solid_waste_authority | Solid Waste Authority of Palm Beach County
+
+# IA
+opportunityiowaIA # state_agency | Iowa Economic Development Authority / Iowa Finance Authority
+
+# IL
+algonquinlakehillsfireIL # fire_district | Algonquin-Lake in the Hills Fire Protection District
+chicagoparkdistrictIL # park_district | Chicago Park District
+cmapIL # regional_planning_agency | Chicago Metropolitan Agency for Planning
+fpdccIL # forest_preserve_district | Forest Preserve District of Cook County
+metraIL # transit | Metra
+metroLINKIL # transit | Rock Island County Metropolitan Mass Transit District
+mwrdIL # water_reclamation_district | Metropolitan Water Reclamation District of Greater Chicago
+
+# LA
+nortaLA # transit | New Orleans Regional Transit Authority
+
+# MD
+wsscwaterMD # water_district | Washington Suburban Sanitary Commission
+
+# ME
+portlandhousingME # housing_authority | Portland Housing Authority
+
+# MI
+georgetowntownshipMI # city | Georgetown Township
+glwaMI # water_district | Great Lakes Water Authority
+stclairshoresMI # city | St. Clair Shores
+walkerMI # city | Walker
+
+# MN
+metroairportsMN # airport_authority | Metropolitan Airports Commission
+minnesotapucMN # state_agency | Minnesota Public Utilities Commission
+
+# MT
+buttesilverbowMT # county | Butte-Silver Bow
+
+# NC
+campoNC # regional_planning_agency | Capital Area Metropolitan Planning Organization
+partNC # transit | Piedmont Authority for Regional Transportation
+
+# NM
+losalamoscountyNM # county | Los Alamos County
+riometroNM # transit | Rio Metro Regional Transit District
+
+# NV
+ivgidNV # utility | Incline Village General Improvement District
+
+# OR
+oregonpucOR # state_agency | Oregon Public Utility Commission
+
+# TX
+atpTX # transit | Austin Transit Partnership
+eaaTX # water_management_district | Edwards Aquifer Authority
+geusTX # utility | Greenville Electric Utility System
+houstonmetroTX # transit | Metropolitan Transit Authority of Harris County
+lcmuaTX # utility | Lake Cities Municipal Utility Authority
+lostpinesgcdTX # water_management_district | Lost Pines Groundwater Conservation District
+ntmwdTX # water_district | North Texas Municipal Water District
+portofgalvestonTX # port | Port of Galveston
+
+# UT
+sandysidUT # utility | Sandy Suburban Improvement District
+utaUT # transit | Utah Transit Authority
+
+# VA
+wataVA # transit | Williamsburg Area Transit Authority
+
+# WA
+mukilteowaterWA # utility | Mukilteo Water and Wastewater District
+pierceconservationWA # conservation_district | Pierce Conservation District
+piercefloodWA # flood_control_district | Pierce County Flood District
+portoflongviewWA # port | Port of Longview
+pscleanairWA # air_quality_board | Puget Sound Clean Air Agency
+
+# WI
+mmsdWI # water_reclamation_district | Milwaukee Metropolitan Sewerage District
+
+# Existing jurisdictions needing a sync after source or extraction changes
+alamogordoNM # city | Alamogordo | corrected source to CivicClerk alamogordonm; wrong-source imports purged
+indianapolisIN # city | Indianapolis | added Granicus indianapolis source
+losangelescountyCA # county | Los Angeles County | added Legistar lacdrp planning source
+westlakevillageCA # city | Westlake Village | corrected CivicPlus domain to www.wlv.org
+elmonteCA # city | El Monte | corrected CivicPlus domain to www.elmonteca.gov
+malibuCA # city | Malibu | corrected CivicPlus domain to www.malibucity.org
+pasadenaCA # city | Pasadena | corrected Granicus host to pasadena, views 20 + 25; council HTML item extraction remains limited
+laverneCA # city | La Verne | fixed crash recovery for planning packet; recovered text remains unverified
+
+# Motioncount research batches 3–6
+gatewaydistrictFL # community_development_district | Gateway Services Community Development District
+tuolumneutilitiesCA # water_district | Tuolumne Utilities District
+charlestownutilityWV # utility | Charles Town Utility Board
+valleysanitaryCA # sanitation_district | Valley Sanitary District
+nc911boardNC # state_agency | North Carolina 911 Board
+cambriacsdCA # community_services_district | Cambria Community Services District
+mojavewaterCA # water_district | Mojave Water Agency
+dupageforestIL # park_district | Forest Preserve District of DuPage County
+spaldingwaterGA # water_district | Spalding County Water Authority
+nftaNY # transit | Niagara Frontier Transportation Authority
+sanmiguelcsdCA # community_services_district | San Miguel Community Services District
+rccdCA # community_college_district | Riverside Community College District
+southernmarinfireCA # fire_district | Southern Marin Fire Protection District
+ncrecNC # state_agency | North Carolina Real Estate Commission
+peoriaparksIL # park_district | Peoria Park District
+sd1KY # sanitation_district | Sanitation District No. 1
+soquelcreekwaterCA # water_district | Soquel Creek Water District
+abcwuaNM # water_district | Albuquerque Bernalillo County Water Utility Authority
+dwsdMI # utility | Detroit Water and Sewerage Department
+tampasportsFL # sports_authority | Tampa Sports Authority
+tvfrOR # fire_district | Tualatin Valley Fire & Rescue
+eastsidefireWA # fire_district | Eastside Fire & Rescue
+trpcWA # regional_planning | Thurston Regional Planning Council
+kittitaspudWA # utility | Kittitas Public Utility District
+ldchealthKS # public_health | Lawrence-Douglas County Public Health
+bcsmpoTX # regional_planning | Bryan/College Station Metropolitan Planning Organization
+southkingfireWA # fire_district | South King Fire
+
+# Motioncount niche agencies, batch 7
+uhsystemTX # university_system | University of Houston System
+texassouthernTX # university | Texas Southern University
+nueceshospitalTX # hospital_district | Nueces County Hospital District
+alamocollegesTX # community_college_district | Alamo Colleges District
+collincollegeTX # community_college_district | Collin College
+clackamascollegeOR # community_college_district | Clackamas Community College
+collegeofthemainlandTX # community_college_district | College of the Mainland
+collegeoflakecountyIL # community_college_district | College of Lake County
+brazosportcollegeTX # community_college_district | Brazosport College
+leecollegeTX # community_college_district | Lee College

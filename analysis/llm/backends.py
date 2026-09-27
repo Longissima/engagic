@@ -122,20 +122,46 @@ _SUMMARY_FIELD_RE = re.compile(r'("summary_markdown"\s*:\s*")(.*?)("\s*,\s*"topi
 _UNESCAPED_QUOTE_RE = re.compile(r'(?<!\\)"')
 
 
+def _load_first_object(candidate: str) -> Any:
+    """json.loads, falling back to the first complete value in the text.
+
+    Repair 4 (trailing extra data) cannot go through the brace-trimming path:
+    when the junk is itself a brace, rfind("}") lands on the junk and the trim
+    is a no-op. raw_decode stops at the end of the first complete value, so it
+    handles a duplicate "}" and any other trailing garbage alike. If the model
+    ever emits two real objects, the first one is the one we want.
+    """
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        start = candidate.find("{")
+        if start < 0:
+            raise
+        return json.JSONDecoder().raw_decode(candidate, start)[0]
+
+
 def parse_json_lenient(text: str) -> Any:
-    """json.loads with three targeted repairs for known open-model quirks.
+    """json.loads with four targeted repairs for known open-model quirks.
 
     1. Escaped delimiters inside the topics array ("topics": [\\"budget\\"]).
     2. Raw double quotes inside the summary string.
     3. Stray characters outside the object (a lone backtick after the closing
        brace, a preamble before the opening one). The object itself is kept
        byte-for-byte; only what lies outside its outermost braces is cut.
+    4. Extra data after the closing brace, including a duplicate "}".
+
+    GLM is asked for json_object mode, which promises only that the output is
+    JSON, never that it matches the schema we inline into the system message;
+    Z.AI's native endpoint offers no json_schema mode to tighten that. So the
+    repair list grows with the observed malformation distribution rather than
+    shrinking. Confidence that raw_decode subsumes future trailing-junk
+    shapes: 8/10.
     """
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
         first_error = exc
-    candidates = []
+    candidates = [text]
 
     def repair_fields(candidate: str) -> str:
         candidate = _ESCAPED_ARRAY_RE.sub(
@@ -158,7 +184,7 @@ def parse_json_lenient(text: str) -> Any:
             candidates.append(trimmed_repaired)
     for candidate in candidates:
         try:
-            return json.loads(candidate)
+            return _load_first_object(candidate)
         except json.JSONDecodeError:
             continue
     raise first_error

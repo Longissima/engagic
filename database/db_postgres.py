@@ -32,6 +32,7 @@ from database.repositories_async.council_members import MINUTES_PREFERRED_VOTE
 from database.repositories_async.deliberation import DeliberationRepository
 from database.repositories_async.engagement import EngagementRepository
 from database.repositories_async.feedback import FeedbackRepository
+from database.repositories_async.pulse import PulseRepository
 from database.repositories_async.userland import UserlandRepository
 from database.migrate import assert_schema_current
 from corpus.store import close_corpus, init_corpus
@@ -96,6 +97,7 @@ class Database:
         self.engagement = EngagementRepository(pool)
         self.feedback = FeedbackRepository(pool)
         self.deliberation = DeliberationRepository(pool)
+        self.pulse = PulseRepository(pool)
 
         # The corpus singleton normally rides the DB lifecycle: adapters and
         # the analyzer reach it via corpus.get_corpus() since neither holds a

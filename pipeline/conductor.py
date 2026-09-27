@@ -20,9 +20,10 @@ from typing import Dict, Any, Optional, List, AsyncGenerator, Iterable, cast
 from database.db_postgres import Database
 from database.models import Jurisdiction
 from exceptions import ProcessingError
-from pipeline.fetcher import Fetcher, SyncResult, SyncStatus
+from pipeline.fetcher import DateRange, Fetcher, SyncResult, SyncStatus
 from pipeline.models import MatterJob, MeetingJob
 from pipeline.processor import Processor
+from pipeline.pulse import PULSE_VENDORS, PulseWatcher
 from pipeline.protocols import MetricsCollector
 from pipeline.click_types import BANANA
 
@@ -49,6 +50,7 @@ OOM_PROTECTED_COMMANDS = frozenset(
         "preview-items",
         "daemon",
         "processor",
+        "pulse",
     }
 )
 
@@ -329,6 +331,7 @@ class Conductor:
         city_bananas: Optional[List[str]],
         *,
         command: str,
+        ranges: Optional[Dict[str, DateRange]] = None,
     ) -> List[SyncResult]:
         """Run one canonical sync cycle for either CLI or daemon."""
         run = await self.db.pipeline_lifecycle.start_run(
@@ -354,7 +357,7 @@ class Conductor:
             results = (
                 await self.fetcher.sync_all()
                 if city_bananas is None
-                else await self.fetcher.sync_cities(city_bananas)
+                else await self.fetcher.sync_cities(city_bananas, ranges=ranges)
             )
             outbox_published = await self.processor.publish_due_outbox(city_bananas)
             # Refresh planner statistics while the load is fresh. Autovacuum is
@@ -1133,6 +1136,50 @@ def main():
                 await db.close()
 
         asyncio.run(run())
+
+    @cli.command("pulse")
+    @click.option("--once", is_flag=True, help="One probe cycle plus one sync drain, then exit.")
+    @click.option("--no-sync", is_flag=True, help="Probe only; changed jurisdictions stay marked dirty.")
+    @click.option("--vendor", "vendors", multiple=True, type=click.Choice(sorted(PULSE_VENDORS)),
+                  help="Restrict probing to these vendors (repeatable).")
+    def pulse(once, no_sync, vendors):
+        """Watch per-jurisdiction change signals; sync only what moved."""
+        async def run():
+            db = await Database.create()
+            conductor = Conductor(db)
+            try:
+                conductor.is_running = True
+                conductor.fetcher.is_running = True
+                watcher = PulseWatcher(
+                    db,
+                    conductor,
+                    sync_enabled=not no_sync,
+                    vendors=frozenset(vendors) or None,
+                )
+                if once:
+                    counts = await watcher.run_probe_cycle()
+                    synced = 0 if no_sync else await watcher.drain_dirty()
+                    return {"probes": counts, "synced": synced}
+
+                def stop():
+                    logger.info("pulse shutdown requested")
+                    watcher.shutdown.set()
+                    conductor.is_running = False
+                    conductor.fetcher.is_running = False
+
+                loop = asyncio.get_running_loop()
+                loop.add_signal_handler(signal.SIGTERM, stop)
+                loop.add_signal_handler(signal.SIGINT, stop)
+                logger.info("starting pulse watcher", sync=not no_sync)
+                await watcher.run_forever()
+                return None
+            finally:
+                await conductor.close()
+                await db.close()
+
+        result = asyncio.run(run())
+        if result is not None:
+            click.echo(json.dumps(result, indent=2))
 
     @cli.command("preview-queue")
     @click.argument("banana", type=BANANA, required=False)

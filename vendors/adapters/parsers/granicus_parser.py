@@ -11,6 +11,7 @@ Supports multiple HTML formats:
    Used by Anaheim and others that redirect to external Questys servers
 """
 
+import hashlib
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -51,7 +52,7 @@ def _string_attribute(element: Tag, name: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]]:
+def parse_viewpublisher_listing(html: str, base_url: str, *, originals_only: bool = False) -> List[Dict[str, Any]]:
     """Parse ViewPublisher.php listing to extract meetings with event_id, title, start, agenda_viewer_url."""
     soup = BeautifulSoup(html, 'html.parser')
     meetings = []
@@ -156,10 +157,27 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
             if option:
                 minutes_viewer_href = _string_attribute(option, 'value') or None
 
-        if not agenda_href and not packet_href:
+        published = []
+        media_urls = set()
+        if originals_only:
+            for link in row.select('a[href], option[value]'):
+                target = str(link.get('href') or link.get('value') or '')
+                label = link.get_text(' ', strip=True)
+                if re.search(r'\b(?:video|audio|webcast)\b', label, re.I):
+                    media_urls.add(urljoin(base_url, target))
+                    continue
+                if re.search(r'(?:AgendaViewer|MinutesViewer|MetaViewer|DocumentViewer|\.(?:pdf|docx?|xlsx?|pptx?|rtf|zip)(?:[?#]|$))', target, re.I):
+                    published.append({'url': urljoin(base_url, target), 'name': label})
+            if not start:
+                raise ValueError('Granicus listing row has no parseable date')
+        if not agenda_href and not packet_href and not originals_only:
             continue
 
         href = agenda_href if agenda_href is not None else packet_href
+        if originals_only and not href:
+            href = next((value for a in row.find_all(['a', 'option'])
+                         for value in (str(a.get('href') or ''), str(a.get('onclick') or ''), str(a.get('value') or ''))
+                         if re.search(r'(?:event_id|clip_id)=\d+', value)), '')
         if href is None:  # Explicitly narrow the fallback for static analysis.
             continue
         if href.startswith('//'):
@@ -176,6 +194,8 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
             event_id = re.search(r'[a-f0-9-]{36}', packet_href)
             event_id = event_id.group(0).replace('-', '')[:12] if event_id else None
 
+        if not event_id and originals_only:
+            event_id = hashlib.sha256(f'{title}|{start}'.encode()).hexdigest()[:16]
         if not event_id:
             continue
 
@@ -199,19 +219,48 @@ def parse_viewpublisher_listing(html: str, base_url: str) -> List[Dict[str, Any]
                 minutes_href = urljoin(base_url, minutes_href)
             meeting['minutes_url'] = minutes_href
 
+        if originals_only:
+            meeting['published_documents'] = published
+            meeting['source_row_html'] = str(row)
+            # Prefer an explicitly labelled packet over arbitrary PDF links.
+            packets = [d['url'] for d in published if 'packet' in d['name'].lower() and 'minutes' not in d['name'].lower()]
+            if packets:
+                meeting['packet_url'] = packets[0]
+                meeting['full_packet_url'] = packets[0]
+            elif meeting.get('packet_url') == meeting.get('minutes_url'):
+                meeting.pop('packet_url', None)
+        if originals_only:
+            for key in ('agenda_viewer_url', 'packet_url'):
+                if meeting.get(key):
+                    meeting[key] = urljoin(base_url, meeting[key])
+            if meeting.get('minutes_url') in media_urls:
+                # Dropdowns may label a MinutesViewer route as Video.
+                meeting.pop('minutes_url', None)
+                minutes = next((d['url'] for d in published if 'minutes' in d['name'].lower()), None)
+                if minutes:
+                    meeting['minutes_url'] = minutes
         meetings.append(meeting)
 
     # Dedup: same event appears in both "Recent" and "Archived" sections.
     # The archived copy may carry the minutes link the recent copy lacks --
     # backfill minutes_url onto the kept row instead of dropping it.
-    kept_by_id: Dict[str, Dict[str, Any]] = {}
+    kept_by_id: Dict[Any, Dict[str, Any]] = {}
     deduped = []
     for m in meetings:
         eid = m.get("event_id")
+        if originals_only and eid:
+            # Event and clip number sequences can overlap across history.
+            eid = (eid, m.get("start"), m.get("title"))
         if eid and eid in kept_by_id:
             kept = kept_by_id[eid]
             if m.get("minutes_url") and not kept.get("minutes_url"):
                 kept["minutes_url"] = m["minutes_url"]
+            if originals_only:
+                for key in ('agenda_viewer_url', 'packet_url', 'full_packet_url'):
+                    if not kept.get(key) and m.get(key):
+                        kept[key] = m[key]
+                kept['published_documents'] = list({d['url']: d for d in
+                    kept.get('published_documents', []) + m.get('published_documents', [])}.values())
             continue
         if eid:
             kept_by_id[eid] = m
@@ -1455,8 +1504,8 @@ def parse_questys_html(html: str, base_url: str) -> Dict[str, Any]:
         'recess', 'reconvene',
     }
 
-    # Walk all paragraphs -- Questys uses <p class=MsoNormal> for everything
-    for p in soup.find_all('p', class_='MsoNormal'):
+    # Word templates use MsoNormal or num for numbered agenda paragraphs.
+    for p in soup.find_all('p', class_=['MsoNormal', 'num']):
         text = p.get_text(strip=True)
         if not text:
             continue

@@ -1,5 +1,6 @@
 """Async MeetingRepository for meeting operations."""
 
+from datetime import datetime
 from typing import List, Optional
 
 from asyncpg import Connection
@@ -174,6 +175,50 @@ class MeetingRepository(BaseRepository):
             )
 
             return build_meeting(row, topics_map.get(row["id"], []))
+
+    async def find_meeting_id_by_natural_key(
+        self,
+        banana: str,
+        date: Optional[datetime],
+        title: str,
+        conn: Optional[Connection] = None,
+    ) -> Optional[str]:
+        """Resolve an already-stored meeting from what the source published.
+
+        generate_meeting_id keys on the vendor's native id, but several vendors
+        run more than one id space over the same meetings. Legistar is the
+        worst case: the API returns EventId and the HTML calendar returns a
+        MeetingDetail id, and the adapter picks between them on transient
+        health (API 500, empty window, garbage items), not on configuration.
+        A retry that falls back therefore mints a second id for a meeting that
+        is already stored. Measured 2026-09-20: 3,036 such pairs, of which 89%
+        had one side's agenda items contained in or overlapping the other's.
+
+        Jurisdiction, exact start timestamp and title are what every path
+        agrees on, so they resolve the meeting when the native id cannot.
+        Returns None unless exactly one row matches: an ambiguous key must mint
+        a fresh id rather than silently merge two real meetings. Undated
+        meetings never resolve, because their sentinel date would collapse
+        every undated meeting sharing a title.
+
+        Confidence: 8/10 - the 11% of pairs with no item overlap are mostly
+        stub-vs-real captures, but a same-jurisdiction, same-second, same-title
+        collision between genuinely distinct meetings stays possible.
+        """
+        if date is None or not banana or not title:
+            return None
+        async with self._ensure_conn(conn) as c:
+            rows = await c.fetch(
+                """
+                SELECT id FROM meetings
+                WHERE banana = $1 AND date = $2 AND title = $3
+                LIMIT 2
+                """,
+                banana, date, title,
+            )
+        if len(rows) != 1:
+            return None
+        return rows[0]["id"]
 
     async def update_meeting_summary(
         self,

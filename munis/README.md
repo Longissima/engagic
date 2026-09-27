@@ -26,7 +26,8 @@ Or use comma-separated list directly:
 
 | File | Count | Description |
 |---|---|---|
-| `processed.txt` | 555 | Item/matter-level summaries generated |
+| `processed.txt` | auto | `run.sh <cmd> knowns`: active non-school jurisdictions with any summary. Routine target. |
+| `all.txt` | auto | `run.sh <cmd> all`: every active jurisdiction with a meeting. Periodic onboarding pass. |
 | `meeting-level.txt` | 31 | Monolithic packet summaries only (their ceiling) |
 | `synced.txt` | 71 | Have meetings in DB, pending processing |
 | `never-synced.txt` | 302 | In DB but 0 meetings fetched from vendor |
@@ -50,9 +51,9 @@ Last updated: 2026-03-28. Total jurisdictions: 959.
 
 ## September 17 expansion
 
-`new-jurisdictions-2026-09-17.txt` is the consolidated list of all 111 jurisdictions
-from the regional expansion: 103 additions and 8 existing jurisdictions with
-source or extraction repairs. It includes agency batches 7, 8, and 9.
+`new-jurisdictions-2026-09-17.txt` is the consolidated list of all 148 jurisdictions
+from the regional expansion: 140 additions and 8 existing jurisdictions with
+source or extraction repairs. It includes agency batches 7, 8, and 9, plus Motioncount research batches 3–6.
 
 ```bash
 ./run.sh sync @munis/new-jurisdictions-2026-09-17.txt

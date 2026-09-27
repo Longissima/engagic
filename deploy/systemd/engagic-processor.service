@@ -1,0 +1,27 @@
+# Continuous queue processor: drains the jobs pulse enqueues (text extraction,
+# summaries) as they arrive. Processing only -- pulse owns syncing, so this does
+# not run the daemon's 24-hour sync loop on top of it.
+# Install: cp deploy/systemd/engagic-processor.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now engagic-processor
+[Unit]
+Description=Engagic Processor (continuous queue drain)
+After=network.target postgresql.service engagic-pulse.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/engagic
+ExecStart=/root/.local/bin/uv run python -c "import asyncio, signal; from database.db_postgres import Database; from pipeline.conductor import Conductor\nasync def main():\n    db = await Database.create()\n    c = Conductor(db)\n    def stop(*_):\n        c.is_running = False; c.processor.is_running = False; c._shutdown_event.set()\n    for s in (signal.SIGTERM, signal.SIGINT): asyncio.get_running_loop().add_signal_handler(s, stop)\n    c.is_running = True; c.processor.is_running = True\n    try:\n        await c.run_processing_daemon()\n    finally:\n        await db.close()\nasyncio.run(main())"
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/opt/engagic
+EnvironmentFile=-/opt/engagic/.env
+EnvironmentFile=-/opt/engagic/.llm_secrets
+LimitNOFILE=65536
+MemoryHigh=2500M
+MemoryMax=3G
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

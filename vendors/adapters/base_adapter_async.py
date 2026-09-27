@@ -87,6 +87,8 @@ class AsyncBaseAdapter:
     # attachment, or corpus-enrichment work on an unsupported vendor.
     MINUTES_DISCOVERY_SUPPORTED = False
 
+    ORIGINALS_ARCHIVE_SUPPORTED = False
+
     def __init__(
         self,
         city_slug: str,
@@ -108,7 +110,7 @@ class AsyncBaseAdapter:
         self._archive_discovery_errors = []
         self._document_acquirer = DocumentSourceAcquirer(
             self._load_document_response,
-            stream_loader=self._get,
+            stream_loader=self._get_archive_document,
             fetch_errors=(VendorHTTPError,),
             corpus_getter=lambda: get_corpus(),
             metrics=self.metrics,
@@ -325,6 +327,10 @@ class AsyncBaseAdapter:
             return max(0.0, delta)
         except (TypeError, ValueError):
             return None
+
+    async def _get_archive_document(self, url: str) -> aiohttp.ClientResponse:
+        """Archive retries are scheduled durably, rather than nested in transport."""
+        return await self._get(url, _max_attempts=1)
 
     async def _get(self, url: str, **kwargs) -> aiohttp.ClientResponse:
         """GET request. Raises VendorHTTPError on failure."""
@@ -691,7 +697,7 @@ class AsyncBaseAdapter:
         Routing policy lives in router.LADDERS; every rung attempt and any
         terminal failure reason ends up in the result's audit trail.
         """
-        if self._minutes_discovery_only or self._originals_only:
+        if self._minutes_discovery_only or (self._originals_only and ladder != "archive_url"):
             # Defense in depth for sweep dry-runs: even if an adapter's
             # metadata-only branch regresses, discovery can never tee bytes to
             # the corpus or invoke a parser.
@@ -703,7 +709,7 @@ class AsyncBaseAdapter:
         # (same producer, later call). Adapters' probe logic reads this as
         # "no items" and falls through its URL ladder, archiving each
         # candidate on the way -- which is exactly stage 1's job.
-        if not config.SYNC_CHUNKING:
+        if not config.SYNC_CHUNKING and ladder != "archive_url":
             if archived_content_sha256 is None:
                 await archive_bytes(pdf_bytes, source_url, self.banana)
             result = ChunkResult(failure_reason=DEFERRED, ladder=ladder)
@@ -802,7 +808,7 @@ class AsyncBaseAdapter:
         ladder: str = "auto",
     ) -> ChunkResult:
         """Download a PDF and run the chunker cascade. Returns full ChunkResult."""
-        if self._minutes_discovery_only or self._originals_only:
+        if self._minutes_discovery_only or (self._originals_only and ladder != "archive_url"):
             return ChunkResult(failure_reason=DEFERRED, ladder=ladder)
 
         try:
@@ -811,6 +817,8 @@ class AsyncBaseAdapter:
                 banana=self.banana,
             )
         except Exception as e:
+            if self._originals_only and ladder == "archive_url":
+                raise
             logger.debug(
                 "pdf download failed",
                 vendor=self.vendor,
@@ -822,6 +830,10 @@ class AsyncBaseAdapter:
             self._record_chunk_audit(vendor_id, result)
             return result
         if artifact.document_format is not DocumentFormat.PDF:
+            if self._originals_only and ladder == "archive_url":
+                if not artifact.data or artifact.document_format is DocumentFormat.HTML:
+                    raise ValueError("Agenda document resolved to an empty response or HTML viewer")
+                return ChunkResult(failure_reason=DEFERRED, ladder=ladder)
             logger.debug(
                 "packet source was not a pdf",
                 vendor=self.vendor,
@@ -1072,7 +1084,36 @@ class AsyncBaseAdapter:
 
         return items
 
-    async def fetch_meetings(self, days_back: int = 28, days_forward: int = 28) -> FetchResult:
+    async def fetch_meetings(self, days_back=28, days_forward=28, *, start=None, end=None, originals_only=False):
+        """Use the normal sync path with an optional explicit [start, end) range.
+
+        Explicit boundaries are naive local calendar dates at midnight.
+        Adapter instances, like normal sync instances, must not be shared
+        between concurrent fetches.
+        """
+        if (start is not None or end is not None or originals_only) and not self.ORIGINALS_ARCHIVE_SUPPORTED:
+            raise NotImplementedError(f"Historical originals mode not verified for {self.vendor}")
+        if (start is None) != (end is None):
+            raise ValueError("Provide both start and end")
+        if start is not None:
+            start, end = datetime.fromisoformat(str(start)), datetime.fromisoformat(str(end))
+            if start.tzinfo or end.tzinfo or start.time() != datetime.min.time() or end.time() != datetime.min.time() or start >= end:
+                raise ValueError("Use increasing, timezone-free midnight date boundaries")
+        self._originals_only = originals_only
+        self._archive_discovery_errors = []
+        self._explicit_range = (start, end) if start is not None else None
+        try:
+            result = await self._fetch_validated_meetings(days_back, days_forward)
+            if originals_only and self._archive_discovery_errors:
+                result.success = False
+                result.error = "; ".join(self._archive_discovery_errors[:10])
+                result.error_type = "IncompleteDocumentDiscovery"
+            return result
+        finally:
+            self._explicit_range = None
+            self._originals_only = False
+
+    async def _fetch_validated_meetings(self, days_back: int = 28, days_forward: int = 28) -> FetchResult:
         """Fetch meetings, validate, return FetchResult.
 
         Returns FetchResult with success=True for valid results (even if empty).
@@ -1087,7 +1128,7 @@ class AsyncBaseAdapter:
                 for meeting in meetings:
                     # Preserve every directly listed source before normal item
                     # validation/filtering; never traverse a document's links.
-                    meeting["archive_documents"] = [
+                    meeting["archive_documents"] = (meeting.get("archive_documents") or []) + [
                         {**att, "vendor_item_id": item.get("vendor_item_id")}
                         for item in meeting.get("items", [])
                         for att in item.get("attachments", [])
@@ -1124,7 +1165,7 @@ class AsyncBaseAdapter:
             # silently discarding every candidate.
             if meetings and (not valid or (self._originals_only and len(valid) != len(meetings))):
                 error = (
-                    f"{len(meetings) - len(valid)} fetched meeting candidate(s) failed "
+                    f"{'All ' if not valid else ''}{len(meetings) - len(valid)} fetched meeting candidate(s) failed "
                     "schema validation"
                 )
                 logger.error(
@@ -1195,6 +1236,9 @@ class AsyncBaseAdapter:
         Returns (start, end) as midnight datetimes so boundary-day meetings
         (stored as midnight) are never excluded by time-of-day comparison.
         """
+        explicit = getattr(self, "_explicit_range", None)
+        if explicit:
+            return explicit[0], explicit[1] - timedelta(microseconds=1)
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         return today - timedelta(days=days_back), today + timedelta(days=days_forward)
 

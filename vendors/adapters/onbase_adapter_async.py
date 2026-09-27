@@ -361,7 +361,7 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
             unique_name = meeting.get("minutes_name")
             if unique_name:
                 meeting["minutes_url"] = (
-                    f"{self.base_url}/Documents/DownloadFileBytes/{unique_name}"
+                    f"Documents/DownloadFileBytes/{unique_name}"
                 )
 
         return meetings
@@ -477,12 +477,7 @@ class AsyncOnBaseAdapter(AsyncBaseAdapter):
 
             minutes_href = meeting_data.get("minutes_url")
             if minutes_href:
-                site = urlparse(base_url)
-                meeting["minutes_url"] = (
-                    f"{site.scheme}://{site.netloc}{minutes_href}"
-                    if minutes_href.startswith("/")
-                    else minutes_href
-                )
+                meeting["minutes_url"] = urljoin(base_url, minutes_href)
 
             if items:
                 meeting["items"] = items

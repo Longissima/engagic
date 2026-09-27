@@ -46,6 +46,9 @@ CANON_TO_DB = {
 }
 OUTCOME_TO_DB = {"PASS": "passed", "FAIL": "failed"}
 
+# Bound every shutdown await; see the finally block in main().
+SHUTDOWN_TIMEOUT_SECONDS = 30
+
 MEETINGS_SQL = """
     SELECT DISTINCT ON (md.meeting_id)
            md.meeting_id, md.content_sha256, m.banana, m.date,
@@ -440,8 +443,16 @@ async def main() -> int:
         print(json.dumps({'counts':dict(counts),'withheld':dict(reasons)},indent=2))
         return 1 if counts['failed'] else 0
     finally:
-        await close_corpus()
-        await db.pool.close()
+        # A pool whose server restarted never drains, and close() waits for
+        # that forever. Six daily cron firings wedged here across one week
+        # (2026-09-12 restart), each leaving a sleeping process and no log.
+        # Shutdown is best-effort: the work is already committed.
+        for closer in (close_corpus(), db.pool.close()):
+            try:
+                await asyncio.wait_for(closer, timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning('shutdown step did not finish', error=str(exc),
+                               error_type=type(exc).__name__)
 
 
 if __name__ == '__main__':

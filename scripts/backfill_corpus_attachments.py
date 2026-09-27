@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from analysis.analyzer_async import AsyncAnalyzer
 from analysis.llm.input_budget import DOCUMENT_ATTACHMENT_TYPES
 from config import get_logger
-from corpus.store import EXTRACT_VERSION, get_corpus
+from corpus.store import COMPATIBLE_EXTRACT_VERSIONS as CORPUS_COMPATIBLE_VERSIONS, EXTRACT_VERSION, get_corpus
 from database.db_postgres import Database
 from database.models import AttachmentInfo
 from exceptions import DocumentDownloadError, ExtractionError
@@ -117,12 +117,37 @@ CORPUS_READY_SQL = """
     )
 """
 
-# Extract version 1 text is still served to readers; re-extracting it would
-# only churn R2. Mirrors corpus.store.COMPATIBLE_EXTRACT_VERSIONS.
-COMPATIBLE_EXTRACT_VERSIONS = ["1", EXTRACT_VERSION]
+# Text a reader will accept is text this backfill must not redo. Derived from
+# corpus.store rather than restated: the hardcoded ["1", EXTRACT_VERSION] kept
+# saying it mirrored that set while silently dropping every version between.
+# When EXTRACT_VERSION went 2 -> 3, store.py grandfathered 2 and this list did
+# not, so 199,638 blobs read as current to every reader and stale to the
+# backfill -- 127k documents queued for re-extraction that were already done.
+COMPATIBLE_EXTRACT_VERSIONS = sorted(CORPUS_COMPATIBLE_VERSIONS)
 
+
+# Independent metadata calls; bounded so a slow vendor cannot monopolise.
+REFRESH_SITE_CONCURRENCY = 8
 
 MAX_REQUEUES = 5
+
+# ingest_one outcomes. The worker backs off only for download requeues:
+# those wait on a remote that needs time. A memory requeue already sat
+# in the admission gate for EXTRACTION_MEMORY_WAIT_SECONDS, and the
+# worker's next action is different work, so sleeping again just idles
+# it. Measured 2026-09-20: 723 memory requeues in one log window at 30s
+# each cost ~3 hours of sleep across 2 workers, and extraction fell to
+# zero per hour while downloads kept succeeding.
+DONE = "done"
+REQUEUE_DOWNLOAD = "requeue_download"
+REQUEUE_MEMORY = "requeue_memory"
+# Neither requeue sleeps the worker. A requeued candidate is appended to the
+# end of the todo list, so the remote gets the rest of the run as its backoff
+# -- tens of thousands of items -- while the worker moves straight to the next
+# one. The old 30s download sleep meant a jurisdiction answering 403 to
+# everything (sanjoseCA, 2026-09-20) stalled both workers 30s per item through
+# a contiguous block of its documents: 4 minutes elapsed, 0 seconds of CPU.
+REQUEUE_BACKOFF_SECONDS = {REQUEUE_DOWNLOAD: 0, REQUEUE_MEMORY: 0}
 # Legistar answers bursts with spurious 404s (55 of 56 Sunnyvale "404"s were
 # 200 minutes later, 2026-09-11). One requeue separates a real dead link from
 # a bad moment before the ledger sees it.
@@ -221,14 +246,29 @@ async def refresh_ephemeral_urls(todo: List[Candidate]) -> None:
     by_site: Dict[tuple, List[Candidate]] = defaultdict(list)
     for candidate in todo:
         by_site[(candidate.vendor, candidate.slug)].append(candidate)
-    for (vendor, slug), group in by_site.items():
-        if vendor != "civicclerk" or not slug:
-            continue
-        try:
-            refreshed = await refresh_attachment_urls(vendor, slug, [c.attachment for c in group])
-            logger.info("refreshed ephemeral urls", vendor=vendor, slug=slug, refreshed=refreshed, of=len(group))
-        except (OSError, RuntimeError, asyncio.TimeoutError) as e:
-            logger.warning("url refresh failed, using stored urls", vendor=vendor, slug=slug, error=str(e)[:200])
+    sites = [(v, slug, g) for (v, slug), g in by_site.items() if v == "civicclerk" and slug]
+    if not sites:
+        return
+
+    # One site at a time meant a run waited on every site's timeouts before
+    # extracting anything: measured 2026-09-20 at ~50s per site across 56 CA
+    # sites, 47 minutes of startup before the first document. Sites are
+    # independent, so bound the fan-out rather than serialize it; the cap is
+    # per-site politeness, not a memory concern -- these are metadata calls.
+    gate = asyncio.Semaphore(REFRESH_SITE_CONCURRENCY)
+
+    async def refresh_site(vendor: str, slug: str, group: List[Candidate]) -> None:
+        async with gate:
+            try:
+                refreshed = await refresh_attachment_urls(vendor, slug, [c.attachment for c in group])
+                logger.info("refreshed ephemeral urls", vendor=vendor, slug=slug, refreshed=refreshed, of=len(group))
+            except (OSError, RuntimeError, asyncio.TimeoutError) as e:
+                logger.warning("url refresh failed, using stored urls", vendor=vendor, slug=slug, error=str(e)[:200])
+
+    started = time.monotonic()
+    await asyncio.gather(*(refresh_site(v, slug, g) for v, slug, g in sites))
+    logger.info("ephemeral url refresh complete", sites=len(sites),
+                seconds=round(time.monotonic() - started, 1))
 
 
 def is_memory_pressure(error: Exception) -> bool:
@@ -237,7 +277,7 @@ def is_memory_pressure(error: Exception) -> bool:
     return isinstance(cause, MemoryAdmissionTimeout) or "shared memory capacity" in str(error)
 
 
-async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, counts: Dict[str, int]) -> bool:
+async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, counts: Dict[str, int]) -> str:
     """Returns False when the candidate should go back on the queue."""
     url = candidate.attachment.url
     identity = candidate.identity
@@ -256,7 +296,7 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
                 banana=candidate.banana, source_identity=identity[:110],
                 content_sha256=(content_sha256 or "")[:16],
             )
-            return True
+            return DONE
         await record_ingest_result(db, result, identity, url, candidate.banana)
         counts["ingested"] += 1
         logger.info(
@@ -271,7 +311,7 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
             candidate.download_requeues += 1
             counts["requeued_download"] += 1
             logger.info("download failed once, requeued", banana=candidate.banana, url=identity[:110], error=failure_error_text(e, url)[:120])
-            return False
+            return REQUEUE_DOWNLOAD
         counts["failed_download"] += 1
         failure = await record_failure(
             db, identity=identity, source_url=url, banana=candidate.banana, stage="download",
@@ -290,7 +330,7 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
             candidate.requeues += 1
             counts["requeued_memory"] += 1
             logger.info("memory pressure, requeued", banana=candidate.banana, url=identity[:110], requeues=candidate.requeues)
-            return False
+            return REQUEUE_MEMORY
         # Partial OCR results are persisted as partial text before this
         # raises; readers accept them, and the ledger keeps a retry pending.
         counts["failed_extract"] += 1
@@ -312,7 +352,7 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
             banana=candidate.banana, url=identity[:110],
             error=failure_error_text(e, url)[:200],
         )
-    return True
+    return DONE
 
 
 async def run_workers(db, analyzer, todo: List[Candidate], args, counts: Dict[str, int]) -> None:
@@ -327,9 +367,12 @@ async def run_workers(db, analyzer, todo: List[Candidate], args, counts: Dict[st
         while cursor < len(todo):
             index = cursor
             cursor += 1
-            if not await ingest_one(db, analyzer, todo[index], args, counts):
+            outcome = await ingest_one(db, analyzer, todo[index], args, counts)
+            if outcome != DONE:
                 todo.append(todo[index])
-                await asyncio.sleep(30)
+                backoff = REQUEUE_BACKOFF_SECONDS.get(outcome, 30)
+                if backoff:
+                    await asyncio.sleep(backoff)
                 continue
             done += 1
             if done % args.progress_every == 0 or done == len(todo):

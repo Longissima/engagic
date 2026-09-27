@@ -17,7 +17,9 @@ _MEMINFO = "/proc/meminfo"
 _POLL_SECONDS = 0.1
 _lock = threading.Lock()
 _reserved_bytes = 0
-_waiters: deque[object] = deque()
+# (ticket, size) so the head's requirement is known to every other waiter;
+# conservative backfill needs it to prove a grant cannot delay the head.
+_waiters: deque[tuple] = deque()
 
 
 class MemoryAdmissionTimeout(TimeoutError):
@@ -78,6 +80,28 @@ class ReservedBytes(bytes):
         return value
 
 
+def reservable_bytes() -> int:
+    """Largest reservation that could be granted right now, budget and host.
+
+    Callers that choose their own work use this to pick something that fits
+    instead of attempting the largest item and retrying on refusal. That keeps
+    the admission gate a safety net rather than a scheduler: a worker holding a
+    500 MB document should not discover the box is full only after paying for
+    the download.
+
+    Advisory only -- it is a snapshot under the same lock the grant path uses,
+    and a concurrent reservation can consume the headroom before the caller
+    acts. reserve_memory remains the authority.
+    """
+    with _lock:
+        by_budget = config.WORK_MEMORY_BUDGET_BYTES - _reserved_bytes
+        available = available_bytes()
+        if available is None:
+            return max(0, by_budget)
+        by_host = available - config.EXTRACTION_MIN_AVAILABLE_BYTES - _reserved_bytes
+        return max(0, min(by_budget, by_host))
+
+
 def _enqueue(size: int) -> object:
     if size <= 0:
         raise ValueError("Memory reservation must be positive")
@@ -85,31 +109,64 @@ def _enqueue(size: int) -> object:
         raise MemoryAdmissionTimeout("Operation exceeds the shared memory budget")
     ticket = object()
     with _lock:
-        _waiters.append(ticket)
+        _waiters.append((ticket, size))
     return ticket
 
 
 def _leave_queue(ticket: object) -> None:
     with _lock:
-        if ticket in _waiters:
-            _waiters.remove(ticket)
+        for entry in _waiters:
+            if entry[0] is ticket:
+                _waiters.remove(entry)
+                break
 
 
 def _try_reserve(size: int, ticket: object) -> Optional[MemoryReservation]:
+    """Admit the head, or backfill behind it when that provably costs it nothing.
+
+    Strict FIFO protects a large extraction from a stream of small downloads,
+    but it also means one oversized document at the head stalls everything
+    behind it. Measured 2026-09-20: Los Angeles ships 511 MB PrimeGov bundles
+    that reserve 1,021 MB each, two workers grabbed two at once, together they
+    exceeded the 2,048 MB budget, and the queue did zero extractions per hour
+    while both timed out and requeued into the same collision.
+
+    A non-head waiter may reserve only when the head's own requirement still
+    fits the budget afterwards:
+
+        _reserved_bytes + size + head_size <= WORK_MEMORY_BUDGET_BYTES
+
+    That invariant is what makes this safe rather than merely faster. Because
+    it holds after every grant, the head's budget test can never fail, so the
+    head is admitted the moment it is checked and waits only on real host
+    memory. Small work flows past a stalled giant; the giant cannot starve.
+
+    Confidence: 9/10 - the budget half is a proof, not a heuristic. The
+    MemAvailable half stays conservative and is re-read per attempt.
+    """
     global _reserved_bytes
     with _lock:
-        # FIFO prevents a stream of small downloads starving an extraction.
-        if _waiters[0] is not ticket:
+        if not _waiters:
             return None
+        head_ticket, head_size = _waiters[0]
+        is_head = head_ticket is ticket
         available = available_bytes()
         required = _reserved_bytes + size
         if required > config.WORK_MEMORY_BUDGET_BYTES:
+            return None
+        if not is_head and required + head_size > config.WORK_MEMORY_BUDGET_BYTES:
             return None
         if available is not None and available < required + config.EXTRACTION_MIN_AVAILABLE_BYTES:
             return None
         reservation = MemoryReservation(size)
         _reserved_bytes += size
-        _waiters.popleft()
+        if is_head:
+            _waiters.popleft()
+        else:
+            for entry in _waiters:
+                if entry[0] is ticket:
+                    _waiters.remove(entry)
+                    break
         return reservation
 
 

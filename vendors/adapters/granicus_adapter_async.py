@@ -22,7 +22,7 @@ from copy import deepcopy
 from difflib import SequenceMatcher
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from urllib.parse import urljoin, urlparse, unquote, parse_qs
+from urllib.parse import urljoin, urlparse, unquote, parse_qs, urldefrag, urlencode
 
 from bs4 import BeautifulSoup
 
@@ -288,6 +288,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Granicus platform."""
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    ORIGINALS_ARCHIVE_SUPPORTED = True
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         """city_slug is the Granicus subdomain (e.g., "redwoodcity-ca"). Raises ValueError if view_id not configured."""
@@ -323,6 +324,8 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
 
         # Keep self.view_id for backward compat (first/primary view)
         self.view_id: int = self.views[0]["view_id"]
+        self._archive_listing_cache = {}
+        self._archive_agenda_scan_semaphore = asyncio.Semaphore(2)
         self.list_url: str = f"{self.base_url}/ViewPublisher.php?view_id={self.view_id}"
 
         logger.info(
@@ -368,6 +371,8 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         meetings_in_range = []
         for idx, result in enumerate(listing_results):
             if isinstance(result, BaseException):
+                if self._originals_only:
+                    raise result
                 logger.warning(
                     "view listing failed",
                     vendor="granicus",
@@ -388,6 +393,8 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                     if start_date <= meeting_date <= end_date:
                         meetings_in_range.append(meeting_data)
                 except (ValueError, AttributeError):
+                    if self._originals_only:
+                        raise
                     logger.debug("skipping meeting with unparseable date", slug=self.slug, date=date_str)
 
         logger.debug(
@@ -413,6 +420,19 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 if meeting.get("event_id") and meeting.get("minutes_url")
             ]
 
+        if self._originals_only:
+            # A clip may occur in several configured body/archive views.
+            unique = {}
+            for row in meetings_in_range:
+                key = (row['event_id'], row['start'], row.get('title'))
+                kept = unique.setdefault(key, deepcopy(row))
+                for key in ('agenda_viewer_url', 'packet_url', 'full_packet_url', 'minutes_url'):
+                    if not kept.get(key) and row.get(key):
+                        kept[key] = row[key]
+                kept['published_documents'] = list({d['url']: d for d in
+                    kept.get('published_documents', []) + row.get('published_documents', [])}.values())
+            meetings_in_range = list(unique.values())
+
         detail_tasks = [
             self._fetch_meeting_detail(meeting_data)
             for meeting_data in meetings_in_range
@@ -423,6 +443,8 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         meetings = []
         for i, result in enumerate(results):
             if isinstance(result, BaseException):
+                if self._originals_only:
+                    raise result
                 logger.warning(
                     "failed to fetch meeting detail",
                     vendor="granicus",
@@ -457,9 +479,14 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
         body = view_config.get("body")
         url = f"{self.base_url}/ViewPublisher.php?view_id={view_id}"
 
+        if self._originals_only and view_id in self._archive_listing_cache:
+            return deepcopy(self._archive_listing_cache[view_id])
         response = await self._get(url)
         html = await self._read_text(response)
-        listing = await asyncio.to_thread(parse_viewpublisher_listing, html, self.base_url)
+        if self._originals_only:
+            listing = await self._archive_view_pages(url, html, view_id)
+        else:
+            listing = await asyncio.to_thread(parse_viewpublisher_listing, html, self.base_url)
 
         if not listing:
             logger.warning("no meetings found in listing", vendor="granicus", slug=self.slug, view_id=view_id)
@@ -471,12 +498,76 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 meta = meeting_data.setdefault("metadata", {})
                 meta["body"] = body
 
+        if self._originals_only:
+            self._archive_listing_cache[view_id] = deepcopy(listing)
         return listing
+
+    async def _archive_view_pages(self, url, html, view_id):
+        """Walk explicit same-view history links; never guess other governing bodies."""
+        pending = [(url, html)]
+        visited = set()
+        signatures = set()
+        rows = {}
+        while pending:
+            page_url, page_html = pending.pop(0)
+            if page_url in visited:
+                continue
+            if len(visited) >= 200:
+                raise ValueError('Granicus archive navigation exceeded 200 pages')
+            visited.add(page_url)
+            if page_html is None:
+                page_html = await self._read_text(await self._get(page_url))
+            soup = BeautifulSoup(page_html, 'html.parser')
+            if not soup.select('table.listingTable, li.table-row'):
+                raise ValueError('Granicus archive has no recognized listing; refusing empty success')
+            parsed = await asyncio.to_thread(parse_viewpublisher_listing, page_html, self.base_url, originals_only=True)
+            signature = frozenset((r['event_id'], r['start']) for r in parsed)
+            if signature and signature in signatures:
+                raise ValueError('Granicus archive navigation repeated the same listing')
+            signatures.add(signature)
+            for row in parsed:
+                key = (row['event_id'], row['start'], row.get('title'))
+                kept = rows.setdefault(key, row)
+                for key in ('packet_url', 'full_packet_url', 'agenda_viewer_url', 'minutes_url'):
+                    if not kept.get(key) and row.get(key):
+                        kept[key] = row[key]
+                kept['published_documents'] = list({d['url']: d for d in
+                    kept.get('published_documents', []) + row.get('published_documents', [])}.values())
+            for select in soup.select('select'):
+                name = str(select.get('name') or select.get('id') or '').lower()
+                if any(word in name for word in ('year', 'month', 'page', 'archive')):
+                    raise ValueError(f'Unsupported Granicus archive selector: {name}')
+            for link in soup.select('a[href], option[value]'):
+                href = str(link.get('href') or link.get('value') or '')
+                label = link.get_text(' ', strip=True).lower()
+                if not href or href.startswith('#'):
+                    continue
+                target = urldefrag(urljoin(page_url, href))[0]
+                parsed_url = urlparse(target)
+                query = parse_qs(parsed_url.query)
+                if parsed_url.netloc == urlparse(self.base_url).netloc and parsed_url.path.lower().endswith('/viewpublisher.php'):
+                    # Fragment links and reordered queries are the same page.
+                    target = parsed_url._replace(query=urlencode(sorted((k, v) for k, vs in query.items() for v in vs)), fragment='').geturl()
+                    if query.get('view_id') != [str(view_id)]:
+                        if any(word in label for word in ('archive', 'older', 'previous')):
+                            raise ValueError('Additional Granicus archive view requires explicit body configuration')
+                        continue
+                    if target not in visited and all(target != p[0] for p in pending):
+                        pending.append((target, None))
+                elif href.lower().startswith('javascript:') and label in ('next', 'next page', 'older', 'older meetings'):
+                    raise ValueError('Unsupported JavaScript Granicus archive pagination')
+        logger.info('granicus archive enumerated', slug=self.slug, view_id=view_id,
+                    pages=len(visited), meetings=len(rows),
+                    earliest=min((r['start'] for r in rows.values()), default=None))
+        return list(rows.values())
 
     async def _fetch_meeting_detail(self, meeting_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Fetch and parse individual meeting agenda, choosing parser based on redirect destination."""
+        originals_only = getattr(self, "_originals_only", False)
         agenda_viewer_url = meeting_data.get("agenda_viewer_url")
         event_id = meeting_data.get("event_id")
+        if originals_only and not agenda_viewer_url:
+            return await self._archive_selected_documents(meeting_data)
 
         if not agenda_viewer_url:
             # No AgendaViewer link -- try direct packet PDF if available
@@ -505,9 +596,21 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
             final_url = str(response.url)
             content_type = response.headers.get("Content-Type", "")
 
+            # Google can label its viewer as binary; unwrap before MIME dispatch.
+            if originals_only and urlparse(final_url).netloc == 'docs.google.com' and urlparse(final_url).path == '/gview':
+                response.release()
+                real_url = parse_qs(urlparse(final_url).query).get('url', [None])[0]
+                if not real_url:
+                    raise ValueError('Google document viewer lacks its source URL')
+                return await self._archive_selected_documents(meeting_data, document_url=real_url)
+
             # DocumentViewer.php redirects serve raw PDF — run chunker directly.
             # Force v1 ("url" path): for Granicus URL-anchored agendas, v1 groups
             # items by boldness/formatting cues correctly where v2 misaligns.
+            if originals_only and content_type and ('application/pdf' in content_type.lower() or
+                    'text/html' not in content_type.lower() and 'xhtml' not in content_type.lower()):
+                response.release()
+                return await self._archive_selected_documents(meeting_data, document_url=final_url)
             if "application/pdf" in content_type:
                 logger.info(
                     "pdf redirect detected",
@@ -564,6 +667,9 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
             # Google Docs viewer wraps PDF in HTML — extract real URL and download
             if "docs.google.com/gview" in final_url:
                 real_pdf_url = parse_qs(urlparse(final_url).query).get("url", [None])[0]
+                if real_pdf_url and originals_only:
+                    response.release()
+                    return await self._archive_selected_documents(meeting_data, document_url=real_pdf_url)
                 if real_pdf_url:
                     logger.info(
                         "google viewer redirect, fetching actual pdf",
@@ -645,12 +751,15 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                     )
 
             # Fetch attachments from S3 staff report PDFs (Bozeman/Carson City style)
-            if items and ("s3.amazonaws.com" in final_url or "cloudfront.net" in final_url):
+            if not originals_only and items and ("s3.amazonaws.com" in final_url or "cloudfront.net" in final_url):
                 items = await self._fetch_s3_pdf_attachments(items, event_id)
 
             # Fetch actual PDF attachments from Questys Documents.htm pages
             if items and ("questys" in final_url or "MsoNormal" in html[:2000]):
                 items = await self._fetch_questys_attachments(items, event_id)
+
+            if originals_only:
+                return await self._archive_selected_documents(meeting_data, html=html, html_url=final_url, items=items)
 
             meeting = {
                 "vendor_id": event_id,
@@ -757,6 +866,12 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
             return meeting
 
         except Exception as e:
+            if originals_only:
+                if meeting_data.get('full_packet_url'):
+                    meeting = self._archive_document_selection(meeting_data)
+                    meeting['archive_fallback_reason'] = str(e)
+                    return meeting
+                raise
             logger.warning(
                 "error fetching meeting detail",
                 vendor="granicus",
@@ -765,6 +880,48 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 error=str(e)
             )
             return None
+
+    async def _archive_selected_documents(self, listing, **kwargs):
+        meeting = self._archive_document_selection(listing, **kwargs)
+        if meeting['archive_selection'] != 'agenda_document':
+            return meeting
+        # Reuse normal acquisition, guarded chunking and the v1 URL parser.
+        # Only agenda discovery is allowed; no packet/text fallback, OCR or
+        # recursive staff-report PDF inspection during archival.
+        async with self._archive_agenda_scan_semaphore:
+            result = await self._chunk_packet_pdf(
+                meeting['packet_url'], listing['event_id'], ladder='archive_url')
+        if result.failure_reason == 'deferred_to_processing':
+            return meeting  # Real non-PDF original: preserve without PDF parsing.
+        if result.failure_reason in {'timeout', 'engine_error', 'open_failed', 'encrypted', 'download_failed'} or any(a.error for a in result.attempts):
+            raise ValueError(f"Granicus agenda attachment discovery failed: {result.failure_reason}")
+        meeting['items'] = _ensure_attachment_portal_urls(result.items)
+        meeting['archive_selection'] = 'agenda_and_linked_attachments'
+        return meeting
+
+    def _archive_document_selection(self, listing, *, document_url=None, html=None, html_url=None, items=None):
+        """Preserve the native agenda tuple or a compiled document, not both."""
+        meeting = {'vendor_id': listing['event_id'], 'title': listing.get('title', ''),
+                   'start': listing['start'], 'items': items or [], 'source_metadata': deepcopy(listing)}
+        if listing.get('minutes_url'):
+            meeting['minutes_url'] = listing['minutes_url']
+        attachments = [a for item in items or [] for a in item.get('attachments', []) if a.get('url')]
+        if html is not None and attachments:
+            meeting['agenda_url'] = html_url
+            meeting['archive_selection'] = 'html_agenda_and_attachments'
+            return meeting
+        agenda, packet = self._find_agenda_and_packet_urls(html, html_url) if html is not None else (None, None)
+        chosen = listing.get('full_packet_url') or packet or listing.get('packet_url') or document_url or agenda
+        if chosen:
+            meeting['packet_url'] = chosen
+            meeting['archive_selection'] = 'full_packet' if listing.get('full_packet_url') or packet else 'agenda_document'
+        else:
+            meeting['archive_documents'] = [d for d in listing.get('published_documents', [])
+                                            if d['url'] != meeting.get('minutes_url')]
+            if html_url:
+                meeting['agenda_url'] = html_url
+            meeting['archive_selection'] = 'published_documents_fallback'
+        return meeting
 
     async def _fetch_agendaonline_attachments(
         self, items: List[Dict[str, Any]], meeting_id: str, base_host: str
@@ -780,6 +937,8 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 if attachments := self._parse_agendaonline_attachments(html, base_host):
                     item["attachments"] = attachments
             except Exception as e:
+                if self._originals_only:
+                    raise
                 logger.debug("failed to fetch item attachments", vendor="granicus", slug=self.slug, item_id=item_id, error=str(e))
             return item
 
@@ -968,6 +1127,8 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                             count=len(pdf_attachments),
                         )
                 except Exception as e:
+                    if self._originals_only:
+                        raise
                     logger.debug(
                         "failed to fetch questys documents page",
                         vendor="granicus",

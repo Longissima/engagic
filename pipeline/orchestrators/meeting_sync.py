@@ -1,5 +1,6 @@
 """Meeting Sync Orchestrator - Coordinates meeting storage workflow."""
 
+import asyncio
 import hashlib
 import json
 from collections import Counter
@@ -173,6 +174,7 @@ class MeetingStoreStats(TypedDict, total=False):
     skipped_title: Optional[str]
     activation_checked: bool
     activation_notifications: int
+    meeting_id_resolved: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +195,7 @@ class MeetingSyncOrchestrator:
         self.matter_enqueue_decider = MatterEnqueueDecider()
         self.vote_processor = VoteProcessor()
 
-    async def archive_meeting(self, meeting_dict, city, adapter, *, max_bytes=2 * 1024**3):
+    async def archive_meeting(self, meeting_dict, city, adapter, *, max_bytes=2 * 1024**3, document_semaphore=None, document_checkpoint=None):
         """Persist stage-one originals and a replayable meeting manifest.
 
         Uses the same adapter transport/acquirer and corpus as ordinary sync.
@@ -201,6 +203,7 @@ class MeetingSyncOrchestrator:
         tracking, activation and processing queues are deliberately untouched.
         """
         from corpus.store import get_corpus
+        from pipeline.document_acquisition import ArchiveDocumentUnavailable
         from pipeline.utils import attachment_identity
 
         corpus = get_corpus()
@@ -221,23 +224,68 @@ class MeetingSyncOrchestrator:
             for att in item.get("attachments") or []:
                 sources.append({**att, "role": "attachment",
                                 "vendor_item_id": item.get("vendor_item_id")})
-        receipts = {}
-        for source in sources:
-            url = source.get("url")
-            if not url:
-                continue
-            identity = attachment_identity(url)
-            if identity in receipts:
-                continue
-            try:
-                receipt = await adapter._document_acquirer.archive(
-                    url, banana=city.banana, max_bytes=max_bytes)
-                receipts[identity] = {"url": url, "status": "archived", **receipt}
-            except Exception as exc:
-                receipts[identity] = {"url": url, "status": "failed",
-                                      "error": str(exc), "error_type": type(exc).__name__}
-                logger.warning("original archival failed", banana=city.banana,
-                               meeting_id=meeting_id, url=url[:160], error=str(exc))
+        if adapter.vendor == "civicclerk":
+            from database.models import AttachmentInfo
+            from pipeline.url_refresh import refresh_attachment_urls
+
+            refresh_targets = {}
+            for source in sources:
+                url = source.get("url")
+                if not url or not source.get("cc_agenda_id"):
+                    continue
+                identity = attachment_identity(url)
+                if identity in refresh_targets:
+                    continue
+                blob = await corpus.blobs.get_blob_for_identity(identity)
+                if blob and blob.get("original_key"):
+                    continue
+                # Path matching preserves the requested native format. Passing
+                # an attachment ID would select the normal PDF-preferred variant.
+                refresh_targets[identity] = AttachmentInfo(
+                    name=source.get("name") or "Attachment", url=url, type="unknown",
+                    cc_agenda_id=int(source["cc_agenda_id"]),
+                )
+            if refresh_targets:
+                await refresh_attachment_urls(adapter.vendor, adapter.slug, refresh_targets.values())
+                sources = [
+                    {**source, "url": refresh_targets[attachment_identity(source["url"])].url}
+                    if source.get("url") and attachment_identity(source["url"]) in refresh_targets
+                    else source for source in sources
+                ]
+        # One shared semaphore can bound downloads across all source workers.
+        # Striped locks prevent simultaneous acquisition of the same identity
+        # across meetings without retaining an ever-growing URL lock cache.
+        semaphore = document_semaphore or asyncio.Semaphore(1)
+        if not hasattr(self, "_archive_locks"):
+            self._archive_locks = [asyncio.Lock() for _ in range(64)]
+        urls = {attachment_identity(source["url"]): source["url"]
+                for source in sources if source.get("url")}
+
+        async def archive_one(identity, url):
+            async with self._archive_locks[hash(identity) % 64]:
+                prior = document_checkpoint.get(city.banana, url) if document_checkpoint else None
+                if prior is not None:
+                    return identity, prior
+                try:
+                    receipt = await adapter._document_acquirer.archive(
+                        url, banana=city.banana, max_bytes=max_bytes,
+                        document_semaphore=semaphore)
+                    outcome = {"url": url, "status": "archived", **receipt}
+                except ArchiveDocumentUnavailable as exc:
+                    outcome = {"url": url, "status": "unavailable",
+                               "http_status": exc.status_code, "error": str(exc)}
+                except Exception as exc:
+                    logger.warning("original archival failed", banana=city.banana,
+                                   meeting_id=meeting_id, url=url[:160], error=str(exc),
+                                   error_type=type(exc).__name__)
+                    outcome = {"url": url, "status": "failed",
+                               "error": str(exc), "error_type": type(exc).__name__}
+                if document_checkpoint:
+                    document_checkpoint.record(city.banana, url, outcome)
+                return identity, outcome
+
+        receipts = dict(await asyncio.gather(
+            *(archive_one(identity, url) for identity, url in urls.items())))
         manifest = {
             "version": 1, "meeting_id": meeting_id, "banana": city.banana,
             "vendor": adapter.vendor, "slug": adapter.slug,
@@ -255,6 +303,8 @@ class MeetingSyncOrchestrator:
         return {
             "meeting_id": meeting_id, "manifest_sha256": sha,
             "manifest_source": source_url, "documents": len(receipts),
+            "archived": sum(d["status"] == "archived" for d in receipts.values()),
+            "unavailable": sum(d["status"] == "unavailable" for d in receipts.values()),
             "failed": failed, "no_documents": not receipts,
             "success": failed == 0,
             "bytes": sum(d.get("bytes", 0) for d in receipts.values()),
@@ -305,6 +355,25 @@ class MeetingSyncOrchestrator:
                 date=meeting_date,
                 title=title,
             )
+
+            # A vendor id is only unique within the id space that produced it.
+            # Legistar's adapter falls back from API to HTML on transient
+            # health, and the two spaces number the same meeting differently,
+            # so an unrecognised id may still be a meeting we already store.
+            # Resolve on what every path agrees about before minting a second
+            # aggregate; see find_meeting_id_by_natural_key for the evidence.
+            if not await self.db.meetings.get_meeting(meeting_id):
+                resolved_id = await self.db.meetings.find_meeting_id_by_natural_key(
+                    city.banana, meeting_date, title,
+                )
+                if resolved_id and resolved_id != meeting_id:
+                    logger.info(
+                        "resolved meeting to existing aggregate",
+                        banana=city.banana, minted=meeting_id,
+                        resolved=resolved_id, vendor_id=str(vendor_id),
+                    )
+                    stats["meeting_id_resolved"] = True
+                    meeting_id = resolved_id
 
             committee_id = await self._lookup_committee_id(city.banana, meeting_dict)
 

@@ -117,6 +117,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
     """Async adapter for cities using Legistar platform."""
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    ORIGINALS_ARCHIVE_SUPPORTED = True
 
     def __init__(
         self,
@@ -128,40 +129,6 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         self.api_token = api_token
         self.base_url = f"https://webapi.legistar.com/v1/{self.slug}"
         self.prefer_aada = self.slug in _PREFER_AADA_SLUGS
-
-    async def fetch_meetings(self, days_back=28, days_forward=28, *, start=None, end=None, originals_only=False):
-        """Use the normal sync path with an optional explicit [start, end) range.
-
-        Explicit boundaries are naive local calendar dates at midnight.
-        Adapter instances, like normal sync instances, must not be shared
-        between concurrent fetches.
-        """
-        if (start is None) != (end is None):
-            raise ValueError("Provide both start and end")
-        if start is not None:
-            start, end = datetime.fromisoformat(str(start)), datetime.fromisoformat(str(end))
-            if start.tzinfo or end.tzinfo or start.time() != datetime.min.time() or end.time() != datetime.min.time() or start >= end:
-                raise ValueError("Use increasing, timezone-free midnight date boundaries")
-        self._originals_only = originals_only
-        self._archive_discovery_errors = []
-        self._explicit_range = (start, end) if start is not None else None
-        try:
-            result = await super().fetch_meetings(days_back, days_forward)
-            if originals_only and self._archive_discovery_errors:
-                result.success = False
-                result.error = "; ".join(self._archive_discovery_errors[:10])
-                result.error_type = "IncompleteDocumentDiscovery"
-            return result
-        finally:
-            self._explicit_range = None
-            self._originals_only = False
-
-    def _date_range(self, days_back, days_forward):
-        explicit = getattr(self, "_explicit_range", None)
-        if explicit:
-            # Existing row processors use an inclusive comparison.
-            return explicit[0], explicit[1] - timedelta(microseconds=1)
-        return super()._date_range(days_back, days_forward)
 
     def _history_error(self, message):
         return VendorParsingError(message, vendor=self.vendor, city_slug=self.slug)
@@ -225,11 +192,17 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
         missing = [m for m in meetings if not m.get("minutes_url")]
         if not missing:
             return meetings
+        previous_minutes_only = self._minutes_discovery_only
         try:
+            self._minutes_discovery_only = True
             html_meetings = await self._fetch_meetings_html(days_back, days_forward)
         except (VendorHTTPError, aiohttp.ClientError, VendorParsingError) as e:
+            if self._originals_only:
+                self._archive_discovery_errors.append(f"Minutes discovery incomplete: {e}")
             logger.debug("legistar html minutes merge skipped", slug=self.slug, error=str(e))
             return meetings
+        finally:
+            self._minutes_discovery_only = previous_minutes_only
         by_id = {
             str(m.get("vendor_id")): m.get("minutes_url")
             for m in html_meetings
@@ -313,6 +286,31 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             return True
         return False
 
+    async def _fetch_api_collection(self, url, params, identity_field, xml_parser):
+        """Page a native API collection; never silently accept a repeated page."""
+        params = {**params, "$top": 1000}
+        rows, seen, offset = [], set(), 0
+        while True:
+            response = await self._get(url, params={**params, "$skip": offset})
+            text = await response.text()
+            try:
+                page = json.loads(text)
+            except (JSONDecodeError, ValueError):
+                root = ET.fromstring(text)
+                if "html" in root.tag.lower():
+                    raise self._history_error("API returned HTML instead of a native collection")
+                page = xml_parser(text)
+            if not isinstance(page, list):
+                raise self._history_error("Expected a list from Legistar API")
+            ids = [str(row.get(identity_field) or "") for row in page]
+            if any(not value for value in ids) or len(set(ids)) != len(ids) or seen.intersection(ids):
+                raise self._history_error("Legistar API pagination repeated or omitted identities")
+            seen.update(ids)
+            rows.extend(page)
+            if len(page) < params["$top"]:
+                return rows
+            offset += len(page)
+
     async def _fetch_meetings_api(self, days_back: int = 28, days_forward: int = 28) -> List[Dict[str, Any]]:
         """Fetch meetings from Legistar Web API."""
         # Build date range
@@ -340,29 +338,8 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
 
         # Fetch events from API
         url = f"{self.base_url}/Events"
-        events = []
-        seen = set()
-        offset = 0
-        while True:
-            response = await self._get(url, params={**params, "$skip": offset})
-            text = await response.text()
-            try:
-                page = json.loads(text)
-            except (JSONDecodeError, ValueError):
-                root = ET.fromstring(text)
-                if not root.tag.endswith("feed"):
-                    raise self._history_error("Unexpected Legistar events response")
-                page = self._parse_xml_events(text)
-            if not isinstance(page, list):
-                raise self._history_error("Expected a list of Legistar events")
-            ids = [str(e.get("EventId", "")) for e in page]
-            if any(not i for i in ids) or len(set(ids)) != len(ids) or seen.intersection(ids):
-                raise self._history_error("Legistar events pagination repeated or omitted identities")
-            seen.update(ids)
-            events.extend(page)
-            if len(page) < params["$top"]:
-                break
-            offset += len(page)
+        events = await self._fetch_api_collection(
+            url, params, "EventId", self._parse_xml_events)
 
         # Some APIs (Nashville) ignore server filters - filter client-side
         filtered_events = []
@@ -538,18 +515,10 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             if self.api_token:
                 params["token"] = self.api_token
 
-            response = await self._get(url, params=params)
+            event_items = await self._fetch_api_collection(
+                url, {**params, "$orderby": "EventItemId asc"},
+                "EventItemId", self._parse_xml_event_items)
 
-            # Parse response
-            content_type = response.headers.get('content-type', '').lower()
-            if 'json' in content_type:
-                event_items = await response.json()
-            else:
-                text = await response.text()
-                event_items = self._parse_xml_event_items(text)
-
-            if self._originals_only and len(event_items) >= 1000:
-                raise self._history_error("EventItems reached the API cap; discovery is incomplete")
             # Process items concurrently (each may fetch matter metadata/attachments)
             item_tasks = []
             for item_data in event_items:
@@ -830,18 +799,10 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
             attachments_url = f"{self.base_url}/matters/{matter_id}/attachments"
             params = {"token": self.api_token} if self.api_token else {}
 
-            response = await self._get(attachments_url, params=params)
+            raw_attachments = await self._fetch_api_collection(
+                attachments_url, {**params, "$orderby": "MatterAttachmentId asc"},
+                "MatterAttachmentId", self._parse_xml_attachments)
 
-            # Parse response (JSON or XML)
-            content_type = response.headers.get('content-type', '').lower()
-            if 'json' in content_type:
-                raw_attachments = await response.json()
-            else:
-                text = await response.text()
-                raw_attachments = self._parse_xml_attachments(text)
-
-            if self._originals_only and len(raw_attachments) >= 1000:
-                raise self._history_error("Matter attachments reached the API cap; discovery is incomplete")
             attachments = []
             for att in raw_attachments:
                 name = (att.get("MatterAttachmentName") or "").strip()
@@ -890,6 +851,7 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
 
                 # Map XML fields to JSON field names
                 field_map = {
+                    'MatterAttachmentId': 'MatterAttachmentId',
                     'MatterAttachmentName': 'MatterAttachmentName',
                     'MatterAttachmentHyperlink': 'MatterAttachmentHyperlink',
                 }
@@ -1162,10 +1124,18 @@ class AsyncLegistarAdapter(AsyncBaseAdapter):
                     calendar_rows = []
                     last_year = (explicit[1] - timedelta(microseconds=1)).year
                     for year in range(explicit[0].year, last_year + 1):
+                        cached = getattr(self, "_calendar_year_cache", None)
+                        if cached and cached[:2] == (url, year):
+                            calendar_rows.extend(cached[2])
+                            continue
                         selected = await self._widen_calendar(url, html, str(year))
                         if selected is None:
                             raise self._history_error(f"Unable to confirm calendar year {year}")
-                        calendar_rows.extend(await self._calendar_pages(url, selected))
+                        year_rows = await self._calendar_pages(url, selected)
+                        # One year retained per adapter instance, shared by
+                        # adjacent range calls and the normal minutes merge.
+                        self._calendar_year_cache = (url, year, year_rows)
+                        calendar_rows.extend(year_rows)
                         html = selected
                 elif days_back > WIDE_CALENDAR_DAYS:
                     widened = await self._widen_calendar(url, html)

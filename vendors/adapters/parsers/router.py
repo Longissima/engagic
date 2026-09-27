@@ -99,6 +99,9 @@ LADDERS: Dict[str, List[str]] = {
     "packet": ["v2:toc", "text:auto"],
     # legacy force_method="url" semantics: v1 first, v2 auto fallback.
     "url_legacy": ["v1:url", "v2:auto", "text:auto"],
+    # Originals archive: same v1 URL parser, no packet/text fallback or
+    # full-document extraction pass. Only discover agenda-linked documents.
+    "archive_url": ["v1:url"],
     # unforced: v2 auto-detect (toc/url/pageref/url_then_toc), v1 fallback.
     "auto": ["v2:auto", "v1:auto", "text:auto"],
     # legacy force_method="v2_url": single rung, no fallback.
@@ -691,14 +694,16 @@ def chunk_pdf(
             }
             if dropped_empty_titles:
                 result.quality["empty_titles_dropped"] = dropped_empty_titles
-            _attach_ground_truth(result, pdf_path)
-            _apply_ocr_shape_policy(result)
+            if ladder != "archive_url":
+                _attach_ground_truth(result, pdf_path)
+                _apply_ocr_shape_policy(result)
             return result
 
     result.failure_reason = _classify_empty(pdf_path, result.attempts, result.profile)
     # No items is not no text: a flat agenda that defeated every rung still
     # carries corpus-worthy ground truth.
-    _attach_ground_truth(result, pdf_path)
+    if ladder != "archive_url":
+        _attach_ground_truth(result, pdf_path)
     return result
 
 

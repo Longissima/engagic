@@ -15,7 +15,7 @@ Confidence: 8/10 - Tested against Raleigh NC, may need adjustments for other cit
 
 import re
 from typing import Dict, Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -96,6 +96,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
     """
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    ORIGINALS_ARCHIVE_SUPPORTED = True
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         """city_slug is the Escribe subdomain (e.g., "pub-raleighnc")"""
@@ -116,15 +117,14 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             "calendarEndDate": end_date.strftime("%Y-%m-%d"),
         }
 
-        response = await self._post(
-            calendar_url,
-            json=payload,
-            headers={"Content-Type": "application/json; charset=utf-8"}
-        )
-        data = await response.json()
-
-        # Response is in {"d": [...]} format
-        meetings_data = data.get("d", [])
+        if self._originals_only:
+            meetings_data = await self._fetch_archive_calendar(start_date, end_date)
+        else:
+            response = await self._post(
+                calendar_url, json=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"})
+            data = await response.json()
+            meetings_data = data.get("d", [])
         if not meetings_data:
             logger.warning("no meetings from calendar API", vendor="escribe", slug=self.slug)
             return []
@@ -135,6 +135,11 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             slug=self.slug,
             count=len(meetings_data)
         )
+
+        if self._originals_only:
+            return await self._bounded_gather(
+                [self._archive_calendar_meeting(row) for row in meetings_data],
+                max_concurrent=3, return_exceptions=False)
 
         results = []
         for meeting_json in meetings_data:
@@ -183,6 +188,105 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         )
 
         return results
+
+    async def _fetch_archive_calendar(self, start, end):
+        """Enumerate inclusive calendar days in bounded, disjoint windows.
+
+        The API end date is exclusive midnight; send the following day.
+        The endpoint has no advertised pagination contract. Split dense results
+        further rather than trusting an arbitrary server-side result cap.
+        """
+        async def fetch(left, right):
+            response = await self._post(
+                f"{self.base_url}/MeetingsCalendarView.aspx/GetCalendarMeetings",
+                json={"calendarStartDate": left.isoformat(), "calendarEndDate": (right + timedelta(days=1)).isoformat()},
+                headers={"Content-Type": "application/json; charset=utf-8"})
+            payload = await response.json()
+            rows = payload.get("d") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError("eScribe calendar response lacks a meeting array")
+            ids = set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("eScribe calendar row is not an object")
+                parsed = self._parse_calendar_meeting(row)
+                if not parsed or row["ID"] in ids:
+                    raise ValueError("eScribe calendar has invalid/repeated meeting IDs")
+                ids.add(row["ID"])
+                stamp = datetime.fromisoformat(parsed["start"]).date()
+                if not left <= stamp <= right:
+                    raise ValueError("eScribe calendar ignored requested dates")
+            if len(rows) >= 100:
+                if left == right:
+                    raise ValueError("eScribe daily calendar may be capped; coverage unverified")
+                middle = left + (right - left) // 2
+                children = await self._bounded_gather(
+                    [fetch(left, middle), fetch(middle + timedelta(days=1), right)],
+                    max_concurrent=2, return_exceptions=False)
+                expanded = [row for child in children for row in child]
+                if not ids <= {row["ID"] for row in expanded}:
+                    raise ValueError("eScribe split calendar lost previously listed meetings")
+                return expanded
+            return rows
+
+        rows = []
+        left, last = start.date(), end.date()
+        while left <= last:
+            right = min(left + timedelta(days=6), last)
+            rows.extend(await fetch(left, right))
+            left = right + timedelta(days=1)
+        if len({row["ID"] for row in rows}) != len(rows):
+            raise ValueError("eScribe repeated meetings across date windows")
+        return rows
+
+    async def _archive_calendar_meeting(self, row):
+        """Use native agenda attachments or one published packet, without PDFs parsing."""
+        basic = self._parse_calendar_meeting(row)
+        if basic is None:
+            raise ValueError("Invalid eScribe archival meeting")
+        documents = []
+        for field in ("MeetingDocumentLink", "AdditionalDocuments"):
+            value = row.get(field) or []
+            if not isinstance(value, list):
+                raise ValueError(f"eScribe {field} is not a document array")
+            for doc in value:
+                if not isinstance(doc, dict):
+                    raise ValueError("Invalid eScribe document entry")
+                if not doc.get("Url"):
+                    continue
+                if str(doc.get("Type", "")).lower() in {"video", "audio", "livevideo"} or str(doc.get("Format", "")).lower() in {"video", "audio", ".mp3", ".mp4"}:
+                    continue
+                documents.append({**doc, "Url": urljoin(self.base_url, doc["Url"])})
+        uuid = basic.get("_uuid")
+        html_docs = [d for d in documents if str(d.get("Format", "")).lower() in {"html", ".html"}
+                     and str(d.get("Type", "")).lower() in {"merged", "agenda"}]
+        html_docs.sort(key=lambda d: d.get("Type") != "Merged")
+        details = None
+        if uuid and (basic.get("has_agenda") or html_docs):
+            details = await self._fetch_meeting_details(
+                uuid, basic, agenda_url=html_docs[0]["Url"] if html_docs else None)
+        result = details or basic
+        attachments = result.get("archive_documents") or []
+        if attachments:
+            result.pop("packet_url", None)
+            result["archive_selection"] = "html_agenda_and_attachments"
+        else:
+            # No separately discoverable attachments: select the compiled file.
+            result.pop("agenda_url", None)
+            if basic.get("packet_url"):
+                result["packet_url"] = basic["packet_url"]
+                result["archive_selection"] = "packet_or_agenda"
+            else:
+                result["archive_selection"] = "published_documents_fallback"
+                result["archive_documents"] = [
+                    {"url": d["Url"], "name": d.get("Title") or d.get("Name"),
+                     "role": "published_document", "vendor_document": d}
+                    for d in documents if d["Url"] != result.get("minutes_url")
+                ]
+        result["source_metadata"] = row
+        result.pop("_uuid", None)
+        result.pop("has_agenda", None)
+        return result
 
     def _parse_calendar_meeting(self, meeting_json: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse meeting from calendar API JSON response."""
@@ -301,10 +405,10 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         return result
 
     async def _fetch_meeting_details(
-        self, meeting_uuid: str, basic_meeting: Dict[str, Any]
+        self, meeting_uuid: str, basic_meeting: Dict[str, Any], *, agenda_url: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """Fetch Agenda=Merged page and extract item-level details."""
-        merged_url = f"{self.base_url}/Meeting.aspx?Id={meeting_uuid}&Agenda=Merged&lang=English"
+        merged_url = agenda_url or f"{self.base_url}/Meeting.aspx?Id={meeting_uuid}&Agenda=Merged&lang=English"
 
         logger.debug(
             "fetching meeting details",
@@ -328,6 +432,16 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
             "minutes_url": basic_meeting.get("minutes_url"),
             "items": items,
         }
+
+        if self._originals_only:
+            # Collect section-level files before semantic item filters. Limit
+            # this to agenda containers so navigation packet links aren't copied.
+            meeting_data["archive_documents"] = [
+                {"url": urljoin(merged_url, string_attr(link, "href")),
+                 "name": link.get_text(" ", strip=True), "role": "attachment"}
+                for link in soup.find_all("a", href=re.compile(r"FileStream\.ashx\?.*DocumentId=", re.I))
+                if link.find_parent("div", class_="AgendaItemContainer") is not None
+            ]
 
         if basic_meeting.get("meeting_status"):
             meeting_data["meeting_status"] = basic_meeting["meeting_status"]

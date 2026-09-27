@@ -4,7 +4,7 @@ import asyncio
 import time
 import random
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -29,6 +29,23 @@ logger = get_logger(__name__).bind(component="fetcher")
 # Legistar dominates the long tail (~30 cities, 4 req/matter), so this is mainly
 # its dial. 8 stays under the legistar rate limiter's 12 slots (rate_limiter_async.py).
 CITY_SYNC_CONCURRENCY = 8
+
+
+# A targeted sync covers [start, end) midnight dates instead of the default
+# window. Set by the pulse watcher when a change signal says which meeting
+# dates moved; never used by the sweep.
+DateRange = Tuple[datetime, datetime]
+
+
+async def _fetch_for_sync(adapter, city: Jurisdiction, date_range: Optional[DateRange]) -> FetchResult:
+    """Default window, or the targeted range when the adapter has verified
+    explicit-range support (the originals-archive path); otherwise the
+    default window, so a hint never narrows an adapter that would ignore it."""
+    if date_range is not None and adapter.ORIGINALS_ARCHIVE_SUPPORTED:
+        logger.info("targeted sync range", city=city.banana, vendor=adapter.vendor,
+                    start=date_range[0].date().isoformat(), end=date_range[1].date().isoformat())
+        return await adapter.fetch_meetings(start=date_range[0], end=date_range[1])
+    return await adapter.fetch_meetings()
 
 
 class SyncStatus(Enum):
@@ -167,7 +184,12 @@ class Fetcher:
             start_time=start_time,
         )
 
-    async def sync_cities(self, city_bananas: List[str]) -> List[SyncResult]:
+    async def sync_cities(
+        self,
+        city_bananas: List[str],
+        *,
+        ranges: Optional[Dict[str, DateRange]] = None,
+    ) -> List[SyncResult]:
         """Canonical sync path. Sync the given jurisdictions.
 
         Vendor-grouped parallel: each vendor's cities run with
@@ -199,6 +221,7 @@ class Fetcher:
             cities,
             initial_results=results,
             start_time=start_time,
+            ranges=ranges,
         )
 
     async def _sync_resolved_cities(
@@ -208,6 +231,7 @@ class Fetcher:
         initial_results: Optional[List[SyncResult]] = None,
         sync_stats: Optional[Dict[str, JurisdictionSyncStats]] = None,
         start_time: Optional[float] = None,
+        ranges: Optional[Dict[str, DateRange]] = None,
     ) -> List[SyncResult]:
         """Run the canonical vendor-parallel path for resolved jurisdictions.
 
@@ -255,7 +279,9 @@ class Fetcher:
                         return None
                     city_start = time.time()
                     try:
-                        result = await self._sync_city_with_retry(city)
+                        result = await self._sync_city_with_retry(
+                            city, date_range=(ranges or {}).get(city.banana)
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -322,6 +348,7 @@ class Fetcher:
         city: Jurisdiction,
         *,
         max_retries: int = 3,
+        date_range: Optional[DateRange] = None,
     ) -> SyncResult:
         """Sync a city across its primary vendor and any extra_vendors.
 
@@ -338,10 +365,13 @@ class Fetcher:
             city.vendor,
             city.slug,
             max_retries=max_retries,
+            date_range=date_range,
         )
 
+        # A targeted sync answers a primary-vendor signal; extra vendor
+        # streams keep their own cadence through the sweep.
         extras = city.extra_vendors or []
-        if not extras:
+        if not extras or date_range is not None:
             return aggregate
 
         for extra in extras:
@@ -367,7 +397,14 @@ class Fetcher:
 
         return aggregate
 
-    async def _sync_with_vendor(self, city: Jurisdiction, vendor: str, slug: str) -> SyncResult:
+    async def _sync_with_vendor(
+        self,
+        city: Jurisdiction,
+        vendor: str,
+        slug: str,
+        *,
+        date_range: Optional[DateRange] = None,
+    ) -> SyncResult:
         """Single-vendor sync pass for a city. One adapter, one fetch, store all meetings."""
         result = SyncResult(city_banana=city.banana, status=SyncStatus.PENDING)
         start_time = time.time()
@@ -393,7 +430,7 @@ class Fetcher:
             result.status = SyncStatus.IN_PROGRESS
 
             try:
-                fetch_result: FetchResult = await adapter.fetch_meetings()
+                fetch_result: FetchResult = await _fetch_for_sync(adapter, city, date_range)
             except (VendorError, ValueError, KeyError) as e:
                 logger.error("error fetching meetings", city=city.banana, vendor=vendor, error=str(e))
                 result.status = SyncStatus.FAILED
@@ -501,6 +538,7 @@ class Fetcher:
         slug: str,
         *,
         max_retries: int = 3,
+        date_range: Optional[DateRange] = None,
     ) -> SyncResult:
         """Retry one vendor pass without replaying successful sibling passes.
 
@@ -515,7 +553,7 @@ class Fetcher:
 
         for attempt in range(max_retries):
             try:
-                result = await self._sync_with_vendor(city, vendor, slug)
+                result = await self._sync_with_vendor(city, vendor, slug, date_range=date_range)
                 last_result = result
                 if result.status == SyncStatus.COMPLETED:
                     return result
@@ -569,10 +607,15 @@ class Fetcher:
         self,
         city: Jurisdiction,
         max_retries: int = 3,
+        *,
+        date_range: Optional[DateRange] = None,
     ) -> SyncResult:
-        """Run independently retried vendor passes, then checkpoint the city."""
-        result = await self._sync_city(city, max_retries=max_retries)
-        if result.status != SyncStatus.COMPLETED:
+        """Run independently retried vendor passes, then checkpoint the city.
+
+        A targeted (date_range) sync does not checkpoint: last_synced_at means
+        the whole window was refreshed, and the sweep relies on that."""
+        result = await self._sync_city(city, max_retries=max_retries, date_range=date_range)
+        if result.status != SyncStatus.COMPLETED or date_range is not None:
             return result
 
         try:

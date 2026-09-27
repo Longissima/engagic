@@ -10,6 +10,7 @@ Item-level adapter that extracts structured agenda items with:
 """
 
 import re
+from urllib.parse import urljoin, urlparse
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
@@ -25,6 +26,7 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
     """Async adapter for cities using CivicClerk platform"""
 
     MINUTES_DISCOVERY_SUPPORTED = True
+    ORIGINALS_ARCHIVE_SUPPORTED = True
 
     def __init__(self, city_slug: str, metrics: Optional[MetricsCollector] = None):
         """city_slug is the CivicClerk subdomain (e.g., 'stlouismo', 'montpelliervt')"""
@@ -35,6 +37,14 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
         """Build API download URL from document dict containing fileId."""
         file_id = doc.get("fileId")
         return f"{self.base_url}/v1/Meetings/GetMeetingFileStream(fileId={file_id},plainText=false)"
+
+    def _attachment_download_url(self, url, attachment_id):
+        # mediaFullPath can be an internal Azure storage key, not a URL.
+        # Use the portal's public download endpoint in that case; do not
+        # guess a blob signature or promise access to an internal DOCX.
+        if url and not urlparse(url).scheme and attachment_id:
+            return f"{self.base_url}/v1/Meetings/GetAttachmentFile(fileId={attachment_id})"
+        return url
 
     def _build_portal_agenda_url(self, event_id: Optional[int], doc: Dict[str, Any]) -> Optional[str]:
         """Build persistent portal URL for a meeting document.
@@ -52,7 +62,9 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
         start_date, end_date = self._date_range(days_back, days_forward)
 
         # Fetch all events (handles pagination)
-        events = await self._fetch_all_events(start_date, end_date)
+        self._archive_event_documents = {}
+        explicit = getattr(self, "_explicit_range", None)
+        events = await self._fetch_all_events(start_date, explicit[1] if explicit else end_date)
 
         logger.info(
             "retrieved events from API",
@@ -95,41 +107,39 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
     async def _fetch_all_events(self, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
         """Fetch all events with OData pagination support."""
         all_events = []
-
-        start_time_str = start_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-3] + "Z"
-        end_time_str = end_date.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-3] + "Z"
-
         params = {
-            "$filter": f"startDateTime gt {start_time_str} and startDateTime lt {end_time_str}",
-            "$orderby": "startDateTime asc, eventName asc",
+            "$filter": f"startDateTime ge {start_date.isoformat(timespec='milliseconds')}Z and startDateTime lt {end_date.isoformat(timespec='milliseconds')}Z",
+            "$orderby": "startDateTime asc, id asc",
         }
-
-        logger.debug(
-            "fetching events",
-            vendor="civicclerk",
-            slug=self.slug,
-            start_date=str(start_date.date()),
-            end_date=str(end_date.date())
-        )
-
         url = f"{self.base_url}/v1/Events"
-
+        seen_urls, seen_ids = set(), set()
         while url:
-            response = await self._get(url, params=params if not all_events else None)
+            if url in seen_urls:
+                raise ValueError("CivicClerk pagination repeated a nextLink")
+            seen_urls.add(url)
+            response = await self._get(url, params=params)
             data = await response.json()
-
-            events = data.get("value", [])
+            if not isinstance(data, dict) or not isinstance(data.get("value"), list):
+                raise ValueError("CivicClerk events response has no valid value list")
+            events = data["value"]
+            ids = [str(e.get("id") or "") for e in events]
+            if any(not i for i in ids) or len(set(ids)) != len(ids) or seen_ids.intersection(ids):
+                raise ValueError("CivicClerk pagination repeated or omitted event identities")
+            for event in events:
+                event_date = datetime.fromisoformat(event["startDateTime"].replace("Z", "+00:00")).replace(tzinfo=None)
+                if not start_date <= event_date < end_date:
+                    raise ValueError("CivicClerk ignored the requested date range")
+            seen_ids.update(ids)
             all_events.extend(events)
-
-            # Check for pagination
             next_link = data.get("@odata.nextLink")
-            if next_link:
-                url = next_link
-                params = None  # nextLink includes all params
-            else:
-                url = None
-
+            if next_link is not None and not isinstance(next_link, str):
+                raise ValueError("Invalid CivicClerk nextLink")
+            url = urljoin(url, next_link) if next_link else None
+            if url and (urlparse(url).scheme != "https" or urlparse(url).netloc != urlparse(self.base_url).netloc):
+                raise ValueError("CivicClerk nextLink changed API origin")
+            params = None
         return all_events
+
 
     async def _process_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Process a single event into a meeting with items."""
@@ -189,6 +199,26 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
         items = []
         if has_agenda and agenda_id:
             items = await self._fetch_meeting_items(agenda_id, event_id)
+
+        if self._originals_only:
+            published = [
+                {"url": self._build_packet_url(doc),
+                 "name": doc.get("fileName") or doc.get("type") or "Meeting file",
+                 "role": doc.get("type") or "document", "cc_file_id": doc["fileId"]}
+                for doc in event.get("publishedFiles", []) or []
+                if doc.get("fileId") and not doc.get("isDeleted") and doc.get("isPublished", True)
+            ]
+            result["archive_documents"] = published + self._archive_event_documents.pop(str(event_id), [])
+            if items:
+                result["items"] = items
+                result["authoritative_item_source"] = "civicclerk_api"
+            for doc in published:
+                role = doc["role"].lower()
+                if role == "agenda":
+                    result["agenda_url"] = doc["url"]
+                elif "packet" in role and "minutes" not in role:
+                    result["packet_url"] = doc["url"]
+            return result
 
         # Detect placeholder items (CivicClerk sometimes returns a single
         # section like "Select MEETING FILES to view meeting materials"
@@ -311,6 +341,9 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
                 raise ValueError("CivicClerk meeting response has no valid items list")
             raw_items = data["items"]
 
+            if self._originals_only:
+                self._archive_event_documents[str(event_id)] = self._collect_archive_documents(raw_items, agenda_id)
+
             # Flatten hierarchy and process items
             items = self._flatten_items(raw_items, event_id, agenda_id)
 
@@ -337,6 +370,36 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             raise RuntimeError(
                 f"CivicClerk agenda {agenda_id} request/parsing failed: {type(e).__name__}: {e}"
             ) from e
+
+    def _collect_archive_documents(self, items, agenda_id):
+        """Preserve originals and conversions, including files on sections."""
+        documents = []
+        for item in items:
+            for attachment in item.get("attachmentsList", []) or []:
+                if attachment.get("isDeleted") or not attachment.get("isPublished", True):
+                    continue
+                for field in ("mediaFullPath", "pdfVersionFullPath"):
+                    if attachment.get(field):
+                        documents.append({
+                            "url": self._attachment_download_url(attachment[field], attachment.get("id")),
+                            "name": attachment.get("fileName") or "Attachment",
+                            "vendor_storage_path": attachment[field] if not urlparse(attachment[field]).scheme else None,
+                            "role": "attachment", "cc_agenda_id": agenda_id,
+                            "cc_attachment_id": attachment.get("id"),
+                            "vendor_item_id": str(item.get("id", "")), "source_field": field,
+                        })
+            for report in item.get("reportsList", []) or []:
+                if report.get("isDeleted") or not report.get("isPublished", True):
+                    continue
+                if report.get("pdfMediaFullPath"):
+                    documents.append({
+                        "url": report["pdfMediaFullPath"],
+                        "name": report.get("agendaObjItemReportName") or "Report",
+                        "role": "report", "cc_agenda_id": agenda_id,
+                        "vendor_item_id": str(item.get("id", "")),
+                    })
+            documents.extend(self._collect_archive_documents(item.get("childItems") or [], agenda_id))
+        return documents
 
     def _flatten_items(
         self,
@@ -403,7 +466,7 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
         for att in item.get("attachmentsList", []):
             if att.get("isPublished", True) and not att.get("isDeleted", False):
                 # Prefer pdfVersionFullPath, fall back to mediaFullPath
-                url = att.get("pdfVersionFullPath") or att.get("mediaFullPath")
+                url = self._attachment_download_url(att.get("pdfVersionFullPath") or att.get("mediaFullPath"), att.get("id"))
                 name = att.get("fileName", "Attachment")
 
                 if url:

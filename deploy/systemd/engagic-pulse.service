@@ -1,0 +1,29 @@
+# Change-signal watcher: probes each jurisdiction's cheapest change signal
+# on an adaptive 10-60 minute cadence, with jitter and failure backoff,
+# and syncs only jurisdictions whose signal moved.
+# Runs as root on purpose: adapters rewrite data/granicus_view_ids.json and
+# data/civicplus_sites.json as root-only 0600, and manual syncs (which this
+# replaces for the leading edge) have always run as root.
+# Install: cp deploy/systemd/engagic-pulse.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now engagic-pulse
+[Unit]
+Description=Engagic Pulse (change-signal watcher)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/engagic
+ExecStart=/root/.local/bin/uv run python -m pipeline.conductor pulse
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/opt/engagic
+EnvironmentFile=-/opt/engagic/.env
+EnvironmentFile=-/opt/engagic/.llm_secrets
+LimitNOFILE=65536
+MemoryHigh=2500M
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

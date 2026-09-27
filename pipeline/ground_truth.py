@@ -81,6 +81,8 @@ def _run_chunk_with_recovery(
             cancel_event=cancel_event,
         ), None
     except GuardCrashed as first_crash:
+        if ladder == "archive_url":
+            raise  # Archival document discovery must not escalate to text recovery.
         remaining = config.CHUNKER_TIMEOUT_SECONDS - (
             time.monotonic() - guard_started
         )

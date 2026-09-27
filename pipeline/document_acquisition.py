@@ -9,11 +9,14 @@ conditional-validation, fail-open, archival, and single-flight behavior.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import time
 import hashlib
 import tempfile
+import zipfile
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -47,6 +50,52 @@ DocumentLoader = Callable[
 CorpusGetter = Callable[[], Optional[CorpusStore]]
 
 
+def _original_media_type(handle, head: bytes, declared: str) -> str:
+    """Classify streamed originals without extracting their contents.
+
+    ZIP directory names distinguish Office formats without loading the full
+    document. Unknown binary formats are still worth preserving.
+    """
+    if b"%PDF-" in head[:1024]:
+        return "application/pdf"
+    if head.startswith(b"PK\x03\x04"):
+        try:
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                names = set(archive.namelist())
+            for entry, media in (
+                ("word/document.xml", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                ("xl/workbook.xml", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                ("ppt/presentation.xml", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+            ):
+                if entry in names:
+                    return media
+        except zipfile.BadZipFile:
+            pass
+        return "application/zip"
+    if head.startswith(b"{\\rtf"):
+        return "application/rtf"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        # OLE containers may be DOC, XLS, or PPT; don't invent a subtype.
+        return "application/x-ole-storage"
+    for magic, media in ((b"\x89PNG\r\n\x1a\n", "image/png"),
+                         (b"\xff\xd8\xff", "image/jpeg"),
+                         (b"GIF8", "image/gif"),
+                         (b"II*\x00", "image/tiff"), (b"MM\x00*", "image/tiff")):
+        if head.startswith(magic):
+            return media
+    return declared if declared and "application/pdf" not in declared.lower() else "application/octet-stream"
+
+
+class ArchiveDocumentUnavailable(RuntimeError):
+    """A concrete document URL returned a terminal access/not-found status."""
+
+    def __init__(self, status_code, *, cached=False):
+        self.status_code = status_code
+        suffix = " (cached for this source run)" if cached else ""
+        super().__init__(f"Document returned HTTP {status_code}{suffix}")
+
+
 class DocumentSourceAcquirer:
     """Acquire one source through shared freshness and single-flight policy.
 
@@ -72,6 +121,7 @@ class DocumentSourceAcquirer:
         self._metrics = metrics or NullMetrics()
         self._metric_component = metric_component
         self._tasks: dict[str, asyncio.Task[DocumentArtifact]] = {}
+        self._archive_missing: OrderedDict[str, int] = OrderedDict()
 
     async def acquire(
         self,
@@ -129,7 +179,8 @@ class DocumentSourceAcquirer:
             return replace(artifact, requested_url=requested_url)
         return artifact
 
-    async def archive(self, source_url: str, *, banana=None, max_bytes=2 * 1024**3):
+    async def archive(self, source_url: str, *, banana=None, max_bytes=2 * 1024**3,
+                      document_semaphore=None):
         """Archive an original without extraction or loading its bytes into RAM.
 
         Historical acquisition reuses the latest archived revision, recording
@@ -146,7 +197,7 @@ class DocumentSourceAcquirer:
         if urlparse(source_url).scheme not in {"http", "https"}:
             raise ValueError("Document source must be HTTP(S)")
         blob = await corpus.blobs.get_blob_for_identity(attachment_identity(source_url))
-        if blob and blob.get("original_key"):
+        if blob and blob.get("original_key") and (blob.get("bytes") or 0) > 0:
             await corpus.record_sighting(blob["content_sha256"], source_url, banana)
             if requested_url != source_url:
                 await corpus.record_alias(blob["content_sha256"], source_url, requested_url, banana)
@@ -155,9 +206,40 @@ class DocumentSourceAcquirer:
                     "content_type": blob.get("content_type")}
         if self._stream_loader is None:
             raise RuntimeError("Transport does not provide streaming acquisition")
-        response = await self._stream_loader(source_url)
+        # Scope negative results to this adapter/run and the exact fetch URL:
+        # a refreshed signed URL must still get its own attempt. Never cache
+        # transient failures or exception tracebacks.
+        if source_url in self._archive_missing:
+            status = self._archive_missing[source_url]
+            self._archive_missing.move_to_end(source_url)
+            raise ArchiveDocumentUnavailable(status, cached=True)
+        async with document_semaphore if document_semaphore is not None else nullcontext():
+            return await self._archive_download(
+                corpus, source_url, requested_url, banana, max_bytes)
+
+    def _remember_missing(self, source_url, status):
+        if status in (403, 404, 410):
+            self._archive_missing[source_url] = status
+            self._archive_missing.move_to_end(source_url)
+            if len(self._archive_missing) > 4096:
+                self._archive_missing.popitem(last=False)
+
+    async def _archive_download(self, corpus, source_url, requested_url, banana, max_bytes):
+        # One attempt per scheduled visit. The checkpoint owns deferred retries;
+        # do not hold a transfer slot through sleeps or repeat body downloads.
+        try:
+            response = await self._stream_loader(source_url)
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            self._remember_missing(source_url, status)
+            if status in (403, 404, 410):
+                raise ArchiveDocumentUnavailable(status) from exc
+            raise
         try:
             if response.status != 200:
+                self._remember_missing(source_url, response.status)
+                if response.status in (403, 404, 410):
+                    raise ArchiveDocumentUnavailable(response.status)
                 raise RuntimeError(f"Document returned HTTP {response.status}")
             length = response.headers.get("Content-Length")
             if length and int(length) > max_bytes:
@@ -180,13 +262,14 @@ class DocumentSourceAcquirer:
                 looks_html = head.lstrip().lower().startswith((b"<!doctype html", b"<html"))
                 pdf_expected = ("application/pdf" in content_type.lower()
                                 or urlparse(source_url).path.lower().endswith(".pdf"))
-                if pdf_expected and b"%PDF-" not in head[:1024]:
-                    raise ValueError("Expected PDF but received another document type")
+                if pdf_expected and looks_html:
+                    raise ValueError("Document download returned HTML instead of a file")
                 if looks_html and any(marker in head.lower() for marker in (
                     b"access denied", b"just a moment...", b"friendly error page",
                     b"<title>sign in", b"<title>login", b"the request could not be satisfied",
                 )):
                     raise ValueError("Document response is an access/error page")
+                content_type = await asyncio.to_thread(_original_media_type, handle, head, content_type)
                 sha = digest.hexdigest()
                 handle.seek(0)
                 archived = await corpus.archive_original(

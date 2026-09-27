@@ -130,7 +130,9 @@ async def _fetch_fresh_attachment_urls(
                 fresh = a.get("pdfVersionFullPath") or a.get("mediaFullPath")
                 if not fresh:
                     continue
-                by_path[fresh.split("?", 1)[0]] = fresh
+                for variant in (a.get("pdfVersionFullPath"), a.get("mediaFullPath")):
+                    if variant:
+                        by_path[variant.split("?", 1)[0]] = variant
                 if aid is not None:
                     try:
                         by_id[int(aid)] = fresh

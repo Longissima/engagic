@@ -148,3 +148,41 @@ class MatterEnqueueDecider:
         else:
             days_distance = 999
         return max(-100, MATTER_PRIORITY_BASE_SCORE - days_distance)
+
+
+# Backfills store meetings the pipeline already has documents for. Those rows
+# are ordinary meetings, so they go through ordinary sync_meeting; only the
+# summarization spend is unwanted. Swapping these in at the call site keeps
+# that decision out of the publish boundary, which stays the single authority
+# on work for live syncs.
+#
+# Both return no skip_reason on purpose. A reason sets confirmed_unchanged in
+# _publish_authoritative_work, which stamps the matter with an attachment_hash
+# and work_version and would convince a later real sync that the summary work
+# was already done. Silence leaves every matter enqueueable.
+class SuppressedEnqueueDecider(EnqueueDecider):
+    """Never enqueue a meeting for LLM processing."""
+
+    def should_enqueue(
+        self,
+        meeting: "Meeting",
+        agenda_items: List["AgendaItem"],
+        has_items: bool,
+        chunk_audit: Optional[dict] = None,
+    ) -> tuple[bool, Optional[str]]:
+        return False, None
+
+
+class SuppressedMatterEnqueueDecider(MatterEnqueueDecider):
+    """Never enqueue a matter for LLM processing."""
+
+    def should_enqueue_matter(
+        self,
+        existing_matter: Optional["Matter"],
+        current_attachment_hash: str,
+        has_attachments: bool,
+        current_attachment_hash_legacy: Optional[str] = None,
+        current_work_version: Optional[str] = None,
+        current_title: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        return False, None
