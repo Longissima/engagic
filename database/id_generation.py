@@ -156,7 +156,8 @@ def generate_matter_id(
     banana: str,
     matter_file: Optional[str] = None,
     matter_id: Optional[str] = None,
-    title: Optional[str] = None
+    title: Optional[str] = None,
+    matter_year: Optional[str] = None,
 ) -> Optional[str]:
     """Generate deterministic matter ID from inputs with strict fallback hierarchy
 
@@ -173,6 +174,9 @@ def generate_matter_id(
         matter_file: Official public identifier (e.g., "251041", "BL2025-1098")
         matter_id: Backend vendor identifier (e.g., UUID, numeric)
         title: Agenda item title (fallback for cities without stable IDs)
+        matter_year: Numbering period for a matter_file that restarts (St. Louis
+            "Board Bill 66" exists once per session). Hashed in only when present,
+            so files that never needed it keep their existing ids.
 
     Returns:
         Composite ID: {banana}_{hash} where hash is first 16 chars of SHA256
@@ -201,6 +205,8 @@ def generate_matter_id(
     # Each level is independent - no mixing
     if matter_file:
         key = f"{banana}:file:{matter_file}"
+        if matter_year:
+            key = f"{key}:year:{matter_year}"
     elif matter_id:
         key = f"{banana}:id:{matter_id}"
     elif title:

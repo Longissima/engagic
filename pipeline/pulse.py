@@ -63,6 +63,12 @@ ROSTER_REFRESH_SECONDS = 900
 SUMMARY_LOG_SECONDS = 600
 SYNC_POLL_SECONDS = 20
 TARGETED_MAX_SPAN_DAYS = 56
+# A dirty jurisdiction whose sync keeps failing (an adapter bug, a dead
+# portal) is retried on an exponential schedule instead of every cycle; it
+# stays dirty, so a fix or restart picks it up. In memory on purpose: a
+# restart is exactly when a retry should happen.
+SYNC_RETRY_FLOOR_SECONDS = 600
+SYNC_RETRY_CEILING_SECONDS = 6 * 3600
 LEGISTAR_DELTA_PAGE = 200
 # CivicClerk: agendas post days-to-weeks before a meeting, so a window from
 # just behind today to 45 days out sees every publication that matters; the
@@ -164,7 +170,11 @@ ADAPTER_PROBES = {
     "municode": _municode_probe,
     "primegov": _primegov_probe,
 }
-PULSE_VENDORS = frozenset({"legistar", *ADAPTER_PROBES})
+# BoardBook stays on the regular sweep: its search index flips between two
+# result sets for the same district (2026-09-30: 94% of its changes found
+# nothing new), so every probe resynced. _boardbook_probe is kept for a
+# future signal that is stable.
+PULSE_VENDORS = frozenset({"legistar", *ADAPTER_PROBES} - {"boardbook"})
 
 
 def resolve_probe(city: Jurisdiction) -> Optional[Probe]:
@@ -588,6 +598,10 @@ def civicweb_rows(payload: Any) -> List[Row]:
 _DESTINY_ROW = re.compile(r"<tr\b.*?</tr>", re.S | re.I)
 _DESTINY_SEQ = re.compile(r"seq(?:=|&#x3d;)(\d+)", re.I)
 _DESTINY_DATE = re.compile(r"\((\d{2})/(\d{2})/(\d{4})\)")
+# A meeting near a month boundary is listed on both month pages, and each
+# copy's links carry that page's get_month/get_year; strip them so both copies
+# fingerprint alike and a window rolling into a new month is not a change.
+_DESTINY_PAGE_PARAMS = re.compile(r"(?:&amp;|&|\?|&#x3f;)get_(?:month|year)(?:=|&#x3d;)\d+", re.I)
 
 
 def destiny_rows(html: str) -> List[Row]:
@@ -606,7 +620,8 @@ def destiny_rows(html: str) -> List[Row]:
                 day = date(year, month, dom)
             except ValueError:
                 day = None
-        rows.append((seq.group(1), day, _fingerprint(re.sub(r"\s+", " ", block))))
+        normalized = re.sub(r"\s+", " ", _DESTINY_PAGE_PARAMS.sub("", block))
+        rows.append((seq.group(1), day, _fingerprint(normalized)))
     return rows
 
 
@@ -697,10 +712,23 @@ async def _fetch_rows_payload(probe: Probe) -> Any:
 
 
 def diff_rows(previous: Optional[Dict[str, Any]], rows: List[Row]) -> Reading:
-    current = {row_id: [fingerprint, day.isoformat() if day else None] for row_id, day, fingerprint in rows}
+    # A listing can repeat one id (Destiny month pages overlap); fold every
+    # copy into one order-independent fingerprint so the stored state and the
+    # comparison see the same thing. Comparing copies one by one against a
+    # last-copy-wins state reported a change on every probe.
+    copies: Dict[str, List[str]] = {}
+    days: Dict[str, Optional[date]] = {}
+    for row_id, day, fingerprint in rows:
+        copies.setdefault(row_id, []).append(fingerprint)
+        days[row_id] = days.get(row_id) or day
+    current = {
+        row_id: [distinct[0] if len(distinct := sorted(set(prints))) == 1 else _fingerprint(distinct),
+                 days[row_id].isoformat() if days[row_id] else None]
+        for row_id, prints in copies.items()
+    }
     if previous is None:
         return Reading({"rows": current})
-    moved = [(row_id, day) for row_id, day, fingerprint in rows
+    moved = [(row_id, days[row_id]) for row_id, (fingerprint, _) in current.items()
              if (previous.get(row_id) or [None])[0] != fingerprint]
     if not moved:
         return Reading({"rows": current})
@@ -845,6 +873,7 @@ class PulseWatcher:
         self.lanes = {vendor: asyncio.Semaphore(SLOTS.get(vendor, 1)) for vendor in self.vendors}
         self.in_flight: Dict[str, asyncio.Task] = {}
         self.counts: Dict[str, int] = {}
+        self.sync_failures: Dict[str, Tuple[int, float]] = {}  # banana -> (failures, retry at, monotonic)
         self._roster: List[Probe] = []
         self._roster_built_at = 0.0
 
@@ -936,7 +965,9 @@ class PulseWatcher:
         return dict(self.counts)
 
     async def drain_dirty(self) -> int:
-        dirty = await self.db.pulse.list_dirty()
+        now = time.monotonic()
+        dirty = [row for row in await self.db.pulse.list_dirty()
+                 if self.sync_failures.get(row["banana"], (0, 0.0))[1] <= now]
         if not dirty:
             return 0
         ranges = {
@@ -950,17 +981,31 @@ class PulseWatcher:
         results = await self.conductor.run_sync_cycle(bananas, command="pulse-sync", ranges=ranges)
         completed = [r.city_banana for r in results if r.status is SyncStatus.COMPLETED]
         cleared = await self.db.pulse.clear_dirty(completed, started_at)
+        backed_off = self.record_sync_outcomes(bananas, set(completed))
         logger.info(
             "pulse sync cycle",
             dirty=len(bananas),
             targeted=len(ranges),
             completed=len(completed),
             cleared=cleared,
+            backed_off=backed_off,
             meetings_found=sum(r.meetings_found for r in results),
             items_stored=sum(r.items_stored for r in results),
             duration_seconds=round(time.monotonic() - started, 1),
         )
         return len(completed)
+
+    def record_sync_outcomes(self, bananas: List[str], completed: set) -> int:
+        """Reset completed jurisdictions, push failed ones back; returns how many are backing off."""
+        now = time.monotonic()
+        for banana in bananas:
+            if banana in completed:
+                self.sync_failures.pop(banana, None)
+                continue
+            failures = self.sync_failures.get(banana, (0, 0.0))[0] + 1
+            delay = min(SYNC_RETRY_CEILING_SECONDS, SYNC_RETRY_FLOOR_SECONDS * 2 ** (failures - 1))
+            self.sync_failures[banana] = (failures, now + _jittered(delay))
+        return len(self.sync_failures)
 
     async def _sleep(self, seconds: float) -> None:
         try:

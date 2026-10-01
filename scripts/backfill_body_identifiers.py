@@ -63,7 +63,7 @@ async def find_candidates(db: Database, banana: str | None) -> list[dict]:
         identifier = extract_identifier(row["title"], row["body_text"])
         if not identifier:
             continue
-        matter_file, matter_type = identifier
+        matter_file, matter_type = identifier.file, identifier.type
         candidates.append(
             {
                 "item_id": row["id"],

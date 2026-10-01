@@ -1,6 +1,6 @@
 """Async MatterRepository for matter operations."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set
 
 from asyncpg import Connection
@@ -16,6 +16,53 @@ logger = get_logger(__name__).bind(component="matter_repository")
 class MatterRepository(BaseRepository):
     """Repository for matter operations."""
 
+    async def get_numbering_runs(self, banana: str) -> Dict[str, List[date]]:
+        """Detected run starts per identifier series (see migration 058)."""
+        rows = await self._fetch("SELECT series, starts FROM numbering_runs WHERE banana = $1", banana)
+        return {row["series"]: list(row["starts"]) for row in rows}
+
+    async def get_run_high(self, banana: str, series: str, start: date, day: date) -> Optional[int]:
+        """Highest bare number of `series` the city used from `start` through `day`."""
+        row = await self._fetchrow(
+            """
+            SELECT max(substring(i.matter_file FROM '([0-9]+)$')::int) AS high
+            FROM items i JOIN meetings m ON m.id = i.meeting_id
+            WHERE m.banana = $1 AND m.date >= $3::date AND m.date < $4::date + 1
+              AND i.matter_file ~ ('^' || $2 || ' [0-9]{1,6}$')
+            """,
+            banana, series, start, day,
+        )
+        return row["high"] if row else None
+
+    async def get_printed_sibling_year(self, banana: str, matter_file: str, day: date, window_days: int) -> Optional[str]:
+        """Year on the nearest same-number matter in this city, within the window.
+
+        Only called for series with no detected runs, where every matter_year
+        is a printed one.
+        """
+        row = await self._fetchrow(
+            """
+            SELECT matter_year FROM city_matters
+            WHERE banana = $1 AND matter_file = $2 AND matter_year IS NOT NULL
+              AND COALESCE(last_seen, first_seen)::date >= $3::date - $4::int
+              AND COALESCE(first_seen, last_seen)::date <= $3::date + $4::int
+            ORDER BY abs(COALESCE(last_seen, first_seen)::date - $3::date)
+            LIMIT 1
+            """,
+            banana, matter_file, day, window_days,
+        )
+        return row["matter_year"] if row else None
+
+    async def replace_numbering_runs(self, banana: str, runs: Dict[str, List[date]]) -> None:
+        async with self._ensure_conn(None) as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM numbering_runs WHERE banana = $1", banana)
+                for series, starts in runs.items():
+                    await conn.execute(
+                        "INSERT INTO numbering_runs (banana, series, starts) VALUES ($1, $2, $3)",
+                        banana, series, starts,
+                    )
+
     async def store_matter(self, matter: Matter, conn: Optional[Connection] = None) -> None:
         """Store or update a matter with topic normalization."""
         async with self._ensure_conn(conn) as c:
@@ -25,11 +72,12 @@ class MatterRepository(BaseRepository):
                     id, banana, matter_id, matter_file, matter_type,
                     title, sponsors, canonical_summary, canonical_topics,
                     attachments, metadata, first_seen, last_seen,
-                    appearance_count, status
+                    appearance_count, status, matter_year
                 )
-                VALUES ($1, $2, $3::text, $4::text, $5::text, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                VALUES ($1, $2, $3::text, $4::text, $5::text, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::text)
                 ON CONFLICT (id) DO UPDATE SET
                     matter_file = EXCLUDED.matter_file,
+                    matter_year = COALESCE(EXCLUDED.matter_year, city_matters.matter_year),
                     matter_type = EXCLUDED.matter_type,
                     title = EXCLUDED.title,
                     sponsors = EXCLUDED.sponsors,
@@ -66,6 +114,7 @@ class MatterRepository(BaseRepository):
                 matter.last_seen,
                 matter.appearance_count or 1,
                 matter.status or "active",
+                matter.matter_year,
             )
 
             if matter.canonical_topics is not None:

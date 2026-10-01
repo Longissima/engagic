@@ -467,8 +467,10 @@ class AsyncBaseAdapter:
         """Remove HTML tags, decode entities, normalize whitespace."""
         if not text:
             return ""
-        # Replace <br> variants with space
-        text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
+        # Line breaks and block boundaries separate words. Attributes matter:
+        # CivicClerk sends <br id="isPasted">, which the old bare-<br> pattern
+        # missed, fusing "Board Bill Number 115" onto "Introduced by".
+        text = re.sub(r'<(?:br|/?(?:p|div|li|tr|td|th|h[1-6]))\b[^>]*>', ' ', text, flags=re.IGNORECASE)
         # Remove all other HTML tags
         text = re.sub(r'<[^>]+>', '', text)
         # Decode common HTML entities

@@ -625,6 +625,19 @@ resolve_targets() {
                  WHERE j.status = 'active' AND EXISTS (SELECT 1 FROM meetings m WHERE m.banana = j.banana)
                  ORDER BY j.banana"
             return ;;
+        unpulsed)
+            # Pulse (engagic-pulse) keeps the rest current; a watched row that
+            # has not probed cleanly in a day falls back here. BoardBook is
+            # excluded from pulse (flapping search index) so it always lands here.
+            regenerate_list unpulsed.txt \
+                "active jurisdictions with meetings that pulse is not watching (daily sweep)" \
+                "SELECT j.banana FROM jurisdictions j
+                 WHERE j.status = 'active' AND EXISTS (SELECT 1 FROM meetings m WHERE m.banana = j.banana)
+                   AND NOT EXISTS (SELECT 1 FROM jurisdiction_pulse p WHERE p.banana = j.banana
+                                   AND p.usable AND p.checked_at > NOW() - INTERVAL '1 day'
+                                   AND j.vendor <> 'boardbook')
+                 ORDER BY j.banana"
+            return ;;
         schools|schooldistricts)
             regenerate_list school-districts.txt \
                 "active type='school_district' jurisdictions" \
@@ -1100,6 +1113,7 @@ show_help() {
     echo "                                  state code (GA), @file path, comma-separated; OR a shortcut:"
     echo "                                    <name>   -> munis/<name>.txt   (e.g. processed, bay-area)"
     echo "                                    knowns   -> munis/processed.txt"
+    echo "                                    unpulsed -> active jurisdictions pulse is not watching (daily cron)"
     echo "                                    schools  -> all active type='school_district' (from DB)"
     echo "    process TARGETS           - Process in a named screen (survives SSH disconnect; run several at once)."
     echo "    sync-and-process TARGETS  - Fetch + process. Same TARGETS as sync."

@@ -102,6 +102,7 @@ def build_matter(row: Any, topics: Optional[List[str]] = None) -> Matter:
         final_vote_date=row.get("final_vote_date"),
         quality_score=row.get("quality_score"),
         rating_count=row.get("rating_count", 0),
+        matter_year=row.get("matter_year"),
     )
 
 

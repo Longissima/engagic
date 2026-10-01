@@ -255,6 +255,7 @@ class Matter:
     final_vote_date: Optional[datetime] = None  # Terminal vote date
     quality_score: Optional[float] = None  # Denormalized from ratings
     rating_count: int = 0  # Denormalized from ratings
+    matter_year: Optional[str] = None  # Numbering period when matter_file restarts (part of id hash)
 
     def __post_init__(self):
         """Validate matter data after initialization"""

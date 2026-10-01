@@ -188,7 +188,7 @@ class TestBodyIdentifiers:
             "Whitfield-Calloway, reso. autho.",
             "Contract No. 6007968 - 100% City Funding to provide a digital evidence "
             "management solution. Contractor: Motorola Solutions Inc.",
-        ) == ("Contract 6007968", "Contract")
+        )[:2] == ("Contract 6007968", "Contract")
 
     def test_amendment_suffix_is_preserved(self):
         """6006718-A1 is a distinct council action from 6006718."""
@@ -203,7 +203,7 @@ class TestBodyIdentifiers:
         assert extract_identifier(
             "Settlement in lawsuit of Michael Butts v City of Detroit; "
             "Case No. 25-011182 NI, File No. L25-8029, (RJB) A37000 in the amount of $76,000.00."
-        ) == ("File L25-8029", "File")
+        )[:2] == ("File L25-8029", "File")
 
     def test_unlabelled_law_file_keys_the_same_as_a_labelled_one(self):
         """One agenda writes 'File No. L24-01403', another drops the label."""
@@ -216,7 +216,7 @@ class TestBodyIdentifiers:
         assert extract_identifier(
             "Zoning Case #26-042 re: 1408 Edgerly Ave.",
             "Amending the Zoning Ordinance and Map of the City of Albany.",
-        ) == ("Case 26-042", "Case")
+        )[:2] == ("Case 26-042", "Case")
 
     def test_identifier_classes_are_namespaced(self):
         """A contract number and a case number can collide numerically in one city."""

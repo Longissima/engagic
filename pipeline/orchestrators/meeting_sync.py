@@ -21,7 +21,13 @@ from database.id_generation import (
 from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
-from parsing.identifiers import extract_identifier
+from parsing.identifiers import (
+    SIBLING_WINDOW_DAYS,
+    Identifier,
+    canonical_matter_file,
+    extract_identifier,
+    numbering_period,
+)
 from pipeline.utils import (
     MatterNoWorkReason,
     MatterWorkSnapshot,
@@ -788,6 +794,8 @@ class MeetingSyncOrchestrator:
             candidates.append((idx, item_data))
 
         identity_candidates: List[Mapping[str, Any]] = []
+        # Loaded on first need: most meetings have no bare instrument numbers.
+        numbering_runs: Dict[str, Any] = {}
         for source_idx, item_data in candidates:
             if item_data.get("sequence"):
                 identity_candidates.append(item_data)
@@ -848,7 +856,12 @@ class MeetingSyncOrchestrator:
                 collision_items += 1
 
             item_attachments = deserialize_attachments(item_data.get("attachments"))
-            matter_file = item_data.get("matter_file")
+            # Identity contract: whoever supplied matter_file (vendor field,
+            # adapter, or the text extractor below), it is validated here and
+            # nowhere else, and only parsing.identifiers decides what a number
+            # means. A placeholder ("2026-XXX"), a bare word ("RESOLUTION",
+            # "-----") or a title fragment is not identity and falls through.
+            matter_file = canonical_matter_file(item_data.get("matter_file"))
             matter_id_vendor = item_data.get("matter_id")
             matter_type = item_data.get("matter_type")
 
@@ -867,13 +880,20 @@ class MeetingSyncOrchestrator:
             # meetings. generate_matter_id lets matter_file win, which re-keys
             # such items on their next sync; the processor promotes an already
             # summarized single appearance to canonical without an LLM call.
-            if not matter_file:
-                derived = extract_identifier(
-                    item_data.get("title"), item_data.get("body_text")
-                )
-                if derived:
-                    matter_file, derived_type = derived
-                    matter_type = derived_type or matter_type
+            identity = (
+                Identifier(matter_file, matter_type)
+                if matter_file
+                else extract_identifier(item_data.get("title"), item_data.get("body_text"))
+            )
+            matter_year = None
+            if identity:
+                matter_file = identity.file
+                matter_type = identity.type or matter_type
+                # A bare number that restarts each period ("Board Bill 66")
+                # is only unique with its period; see numbering_period.
+                matter_year = await self._numbering_period(stored_meeting, identity, numbering_runs)
+            # Carried to matter tracking, which builds the aggregate row.
+            item_data["matter_year"] = matter_year
 
             matter_id = None
             if matter_file or matter_id_vendor:
@@ -881,6 +901,7 @@ class MeetingSyncOrchestrator:
                     banana=stored_meeting.banana,
                     matter_file=matter_file,
                     matter_id=matter_id_vendor,
+                    matter_year=matter_year,
                 )
 
             agenda_item = AgendaItem(
@@ -1119,6 +1140,7 @@ class MeetingSyncOrchestrator:
                     last_seen=meeting.date,
                     appearance_count=1,
                     status=vendor_matter_status or "active",
+                    matter_year=raw_item.get("matter_year"),
                 )
 
                 await self.db.matters.store_matter(matter_obj, conn=conn)
@@ -1544,6 +1566,35 @@ class MeetingSyncOrchestrator:
         logger.info(
             "enqueued matter for processing", matter_id=matter_id, priority=priority
         )
+
+    async def _numbering_period(
+        self, meeting: Meeting, identity: Identifier, runs: Dict[str, Any]
+    ) -> Optional[str]:
+        """numbering_period with the city's detected runs and the run's high mark.
+
+        `runs` is the per-meeting memo: {"loaded": bool, series: [starts]}.
+        """
+        if identity.year or meeting.date is None:
+            return numbering_period(identity, meeting.date)
+        if not runs.get("loaded"):
+            runs.update(await self.db.matters.get_numbering_runs(meeting.banana), loaded=True)
+        series = identity.file.partition(" ")[0]
+        starts = runs.get(series) or []
+        day = meeting.date.date() if isinstance(meeting.date, datetime) else meeting.date
+        if not starts:
+            # No detected restarts: a year the city printed beside this same
+            # number elsewhere is the only period evidence there is.
+            sibling = await self.db.matters.get_printed_sibling_year(
+                meeting.banana, identity.file, day, SIBLING_WINDOW_DAYS
+            )
+            return numbering_period(identity, meeting.date, printed_sibling=sibling)
+        latest = max((start for start in starts if start <= day), default=None)
+        high = (
+            await self.db.matters.get_run_high(meeting.banana, series, latest, day)
+            if latest
+            else None
+        )
+        return numbering_period(identity, meeting.date, starts, high)
 
     @staticmethod
     async def _claim_city_activation(banana: str, conn: Connection) -> bool:

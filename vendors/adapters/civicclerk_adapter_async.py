@@ -11,7 +11,7 @@ Item-level adapter that extracts structured agenda items with:
 
 import re
 from urllib.parse import urljoin, urlparse
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
@@ -450,8 +450,12 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
         if not title:
             return None
 
-        # Parse bill number and matter type from title
-        matter_file, matter_type = self._parse_bill_number(raw_title)
+        # No matter_file here: CivicClerk publishes no matter key, and the
+        # shared funnel (meeting_sync -> parsing.identifiers) reads the one the
+        # title cites. This adapter's own regex kept only the first digit run,
+        # so "Resolution 2026-059" keyed as "RES2026" and merged every 2026
+        # resolution in a city; it also keyed on cited ordinances ("pursuant to
+        # Ordinance Number 70333"). Removed 2026-10-01.
 
         # Get sequence
         sequence = item.get("sortOrder", 0)
@@ -544,10 +548,6 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
             "sequence": sequence,
         }
 
-        if matter_file:
-            result["matter_file"] = matter_file
-        if matter_type:
-            result["matter_type"] = matter_type
         if attachments:
             result["attachments"] = attachments
 
@@ -558,35 +558,6 @@ class AsyncCivicClerkAdapter(AsyncBaseAdapter):
 
         return result
 
-
-    def _parse_bill_number(self, html_title: str) -> Tuple[Optional[str], Optional[str]]:
-        """Parse bill/resolution number from HTML title. Returns (matter_file, matter_type)."""
-        # Strip HTML first for cleaner matching
-        text = self._strip_html(html_title)
-
-        patterns = [
-            # Board Bill Number 107 -> BB107
-            (r'Board\s+Bill\s+(?:Number\s+)?(\d+)', 'BB', 'Board Bill'),
-            # Resolution Number 123 or Resolution 123 -> RES123
-            (r'Resolution\s+(?:Number\s+)?(\d+)', 'RES', 'Resolution'),
-            # Ordinance Number 456 or Ordinance No. 70333 -> ORD456
-            (r'Ordinance\s+(?:Number\s+|No\.\s*)?(\d+)', 'ORD', 'Ordinance'),
-            # BB 107 or BB107 -> BB107
-            (r'\bBB\s*(\d+)\b', 'BB', 'Board Bill'),
-            # RES 123 or RES123 -> RES123
-            (r'\bRES\s*(\d+)\b', 'RES', 'Resolution'),
-            # ORD 456 or ORD456 -> ORD456
-            (r'\bORD\s*(\d+)\b', 'ORD', 'Ordinance'),
-        ]
-
-        for pattern, prefix, matter_type in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                number = match.group(1)
-                matter_file = f"{prefix}{number}"
-                return matter_file, matter_type
-
-        return None, None
 
     # ------------------------------------------------------------------
     # Placeholder detection

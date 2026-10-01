@@ -6,6 +6,8 @@ from pipeline.pulse import (
     MISSING_RECHECK_SECONDS,
     PROBE_CEILING_SECONDS,
     PROBE_FLOOR_SECONDS,
+    PULSE_VENDORS,
+    PulseWatcher,
     SignalMissing,
     boardbook_rows,
     civicclerk_activity,
@@ -175,3 +177,38 @@ def test_boardbook_rows_dates_and_ids():
         "sparqmeetingsagendaitems:18874858": date(2026, 10, 1),
         "sparqmeetingsdocuments:69a1c561-1e0f": None,
     }
+
+
+def test_destiny_month_overlap_is_stable():
+    def page(month):
+        return (
+            f'<tr><td><a href="/agenda_publish.cfm&#x3f;id&#x3d;1&amp;get_month&#x3d;{month}&amp;get_year&#x3d;2026'
+            '&amp;dsp&#x3d;ag&amp;seq&#x3d;121" title="View Agenda for Council (10/06/2026)">October 6</a></td></tr>'
+        )
+    both = destiny_rows(page(9) + "\n" + page(10))
+    state = diff_rows(None, both).state["rows"]
+    assert list(state) == ["121"]
+    assert not diff_rows(state, both).changed
+    assert not diff_rows(state, destiny_rows(page(10))).changed
+
+
+def test_duplicate_ids_with_distinct_copies_do_not_flap():
+    rows = [("a", date(2026, 10, 1), "x"), ("a", date(2026, 10, 1), "y")]
+    state = diff_rows(None, rows).state["rows"]
+    assert not diff_rows(state, rows).changed
+    assert not diff_rows(state, list(reversed(rows))).changed
+    assert diff_rows(state, [("a", date(2026, 10, 1), "z"), rows[1]]).changed
+
+
+def test_boardbook_is_left_to_the_sweep():
+    assert "boardbook" not in PULSE_VENDORS
+
+
+def test_failed_syncs_back_off_and_completed_reset():
+    watcher = PulseWatcher.__new__(PulseWatcher)
+    watcher.sync_failures = {}
+    assert watcher.record_sync_outcomes(["a", "b"], {"b"}) == 1
+    first_retry = watcher.sync_failures["a"][1]
+    watcher.record_sync_outcomes(["a"], set())
+    assert watcher.sync_failures["a"][0] == 2 and watcher.sync_failures["a"][1] > first_retry
+    assert watcher.record_sync_outcomes(["a"], {"a"}) == 0

@@ -172,7 +172,7 @@ async def plan(db, banana) -> Tuple[int, Dict[Tuple[str, str], Target]]:
         derived = extract_identifier(row["title"], row["body_text"])
         if not derived:
             continue
-        matter_file, matter_type = derived
+        matter_file, matter_type = derived.file, derived.type
         target = generate_matter_id(banana=row["banana"], matter_file=matter_file)
         if not target or target == row["matter_id"]:
             continue

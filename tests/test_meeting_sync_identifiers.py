@@ -1,5 +1,6 @@
 """Derived identifiers retain their semantic type through matter tracking."""
 
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -191,3 +192,35 @@ async def test_derived_identifier_type_is_written_to_new_matter():
     assert len(stored) == 1
     assert stored[0].matter_file == "Contract 6007968"
     assert stored[0].matter_type == "Contract"
+
+
+@pytest.mark.asyncio
+async def test_funnel_keys_restarting_numbers_by_period_and_rejects_placeholders():
+    class Items:
+        async def get_agenda_items(self, _meeting_id):
+            return []
+
+    class Matters:
+        async def get_numbering_runs(self, _banana):
+            return {"Bill": [date(2026, 5, 4)]}
+
+        async def get_run_high(self, _banana, _series, _start, _day):
+            return 150
+
+    orchestrator = MeetingSyncOrchestrator(SimpleNamespace(items=Items(), matters=Matters()))
+
+    async def process(meeting_date, items):
+        meeting = SimpleNamespace(id=f"stlouisMO_{meeting_date:%Y%m%d}", banana="stlouisMO", date=meeting_date)
+        return await orchestrator._process_agenda_items(items, meeting, {})
+
+    old = await process(date(2026, 3, 3), [{"vendor_item_id": "1", "sequence": 1,
+                                             "title": "Board Bill Number 66 Introduced by Shane Cohn"}])
+    new = await process(date(2026, 9, 9), [
+        {"vendor_item_id": "1", "sequence": 1, "title": "Board Bill Number 66 Introduced by Michael Browning"},
+        {"vendor_item_id": "2", "sequence": 2, "title": "Adopt Resolution No. 2026-XXX", "matter_file": "-----"},
+    ])
+
+    assert old[0].matter_file == new[0].matter_file == "Bill 66"
+    assert old[0].matter_id != new[0].matter_id
+    assert new[0].matter_id == generate_matter_id("stlouisMO", matter_file="Bill 66", matter_year="2026")
+    assert new[1].matter_file is None and new[1].matter_id is None
