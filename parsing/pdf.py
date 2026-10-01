@@ -535,7 +535,7 @@ def _extract_plain_page_text(page: fitz.Page) -> str:
     if has_excessive_layout_padding(text):
         native = cast(str, page.get_text(sort=False))
         if len(native.strip()) >= 200 and len(text) > 3 * len(native):
-            logger.info("using native text order after excessive layout padding")
+            logger.debug("using native text order after excessive layout padding")
             return native
     return text
 
@@ -621,7 +621,7 @@ class PdfExtractor:
         # Each worker gets 1 thread to avoid CPU thrashing
         os.environ.setdefault('OMP_THREAD_LIMIT', '1')
 
-        logger.info(
+        logger.debug(
             "PDF extractor initialized",
             ocr_workers=self.max_ocr_workers,
             ocr_dpi=self.ocr_dpi,
