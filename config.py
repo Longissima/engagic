@@ -98,10 +98,11 @@ class Config:
         # for production volume (2026-09-08: GLM-5.3-flash replaced Gemini
         # flash-lite at ~4x lower cost); "openrouter" is the bench that
         # reaches every model with one request shape for the next bake-off;
-        # "gemini" is the native SDK kept for rollback and its Batch lane.
+        # "gemini" is the native SDK kept for rollback and its Batch lane;
+        # "anthropic" is the Messages API (Haiku).
         self.LLM_BACKEND = os.getenv("ENGAGIC_LLM_BACKEND", "zai").lower()
-        if self.LLM_BACKEND not in ("openrouter", "zai", "gemini"):
-            raise ValueError("ENGAGIC_LLM_BACKEND must be 'openrouter', 'zai', or 'gemini'")
+        if self.LLM_BACKEND not in ("openrouter", "zai", "gemini", "anthropic"):
+            raise ValueError("ENGAGIC_LLM_BACKEND must be 'openrouter', 'zai', 'gemini', or 'anthropic'")
         # OpenRouter provider routing. ORDER pins named providers (bench
         # mode: a number measures one known endpoint). SORT, when set, wins
         # over ORDER and spreads load by "throughput", "price", or "latency"
@@ -341,6 +342,7 @@ class Config:
             "openrouter": "z-ai/glm-5.3-flash",
             "zai": "glm-5.3-flash",
             "gemini": "gemini-3.1-flash-lite",
+            "anthropic": "claude-haiku-5-5",
         }[self.LLM_BACKEND]
         self.SMALL_DOC_MODEL = os.getenv("ENGAGIC_SMALL_DOC_MODEL", "gemini-2.5-flash-lite")
 
@@ -395,6 +397,8 @@ class Config:
             return self.OPENROUTER_API_KEY
         if self.LLM_BACKEND == "zai":
             return self.ZAI_API_KEY
+        if self.LLM_BACKEND == "anthropic":
+            return self.ANTHROPIC_API_KEY
         return self.GEMINI_API_KEY or self.LLM_API_KEY
 
     def get_postgres_dsn(self) -> str:

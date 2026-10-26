@@ -20,7 +20,7 @@ import statistics
 import time
 from pathlib import Path
 
-from analysis.llm.backends import OpenRouterBackend, ZaiBackend
+from analysis.llm.backends import AnthropicBackend, OpenRouterBackend, ZaiBackend
 from analysis.llm.document_representation import render_documents
 from analysis.llm.summarizer import Summarizer
 from config import config, get_logger
@@ -93,10 +93,12 @@ async def rebuild_item_text(db, corpus, row, max_chars):
 
 
 def build_bench_backend(spec):
-    """"zai:glm-5.3-flash" hits the native endpoint; anything else is an
+    """"zai:glm-5.3-flash" and "anthropic:claude-haiku-5-5" hit native endpoints; anything else is an
     OpenRouter slug pinned to its known provider."""
     if spec.startswith("zai:"):
         return ZaiBackend(config.ZAI_API_KEY or "", spec.split(":", 1)[1])
+    if spec.startswith("anthropic:"):
+        return AnthropicBackend(config.ANTHROPIC_API_KEY or "", spec.split(":", 1)[1])
     return OpenRouterBackend(
         config.OPENROUTER_API_KEY or "",
         spec,

@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
+import anthropic
 import requests
 from google import genai
 from google.genai import types
@@ -57,6 +58,9 @@ MODEL_PRICING_PER_MILLION: Dict[str, tuple[float, float, float]] = {
     "gemini-3.1-flash-lite-preview": (0.25, 1.50, 0.025),
     "gemini-2.5-flash-lite": (0.10, 0.40, 0.01),
     "gemini-2.5-flash": (0.30, 2.50, 0.03),
+    # Anthropic list 2026-10-24, prompts up to 100K tokens; AnthropicBackend
+    # prices the long-context tier and cache writes itself.
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
 }
 
 _RETRYABLE_HTTP = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
@@ -539,6 +543,129 @@ class ZaiBackend(OpenAICompatibleBackend):
             body["response_format"] = {"type": "json_object"}
 
 
+class AnthropicBackend:
+    """Anthropic Messages API through the official SDK.
+
+    Thinking is adaptive and cannot be switched off on current models; effort is
+    the only knob. Sampling parameters are rejected (400), so temperature is not
+    sent. The schema rides in the system prompt, as on Z.AI, so a model swap
+    changes the model and nothing else. The SDK retries 429/5xx/529 itself; an
+    empty account or a bad key is raised as LLMAccountError and never retried.
+    """
+
+    name = "anthropic"
+    supports_context_cache = False
+    supports_batch = False
+
+    # (input, output) $/1M below and above the long-context threshold.
+    _TIERS = {"claude-haiku-5-5": ((0.10, 0.50), (0.50, 2.50), 100_000)}
+    _CACHE_WRITE, _CACHE_READ = 1.25, 0.10
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        *,
+        timeout_seconds: float = 600.0,
+        max_retries: int = 4,
+        max_inflight: int = 0,
+    ):
+        if not api_key:
+            raise ValueError("API key required for the anthropic backend")
+        self.model = model
+        self.client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds, max_retries=max_retries)
+        self._inflight = threading.BoundedSemaphore(max_inflight) if max_inflight > 0 else None
+
+    def complete(
+        self,
+        *,
+        user: str,
+        system: Optional[str],
+        schema: Optional[dict],
+        effort: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> Completion:
+        if schema is not None:
+            note = "Respond with a single JSON object matching this JSON Schema exactly:\n" + json.dumps(schema)
+            system = f"{system}\n\n{note}" if system else note
+        params: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": user}],
+        }
+        if system:
+            # The instruction block is identical across items; concurrent calls
+            # read the prefix the first one wrote.
+            params["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        if effort in EFFORT_LEVELS:
+            params["output_config"] = {"effort": effort}
+        started = time.monotonic()
+        try:
+            if self._inflight is None:
+                message = self._call(params)
+            else:
+                with self._inflight:
+                    message = self._call(params)
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            raise LLMAccountError(f"anthropic account unavailable: {exc}", model=self.model, prompt_type="unknown") from exc
+        except anthropic.BadRequestError as exc:
+            if "credit balance" in str(exc).lower():
+                raise LLMAccountError(f"anthropic account unavailable: {exc}", model=self.model, prompt_type="unknown") from exc
+            raise LLMError(f"anthropic: {exc}", model=self.model, prompt_type="unknown") from exc
+        except anthropic.APIError as exc:
+            raise LLMError(f"anthropic retries exhausted: {exc}", model=self.model, prompt_type="unknown", original_error=exc) from exc
+        return self._completion(message, started)
+
+    def _call(self, params: Dict[str, Any]) -> "anthropic.types.Message":
+        # Streaming keeps a long think under the SDK's non-streaming timeout guard.
+        with self.client.messages.stream(**params) as stream:
+            return stream.get_final_message()
+
+    def _completion(self, message: "anthropic.types.Message", started: float) -> Completion:
+        if message.stop_reason == "refusal":
+            raise LLMError(
+                f"anthropic refusal: {getattr(message, 'stop_details', None)}", model=self.model, prompt_type="unknown"
+            )
+        content = "".join(b.text for b in message.content if b.type == "text")
+        usage = message.usage
+        fresh = usage.input_tokens
+        written = usage.cache_creation_input_tokens or 0
+        read = usage.cache_read_input_tokens or 0
+        if not content.strip():
+            raise LLMError(
+                f"anthropic returned empty content (stop_reason={message.stop_reason}, output_tokens={usage.output_tokens})",
+                model=self.model,
+                prompt_type="unknown",
+            )
+        cost = None
+        if self.model in self._TIERS:
+            low, high, threshold = self._TIERS[self.model]
+            rate_in, rate_out = high if fresh + written + read > threshold else low
+            cost = ((fresh + written * self._CACHE_WRITE + read * self._CACHE_READ) * rate_in + usage.output_tokens * rate_out) / 1e6
+        details = getattr(usage, "output_tokens_details", None)
+        thinking = details.get("thinking_tokens") if isinstance(details, dict) else getattr(details, "thinking_tokens", 0)
+        return Completion(
+            text=content,
+            model=message.model,
+            provider=self.name,
+            input_tokens=fresh + written + read,
+            output_tokens=usage.output_tokens,
+            reasoning_tokens=int(thinking or 0),
+            cached_tokens=read,
+            cost_usd=cost,
+            finish_reason="length" if message.stop_reason == "max_tokens" else message.stop_reason,
+            latency_seconds=time.monotonic() - started,
+        )
+
+    def count_tokens(self, text: str) -> int:
+        # Same pessimistic ceiling as the other transports; an exact count is a paid round trip.
+        return max(1, len(text) // 3)
+
+    def estimate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+        return price_estimate(self.model, input_tokens, output_tokens, cached_tokens)
+
+
 class _TransientError(Exception):
     def __init__(self, message: str, *, rate_limited: bool = False):
         super().__init__(message)
@@ -715,6 +842,12 @@ def build_backend(api_key: Optional[str] = None) -> ChatBackend:
         return GeminiBackend(
             api_key or config.GEMINI_API_KEY or config.LLM_API_KEY or "",
             config.PRIMARY_MODEL,
+        )
+    if config.LLM_BACKEND == "anthropic":
+        return AnthropicBackend(
+            api_key or config.ANTHROPIC_API_KEY or "",
+            config.PRIMARY_MODEL,
+            max_inflight=config.LLM_MAX_INFLIGHT,
         )
     if config.LLM_BACKEND == "zai":
         return ZaiBackend(
