@@ -131,7 +131,10 @@ class Jurisdiction:
     vendor: str  # primegov, legistar, granicus, etc.
     slug: str  # cityofpaloalto (vendor-specific)
     extra_vendors: Optional[List[Dict[str, str]]] = None  # Additive [{vendor, slug}] for multi-vendor jurisdictions; NULL for 99% of rows
-    type: Optional[str] = None  # city, county, school_district, utility, transit, water_district, etc.
+    # Class (city, county, school_district, special_district, state), derived by
+    # the database from kind; set kind, never type. See database/jurisdiction_kinds.py.
+    type: Optional[str] = None
+    kind: Optional[str] = None  # port, fire_district, transit...: a jurisdiction_kinds row
     county_banana: Optional[str] = None  # FK to parent county jurisdiction
     status: str = "active"
     population: Optional[int] = None  # Census population

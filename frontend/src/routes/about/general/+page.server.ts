@@ -1,5 +1,5 @@
 import { createServerApiClient } from '$lib/api/server';
-import type { AnalyticsData } from '$lib/api/types';
+import type { PlatformMetrics } from '$lib/api/types';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async ({ setHeaders, locals }) => {
@@ -9,12 +9,12 @@ export const load: PageServerLoad = async ({ setHeaders, locals }) => {
 
 	const apiClient = createServerApiClient(locals.clientIp, locals.ssrAuthSecret, locals.userAgent);
 
-	let analytics: AnalyticsData | null = null;
+	let platformMetrics: PlatformMetrics | null = null;
 	try {
-		analytics = await apiClient.getAnalytics();
+		platformMetrics = await apiClient.getPlatformMetrics();
 	} catch (error) {
-		console.error('Failed to load about/general analytics:', error);
+		console.error('Failed to load about/general coverage:', error);
 	}
 
-	return { analytics };
+	return { platformMetrics };
 };

@@ -3,14 +3,20 @@
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
-	// Prefer "live" counts (jurisdictions with at least one summary at meeting/item/matter
-	// level) over naive table totals — those include jurisdictions we haven't summarized yet.
-	const byType = $derived(
-		data.analytics?.real_metrics.by_type?.live ?? data.analytics?.real_metrics.by_type?.total
-	);
-	const total = $derived(
-		byType ? byType.city + byType.county + byType.school_district : null
-	);
+	// "live" = at least one summary at meeting/item/matter level. Table totals
+	// include jurisdictions onboarded but not yet summarized, so they overclaim.
+	const live = $derived.by(() => {
+		const rows = data.platformMetrics?.coverage?.by_class;
+		if (!rows?.length) return null;
+		const of = (type: string) => rows.find((r) => r.type === type)?.live ?? 0;
+		return {
+			total: rows.reduce((sum, r) => sum + r.live, 0),
+			city: of('city'),
+			county: of('county'),
+			school_district: of('school_district'),
+			other: of('special_district') + of('state')
+		};
+	});
 </script>
 
 <SeoHead
@@ -29,8 +35,8 @@
 	<section class="section">
 		<div class="section-rule">What We Cover</div>
 		<p>"Local government" isn't just city hall. The decisions that shape your block come from a patchwork of <strong>jurisdictions</strong>: cities and towns, counties, school districts, and special-purpose boards. Engagic treats them all as first-class.</p>
-		{#if byType && total}
-			<p>Right now we're tracking <strong>{total.toLocaleString()}</strong> jurisdictions: <strong>{byType.city.toLocaleString()}</strong> cities, <strong>{byType.county.toLocaleString()}</strong> counties, and <strong>{byType.school_district.toLocaleString()}</strong> school districts.</p>
+		{#if live}
+			<p>Right now we're summarizing <strong>{live.total.toLocaleString()}</strong> jurisdictions: <strong>{live.city.toLocaleString()}</strong> cities and towns, <strong>{live.county.toLocaleString()}</strong> counties, <strong>{live.school_district.toLocaleString()}</strong> school districts, and <strong>{live.other.toLocaleString()}</strong> special districts and state bodies, from transit agencies and ports to water and fire districts.</p>
 		{/if}
 	</section>
 
@@ -39,8 +45,8 @@
 		<div class="feature-list">
 			<div class="feature-item">
 				<h3 class="feature-heading">Find What Matters</h3>
-				{#if total}
-					<p>We track {total.toLocaleString()}+ jurisdictions, pulling meeting agendas and documents so you don't have to hunt across government websites.</p>
+				{#if live}
+					<p>We track {live.total.toLocaleString()}+ jurisdictions, pulling meeting agendas and documents so you don't have to hunt across government websites.</p>
 				{:else}
 					<p>We track jurisdictions across the US, pulling meeting agendas and documents so you don't have to hunt across government websites.</p>
 				{/if}

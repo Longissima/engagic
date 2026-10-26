@@ -2,6 +2,7 @@
 Monitoring and health check API routes
 """
 
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict
 
@@ -353,6 +354,22 @@ async def get_platform_metrics(db: Database = Depends(get_db)):
                 "meeting_summaries_30d": metrics["meeting_summaries_30d"],
             },
             "trends": metrics["trends"],
+            "coverage": {
+                # One row per class; "census" is the Census of Governments
+                # count of that class nationally (none for state bodies).
+                "by_class": [
+                    {**row, "census": metrics["census_by_class"].get(row["type"])}
+                    for row in metrics["coverage_by_class"]
+                ],
+                "top_kinds": metrics["top_kinds"],
+                # Meetings in the last 60 days that we saw before they happened.
+                "timeliness": {
+                    "meetings": metrics["timely_summarized"],
+                    "summarized_before": metrics["summarized_before_meeting"],
+                    "median_hours_to_summary": round(metrics["median_hours_to_summary"] or 0, 1),
+                    "median_days_notice": round(metrics["median_days_notice"] or 0, 1),
+                },
+            },
         }
     except Exception as e:
         logger.error("error fetching platform metrics", error=str(e))
@@ -537,6 +554,8 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                     c.name,
                     c.state,
                     c.type AS jurisdiction_type,
+                    c.kind,
+                    k.label AS kind_label,
                     COALESCE(c.population, 0) AS population,
                     CASE
                         WHEN COALESCE(mc.cnt, 0) > 0 THEN 'matter'
@@ -553,6 +572,7 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                         ELSE 0
                     END AS summary_count
                 FROM jurisdictions c
+                JOIN jurisdiction_kinds k ON k.kind = c.kind
                 JOIN synced_counts sc ON c.banana = sc.banana
                 LEFT JOIN matter_counts mc ON c.banana = mc.banana
                 LEFT JOIN item_counts ic ON c.banana = ic.banana
@@ -565,6 +585,8 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                     "name": row["name"],
                     "state": row["state"],
                     "type": row["jurisdiction_type"],
+                    "kind": row["kind"],
+                    "kind_label": row["kind_label"],
                     "population": row["population"],
                     "coverage_type": row["coverage_type"],
                     "summary_count": row["summary_count"],
@@ -579,11 +601,7 @@ async def get_city_coverage(db: Database = Depends(get_db)):
                 "monolithic": sum(1 for c in cities if c["coverage_type"] == "monolithic"),
                 "synced": sum(1 for c in cities if c["coverage_type"] == "synced"),
                 "total": len(cities),
-                "by_type": {
-                    "city": sum(1 for c in cities if c["type"] == "city"),
-                    "county": sum(1 for c in cities if c["type"] == "county"),
-                    "school_district": sum(1 for c in cities if c["type"] == "school_district"),
-                },
+                "by_type": dict(Counter(c["type"] for c in cities).most_common()),
             }
 
         return {

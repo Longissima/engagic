@@ -285,6 +285,40 @@ export interface PlatformMetrics {
 		votes: number[];
 		summaries: number[];
 	};
+	coverage?: {
+		by_class: ClassCoverage[];
+		top_kinds: KindCount[];
+		timeliness: {
+			/** Meetings in the last 60 days we saw before they happened and summarized. */
+			meetings: number;
+			summarized_before: number;
+			median_hours_to_summary: number;
+			median_days_notice: number;
+		};
+	};
+}
+
+export type JurisdictionClass = 'city' | 'county' | 'school_district' | 'special_district' | 'state';
+
+export interface ClassCoverage {
+	type: JurisdictionClass;
+	total: number;
+	/** Has at least one meeting ingested. */
+	active: number;
+	/** Has at least one summary. */
+	live: number;
+	/** Summarized a meeting held in the last 30 days. */
+	fresh: number;
+	/** Census of Governments count nationally; null for state bodies. */
+	census: number | null;
+}
+
+export interface KindCount {
+	kind: string;
+	label: string;
+	type: JurisdictionClass;
+	total: number;
+	live: number;
 }
 
 // Flyer generation types (mirrors backend Pydantic models)
@@ -890,12 +924,14 @@ export interface GlobalHappeningResponse {
 
 // Jurisdiction coverage types for transparency page
 export type CoverageType = 'matter' | 'item' | 'monolithic' | 'synced' | 'pending';
-export type JurisdictionType = 'city' | 'county' | 'school_district';
+export type JurisdictionType = string;
 
 export interface CityWithCoverage {
 	name: string;
 	state: string;
 	type: JurisdictionType;
+	kind: string;
+	kind_label: string;
 	population: number;
 	coverage_type: CoverageType;
 	summary_count: number;
@@ -907,11 +943,8 @@ export interface CityCoverageSummary {
 	monolithic: number;
 	synced: number;
 	total: number;
-	by_type?: {
-		city: number;
-		county: number;
-		school_district: number;
-	};
+	/** Count per jurisdiction type, largest first. */
+	by_type?: Record<string, number>;
 }
 
 export interface CityCoverageResponse {

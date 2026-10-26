@@ -1,18 +1,28 @@
 <script lang="ts">
 	import type { PageData } from './$types';
-	import type { CityCoverageResponse, CoverageType, JurisdictionType } from '$lib/api/types';
+	import type { CityCoverageResponse, CoverageType, JurisdictionClass } from '$lib/api/types';
 	import { apiClient } from '$lib/api/api-client';
 	import SeoHead from '$lib/components/SeoHead.svelte';
 
 	let { data }: { data: PageData } = $props();
 	let activeView: 'overview' | 'coverage' = $state('overview');
 
-	// `cities_covered` is every row in `jurisdictions` -- cities, counties AND
-	// school districts -- so it cannot be the denominator of a card titled
-	// "Cities". Use the typed breakdown the endpoint already returns, the same
-	// way /about/general does.
-	const byTypeTotal = $derived(data.analytics?.real_metrics.by_type?.total ?? null);
-	const jurisdictionsCovered = $derived(data.analytics?.real_metrics.cities_covered ?? 0);
+	// Coverage is reported per class (jurisdictions.type), against the Census of
+	// Governments count of that class; kinds are the detail beneath a class.
+	const CLASS_ORDER: JurisdictionClass[] = ['city', 'county', 'school_district', 'special_district', 'state'];
+	const CLASS_LABELS: Record<JurisdictionClass, string> = {
+		city: 'Cities and towns',
+		county: 'Counties',
+		school_district: 'School districts',
+		special_district: 'Special districts',
+		state: 'State bodies'
+	};
+	const coverage = $derived(data.platformMetrics?.coverage ?? null);
+	const classRows = $derived(
+		[...(coverage?.by_class ?? [])].sort((a, b) => CLASS_ORDER.indexOf(a.type) - CLASS_ORDER.indexOf(b.type))
+	);
+	const freshTotal = $derived(classRows.reduce((sum, r) => sum + r.fresh, 0));
+	const timeliness = $derived(coverage?.timeliness ?? null);
 	let cityCoverage = $state<CityCoverageResponse | null>(null);
 	let coverageLoading = $state(false);
 	let coverageError = $state(false);
@@ -52,6 +62,12 @@
 		return `${(bytes / 1000 ** unit).toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`;
 	}
 
+	function percent(part: number, whole: number): string {
+		if (!whole) return '-';
+		const value = (part / whole) * 100;
+		return `${value < 10 ? value.toFixed(1) : Math.round(value)}%`;
+	}
+
 	function formatGrowth(num: number): string {
 		if (num >= 1000) {
 			return '+' + (num / 1000).toFixed(1) + 'K this month';
@@ -85,15 +101,6 @@
 			case 'monolithic': return 'coverage-monolithic';
 			case 'synced': return 'coverage-synced';
 			default: return 'coverage-pending';
-		}
-	}
-
-	function jurisdictionLabel(type: JurisdictionType): string {
-		switch (type) {
-			case 'city': return 'City';
-			case 'county': return 'County';
-			case 'school_district': return 'School District';
-			default: return type;
 		}
 	}
 
@@ -141,7 +148,7 @@
 		{#if cityCoverage}
 			<section class="metrics-section">
 				<h1 class="primary-heading">Jurisdiction Coverage</h1>
-				<p class="section-desc">All jurisdictions with active coverage — cities, counties, and school districts — sorted by population. Coverage depth indicates the granularity of legislative tracking.</p>
+				<p class="section-desc">All jurisdictions with active coverage — cities, counties, school districts, and special-purpose bodies — sorted by population. Coverage depth indicates the granularity of legislative tracking.</p>
 
 				<div class="coverage-summary">
 					<div class="summary-item">
@@ -168,7 +175,9 @@
 
 				{#if cityCoverage.summary.by_type}
 					{@const bt = cityCoverage.summary.by_type}
-					<p class="coverage-breakdown">{bt.city.toLocaleString()} cities · {bt.county.toLocaleString()} counties · {bt.school_district.toLocaleString()} school districts</p>
+					<p class="coverage-breakdown">
+						{CLASS_ORDER.filter((c) => bt[c]).map((c) => `${CLASS_LABELS[c]} ${bt[c].toLocaleString()}`).join(' · ')}
+					</p>
 				{/if}
 
 				<div class="jurisdiction-table-container">
@@ -186,7 +195,7 @@
 							{#each cityCoverage.cities as city}
 								<tr>
 									<td class="col-jurisdiction">{city.name}, {city.state}</td>
-									<td class="col-type">{jurisdictionLabel(city.type)}</td>
+									<td class="col-type">{city.kind_label}</td>
 									<td class="col-coverage">
 										<span class="coverage-badge {coverageClass(city.coverage_type)}">
 											{coverageLabel(city.coverage_type)}
@@ -209,213 +218,226 @@
 			</div>
 		{/if}
 	{:else}
-		{#if data.analytics}
-		<section class="metrics-section">
-			<h1 class="primary-heading">Coverage Overview</h1>
-			<div class="cards-grid">
-				<div class="stats-card">
-					<div class="stat-numbers-split">
-						<span class="number-primary">{formatNumber(data.analytics.real_metrics.frequently_updated_cities)}</span>
-						<span class="number-separator">/</span>
-						<span class="number-secondary">{formatNumber(jurisdictionsCovered)}</span>
-					</div>
-					<div class="stat-title">Frequently Updated Jurisdictions</div>
-					<div class="stat-description">
-						{#if byTypeTotal}
-							7+ summarized meetings; total coverage spans
-							{formatNumber(byTypeTotal.city)} cities, {formatNumber(byTypeTotal.county)} counties,
-							{formatNumber(byTypeTotal.school_district)} school districts
-						{:else}
-							7+ meetings with summaries
-						{/if}
-					</div>
+		{#if classRows.length}
+			<section class="metrics-section">
+				<h1 class="primary-heading">Coverage</h1>
+				<p class="section-desc">
+					Jurisdictions with at least one summary, against how many of each the Census of Governments counts
+					nationally. Onboarded includes bodies we sync but have not summarized yet.
+				</p>
+				<div class="jurisdiction-table-container class-table-container">
+					<table class="jurisdiction-table">
+						<thead>
+							<tr>
+								<th class="col-jurisdiction">Class</th>
+								<th class="col-count">Summarized</th>
+								<th class="col-count">Onboarded</th>
+								<th class="col-count">Nationally</th>
+								<th class="col-count">Share</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each classRows as row (row.type)}
+								<tr>
+									<td class="col-jurisdiction">{CLASS_LABELS[row.type]}</td>
+									<td class="col-count">{row.live.toLocaleString()}</td>
+									<td class="col-count">{row.total.toLocaleString()}</td>
+									<td class="col-count">{row.census ? row.census.toLocaleString() : '-'}</td>
+									<td class="col-count">{row.census ? percent(row.live, row.census) : '-'}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
 				</div>
 
-				<div class="stats-card">
-					<div class="number-primary">{formatNumber(data.analytics.real_metrics.meetings_tracked)}</div>
-					<div class="stat-title">Meetings Tracked</div>
-					{#if data.platformMetrics?.trends.meetings}
-						<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
-							<path d={sparklinePath(data.platformMetrics.trends.meetings)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
-						</svg>
-						<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meetings_30d)}</div>
-					{:else}
+				{#if coverage?.top_kinds.length}
+					<div class="kinds">
+						<h2 class="kinds-heading">Beyond city hall</h2>
+						<ol class="kind-list">
+							{#each coverage.top_kinds as k (k.kind)}
+								<li class="kind-row">
+									<span class="kind-name">{k.label}</span>
+									<span class="kind-count">{k.total.toLocaleString()}</span>
+									<span class="kind-live">{k.live.toLocaleString()} summarized</span>
+								</li>
+							{/each}
+						</ol>
+					</div>
+				{/if}
+			</section>
+		{/if}
+
+		{#if timeliness?.meetings}
+			<section class="metrics-section">
+				<h2 class="primary-heading">In Time to Act</h2>
+				<p class="section-desc">Meetings held in the last 60 days that we saw before they happened.</p>
+				<div class="cards-grid">
+					<div class="stats-card highlight-card">
+						<div class="number-primary">{percent(timeliness.summarized_before, timeliness.meetings)}</div>
+						<div class="stat-title">Summarized Beforehand</div>
 						<div class="stat-description">
-							Council, committee, and board meetings
+							{timeliness.summarized_before.toLocaleString()} of {timeliness.meetings.toLocaleString()} meetings had a summary before they began
 						</div>
-					{/if}
-				</div>
-
-				<div class="stats-card">
-					<div class="number-primary">{formatNumber(data.analytics.real_metrics.matters_tracked)}</div>
-					<div class="stat-title">Legislative Matters</div>
-					{#if data.platformMetrics?.trends.matters}
-						<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
-							<path d={sparklinePath(data.platformMetrics.trends.matters)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
-						</svg>
-						<div class="stat-description">{formatGrowth(data.platformMetrics.growth.matters_30d)}</div>
-					{:else}
-						<div class="stat-description">Across {formatNumber(data.analytics.real_metrics.agenda_items_processed)} agenda items</div>
-					{/if}
-				</div>
-
-				<div class="stats-card">
-					<div class="number-primary">{formatNumber(data.analytics.real_metrics.unique_item_summaries)}</div>
-					<div class="stat-title">Unique Summaries</div>
-					<div class="stat-description">
-						Across {formatNumber(data.analytics.real_metrics.meetings_with_items)} item-level meetings
+					</div>
+					<div class="stats-card">
+						<div class="number-primary">{timeliness.median_days_notice} days</div>
+						<div class="stat-title">Median Notice</div>
+						<div class="stat-description">From first seeing a meeting to the meeting itself</div>
+					</div>
+					<div class="stats-card">
+						<div class="number-primary">{timeliness.median_hours_to_summary} h</div>
+						<div class="stat-title">Median Time to Summary</div>
+						<div class="stat-description">From first seeing a meeting to its first summary</div>
+					</div>
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(freshTotal)}</div>
+						<div class="stat-title">Current Jurisdictions</div>
+						<div class="stat-description">Summarized a meeting held in the last 30 days</div>
 					</div>
 				</div>
-			</div>
-		</section>
+			</section>
 		{/if}
 
 		{#if data.platformMetrics}
+			{@const pm = data.platformMetrics}
 			<section class="metrics-section">
-				<h2 class="primary-heading">Civic Infrastructure</h2>
+				<h2 class="primary-heading">The Record</h2>
+				<div class="cards-grid">
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(pm.content.meetings)}</div>
+						<div class="stat-title">Meetings Tracked</div>
+						{#if pm.trends.meetings}
+							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
+								<path d={sparklinePath(pm.trends.meetings)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
+							</svg>
+						{/if}
+						<div class="stat-description">{formatNumber(pm.processing.summarized_meetings)} summarized · {formatGrowth(pm.growth.meetings_30d)}</div>
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(pm.content.agenda_items)}</div>
+						<div class="stat-title">Agenda Items</div>
+						{#if pm.trends.items}
+							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
+								<path d={sparklinePath(pm.trends.items)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
+							</svg>
+						{/if}
+						<div class="stat-description">{formatGrowth(pm.growth.items_30d)}</div>
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(pm.content.matters)}</div>
+						<div class="stat-title">Legislative Matters</div>
+						{#if pm.trends.matters}
+							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
+								<path d={sparklinePath(pm.trends.matters)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
+							</svg>
+						{/if}
+						<div class="stat-description">Followed across {formatNumber(pm.content.matter_appearances)} appearances · {formatGrowth(pm.growth.matters_30d)}</div>
+					</div>
+
+					<div class="stats-card highlight-card">
+						<div class="number-primary">{formatNumber(data.analytics?.real_metrics.unique_item_summaries ?? pm.processing.summarized_items)}</div>
+						<div class="stat-title">Unique Summaries</div>
+						<div class="stat-description">A recurring matter counts once · {pm.processing.item_summary_rate}% of analyzed items summarized</div>
+					</div>
+				</div>
+			</section>
+
+			<section class="metrics-section">
+				<h2 class="primary-heading">Accountability</h2>
+				<div class="cards-grid">
+					<div class="stats-card highlight-card">
+						<div class="number-primary">{formatNumber(pm.accountability.votes)}</div>
+						<div class="stat-title">Ballots Recorded</div>
+						<div class="stat-description">{formatNumber(pm.accountability.votes_with_receipt)} with source quotes ({pm.accountability.vote_receipt_rate}%)</div>
+						{#if pm.trends.votes}
+							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
+								<path d={sparklinePath(pm.trends.votes)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
+							</svg>
+							<div class="stat-description">{formatGrowth(pm.growth.votes_30d)}</div>
+						{/if}
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(pm.accountability.motions)}</div>
+						<div class="stat-title">Motions Recorded</div>
+						<div class="stat-description">{formatNumber(pm.accountability.divided_motions)} had both yes and no votes</div>
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(pm.accountability.meetings_with_votes)}</div>
+						<div class="stat-title">Meetings with Votes</div>
+						<div class="stat-description">Meetings with recorded roll calls</div>
+					</div>
+
+					<div class="stats-card">
+						<div class="number-primary">{formatNumber(pm.accountability.cities_with_votes)}</div>
+						<div class="stat-title">Jurisdictions with Vote Data</div>
+						<div class="stat-description">{formatNumber(pm.accountability.officials_with_votes)} officials on the record</div>
+					</div>
+				</div>
+			</section>
+
+			<section class="metrics-section">
+				<h2 class="primary-heading">Who Decides</h2>
 				<div class="cards-grid">
 					<a href="/council-members" class="stats-card stats-card-link">
-						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.council_members)}</div>
-						<div class="stat-title">Council Members</div>
-						<div class="stat-description">Elected officials tracked</div>
+						<div class="number-primary">{formatNumber(pm.civic_infrastructure.council_members)}</div>
+						<div class="stat-title">Officials</div>
+						<div class="stat-description">Elected and appointed members tracked</div>
 						<span class="card-arrow">View by city</span>
 					</a>
 
 					<a href="/committees" class="stats-card stats-card-link">
-						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.committees)}</div>
+						<div class="number-primary">{formatNumber(pm.civic_infrastructure.committees)}</div>
 						<div class="stat-title">Committees</div>
-						<div class="stat-description">Legislative bodies monitored</div>
+						<div class="stat-description">Councils, boards, and commissions monitored</div>
 						<span class="card-arrow">View by city</span>
 					</a>
 
 					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.committee_assignments)}</div>
+						<div class="number-primary">{formatNumber(pm.civic_infrastructure.committee_assignments)}</div>
 						<div class="stat-title">Committee Assignments</div>
-						<div class="stat-description">Member-to-committee relationships</div>
+						<div class="stat-description">Who sits on which body</div>
 					</div>
 
 					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.sponsorships)}</div>
+						<div class="number-primary">{formatNumber(pm.accountability.sponsorships)}</div>
 						<div class="stat-title">Sponsorships</div>
-						<div class="stat-description">Legislation authorship tracked</div>
+						<div class="stat-description">Who authored which legislation</div>
 					</div>
 				</div>
 			</section>
 
-			<section class="metrics-section">
-				<h2 class="primary-heading">Accountability Data</h2>
-				<div class="cards-grid">
-					<div class="stats-card highlight-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.votes)}</div>
-						<div class="stat-title">Ballots Recorded</div>
-						<div class="stat-description">{formatNumber(data.platformMetrics.accountability.votes_with_receipt)} with source quotes ({data.platformMetrics.accountability.vote_receipt_rate}%)</div>
-						{#if data.platformMetrics.trends.votes}
-							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
-								<path d={sparklinePath(data.platformMetrics.trends.votes)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
-							</svg>
-							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.votes_30d)}</div>
-						{:else}
-							<div class="stat-description">One official's vote on one motion</div>
-						{/if}
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.motions)}</div>
-						<div class="stat-title">Motions Recorded</div>
-						<div class="stat-description">
-							{formatNumber(data.platformMetrics.accountability.divided_motions)} had both yes and no votes
+			{#if pm.corpus}
+				<section class="metrics-section">
+					<h2 class="primary-heading">Source Documents</h2>
+					<div class="cards-grid">
+						<div class="stats-card">
+							<div class="number-primary">{formatNumber(pm.corpus.documents)}</div>
+							<div class="stat-title">Unique Documents</div>
+							<div class="stat-description">
+								Counted once however often cited · {formatNumber(pm.corpus.ocr_documents)} needed OCR
+							</div>
+						</div>
+						<div class="stats-card">
+							<div class="number-primary">{formatNumber(pm.corpus.pages)}</div>
+							<div class="stat-title">Document Pages</div>
+							<div class="stat-description">{formatNumber(pm.corpus.ocr_pages)} read by OCR</div>
+						</div>
+						<div class="stats-card">
+							<div class="number-primary">{formatNumber(pm.civic_infrastructure.minutes_documents)}</div>
+							<div class="stat-title">Minutes Parsed</div>
+							<div class="stat-description">Read for roll calls and outcomes</div>
+						</div>
+						<div class="stats-card">
+							<div class="number-primary">{formatBytes(pm.corpus.archived_bytes)}</div>
+							<div class="stat-title">Archived Originals</div>
+							<div class="stat-description">Kept even after a city takes them down</div>
 						</div>
 					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.meetings_with_votes)}</div>
-						<div class="stat-title">Meetings with Votes</div>
-						<div class="stat-description">
-							Meetings with recorded roll calls
-						</div>
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.accountability.cities_with_votes)}</div>
-						<div class="stat-title">Jurisdictions with Vote Data</div>
-						<div class="stat-description">
-							{formatNumber(data.platformMetrics.accountability.officials_with_votes)} officials on the record
-						</div>
-					</div>
-				</div>
-			</section>
-
-			<section class="metrics-section">
-				<h2 class="primary-heading">Processing</h2>
-				<div class="cards-grid">
-					<div class="stats-card highlight-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.processing.summarized_items)}</div>
-						<div class="stat-title">Items Summarized</div>
-						<div class="stat-description">{data.platformMetrics.processing.item_summary_rate}% of {formatNumber(data.platformMetrics.processing.items_analyzed)} analyzed items</div>
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.content.agenda_items)}</div>
-						<div class="stat-title">Agenda Items Ingested</div>
-						{#if data.platformMetrics.trends.items}
-							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
-								<path d={sparklinePath(data.platformMetrics.trends.items)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
-							</svg>
-							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.items_30d)}</div>
-						{:else}
-							<div class="stat-description">Total items collected from agendas</div>
-						{/if}
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.civic_infrastructure.minutes_documents)}</div>
-						<div class="stat-title">Minutes Parsed</div>
-						<div class="stat-description">Minutes documents processed for roll calls</div>
-					</div>
-
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.processing.summarized_meetings)}</div>
-						<div class="stat-title">Meetings Summarized</div>
-						{#if data.platformMetrics.trends.summaries}
-							<svg class="sparkline" viewBox="0 0 80 24" preserveAspectRatio="none">
-								<path d={sparklinePath(data.platformMetrics.trends.summaries)} fill="none" stroke="var(--civic-blue)" stroke-width="1.5" />
-							</svg>
-							<div class="stat-description">{formatGrowth(data.platformMetrics.growth.meeting_summaries_30d)}</div>
-						{:else}
-							<div class="stat-description">Full meeting summaries generated</div>
-						{/if}
-					</div>
-				</div>
-			</section>
-			{#if data.platformMetrics.corpus}
-			<section class="metrics-section">
-				<h2 class="primary-heading">Document Corpus</h2>
-				<div class="cards-grid">
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.corpus.attachments)}</div>
-						<div class="stat-title">Attachment Entries</div>
-						<div class="stat-description">Listed on agenda items and matters; includes repeated references</div>
-					</div>
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.corpus.documents)}</div>
-						<div class="stat-title">Unique Documents</div>
-						<div class="stat-description">
-							{formatNumber(data.platformMetrics.corpus.native_documents)} native text · {formatNumber(data.platformMetrics.corpus.ocr_documents)} used OCR
-						</div>
-						<div class="stat-description">OCR includes mixed text/scanned files; unclassified files excluded from the split</div>
-					</div>
-					<div class="stats-card">
-						<div class="number-primary">{formatNumber(data.platformMetrics.corpus.pages)}</div>
-						<div class="stat-title">Document Pages</div>
-						<div class="stat-description">{formatNumber(data.platformMetrics.corpus.ocr_pages)} OCR pages · {formatNumber(data.platformMetrics.corpus.documents_with_pages)} documents with page counts</div>
-					</div>
-					<div class="stats-card">
-						<div class="number-primary">{formatBytes(data.platformMetrics.corpus.archived_bytes)}</div>
-						<div class="stat-title">Archived Source Size</div>
-						<div class="stat-description">Original files, counted once per unique document</div>
-					</div>
-				</div>
-			</section>
+				</section>
 			{/if}
 		{/if}
 
@@ -521,31 +543,12 @@
 		opacity: 1;
 	}
 
-	.stat-numbers-split {
-		display: flex;
-		align-items: baseline;
-		gap: 0.25rem;
-	}
-
 	.number-primary {
 		font-family: var(--font-display);
 		font-size: 3rem;
 		font-weight: 400;
 		color: var(--text-primary);
 		line-height: 1;
-	}
-
-	.number-separator {
-		font-family: var(--font-mono);
-		font-size: 2rem;
-		color: var(--text-secondary);
-	}
-
-	.number-secondary {
-		font-family: var(--font-mono);
-		font-size: 2rem;
-		font-weight: 500;
-		color: var(--text-secondary);
 	}
 
 	.stat-title {
@@ -595,14 +598,6 @@
 
 		.number-primary {
 			font-size: 1.75rem;
-		}
-
-		.number-separator {
-			font-size: 1.25rem;
-		}
-
-		.number-secondary {
-			font-size: 1.25rem;
 		}
 
 		.stat-title {
@@ -758,6 +753,66 @@
 
 	.col-coverage {
 		min-width: 140px;
+	}
+
+	.class-table-container {
+		max-height: none;
+		max-width: var(--width-state);
+	}
+
+	.kinds {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-sm);
+		max-width: var(--width-state);
+	}
+
+	.kinds-heading {
+		font-family: var(--font-mono);
+		font-size: 0.85rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: var(--text-secondary);
+		margin: var(--space-md) 0 0 0;
+	}
+
+	.kind-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		column-gap: var(--space-xl);
+	}
+
+	.kind-row {
+		display: grid;
+		grid-template-columns: 1fr auto auto;
+		align-items: baseline;
+		gap: var(--space-md);
+		padding: var(--space-sm) 0;
+		border-bottom: 1px solid var(--border-subtle);
+		font-size: 0.9rem;
+	}
+
+	.kind-count {
+		font-family: var(--font-mono);
+		font-weight: 600;
+	}
+
+	.kind-live {
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		color: var(--text-secondary);
+		min-width: 7em;
+		text-align: right;
+	}
+
+	@media (max-width: 640px) {
+		.kind-list {
+			grid-template-columns: 1fr;
+		}
 	}
 
 	.coverage-breakdown {

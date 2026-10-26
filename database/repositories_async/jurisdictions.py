@@ -14,6 +14,7 @@ from datetime import datetime
 
 from database.repositories_async.base import BaseRepository
 from database.repositories_async.helpers import deserialize_city_participation, deserialize_extra_vendors
+from database.jurisdiction_kinds import classify
 from database.models import Jurisdiction
 from config import get_logger
 
@@ -38,6 +39,7 @@ def _build_jurisdiction(row, zipcodes: List[str]) -> Jurisdiction:
         slug=row["slug"],
         extra_vendors=deserialize_extra_vendors(row["extra_vendors"]),
         type=row["type"],
+        kind=row.get("kind"),
         county_banana=row["county_banana"],
         status=row["status"],
         participation=deserialize_city_participation(row["participation"]),
@@ -68,8 +70,8 @@ class JurisdictionRepository(BaseRepository):
         async with self.transaction() as conn:
             await conn.execute(
                 """
-                INSERT INTO jurisdictions (banana, name, state, vendor, slug, extra_vendors, type, county_banana, status, population, geom)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                INSERT INTO jurisdictions (banana, name, state, vendor, slug, extra_vendors, type, kind, county_banana, status, population, geom)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 """,
                 city.banana,
                 city.name,
@@ -78,6 +80,7 @@ class JurisdictionRepository(BaseRepository):
                 city.slug,
                 json.dumps(city.extra_vendors) if city.extra_vendors else None,
                 city.type,
+                city.kind or classify(city.name, city.type, banana=city.banana),
                 city.county_banana,
                 city.status or "active",
                 city.population,
@@ -107,15 +110,17 @@ class JurisdictionRepository(BaseRepository):
         async with self.transaction() as conn:
             await conn.execute(
                 """
-                INSERT INTO jurisdictions (banana, name, state, vendor, slug, extra_vendors, type, county_banana, status, population)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                INSERT INTO jurisdictions (banana, name, state, vendor, slug, extra_vendors, type, kind, county_banana, status, population)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($11, $8), $9, $10, $12)
                 ON CONFLICT (banana) DO UPDATE SET
                     name = EXCLUDED.name,
                     state = EXCLUDED.state,
                     vendor = EXCLUDED.vendor,
                     slug = EXCLUDED.slug,
                     extra_vendors = COALESCE(EXCLUDED.extra_vendors, jurisdictions.extra_vendors),
-                    type = COALESCE(EXCLUDED.type, jurisdictions.type),
+                    -- A curated kind is never replaced by a re-classification; only an
+                    -- explicit kind ($11) moves it. type follows kind via trigger.
+                    kind = COALESCE($11, jurisdictions.kind),
                     county_banana = COALESCE(EXCLUDED.county_banana, jurisdictions.county_banana),
                     status = COALESCE(EXCLUDED.status, jurisdictions.status),
                     population = COALESCE(EXCLUDED.population, jurisdictions.population)
@@ -127,8 +132,10 @@ class JurisdictionRepository(BaseRepository):
                 city.slug,
                 json.dumps(city.extra_vendors) if city.extra_vendors else None,
                 city.type,
+                classify(city.name, city.type, banana=city.banana),
                 city.county_banana,
                 city.status or "active",
+                city.kind,
                 city.population,
             )
 

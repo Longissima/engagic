@@ -450,6 +450,11 @@ class Database:
                 UNION
                 SELECT banana FROM matter_flags WHERE has_content
             ),
+            -- Summarized a meeting held in the last 30 days: covered and current.
+            fresh_bananas AS (
+                SELECT DISTINCT banana FROM meeting_flags
+                WHERE has_content AND date >= NOW() - INTERVAL '30 days' AND date <= NOW()
+            ),
             frequently_updated AS (
                 SELECT banana
                 FROM meeting_flags
@@ -513,12 +518,50 @@ class Database:
                 LEFT JOIN active_bananas ab ON ab.banana = j.banana
                 LEFT JOIN live_bananas lb ON lb.banana = j.banana
                 LEFT JOIN frequently_updated fu ON fu.banana = j.banana
+            ),
+            -- Coverage per class (the five-way type) and the kinds worth featuring.
+            -- The city/county/school_district columns above predate the special
+            -- districts and agencies onboarded in 2026-09/10.
+            class_rollup AS (
+                SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
+                    'type', t.type, 'total', t.total, 'active', t.active, 'live', t.live, 'fresh', t.fresh
+                ) ORDER BY t.total DESC), '[]'::JSONB) AS coverage_by_class
+                FROM (
+                    SELECT j.type,
+                           COUNT(*) AS total,
+                           COUNT(ab.banana) AS active,
+                           COUNT(lb.banana) AS live,
+                           COUNT(fb.banana) AS fresh
+                    FROM jurisdictions j
+                    LEFT JOIN active_bananas ab ON ab.banana = j.banana
+                    LEFT JOIN live_bananas lb ON lb.banana = j.banana
+                    LEFT JOIN fresh_bananas fb ON fb.banana = j.banana
+                    GROUP BY j.type
+                ) t
+            ),
+            kind_rollup AS (
+                -- Beneath the general-purpose classes, where the variety is.
+                SELECT COALESCE(JSONB_AGG(JSONB_BUILD_OBJECT(
+                    'kind', t.kind, 'label', t.label, 'type', t.type, 'total', t.total, 'live', t.live
+                ) ORDER BY t.total DESC, t.kind), '[]'::JSONB) AS top_kinds
+                FROM (
+                    SELECT j.kind, k.label, k.type, COUNT(*) AS total, COUNT(lb.banana) AS live
+                    FROM jurisdictions j
+                    JOIN jurisdiction_kinds k ON k.kind = j.kind
+                    LEFT JOIN live_bananas lb ON lb.banana = j.banana
+                    WHERE k.type IN ('special_district', 'state')
+                    GROUP BY j.kind, k.label, k.type
+                    ORDER BY COUNT(*) DESC, j.kind
+                    LIMIT 10
+                ) t
             )
         SELECT
             ir.*,
             mr.*,
             mar.*,
             jr.*,
+            cr.coverage_by_class,
+            kr.top_kinds,
             (
                 SELECT ARRAY_AGG(COALESCE(iw.cnt, 0) ORDER BY w.week_start)
                 FROM weeks w LEFT JOIN item_weekly iw ON iw.wk = w.week_start
@@ -539,6 +582,8 @@ class Database:
         CROSS JOIN meeting_rollup mr
         CROSS JOIN matter_rollup mar
         CROSS JOIN jurisdiction_rollup jr
+        CROSS JOIN class_rollup cr
+        CROSS JOIN kind_rollup kr
     """
 
     _PLATFORM_METRICS_INFRASTRUCTURE = """
@@ -676,6 +721,48 @@ class Database:
         CROSS JOIN motion_rollup mr
     """
 
+    # Whether summaries arrive in time to act on, and the Census universe each
+    # class is measured against. Only meetings first seen before they happened
+    # count toward timeliness: an archived meeting backfilled a year late was
+    # never a chance to weigh in, and counting it made 66% look late (2026-10-24).
+    _PLATFORM_METRICS_COVERAGE = """
+        WITH per_meeting AS (
+            SELECT m.date, m.created_at AS seen,
+                   LEAST(
+                       CASE WHEN COALESCE(m.summary, '') <> '' THEN m.summary_updated_at END,
+                       MIN(i.summary_updated_at) FILTER (WHERE i.summary IS NOT NULL)
+                   ) AS summarized
+            FROM meetings m
+            LEFT JOIN items i ON i.meeting_id = m.id
+            WHERE m.date >= NOW() - INTERVAL '60 days' AND m.date <= NOW()
+              AND m.created_at < m.date
+            GROUP BY m.id
+        ),
+        census AS (
+            SELECT CASE
+                       WHEN sheet = 'general' AND unit_type LIKE '1%' THEN 'county'
+                       WHEN sheet = 'general' THEN 'city'
+                       WHEN sheet IN ('school', 'dependent_school') THEN 'school_district'
+                       ELSE 'special_district'
+                   END AS type,
+                   COUNT(*) AS n
+            FROM census_government_units
+            WHERE is_active
+            GROUP BY 1
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE summarized IS NOT NULL) AS timely_summarized,
+            COUNT(*) FILTER (WHERE summarized < date) AS summarized_before_meeting,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY EXTRACT(EPOCH FROM summarized - seen) / 3600
+            ) FILTER (WHERE summarized IS NOT NULL) AS median_hours_to_summary,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY EXTRACT(EPOCH FROM date - seen) / 86400
+            ) FILTER (WHERE summarized IS NOT NULL) AS median_days_notice,
+            (SELECT COALESCE(JSONB_OBJECT_AGG(type, n), '{}'::JSONB) FROM census) AS census_by_class
+        FROM per_meeting
+    """
+
     async def _fetchrow_on_own_connection(self, query: str) -> asyncpg.Record:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(query)
@@ -697,13 +784,14 @@ class Database:
                 return cached[1]
 
             started = time.monotonic()
-            content, infrastructure, votes = await asyncio.gather(
+            content, infrastructure, votes, coverage = await asyncio.gather(
                 self._fetchrow_on_own_connection(self._PLATFORM_METRICS_CONTENT),
                 self._fetchrow_on_own_connection(self._PLATFORM_METRICS_INFRASTRUCTURE),
                 self._fetchrow_on_own_connection(self._PLATFORM_METRICS_VOTES),
+                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_COVERAGE),
             )
 
-            metrics = {**dict(content), **dict(infrastructure), **dict(votes)}
+            metrics = {**dict(content), **dict(infrastructure), **dict(votes), **dict(coverage)}
 
             # Rates use the processed-meeting denominator, not every item ever seen
             if metrics['meetings'] > 0:

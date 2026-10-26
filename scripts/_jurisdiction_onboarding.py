@@ -1,7 +1,9 @@
-"""One onboarding flow for every jurisdiction type.
+"""One onboarding flow for every jurisdiction kind.
 
-Types are suggestions, not a closed enum. Only geographic enrichment and
-county linking depend on type; identity and vendor configuration do not.
+The operator picks a kind from the jurisdiction_kinds registry; its class
+(type) follows. Only geographic enrichment and county linking depend on the
+class; identity and vendor configuration do not. There is no free-text entry:
+that prompt grew 60 types by 2026-10, so a new kind is added by migration.
 """
 
 import re
@@ -15,32 +17,20 @@ from scripts._jurisdiction_geography import (
 from scripts._jurisdiction_naming import make_banana
 
 
-SUGGESTED_TYPES = (
-    "city", "county", "school_district", "water_district",
-    "water_management_district", "air_quality_board", "utility", "transit",
-)
-
-
-def normalize_type(value: str) -> str:
-    value = re.sub(r"[\s-]+", "_", value.strip().lower())
-    if not re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*", value):
-        raise ValueError("Type must be words separated by spaces, hyphens, or underscores")
-    return value
-
-
-async def select_type(db) -> str:
+async def select_kind(db) -> tuple[str, str]:
+    """(kind, class) picked from the registry, general-purpose classes first."""
     async with db.pool.acquire() as conn:
-        rows = await conn.fetch("SELECT DISTINCT type FROM jurisdictions ORDER BY type")
-    types = list(dict.fromkeys((*SUGGESTED_TYPES, *(r['type'] for r in rows if r['type']))))
-    for index, kind in enumerate(types, 1):
-        print(f"  {index}. {kind}")
-    choice = input("Type (number or enter any type name): ").strip()
-    if choice.isdigit():
-        index = int(choice) - 1
-        if not 0 <= index < len(types):
-            raise ValueError("Invalid type selection")
-        return types[index]
-    return normalize_type(choice)
+        rows = await conn.fetch(
+            """SELECT kind, type, label FROM jurisdiction_kinds
+               ORDER BY array_position(ARRAY['city','county','school_district','state','special_district'], type), label"""
+        )
+    for index, row in enumerate(rows, 1):
+        print(f"  {index}. {row['label']} ({row['type']})")
+    choice = input("Kind (number): ").strip()
+    if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+        raise ValueError("Pick a listed kind; new kinds are added to jurisdiction_kinds by migration")
+    row = rows[int(choice) - 1]
+    return row["kind"], row["type"]
 
 
 def required(prompt: str) -> str:
@@ -50,7 +40,7 @@ def required(prompt: str) -> str:
     return value
 
 
-async def collect_jurisdiction(db, kind: str) -> tuple[Jurisdiction, bytes | None]:
+async def collect_jurisdiction(db, kind: str, cls: str) -> tuple[Jurisdiction, bytes | None]:
     name = required("Jurisdiction name (full name, including County/District/etc.): ")
     state = required("State (2-letter code): ").upper()
     if not re.fullmatch(r"[A-Z]{2}", state):
@@ -63,7 +53,7 @@ async def collect_jurisdiction(db, kind: str) -> tuple[Jurisdiction, bytes | Non
     slug = required("Slug (vendor-specific): ")
     vendor = required("Vendor (granicus/primegov/legistar/boardbook/etc.): ").lower()
     county_banana = None
-    if kind != "county":
+    if cls != "county":
         county_banana = input("Parent county banana (optional; leave blank for regional bodies): ").strip() or None
         if county_banana:
             parent = await db.jurisdictions.get_city(county_banana)
@@ -88,7 +78,7 @@ async def collect_jurisdiction(db, kind: str) -> tuple[Jurisdiction, bytes | Non
     if population is not None and not 0 <= population <= 2**31 - 1:
         raise ValueError("Population must be a nonnegative PostgreSQL integer")
     return Jurisdiction(
-        banana=banana, name=name, state=state, type=kind,
+        banana=banana, name=name, state=state, type=cls, kind=kind,
         vendor=vendor, slug=slug, county_banana=county_banana,
         population=population, zipcodes=zipcodes, status="active",
     ), geometry
@@ -123,8 +113,8 @@ async def link_county_cities(db, county: Jurisdiction) -> None:
 async def add_jurisdiction(db) -> bool:
     print("\n=== ADD JURISDICTION ===")
     try:
-        kind = await select_type(db)
-        jurisdiction, geometry = await collect_jurisdiction(db, kind)
+        kind, cls = await select_kind(db)
+        jurisdiction, geometry = await collect_jurisdiction(db, kind, cls)
         await db.jurisdictions.add_city(jurisdiction, geometry=geometry)
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled")
@@ -133,7 +123,7 @@ async def add_jurisdiction(db) -> bool:
         print(f"Error adding jurisdiction: {exc}")
         return False
     print(f"Added {kind} '{jurisdiction.name}, {jurisdiction.state}' ({jurisdiction.banana})")
-    if kind == 'county':
+    if cls == 'county':
         try:
             await link_county_cities(db, jurisdiction)
         except (KeyboardInterrupt, EOFError, Exception) as exc:

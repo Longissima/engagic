@@ -38,6 +38,15 @@ class MetricsDatabaseStub(Database):
                 "vote_trend": [5] * 8,
                 "votes_by_city": [{"city": "example", "votes": 30, "voters": 2}],
             }
+        if query == self._PLATFORM_METRICS_COVERAGE:
+            self.calls["coverage"] += 1
+            return {
+                "timely_summarized": 5,
+                "summarized_before_meeting": 3,
+                "median_hours_to_summary": 36.0,
+                "median_days_notice": 4.4,
+                "census_by_class": {"city": 100},
+            }
         raise AssertionError("unexpected metrics query")
 
 
@@ -52,7 +61,7 @@ async def test_platform_metrics_single_flight_and_cache():
     )
 
     assert first is second is third
-    assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1}
+    assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1, "coverage": 1}
     assert first["vote_receipt_rate"] == 40.0
     assert first["meeting_summary_rate"] == 40.0
     assert first["item_summary_rate"] == 60.0
@@ -65,7 +74,7 @@ async def test_platform_metrics_single_flight_and_cache():
     }
 
     assert await db.get_platform_metrics() is first
-    assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1}
+    assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1, "coverage": 1}
 
 
 def test_content_snapshot_scans_items_heap_once():
