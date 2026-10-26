@@ -1,5 +1,6 @@
 import asyncio
 from collections import Counter
+from decimal import Decimal
 
 import pytest
 
@@ -12,46 +13,47 @@ class MetricsDatabaseStub(Database):
         self._platform_metrics_cache = None
         self._platform_metrics_lock = asyncio.Lock()
         self.calls: Counter[str] = Counter()
+        self.snapshot: dict | None = None
 
-    async def _fetchrow_on_own_connection(self, query: str):
+    async def _read_platform_metrics_snapshot(self):
+        return self.snapshot
+
+    async def _write_platform_metrics_snapshot(self, metrics, elapsed_ms):
+        self.snapshot = {"metrics": metrics, "age_seconds": 0.0}
+
+    async def _fetch_platform_metrics_rows(self):
         await asyncio.sleep(0.01)
-        if query == self._PLATFORM_METRICS_CONTENT:
-            self.calls["content"] += 1
-            return {
-                "meetings": 10,
-                "summarized_meetings": 4,
-                "summarized_items": 12,
-                "items_analyzed": 20,
-                "meeting_trend": [1] * 8,
-                "item_trend": [2] * 8,
-                "matter_trend": [3] * 8,
-                "summary_trend": [4] * 8,
-            }
-        if query == self._PLATFORM_METRICS_INFRASTRUCTURE:
-            self.calls["infrastructure"] += 1
-            return {"committees": 3}
-        if query == self._PLATFORM_METRICS_VOTES:
-            self.calls["votes"] += 1
-            return {
-                "votes": 30,
-                "votes_with_receipt": 12,
-                "vote_trend": [5] * 8,
-                "votes_by_city": [{"city": "example", "votes": 30, "voters": 2}],
-            }
-        if query == self._PLATFORM_METRICS_COVERAGE:
-            self.calls["coverage"] += 1
-            return {
-                "timely_summarized": 5,
-                "summarized_before_meeting": 3,
-                "median_hours_to_summary": 36.0,
-                "median_days_notice": 4.4,
-                "census_by_class": {"city": 100},
-            }
-        raise AssertionError("unexpected metrics query")
+        self.calls["compute"] += 1
+        content = {
+            "meetings": 10,
+            "summarized_meetings": 4,
+            "summarized_items": 12,
+            "items_analyzed": 20,
+            "total_pop": Decimal("2000000"),
+            "meeting_trend": [1] * 8,
+            "item_trend": [2] * 8,
+            "matter_trend": [3] * 8,
+            "summary_trend": [4] * 8,
+        }
+        infrastructure = {"committees": 3}
+        votes = {
+            "votes": 30,
+            "votes_with_receipt": 12,
+            "vote_trend": [5] * 8,
+            "votes_by_city": [{"city": "example", "votes": 30, "voters": 2}],
+        }
+        coverage = {
+            "timely_summarized": 5,
+            "summarized_before_meeting": 3,
+            "median_hours_to_summary": 36.0,
+            "median_days_notice": 4.4,
+            "census_by_class": {"city": 100},
+        }
+        return [content, infrastructure, votes, coverage]
 
 
 @pytest.mark.asyncio
-async def test_platform_metrics_single_flight_and_cache():
+async def test_platform_metrics_bootstrap_is_single_flight():
     db = MetricsDatabaseStub()
 
     first, second, third = await asyncio.gather(
@@ -60,11 +62,12 @@ async def test_platform_metrics_single_flight_and_cache():
         db.get_platform_metrics(),
     )
 
-    assert first is second is third
-    assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1, "coverage": 1}
+    assert first == second == third
+    assert db.calls == {"compute": 1}
     assert first["vote_receipt_rate"] == 40.0
     assert first["meeting_summary_rate"] == 40.0
     assert first["item_summary_rate"] == 60.0
+    assert first["total_pop"] == 2_000_000 and type(first["total_pop"]) is int
     assert first["trends"] == {
         "meetings": [1] * 8,
         "items": [2] * 8,
@@ -73,8 +76,29 @@ async def test_platform_metrics_single_flight_and_cache():
         "summaries": [4] * 8,
     }
 
-    assert await db.get_platform_metrics() is first
-    assert db.calls == {"content": 1, "infrastructure": 1, "votes": 1, "coverage": 1}
+
+@pytest.mark.asyncio
+async def test_requests_never_recompute_an_existing_snapshot():
+    db = MetricsDatabaseStub()
+    db.snapshot = {"metrics": {"meetings": 7}, "age_seconds": 10 * Database.PLATFORM_METRICS_REFRESH_SECONDS}
+
+    assert (await db.get_platform_metrics())["meetings"] == 7
+    assert db.calls == {}
+
+
+@pytest.mark.asyncio
+async def test_refresh_skips_a_fresh_snapshot_and_replaces_a_stale_one():
+    db = MetricsDatabaseStub()
+    window = Database.PLATFORM_METRICS_REFRESH_SECONDS
+
+    db.snapshot = {"metrics": {"meetings": 7}, "age_seconds": window - 1}
+    assert (await db.refresh_platform_metrics(min_age_seconds=window))["meetings"] == 7
+    assert db.calls == {}
+
+    db.snapshot["age_seconds"] = window + 1
+    assert (await db.refresh_platform_metrics(min_age_seconds=window))["meetings"] == 10
+    assert db.calls == {"compute": 1}
+    assert db.snapshot["metrics"]["meetings"] == 10
 
 
 def test_content_snapshot_scans_items_heap_once():

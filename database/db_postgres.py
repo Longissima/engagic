@@ -8,6 +8,7 @@ import asyncio
 import asyncpg
 import json
 import time
+from decimal import Decimal
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pathlib import Path
@@ -109,10 +110,8 @@ class Database:
         if initialize_corpus:
             init_corpus(self.document_blobs)
 
-        # Platform metrics are whole-table aggregates over 700k+ items and the
-        # numbers move on the sync cadence, not per request. Cache with
-        # single-flight so concurrent analytics/platform callers cost one compact
-        # snapshot scan, not one scan per endpoint or visitor.
+        # The persisted snapshot row, reused in process for a minute. The lock
+        # makes the refresh single-flight within this process.
         self._platform_metrics_cache: Optional[tuple[float, dict]] = None
         self._platform_metrics_lock = asyncio.Lock()
 
@@ -287,11 +286,18 @@ class Database:
             stats['summary_rate'] = f"{summarized / total * 100:.1f}%" if total > 0 else "0%"
             return stats
 
-    # Platform metrics are read on every /about/metrics render (SSR, plus the
-    # client's retries). Recomputing costs a full pass over items/meetings/votes,
-    # so results are cached for this long. Numbers advance on the sync cadence --
-    # minutes of staleness is invisible on a stats page.
-    PLATFORM_METRICS_TTL_SECONDS = 300
+    # Platform metrics are a snapshot in platform_metrics_snapshot, recomputed
+    # off the request path. The pass reads all of items (10 GB, 7.3M rows on
+    # 2026-10-26): ~100 s and ~9 GB of reads on this 3.7 GB-RAM box. As a
+    # 5-minute cache miss it ran in front of visitors and spilled temp until
+    # Postgres hit ENOSPC. Numbers advance on the sync cadence, so hourly is
+    # plenty; requests never recompute while a row exists, however old.
+    PLATFORM_METRICS_REFRESH_SECONDS = 3600
+    PLATFORM_METRICS_TTL_SECONDS = 60
+    # At the 4 MB default the content pass spilled past 1.5 GB of temp; at
+    # 64 MB its hashes stay in one batch (685 MB left, all CTE tuplestores).
+    # The four queries run one at a time, so this is the per-refresh peak.
+    PLATFORM_METRICS_WORK_MEM = "64MB"
 
     # A cache miss used to launch five queries which independently scanned the
     # 2 GB items relation. Under production I/O pressure the scans amplified one
@@ -327,6 +333,13 @@ class Database:
                         AND canonical_summary != '' AS has_content
                 FROM city_matters
             ),
+            -- The join build side is only the matters with content (108k of
+            -- 1.9M). Joining all of matter_flags overflowed work_mem into
+            -- batches, and a batched hash join writes the outer side to temp
+            -- at full width -- every item's summary and attachments, ~GBs.
+            content_matters AS MATERIALIZED (
+                SELECT id FROM matter_flags WHERE has_content
+            ),
             item_flags AS MATERIALIZED (
                 SELECT
                     i.meeting_id,
@@ -337,9 +350,9 @@ class Database:
                     i.summary IS NOT NULL AS has_summary,
                     i.summary IS NOT NULL AND i.summary != '' AS has_content,
                     i.filter_reason IS NOT NULL AS has_filter,
-                    COALESCE(mf.has_content, FALSE) AS has_matter_content
+                    cm.id IS NOT NULL AS has_matter_content
                 FROM items i
-                LEFT JOIN matter_flags mf ON mf.id = i.matter_id
+                LEFT JOIN content_matters cm ON cm.id = i.matter_id
             ),
             item_stats AS MATERIALIZED (
                 SELECT
@@ -727,16 +740,21 @@ class Database:
     # never a chance to weigh in, and counting it made 66% look late (2026-10-24).
     _PLATFORM_METRICS_COVERAGE = """
         WITH per_meeting AS (
+            -- LATERAL keeps the items lookup on idx_items_meeting_summarized;
+            -- a plain join + GROUP BY planned a seq scan of all items (34 s).
             SELECT m.date, m.created_at AS seen,
                    LEAST(
                        CASE WHEN COALESCE(m.summary, '') <> '' THEN m.summary_updated_at END,
-                       MIN(i.summary_updated_at) FILTER (WHERE i.summary IS NOT NULL)
+                       first_item.summarized
                    ) AS summarized
             FROM meetings m
-            LEFT JOIN items i ON i.meeting_id = m.id
+            LEFT JOIN LATERAL (
+                SELECT MIN(i.summary_updated_at) AS summarized
+                FROM items i
+                WHERE i.meeting_id = m.id AND i.summary IS NOT NULL
+            ) first_item ON TRUE
             WHERE m.date >= NOW() - INTERVAL '60 days' AND m.date <= NOW()
               AND m.created_at < m.date
-            GROUP BY m.id
         ),
         census AS (
             SELECT CASE
@@ -763,65 +781,111 @@ class Database:
         FROM per_meeting
     """
 
-    async def _fetchrow_on_own_connection(self, query: str) -> asyncpg.Record:
+    async def _fetch_platform_metrics_rows(self) -> list[asyncpg.Record]:
+        # Sequential on one connection: four concurrent full scans on a 3-core
+        # box amplified each other's I/O and multiplied peak temp and memory.
+        rows = []
         async with self.pool.acquire() as conn:
-            return await conn.fetchrow(query)
+            for query in (
+                self._PLATFORM_METRICS_CONTENT,
+                self._PLATFORM_METRICS_INFRASTRUCTURE,
+                self._PLATFORM_METRICS_VOTES,
+                self._PLATFORM_METRICS_COVERAGE,
+            ):
+                async with conn.transaction():
+                    await conn.execute(f"SET LOCAL work_mem = '{self.PLATFORM_METRICS_WORK_MEM}'")
+                    rows.append(await conn.fetchrow(query))
+        return rows
 
-    async def get_platform_metrics(self, *, force_refresh: bool = False) -> dict:
-        """Get comprehensive platform metrics for impact/about page.
+    async def _read_platform_metrics_snapshot(self) -> Optional[asyncpg.Record]:
+        return await self.pool.fetchrow("""
+            SELECT metrics, EXTRACT(EPOCH FROM NOW() - computed_at)::float8 AS age_seconds
+            FROM platform_metrics_snapshot WHERE id = 1
+        """)
 
-        Served from a process-local TTL cache. On a miss, exactly one caller
-        computes while the rest wait on the lock and then read the fresh entry --
-        a retry storm from an SSR timeout must not multiply the scan cost.
+    async def _write_platform_metrics_snapshot(self, metrics: dict, elapsed_ms: int) -> None:
+        await self.pool.execute("""
+            INSERT INTO platform_metrics_snapshot (id, metrics, computed_at, elapsed_ms)
+            VALUES (1, $1, NOW(), $2)
+            ON CONFLICT (id) DO UPDATE
+            SET metrics = EXCLUDED.metrics, computed_at = EXCLUDED.computed_at,
+                elapsed_ms = EXCLUDED.elapsed_ms
+        """, metrics, elapsed_ms)
+
+    async def _compute_platform_metrics(self) -> dict:
+        content, infrastructure, votes, coverage = await self._fetch_platform_metrics_rows()
+
+        # SUM over bigint returns numeric; the snapshot is JSON.
+        metrics = {
+            key: (int(value) if value == value.to_integral_value() else float(value))
+            if isinstance(value, Decimal) else value
+            for row in (content, infrastructure, votes, coverage)
+            for key, value in dict(row).items()
+        }
+
+        # Rates use the processed-meeting denominator, not every item ever seen
+        if metrics['meetings'] > 0:
+            metrics['meeting_summary_rate'] = round(metrics['summarized_meetings'] / metrics['meetings'] * 100, 1)
+        else:
+            metrics['meeting_summary_rate'] = 0
+
+        if metrics['items_analyzed'] > 0:
+            metrics['item_summary_rate'] = round(metrics['summarized_items'] / metrics['items_analyzed'] * 100, 1)
+        else:
+            metrics['item_summary_rate'] = 0
+
+        # Share of the vote record a reader can check against source text.
+        if metrics['votes'] > 0:
+            metrics['vote_receipt_rate'] = round(metrics['votes_with_receipt'] / metrics['votes'] * 100, 1)
+        else:
+            metrics['vote_receipt_rate'] = 0
+
+        metrics['trends'] = {
+            'meetings': metrics.pop('meeting_trend'),
+            'items': metrics.pop('item_trend'),
+            'matters': metrics.pop('matter_trend'),
+            'votes': metrics.pop('vote_trend'),
+            'summaries': metrics.pop('summary_trend'),
+        }
+        return metrics
+
+    async def refresh_platform_metrics(self, *, min_age_seconds: float = 0) -> dict:
+        """Recompute the snapshot unless one younger than min_age_seconds exists.
+
+        Age comes from the table, not process memory, so a restart or a
+        concurrent caller that waited on the lock does not repeat a pass that
+        just finished. Returns the snapshot either way.
         """
-        cached = self._platform_metrics_cache
-        if not force_refresh and cached and time.monotonic() - cached[0] < self.PLATFORM_METRICS_TTL_SECONDS:
-            return cached[1]
-
         async with self._platform_metrics_lock:
-            cached = self._platform_metrics_cache
-            if not force_refresh and cached and time.monotonic() - cached[0] < self.PLATFORM_METRICS_TTL_SECONDS:
-                return cached[1]
-
-            started = time.monotonic()
-            content, infrastructure, votes, coverage = await asyncio.gather(
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_CONTENT),
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_INFRASTRUCTURE),
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_VOTES),
-                self._fetchrow_on_own_connection(self._PLATFORM_METRICS_COVERAGE),
-            )
-
-            metrics = {**dict(content), **dict(infrastructure), **dict(votes), **dict(coverage)}
-
-            # Rates use the processed-meeting denominator, not every item ever seen
-            if metrics['meetings'] > 0:
-                metrics['meeting_summary_rate'] = round(metrics['summarized_meetings'] / metrics['meetings'] * 100, 1)
+            row = await self._read_platform_metrics_snapshot()
+            if row is not None and row['age_seconds'] < min_age_seconds:
+                metrics = row['metrics']
             else:
-                metrics['meeting_summary_rate'] = 0
-
-            if metrics['items_analyzed'] > 0:
-                metrics['item_summary_rate'] = round(metrics['summarized_items'] / metrics['items_analyzed'] * 100, 1)
-            else:
-                metrics['item_summary_rate'] = 0
-
-            # Share of the vote record a reader can check against source text.
-            if metrics['votes'] > 0:
-                metrics['vote_receipt_rate'] = round(metrics['votes_with_receipt'] / metrics['votes'] * 100, 1)
-            else:
-                metrics['vote_receipt_rate'] = 0
-
-            metrics['trends'] = {
-                'meetings': metrics.pop('meeting_trend'),
-                'items': metrics.pop('item_trend'),
-                'matters': metrics.pop('matter_trend'),
-                'votes': metrics.pop('vote_trend'),
-                'summaries': metrics.pop('summary_trend'),
-            }
-
-            elapsed_ms = round((time.monotonic() - started) * 1000)
-            logger.info("platform metrics computed", elapsed_ms=elapsed_ms)
+                started = time.monotonic()
+                metrics = await self._compute_platform_metrics()
+                elapsed_ms = round((time.monotonic() - started) * 1000)
+                await self._write_platform_metrics_snapshot(metrics, elapsed_ms)
+                logger.info("platform metrics computed", elapsed_ms=elapsed_ms)
             self._platform_metrics_cache = (time.monotonic(), metrics)
             return metrics
+
+    async def get_platform_metrics(self) -> dict:
+        """Get platform metrics for the impact/about and analytics pages.
+
+        Reads the persisted snapshot. Only an empty table (first boot after the
+        migration) computes here, single-flight through refresh_platform_metrics.
+        """
+        cached = self._platform_metrics_cache
+        if cached and time.monotonic() - cached[0] < self.PLATFORM_METRICS_TTL_SECONDS:
+            return cached[1]
+
+        row = await self._read_platform_metrics_snapshot()
+        if row is None:
+            return await self.refresh_platform_metrics(
+                min_age_seconds=self.PLATFORM_METRICS_REFRESH_SECONDS
+            )
+        self._platform_metrics_cache = (time.monotonic(), row['metrics'])
+        return row['metrics']
 
     async def get_city(
         self,

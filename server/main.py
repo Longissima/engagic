@@ -49,26 +49,32 @@ async def lifespan(app: FastAPI):
     # Store in app state
     app.state.db = db
 
-    # Populate the shared analytics/platform snapshot before the first visitor
-    # needs it. This runs in the background so health checks and deploy startup
-    # are not held hostage by an aggregate refresh.
-    async def warm_public_metrics() -> None:
-        try:
-            await db.get_platform_metrics()
-            logger.info("warmed public metrics cache")
-        except Exception as exc:
-            logger.warning("failed to warm public metrics cache", error=str(exc))
+    # The one writer of the public metrics snapshot; requests only read it.
+    # Polls every 5 minutes so a restart late in an interval still refreshes on
+    # time (the age check reads the table). A failed pass waits a full interval:
+    # retrying a pass that just hit ENOSPC every 5 minutes is how the disk
+    # filled in the first place.
+    async def refresh_public_metrics() -> None:
+        while True:
+            delay = 300
+            try:
+                await db.refresh_platform_metrics(
+                    min_age_seconds=Database.PLATFORM_METRICS_REFRESH_SECONDS
+                )
+            except Exception as exc:
+                logger.warning("failed to refresh public metrics", error=str(exc))
+                delay = Database.PLATFORM_METRICS_REFRESH_SECONDS
+            await asyncio.sleep(delay)
 
-    metrics_warm_task = asyncio.create_task(warm_public_metrics())
+    metrics_refresh_task = asyncio.create_task(refresh_public_metrics())
 
     yield
 
     # Shutdown: Close connection pool
     try:
-        if not metrics_warm_task.done():
-            metrics_warm_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await metrics_warm_task
+        metrics_refresh_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await metrics_refresh_task
 
         # Log connection count before closing
         active_connections = db.pool.get_size()
