@@ -21,6 +21,11 @@ Usage:
     uv run python scripts/backfill_corpus_attachments.py --banana paloaltoCA,sunnyvaleCA --since 2025-09-01 --dry-run
     uv run python scripts/backfill_corpus_attachments.py --banana paloaltoCA,sunnyvaleCA --since 2025-09-01 --concurrency 4
     uv run python scripts/backfill_corpus_attachments.py --state CA --since 2025-09-01 --concurrency 3
+    uv run python scripts/backfill_corpus_attachments.py --lookback-days 14 --forward-days 45 --skip-filtered --limit 2000
+
+The rolling form is what deploy/systemd/engagic-corpus-window runs: new agenda
+items get corpus text whether or not the summarizing processor is running, so
+readers that want documents rather than summaries never wait on it.
 """
 
 import argparse
@@ -29,7 +34,7 @@ import json
 import sys
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -392,8 +397,12 @@ def parse_date(value: str) -> date:
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--since", type=parse_date, required=True, help="earliest meeting date (YYYY-MM-DD)")
+    parser.add_argument("--since", type=parse_date, default=None, help="earliest meeting date (YYYY-MM-DD)")
     parser.add_argument("--until", type=parse_date, default=None, help="latest meeting date, inclusive")
+    parser.add_argument("--lookback-days", type=int, default=None,
+                        help="rolling window instead of --since/--until: meetings from this many days ago")
+    parser.add_argument("--forward-days", type=int, default=None,
+                        help="with --lookback-days: through this many days ahead (posted agendas)")
     parser.add_argument("--banana", default=None, help="comma-separated jurisdictions; default all")
     parser.add_argument("--state", default=None, help="two-letter state code; default all")
     parser.add_argument("--limit", type=int, default=1_000_000, help="max identities this run")
@@ -405,6 +414,16 @@ async def main() -> int:
     parser.add_argument("--retry-failures", action="store_true", help="retry non-permanent ledger failures before their backoff expires")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    # The scheduled window is relative so a timer can run it unchanged; the
+    # corpus is the only state, so overlapping windows cost one ready check.
+    if args.lookback_days is not None:
+        if args.since or args.until:
+            parser.error("--lookback-days replaces --since/--until")
+        today = date.today()
+        args.since = today - timedelta(days=args.lookback_days)
+        args.until = today + timedelta(days=args.forward_days) if args.forward_days is not None else None
+    elif args.since is None:
+        parser.error("--since or --lookback-days is required")
     args.bananas = [b.strip() for b in args.banana.split(",") if b.strip()] if args.banana else None
     if min(args.limit, args.concurrency, args.max_failures, args.failure_retry_days, args.progress_every) < 1:
         parser.error("limit, concurrency, max failures, retry days, and progress interval must be positive")

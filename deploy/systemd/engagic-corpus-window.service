@@ -1,0 +1,30 @@
+# Corpus text for the live window, independent of the summarizing processor.
+# Pulse syncs agenda items; this extracts their attachments into the corpus
+# (download, sha256, archive original, extract) with the LLM disabled, so
+# motioncount's ledger, which reads documents rather than summaries, is never
+# gated on engagic-processor running. A bounded batch per run, newest meetings
+# first; the timer re-runs it after each run ends. State is the corpus itself.
+# Runs as root for the same reason as pulse: URL refresh rewrites root-only
+# adapter caches under data/.
+# Install: cp deploy/systemd/engagic-corpus-window.{service,timer} /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now engagic-corpus-window.timer
+[Unit]
+Description=Engagic corpus text for the live agenda window
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/engagic
+ExecStart=/root/.local/bin/uv run python scripts/backfill_corpus_attachments.py --lookback-days 14 --forward-days 45 --skip-filtered --limit 2000 --concurrency 3
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONPATH=/opt/engagic
+Environment=MALLOC_ARENA_MAX=2
+# Extraction children share this cgroup; the admission budget stays under MemoryMax.
+Environment=ENGAGIC_WORK_MEMORY_BUDGET_MB=1100
+EnvironmentFile=-/opt/engagic/.env
+EnvironmentFile=-/opt/engagic/.llm_secrets
+LimitNOFILE=65536
+MemoryHigh=1200M
+MemoryMax=1600M
+TimeoutStartSec=3h

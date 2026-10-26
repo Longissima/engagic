@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-run the corpus window 5 minutes after each run ends
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
