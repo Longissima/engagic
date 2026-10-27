@@ -149,7 +149,12 @@ def hash_attachments_fast(attachments: List[Any]) -> str:
     """
     if not attachments:
         return ""
-    pairs = [(attachment_identity(att.url or ""), att.name or "") for att in attachments]
+    # A page span is a different document from its whole file. Pages join the
+    # tuple only when present, so every hash stored before spans is unchanged.
+    pairs = [
+        (attachment_identity(att.url or ""), att.name or "", *([att.pages] if getattr(att, "pages", None) else []))
+        for att in attachments
+    ]
     pairs.sort()
     content = json.dumps(pairs, sort_keys=True)
     return f"{ATTACHMENT_HASH_VERSION}:{hashlib.sha256(content.encode()).hexdigest()}"
@@ -324,14 +329,18 @@ def aggregate_matter_attachments(appearances: Iterable[Any]) -> List[Any]:
         ),
     )
     attachments: List[Any] = []
-    seen_identities: set[str] = set()
+    seen_identities: set[tuple[str, Optional[tuple[int, ...]]]] = set()
     for item in ordered:
         for attachment in (getattr(item, "attachments", None) or []):
             url = getattr(attachment, "url", None)
             identity = attachment_identity(url or "")
-            if not identity or identity in seen_identities:
+            # Page spans of one packet are distinct documents; collapsing them
+            # by URL would drop every staff report after the first.
+            pages = getattr(attachment, "pages", None)
+            key = (identity, tuple(pages) if pages else None)
+            if not identity or key in seen_identities:
                 continue
-            seen_identities.add(identity)
+            seen_identities.add(key)
             attachments.append(attachment)
     return attachments
 
@@ -565,10 +574,12 @@ def meeting_work_version(meeting: Any, agenda_items: Iterable[Any]) -> str:
                 "url": attachment_identity(getattr(attachment, "url", "") or ""),
                 "name": getattr(attachment, "name", "") or "",
                 "type": getattr(attachment, "type", "") or "",
+                # Present only on spans, so whole-file versions are unchanged.
+                **({"pages": list(attachment.pages)} if getattr(attachment, "pages", None) else {}),
             }
             for attachment in (getattr(item, "attachments", None) or [])
         ]
-        attachments.sort(key=lambda value: (value["url"], value["name"], value["type"]))
+        attachments.sort(key=lambda value: (value["url"], value["name"], value["type"], value.get("pages") or []))
         item_inputs.append(
             {
                 "id": getattr(item, "id", None),

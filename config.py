@@ -268,6 +268,13 @@ class Config:
         # receives perfect shape" contract, which the corpus dissolved.
         self.SYNC_CHUNKING = os.getenv("ENGAGIC_SYNC_CHUNKING", "true").lower() == "true"
 
+        # Stage 1 at sync (MeetingSyncOrchestrator.archive_sources): new
+        # original downloads per city per sync. Already-archived sources cost
+        # no request, so steady state is the handful a sync newly discovers;
+        # the cap only meters a backlog. 0 disables archival at sync.
+        self.SYNC_ARCHIVE_BUDGET = int(os.getenv("ENGAGIC_SYNC_ARCHIVE_BUDGET", "200"))
+        self.SYNC_ARCHIVE_CONCURRENCY = int(os.getenv("ENGAGIC_SYNC_ARCHIVE_CONCURRENCY", "2"))
+
         # Payment processing
         self.STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
         self.STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")

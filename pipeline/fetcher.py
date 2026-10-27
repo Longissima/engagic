@@ -483,6 +483,7 @@ class Fetcher:
                     meeting_dict,
                     city,
                     check_city_activation=activation_pending,
+                    source_pages=adapter.source_pages,
                 )
                 if storage_stats.get("activation_checked"):
                     activation_pending = False
@@ -496,6 +497,16 @@ class Fetcher:
                 items_stored_count += storage_stats.get('items_stored', 0)
                 matters_tracked_count += storage_stats.get('matters_tracked', 0)
                 matters_duplicate_count += storage_stats.get('matters_duplicate', 0)
+
+            if not interrupted:
+                # Stage 1: the original of everything these meetings name,
+                # through this adapter's rate-limited transport. A passenger:
+                # archival trouble never changes the sync's outcome.
+                try:
+                    await self.meeting_sync.archive_sources(all_meetings, city, adapter)
+                except Exception as e:
+                    logger.warning("sync archival failed", city=city.banana, vendor=vendor,
+                                   error=str(e), error_type=type(e).__name__)
 
             if interrupted:
                 result.meetings_processed = processed_count

@@ -267,6 +267,7 @@ class AsyncBoardBookAdapter(AsyncBaseAdapter):
 
         soup = BeautifulSoup(html, "html.parser")
         items = self._parse_agenda_items(soup)
+        await self._source_page(response, items)
         packet_url = self._extract_custom_agenda_pdf(soup)
 
         meeting: Dict[str, Any] = {

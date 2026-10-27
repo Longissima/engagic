@@ -32,6 +32,7 @@ from vendors.adapters.parsers.agenda_chunker import (
     _extract_meeting_metadata,
     _extract_memo_content,
     _extract_matter_file,
+    _memo_documents,
     _is_attachment_url,
     _attachment_type,
     _is_section_header,
@@ -1122,6 +1123,10 @@ def parse_agenda_pdf_v2(
         ]
         if embedded_documents:
             item_metadata["embedded_documents"] = embedded_documents
+        documents = _memo_documents(item.memos, item.title)
+        if documents:
+            item_metadata["documents"] = documents
+            item_metadata["agenda_text"] = item.body
         if item_metadata:
             pipeline_item["metadata"] = item_metadata
 

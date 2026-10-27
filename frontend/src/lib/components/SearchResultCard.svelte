@@ -4,6 +4,7 @@
 	import type { CitySearchResult, CitySearchItemResult, CitySearchMatterResult } from '$lib/api/types';
 	import { generateMeetingSlug } from '$lib/utils/utils';
 	import { generateAnchorId } from '$lib/utils/anchor';
+	import { attachmentHref, attachmentKey, attachmentPagesLabel } from '$lib/utils/attachments';
 
 	interface Props {
 		result: CitySearchResult;
@@ -186,15 +187,15 @@
 				<div class="attachments-section">
 					<span class="label">Documents:</span>
 					<div class="attachment-list">
-						{#each attachments as attachment (attachment.url)}
+						{#each attachments as attachment (attachmentKey(attachment))}
 							<a
-								href={attachment.portal_url || attachment.url}
+								href={attachmentHref(attachment)}
 								target="_blank"
 								rel="noopener noreferrer"
 								class="attachment-link"
 								onclick={(e) => e.stopPropagation()}
 							>
-								{attachment.name || 'View Document'}
+								{attachment.name || 'View Document'}{attachmentPagesLabel(attachment)}
 							</a>
 						{/each}
 					</div>

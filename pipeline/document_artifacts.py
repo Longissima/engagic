@@ -285,3 +285,60 @@ def text_for_analysis(result: dict) -> str:
         "Use the available text; do not infer that something is absent from unreadable pages.]\n\n"
         + text
     )
+
+
+_PAGE_MARKER_RE = re.compile(r"^--- PAGE (\d+) ---$", re.MULTILINE)
+
+
+def attachment_label(attachment) -> str:
+    """Model- and human-facing name; a page span names its pages."""
+    name = getattr(attachment, "name", None) or "Unnamed attachment"
+    pages = getattr(attachment, "pages", None)
+    if not pages:
+        return name
+    first, last = pages
+    return f"{name} (pages {first}-{last})" if last != first else f"{name} (page {first})"
+
+
+def attachment_key(attachment) -> str:
+    """One readable unit per (document, span): spans of one packet are
+    different documents to the items that cite them, never shared context."""
+    pages = getattr(attachment, "pages", None)
+    url = getattr(attachment, "url", "") or ""
+    return f"{url}#pages={pages[0]}-{pages[1]}" if pages else url
+
+
+def span_of(result: dict, pages) -> dict:
+    """Restrict an extraction result to a page span of its document.
+
+    Extracted PDF text carries "--- PAGE n ---" markers (parsing/pdf.py), so a
+    chunked item reads exactly the packet pages it came from, from the same
+    OCR-complete corpus text every reader uses. Text without markers (a
+    non-PDF format) cannot be cut and is returned whole.
+    """
+    if not pages:
+        return result
+    first, last = pages
+    text = result.get("text") or ""
+    markers = list(_PAGE_MARKER_RE.finditer(text))
+    if not markers:
+        return result
+    kept = []
+    for index, marker in enumerate(markers):
+        if first <= int(marker.group(1)) <= last:
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+            kept.append(text[marker.start():end].rstrip())
+    span = {**result, "text": "\n\n".join(kept), "page_count": last - first + 1}
+    pending = result.get("ocr_pending_pages")
+    if pending is not None:
+        # Partiality is per page: a span whose pages all have text is
+        # complete even when other pages of the packet still await OCR.
+        pending = [page for page in pending if first <= int(page) <= last]
+        span.update(
+            ocr_pending_pages=pending,
+            ocr_pending=len(pending),
+            extraction_incomplete=bool(pending),
+        )
+        if not pending:
+            span["method"] = str(result.get("method") or "").removesuffix("-partial")
+    return span

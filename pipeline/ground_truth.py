@@ -208,7 +208,7 @@ async def produce_ground_truth(
         set_city_hint(vendor, slug, ladder, result.winning_rung)
 
     if source_url:
-        _attach_incomplete_source_links(result, source_url)
+        _stamp_sources(result, source_url, content_sha256)
 
     # Retain available text, including the pages still awaiting OCR.
     corpus_store = get_corpus()
@@ -222,34 +222,35 @@ async def produce_ground_truth(
     return result
 
 
-def _attach_incomplete_source_links(result: ChunkResult, source_url: str) -> None:
-    """Expose OCR-incomplete structural pages without reprocessing the URL."""
+def _stamp_sources(
+    result: ChunkResult, source_url: str, content_sha256: Optional[str]
+) -> None:
+    """Point each item's text at the PDF pages it was cut from.
+
+    The chunker knows pages, only the producer knows the URL and the archived
+    bytes. Page-range documents become page-span attachments in the item
+    funnel; the item's own listing text gets body_source. An OCR-incomplete
+    item with no documents of its own gets its page range as one, so its
+    complete text is read from the OCR'd corpus copy instead of the partial
+    chunk text.
+    """
     base_url, _fragment = urldefrag(source_url)
     for item in result.items:
         metadata = item.get("metadata") or {}
-        if not metadata.get("extraction_incomplete"):
+        page_start = metadata.get("page_start")
+        page_end = metadata.get("page_end") or page_start
+        if page_start:
+            item["body_source"] = [{
+                "url": base_url,
+                "pages": [page_start, page_end],
+                **({"content_sha256": content_sha256} if content_sha256 else {}),
+            }]
+        documents = metadata.get("documents") or []
+        if not documents and metadata.get("extraction_incomplete") and page_start:
+            documents = [{"name": "Source pages", "page_start": page_start, "page_end": page_end}]
+        if not documents:
             continue
-        pages = metadata.get("ocr_pending_pages") or []
-        if not pages:
-            try:
-                pages = [int(metadata["page_start"])]
-            except (KeyError, TypeError, ValueError):
-                pages = []
-        first_page = pages[0] if pages else None
-        if not pages:
-            page_label = "document"
-        elif len(pages) == 1:
-            page_label = str(first_page)
-        elif pages == list(range(pages[0], pages[-1] + 1)):
-            page_label = f"{pages[0]}-{pages[-1]}"
-        else:
-            page_label = f"{first_page} and {len(pages) - 1} other page(s)"
-        url = f"{base_url}#page={first_page}" if first_page else base_url
-        attachments = item.setdefault("attachments", [])
-        if any(att.get("url") == url for att in attachments):
-            continue
-        attachments.append({
-            "name": f"Source page {page_label} (OCR incomplete)",
-            "url": url,
-            "type": "source_link",
-        })
+        for document in documents:
+            document["url"] = base_url
+        metadata["documents"] = documents
+        item["metadata"] = metadata

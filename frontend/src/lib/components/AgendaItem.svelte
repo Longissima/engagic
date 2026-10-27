@@ -3,6 +3,7 @@
 	import type { AgendaItem as AgendaItemType, Meeting, MeetingVoteMatter } from '$lib/api/types';
 	import { generateFlyer } from '$lib/api/index';
 	import { generateAnchorId } from '$lib/utils/anchor';
+	import { attachmentHref, attachmentKey, attachmentPagesLabel } from '$lib/utils/attachments';
 	import { buildItemShareLink } from '$lib/utils/utils';
 	import { SvelteSet } from 'svelte/reactivity';
 	import VoteBadge from './VoteBadge.svelte';
@@ -315,10 +316,10 @@
 				<div class="item-attachments-container">
 					<div class="attachments-label">Attachments:</div>
 					<div class="item-attachments">
-						{#each item.attachments as attachment (attachment.url || attachment.name)}
+						{#each item.attachments as attachment (attachmentKey(attachment))}
 							{#if attachment.url}
-								<a href={attachment.portal_url || attachment.url} target="_blank" rel="noopener noreferrer" class="attachment-link" onclick={(e) => e.stopPropagation()}>
-									{attachment.name || 'View Packet'}
+								<a href={attachmentHref(attachment)} target="_blank" rel="noopener noreferrer" class="attachment-link" onclick={(e) => e.stopPropagation()}>
+									{attachment.name || 'View Packet'}{attachmentPagesLabel(attachment)}
 								</a>
 							{/if}
 						{/each}

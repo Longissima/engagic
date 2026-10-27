@@ -31,6 +31,7 @@ from analysis.analyzer_async import AsyncAnalyzer
 from config import get_logger
 from corpus.store import EXTRACT_VERSION, get_corpus
 from database.db_postgres import Database
+from database.repositories_async.document_blobs import RECORD_FAILURE_SQL
 from exceptions import DocumentDownloadError, ExtractionError
 from pipeline.utils import attachment_identity
 
@@ -100,30 +101,6 @@ FAILURE_STATE_SQL = """
     FROM document_ingest_failure
     WHERE source_identity = ANY($1::text[])
       AND extract_version = $2
-"""
-
-RECORD_FAILURE_SQL = """
-    INSERT INTO document_ingest_failure AS current_failure (
-        source_identity, extract_version, banana, failure_stage,
-        attempt_count, permanent, last_error, retry_after
-    )
-    VALUES (
-        $1, $2, $3, $4, 1, ($6::boolean OR 1 >= $7), $5,
-        CURRENT_TIMESTAMP + make_interval(days => $8)
-    )
-    ON CONFLICT (source_identity, extract_version) DO UPDATE SET
-        banana = COALESCE(current_failure.banana, EXCLUDED.banana),
-        failure_stage = EXCLUDED.failure_stage,
-        attempt_count = current_failure.attempt_count + 1,
-        permanent = (
-            current_failure.permanent
-            OR $6::boolean
-            OR current_failure.attempt_count + 1 >= $7
-        ),
-        last_error = EXCLUDED.last_error,
-        last_failed_at = CURRENT_TIMESTAMP,
-        retry_after = CURRENT_TIMESTAMP + make_interval(days => $8)
-    RETURNING attempt_count, permanent
 """
 
 CLEAR_FAILURE_SQL = """

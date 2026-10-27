@@ -1081,6 +1081,7 @@ class AsyncCivicPlusAdapter(AsyncBaseAdapter):
                 self._archive_html[vendor_id] = html
             parsed = await asyncio.to_thread(parse_civicplus_html, html, self.base_url or "")
             items = parsed.get("items", [])
+            await self._source_page(response, items)
 
             if items:
                 self._record_html_audit(vendor_id, parsed.get("html_pattern"), items)

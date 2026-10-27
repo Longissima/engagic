@@ -172,6 +172,33 @@ def _attachment_identity(attachment: Dict[str, Any]) -> tuple[str, ...]:
     return ("label", _normalized_item_text(attachment.get("name")))
 
 
+def _merge_packet_text(
+    target: Dict[str, Any],
+    metadata: Dict[str, Any],
+    packet_item: Dict[str, Any],
+    packet_body: str,
+) -> None:
+    """Append the packet's words to the agenda item, with their source.
+
+    A chunked target keeps its agenda words apart from its own documents'
+    text (metadata.agenda_text); the packet's words belong in both.
+    """
+    for holder, key in ((target, "body_text"), (metadata, "agenda_text")):
+        if holder is metadata and key not in metadata:
+            continue
+        current = str(holder.get(key) or "").strip()
+        if not current:
+            holder[key] = packet_body
+        elif _normalized_item_text(packet_body) not in _normalized_item_text(current):
+            holder[key] = f"{current}\n\n[Packet evidence]\n{packet_body}"
+        else:
+            continue
+        if holder is target and packet_item.get("body_source"):
+            target["body_source"] = (
+                list(target.get("body_source") or []) + deepcopy(packet_item["body_source"])
+            )
+
+
 def _merge_packet_evidence(
     agenda_items: List[Dict[str, Any]],
     packet_items: List[Dict[str, Any]],
@@ -221,27 +248,28 @@ def _merge_packet_evidence(
             existing_attachments.append(deepcopy(attachment))
             seen_attachments.add(identity)
 
-        packet_body = str(packet_item.get("body_text") or "").strip()
-        agenda_body = str(target.get("body_text") or "").strip()
+        packet_metadata = packet_item.get("metadata") or {}
+        packet_documents = packet_metadata.get("documents") or []
+        # Packet pages travel as documents (page spans), so only the packet's
+        # own agenda words merge as text; pasting the pages too would hand the
+        # model the same staff report twice.
+        if packet_documents and "agenda_text" in packet_metadata:
+            packet_body = str(packet_metadata.get("agenda_text") or "").strip()
+        else:
+            packet_body = str(packet_item.get("body_text") or "").strip()
+        metadata = target.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            target["metadata"] = metadata
         if packet_body:
-            normalized_packet = _normalized_item_text(packet_body)
-            normalized_agenda = _normalized_item_text(agenda_body)
-            if not agenda_body:
-                target["body_text"] = packet_body
-            elif normalized_packet and normalized_packet not in normalized_agenda:
-                target["body_text"] = (
-                    f"{agenda_body}\n\n[Packet evidence]\n{packet_body}"
-                )
+            _merge_packet_text(target, metadata, packet_item, packet_body)
+        if packet_documents:
+            metadata["documents"] = list(metadata.get("documents") or []) + deepcopy(packet_documents)
 
         for field in ("matter_id", "matter_file", "matter_type"):
             if not target.get(field) and packet_item.get(field):
                 target[field] = packet_item[field]
 
-        packet_metadata = packet_item.get("metadata") or {}
-        metadata = target.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-            target["metadata"] = metadata
         if packet_metadata.get("page_start") is not None:
             metadata.setdefault("packet_page_start", packet_metadata["page_start"])
         if packet_metadata.get("page_end") is not None:
@@ -1184,6 +1212,7 @@ class AsyncGranicusAdapter(AsyncBaseAdapter):
                 pdf_bytes,
                 vendor_id=event_id,
                 force_method=force_method,
+                source_url=str(response.url),
             )
             # Transfer the buffer to the parser coroutine instead of retaining
             # a second reference for the duration of guarded extraction.

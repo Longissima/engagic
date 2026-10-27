@@ -5,7 +5,7 @@ Pydantic dataclasses with runtime validation for core entities.
 """
 
 
-from typing import Optional, List, Dict
+from typing import Any, Dict, List, Optional
 from datetime import date, datetime
 from pydantic import BaseModel, ConfigDict
 from pydantic.dataclasses import dataclass
@@ -116,6 +116,7 @@ class AttachmentInfo(BaseModel):
     meta_id: Optional[str] = None  # Granicus-specific
     cc_agenda_id: Optional[int] = None  # CivicClerk Meetings/{id} -- input to URL refresh
     cc_attachment_id: Optional[int] = None  # CivicClerk attachment id within agenda
+    pages: Optional[List[int]] = None  # [first, last] 1-indexed span of url; None = whole document
 
 
 # --- Domain Dataclasses (with runtime validation) ---
@@ -463,6 +464,7 @@ class AgendaItem:
     attachments: Optional[List[AttachmentInfo]] = None  # Attachment metadata (name, url, type)
     attachment_hash: Optional[str] = None  # SHA-256 hash of attachments for change detection
     body_text: Optional[str] = None  # Coversheet/detail page text (when no PDF attachments)
+    body_source: Optional[List[Dict[str, Any]]] = None  # Where body_text was cut from: [{url, pages?, content_sha256?}]
     matter_id: Optional[str] = None  # Backend unique identifier
     matter_file: Optional[str] = None  # Official public identifier (BL2025-1005, 25-1209)
     matter_type: Optional[str] = None  # Flexible metadata (Ordinance, CD 12, etc.)

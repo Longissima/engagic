@@ -13,7 +13,13 @@ from database.db_postgres import Database
 from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
 from pipeline.ground_truth import produce_ground_truth
-from pipeline.document_artifacts import DocumentFormat, text_for_analysis
+from pipeline.document_artifacts import (
+    DocumentFormat,
+    attachment_key,
+    attachment_label,
+    span_of,
+    text_for_analysis,
+)
 from pipeline.job_runner import (
     JobExecutionPolicy,
     JobRunner,
@@ -1912,49 +1918,55 @@ class Processor:
             logger.debug("no attachments or body text for item", title=item.title[:50])
             return None
 
-        # Collect valid attachments to extract
-        attachments_to_extract = []
-        for att in item.attachments:
-            att_url, att_type, att_name = att.url, att.type, att.name
-
-            if att_type not in DOCUMENT_ATTACHMENT_TYPES or not att_url:
-                continue
-
-            attachments_to_extract.append((att_url, att_name))
+        # Each distinct file is extracted once; page spans of it are cut
+        # from that one extraction.
+        attachments_to_read = [
+            att for att in item.attachments
+            if att.type in DOCUMENT_ATTACHMENT_TYPES and att.url
+        ]
+        urls_to_extract = list(dict.fromkeys(att.url for att in attachments_to_read))
 
         # Concurrent PDF extraction (global semaphore caps total across all meetings)
         semaphore = self._pdf_semaphore
 
-        async def extract_attachment(att_url: str, att_name: Optional[str]) -> Optional[tuple[str, str, int]]:
+        async def extract_attachment(att_url: str) -> Optional[dict]:
             async with semaphore:
                 try:
                     result = await analyzer.extract_document_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
-                        logger.debug("extracted attachment text", attachment=att_name or att_url, pages=result.get('page_count', 0), chars=len(result['text']))
-                        return (att_name or att_url, text_for_analysis(result), result.get("page_count", 0))
+                        logger.debug("extracted attachment text", attachment=att_url, pages=result.get('page_count', 0), chars=len(result['text']))
+                        return result
                     return None
                 except (ExtractionError, OSError, IOError) as e:
-                    logger.warning("failed to extract attachment", name=att_name or att_url, error=str(e))
+                    logger.warning("failed to extract attachment", name=att_url, error=str(e))
                     return None
 
         # Extract text from attachments concurrently
         item_parts = []
         total_page_count = 0
 
-        if attachments_to_extract:
+        if urls_to_extract:
             results = await asyncio.gather(
-                *[extract_attachment(url, name) for url, name in attachments_to_extract],
+                *[extract_attachment(url) for url in urls_to_extract],
                 return_exceptions=True
             )
-
-            for result in results:
+            extracted: Dict[str, dict] = {}
+            for url, result in zip(urls_to_extract, results):
                 if isinstance(result, BaseException):
                     logger.error("unexpected extraction exception", error=str(result))
                     continue
                 if result:
-                    name, text, page_count = result
-                    item_parts.append(f"=== {name} ===\n{text}")
-                    total_page_count += page_count
+                    extracted[url] = result
+
+            for att in attachments_to_read:
+                result = extracted.get(att.url)
+                if not result:
+                    continue
+                span = span_of(result, att.pages)
+                if not span.get("text"):
+                    continue
+                item_parts.append(f"=== {attachment_label(att)} ===\n{text_for_analysis(span)}")
+                total_page_count += span.get("page_count", 0)
 
         if not item_parts:
             logger.warning("no text extracted for item", title=item.title[:50])
@@ -3224,90 +3236,96 @@ class Processor:
         return already_processed, need_processing, filter_writes
 
     async def _build_document_cache(self, need_processing: List, banana: Optional[str] = None) -> tuple[Dict, Dict, set]:
-        """Build a meeting cache retaining every distinct attachment URL.
+        """Build a meeting cache retaining every distinct attachment.
+
+        Keys are attachment_key()s: a whole file is keyed by its URL, a page
+        span by URL plus pages. Each file is extracted once and every span of
+        it is cut from that extraction, so a packet cited by twenty items is
+        read once yet each item sees only its own pages, never the packet as
+        shared context.
 
         banana is corpus provenance only, from the meeting row (DB truth)."""
         logger.info("building meeting-level document cache")
         document_cache = {}
         item_attachments = {}
-        all_urls = set()
-        url_to_items = {}
-        url_to_name = {}
+        key_to_items: Dict[str, List[str]] = {}
+        key_to_attachment: Dict[str, Any] = {}
 
         for item in need_processing:
-            item_urls = []
+            item_keys = []
             for att in (item.attachments or []):
                 if att.type in DOCUMENT_ATTACHMENT_TYPES and att.url:
-                    item_urls.append(att.url)
-                    if att.name and att.url not in url_to_name:
-                        url_to_name[att.url] = att.name
+                    key = attachment_key(att)
+                    item_keys.append(key)
+                    key_to_attachment.setdefault(key, att)
 
             # Every listed revision is evidence. The corpus keeps historical
             # bytes, and prompt assembly must not silently select only the
             # newest filename-level "VerN" attachment.
-            retained_item_urls = list(dict.fromkeys(item_urls))
-            item_attachments[item.id] = retained_item_urls
+            retained_item_keys = list(dict.fromkeys(item_keys))
+            item_attachments[item.id] = retained_item_keys
 
-            for url in retained_item_urls:
-                all_urls.add(url)
-                url_to_items.setdefault(url, []).append(item.id)
+            for key in retained_item_keys:
+                key_to_items.setdefault(key, []).append(item.id)
 
-        logger.info("collected unique URLs", url_count=len(all_urls), item_count=len(need_processing))
+        urls_to_extract = list(dict.fromkeys(att.url for att in key_to_attachment.values()))
+        logger.info("collected unique URLs", url_count=len(urls_to_extract), item_count=len(need_processing))
 
         if not self.analyzer:
             logger.error("analyzer not initialized, cannot extract attachments")
-            return {}, item_attachments, all_urls
+            return {}, item_attachments, set(key_to_items)
         analyzer = self.analyzer
-
-        urls_to_extract = []
-        for att_url in all_urls:
-            att_name = url_to_name.get(att_url, "")
-            urls_to_extract.append((att_url, att_name))
 
         # Concurrent PDF extraction (global semaphore caps total across all meetings)
         semaphore = self._pdf_semaphore
 
-        async def extract_with_limit(att_url: str, att_name: str) -> tuple[str, Optional[Dict]]:
+        async def extract_with_limit(att_url: str) -> Optional[Dict]:
             async with semaphore:
                 try:
                     result = await analyzer.extract_document_async(att_url, banana=banana)
                     if result.get("success") and result.get("text"):
-                        text = text_for_analysis(result)
-                        page_count = result.get("page_count", 0)
-                        return att_url, {
-                            "text": text,
-                            "page_count": page_count,
-                            "name": att_name or att_url,
-                            "content_sha256": result.get("content_sha256"),
-                            "source_url": result.get("source_url") or att_url,
-                            "document_format": result.get("document_format"),
-                            "extraction_incomplete": result.get("extraction_incomplete", False),
-                            "ocr_pending_pages": result.get("ocr_pending_pages"),
-                        }
-                    return att_url, None
+                        return result
+                    return None
                 except (ExtractionError, OSError, IOError) as e:
-                    logger.warning("failed to extract document", attachment=att_name or att_url, error=str(e))
-                    return att_url, None
+                    logger.warning("failed to extract document", attachment=att_url, error=str(e))
+                    return None
 
         # Run extractions concurrently
+        extracted: Dict[str, Dict] = {}
         if urls_to_extract:
             logger.info("extracting documents concurrently", count=len(urls_to_extract))
             extraction_results = await asyncio.gather(
-                *[extract_with_limit(url, name) for url, name in urls_to_extract],
+                *[extract_with_limit(url) for url in urls_to_extract],
                 return_exceptions=True
             )
-
-            for result in extraction_results:
+            for att_url, result in zip(urls_to_extract, extraction_results):
                 if isinstance(result, BaseException):
                     logger.error("unexpected extraction exception", error=str(result))
                     continue
-                att_url, data = result
-                if data:
-                    document_cache[att_url] = data
-                    item_count = len(url_to_items[att_url])
-                    logger.info("extracted document", attachment=data["name"], pages=data.get('page_count', 0), shared=(item_count > 1))
+                if result:
+                    extracted[att_url] = result
 
-        shared_urls = {url for url, items in url_to_items.items() if len(items) > 1 and url in document_cache}
+        for key, att in key_to_attachment.items():
+            result = extracted.get(att.url)
+            if not result:
+                continue
+            span = span_of(result, att.pages)
+            if not span.get("text"):
+                continue
+            document_cache[key] = {
+                "text": text_for_analysis(span),
+                "page_count": span.get("page_count", 0),
+                "name": attachment_label(att) if att.name else key,
+                "content_sha256": span.get("content_sha256"),
+                "source_url": span.get("source_url") or att.url,
+                "pages": att.pages,
+                "document_format": span.get("document_format"),
+                "extraction_incomplete": span.get("extraction_incomplete", False),
+                "ocr_pending_pages": span.get("ocr_pending_pages"),
+            }
+            logger.info("extracted document", attachment=document_cache[key]["name"], pages=span.get('page_count', 0), shared=(len(key_to_items[key]) > 1))
+
+        shared_urls = {key for key, items in key_to_items.items() if len(items) > 1 and key in document_cache}
         logger.info("cached documents", total_cached=len(document_cache), shared_count=len(shared_urls))
 
         return document_cache, item_attachments, shared_urls
@@ -3337,7 +3355,7 @@ class Processor:
                 total_page_count = 0
                 has_shared_attachments = False
                 url_names = {
-                    att.url: (att.name or att.url)
+                    attachment_key(att): (attachment_label(att) if att.name else att.url)
                     for att in (item.attachments or [])
                     if att.url
                 }

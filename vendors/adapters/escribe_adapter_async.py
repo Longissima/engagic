@@ -422,6 +422,7 @@ class AsyncEscribeAdapter(AsyncBaseAdapter):
         soup = BeautifulSoup(html, 'html.parser')
 
         items = await self._parse_agenda_items(soup, meeting_uuid, merged_url)
+        await self._source_page(response, items)
 
         meeting_data = {
             "vendor_id": basic_meeting["vendor_id"],

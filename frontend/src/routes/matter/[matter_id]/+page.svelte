@@ -5,6 +5,7 @@
 	import { cleanSummary } from '$lib/utils/markdown-utils';
 	import SeoHead from '$lib/components/SeoHead.svelte';
 	import { truncateForMeta } from '$lib/utils/utils';
+	import { attachmentHref, attachmentKey, attachmentPagesLabel } from '$lib/utils/attachments';
 	import { getMatterSponsors, getCityCouncilMembers } from '$lib/api';
 	import type { CouncilMember, MatterVotesResponse } from '$lib/api/types';
 	import VoteBadge from '$lib/components/VoteBadge.svelte';
@@ -223,9 +224,9 @@
 				</button>
 				{#if attachmentsExpanded}
 					<div class="attachments-list">
-						{#each attachments as attachment}
-							<a href={attachment.portal_url || attachment.url} target="_blank" rel="noopener noreferrer" class="attachment-link">
-								<span class="attachment-name">{attachment.name}</span>
+						{#each attachments as attachment (attachmentKey(attachment))}
+							<a href={attachmentHref(attachment)} target="_blank" rel="noopener noreferrer" class="attachment-link">
+								<span class="attachment-name">{attachment.name}{attachmentPagesLabel(attachment)}</span>
 							</a>
 						{/each}
 					</div>

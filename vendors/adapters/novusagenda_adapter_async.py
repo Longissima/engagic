@@ -416,6 +416,7 @@ class AsyncNovusAgendaAdapter(AsyncBaseAdapter):
                         body_text = self._extract_coversheet_text(html)
                         if body_text:
                             item["body_text"] = body_text
+                            await self._source_page(response, [item])
                         return item
                     except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as e:
                         if attempt == 0:

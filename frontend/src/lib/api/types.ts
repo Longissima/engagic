@@ -30,6 +30,7 @@ export interface AgendaItem {
 		type: string;
 		portal_url?: string;  // Stable viewer URL (CivicClerk portal)
 		history_id?: string;  // PrimeGov-specific
+		pages?: [number, number];  // Span of url (chunked packet); absent = whole document
 	}>;
 	summary?: string;
 	topics?: string[];
@@ -390,7 +391,7 @@ export interface Matter {
 	canonical_summary?: string;
 	canonical_topics?: string[];
 	sponsors?: string[];
-	attachments?: Array<{ name: string; url: string; type: string; history_id?: string }>;
+	attachments?: Array<{ name: string; url: string; type: string; history_id?: string; portal_url?: string; pages?: [number, number] }>;
 	first_seen: string;
 	last_seen: string;
 	appearance_count?: number;  // Number of times this matter appeared across meetings
@@ -512,7 +513,7 @@ export interface CitySearchItemResult {
 	matter_id?: string;
 	matter_file?: string;
 	matter_type?: string;
-	attachments?: Array<{ name: string; url: string; type: string }>;
+	attachments?: Array<{ name: string; url: string; type: string; portal_url?: string; pages?: [number, number] }>;
 	meeting_id: string;
 	meeting_title?: string;
 	meeting_date?: string;
@@ -532,7 +533,7 @@ export interface CitySearchMatterResult {
 	canonical_summary?: string;
 	canonical_topics?: string[];
 	sponsors?: string[];
-	attachments?: Array<{ name: string; url: string; type: string }>;
+	attachments?: Array<{ name: string; url: string; type: string; portal_url?: string; pages?: [number, number] }>;
 	first_seen: string;
 	last_seen: string;
 	appearance_count?: number;

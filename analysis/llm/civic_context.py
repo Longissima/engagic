@@ -1,5 +1,7 @@
 """Explicit jurisdiction/body and document context for every summary lane."""
 
+from pipeline.document_artifacts import attachment_label
+
 
 def civic_context(jurisdiction, meeting, committee=None):
     name = getattr(jurisdiction, 'name', None) or 'Not recorded'
@@ -21,7 +23,7 @@ def civic_context(jurisdiction, meeting, committee=None):
 
 
 def attachment_inventory(attachments):
-    names = [getattr(a, 'name', None) or 'Unnamed attachment' for a in (attachments or [])]
+    names = [attachment_label(a) for a in (attachments or [])]
     return (
         '[ATTACHMENT INVENTORY]\n'
         f'This item has {len(names)} linked attachment(s): ' + ('; '.join(names) or 'none') + '.\n'

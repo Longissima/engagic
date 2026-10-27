@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,7 +11,8 @@ from typing import Any, Dict, List, Mapping, Optional, TypedDict
 
 from asyncpg import Connection
 
-from config import get_logger
+from config import config, get_logger
+from corpus.store import EXTRACT_VERSION, get_corpus, sha256_hex
 from database.id_generation import (
     generate_meeting_id,
     generate_matter_id,
@@ -18,7 +20,7 @@ from database.id_generation import (
     normalize_sponsor_name,
     validate_matter_id,
 )
-from database.models import Jurisdiction, Meeting, AgendaItem, Matter, MatterMetadata
+from database.models import AgendaItem, AttachmentInfo, Jurisdiction, Matter, MatterMetadata, Meeting
 from database.repositories_async.helpers import deserialize_attachments
 from exceptions import DatabaseError, ValidationError
 from parsing.identifiers import (
@@ -31,9 +33,11 @@ from parsing.identifiers import (
 from pipeline.utils import (
     MatterNoWorkReason,
     MatterWorkSnapshot,
+    attachment_identity,
     matter_no_work_version,
     meeting_work_version,
 )
+from pipeline.document_acquisition import ArchiveDocumentUnavailable
 from pipeline.orchestrators.matter_filter import MatterFilter
 from pipeline.orchestrators.enqueue_decider import EnqueueDecider, MatterEnqueueDecider
 from pipeline.orchestrators.vote_processor import VoteProcessor
@@ -99,6 +103,90 @@ def _source_audit(meeting_dict: Mapping[str, Any]) -> Dict[str, Any]:
             "rule_counts": dict(Counter(d.rule_id for d in decisions)),
         },
     }
+
+
+def _meeting_sources(meeting_dict: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Every document a vendor meeting names: agenda, packet(s), minutes,
+    listed documents, and each item's attachments."""
+    sources: List[Dict[str, Any]] = []
+    for role in ("agenda_url", "packet_url", "minutes_url"):
+        value = meeting_dict.get(role)
+        for url in [value] if isinstance(value, str) else (value or []):
+            if url:
+                sources.append({"url": url, "role": role})
+    sources.extend(meeting_dict.get("agenda_sources") or [])
+    sources.extend(meeting_dict.get("archive_documents") or [])
+    for item in meeting_dict.get("items") or []:
+        for att in item.get("attachments") or []:
+            sources.append({**att, "role": "attachment",
+                            "vendor_item_id": item.get("vendor_item_id")})
+    return sources
+
+
+def _body_source(value: Any) -> Optional[List[Dict[str, Any]]]:
+    """Normalize an adapter's body_source to [{url, pages?, content_sha256?}].
+
+    Adapter output is untrusted shape: an entry without an http(s) URL, or
+    with a malformed page span, is dropped rather than stored as provenance.
+    """
+    entries: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value if isinstance(value, list) else []:
+        if not isinstance(raw, Mapping):
+            continue
+        url = str(raw.get("url") or "")
+        if not url.startswith(("http://", "https://")):
+            continue
+        entry: Dict[str, Any] = {"url": url}
+        pages = raw.get("pages")
+        if pages is not None:
+            try:
+                first, last = (int(page) for page in pages)
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= first <= last:
+                continue
+            entry["pages"] = [first, last]
+        sha = raw.get("content_sha256")
+        if isinstance(sha, str) and len(sha) == 64:
+            entry["content_sha256"] = sha
+        key = json.dumps(entry, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            entries.append(entry)
+    return entries or None
+
+
+def _document_spans(documents: List[Mapping[str, Any]]) -> tuple[List[AttachmentInfo], bool]:
+    """Page-span attachments for a chunked item's documents.
+
+    Returns the spans and whether every document became one; a document the
+    producer could not stamp with its source URL leaves its text in body_text.
+    """
+    spans: List[AttachmentInfo] = []
+    seen: set[tuple[str, int, int]] = set()
+    all_spanned = True
+    for document in documents:
+        url = str(document.get("url") or "")
+        try:
+            first = int(document["page_start"])
+            last = int(document.get("page_end") or first)
+        except (KeyError, TypeError, ValueError):
+            all_spanned = False
+            continue
+        if not url or not 1 <= first <= last:
+            all_spanned = False
+            continue
+        if (url, first, last) in seen:
+            continue
+        seen.add((url, first, last))
+        spans.append(AttachmentInfo(
+            name=str(document.get("name") or "Agenda packet")[:200],
+            url=url,
+            type="pdf",
+            pages=[first, last],
+        ))
+    return spans, all_spanned
 
 
 def _normalize_item_identity_text(value: Any) -> str:
@@ -213,10 +301,6 @@ class MeetingSyncOrchestrator:
         The manifest retains native items; domain rows, summaries, matter
         tracking, activation and processing queues are deliberately untouched.
         """
-        from corpus.store import get_corpus
-        from pipeline.document_acquisition import ArchiveDocumentUnavailable
-        from pipeline.utils import attachment_identity
-
         corpus = get_corpus()
         if corpus is None:
             raise RuntimeError("Archival requires the corpus")
@@ -225,18 +309,8 @@ class MeetingSyncOrchestrator:
             date=self._parse_meeting_date(meeting_dict),
             title=meeting_dict.get("title") or "Meeting",
         )
-        sources = []
-        for role in ("agenda_url", "packet_url", "minutes_url"):
-            if meeting_dict.get(role):
-                sources.append({"url": meeting_dict[role], "role": role})
-        sources.extend(meeting_dict.get("agenda_sources") or [])
-        sources.extend(meeting_dict.get("archive_documents") or [])
-        for item in meeting_dict.get("items") or []:
-            for att in item.get("attachments") or []:
-                sources.append({**att, "role": "attachment",
-                                "vendor_item_id": item.get("vendor_item_id")})
+        sources = _meeting_sources(meeting_dict)
         if adapter.vendor == "civicclerk":
-            from database.models import AttachmentInfo
             from pipeline.url_refresh import refresh_attachment_urls
 
             refresh_targets = {}
@@ -334,12 +408,130 @@ class MeetingSyncOrchestrator:
             "reused": sum(d.get("reused", False) for d in receipts.values()),
         }
 
+    async def archive_sources(self, meetings, city, adapter) -> Dict[str, int]:
+        """Stage 1 at sync: archive the original of every document the synced
+        meetings name, so R2 holds every source whether or not anything reads
+        it yet. Text extraction stays with the corpus window and the processor.
+
+        Bytes only, through the adapter's own transport and rate limits. An
+        identity already archived costs one batched lookup and no request; a
+        download the ledger deferred is skipped. New downloads are capped per
+        city per sync (upcoming and recent meetings first), so a backlog drains
+        across syncs instead of landing on a vendor host at once. A store
+        failure is a passenger: it is counted and logged, never raised.
+        """
+        stats = {"sources": 0, "already_archived": 0, "deferred": 0,
+                 "archived": 0, "unavailable": 0, "failed": 0, "over_budget": 0}
+        budget = config.SYNC_ARCHIVE_BUDGET
+        if get_corpus() is None or budget <= 0:
+            return stats
+        started = time.monotonic()
+        urls: Dict[str, str] = {}
+        for meeting in sorted(meetings, key=lambda m: str(m.get("start") or ""), reverse=True):
+            for source in _meeting_sources(meeting):
+                url = source.get("url")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    urls.setdefault(attachment_identity(url), url)
+        stats["sources"] = len(urls)
+        if not urls:
+            return stats
+
+        archived = await self.db.document_blobs.archived_identities(urls)
+        deferred = await self.db.document_blobs.deferred_download_identities(
+            set(urls) - archived, EXTRACT_VERSION
+        )
+        pending = [(identity, url) for identity, url in urls.items()
+                   if identity not in archived and identity not in deferred]
+        stats.update(already_archived=len(archived), deferred=len(deferred),
+                     over_budget=max(0, len(pending) - budget))
+
+        todo = iter(pending[:budget])
+
+        async def worker() -> None:
+            for identity, url in todo:
+                try:
+                    await adapter._document_acquirer.archive(
+                        url, banana=city.banana, max_bytes=config.CORPUS_MAX_ORIGINAL_BYTES
+                    )
+                    stats["archived"] += 1
+                except (ArchiveDocumentUnavailable, ValueError) as exc:
+                    # 403/404/410, or a verdict on the bytes (viewer shell,
+                    # oversize, empty): refetching next sync cannot help.
+                    stats["unavailable" if isinstance(exc, ArchiveDocumentUnavailable) else "failed"] += 1
+                    await self._record_download_failure(identity, city.banana, exc)
+                except Exception as exc:
+                    # Transient: left unrecorded so the next sync retries it.
+                    stats["failed"] += 1
+                    logger.debug("sync archival failed", banana=city.banana,
+                                 url=identity[:120], error=str(exc), error_type=type(exc).__name__)
+
+        await asyncio.gather(*(worker() for _ in range(max(1, config.SYNC_ARCHIVE_CONCURRENCY))))
+        logger.info("archived sync sources", banana=city.banana, vendor=adapter.vendor,
+                    duration_seconds=round(time.monotonic() - started, 1), **stats)
+        return stats
+
+    async def _pinned_body_source(
+        self,
+        item_data: Mapping[str, Any],
+        body_text: Optional[str],
+        existing: Optional[AgendaItem],
+        source_pages: Optional[Mapping[str, tuple[bytes, str]]],
+        banana: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Where body_text was cut from, with each scraped page archived.
+
+        A page is archived only when this text is new or changed. Unchanged
+        text keeps the pointer it already has, so a page that differs every
+        fetch (session tokens, timestamps) adds no revision until its items
+        do. A failed archive leaves a URL-only pointer, never a sha that R2
+        does not hold.
+        """
+        if not body_text:
+            return None
+        entries = _body_source(item_data.get("body_source"))
+        if not entries:
+            return None
+        if existing is not None and existing.body_source and existing.body_text == body_text:
+            return existing.body_source
+        corpus = get_corpus()
+        if corpus is None or not source_pages:
+            return entries
+        for entry in entries:
+            page = source_pages.get(entry["url"])
+            if "content_sha256" in entry or page is None:
+                continue
+            data, content_type = page
+            sha = await asyncio.to_thread(sha256_hex, data)
+            if await corpus.archive_original(
+                sha, byte_count=len(data), data=data, source_url=entry["url"],
+                banana=banana, content_type=content_type or None,
+            ):
+                entry["content_sha256"] = sha
+        return entries
+
+    async def _record_download_failure(self, identity: str, banana: str, error: Exception) -> None:
+        try:
+            await self.db.document_blobs.record_ingest_failure(
+                source_identity=identity,
+                extract_version=EXTRACT_VERSION,
+                banana=banana,
+                stage="download",
+                error_text=f"{type(error).__name__}: {error}",
+                permanent=False,
+                max_failures=3,
+                retry_days=7,
+            )
+        except Exception as ledger_error:
+            logger.warning("could not record archival failure", url=identity[:120],
+                           error=str(ledger_error))
+
     async def sync_meeting(
         self,
         meeting_dict: Dict[str, Any],
         city: Jurisdiction,
         *,
         check_city_activation: bool = False,
+        source_pages: Optional[Mapping[str, tuple[bytes, str]]] = None,
     ) -> tuple[Optional[Meeting], MeetingStoreStats]:
         """Transform vendor meeting dict, store meeting and items, enqueue for processing."""
         stats: MeetingStoreStats = {
@@ -434,6 +626,7 @@ class MeetingSyncOrchestrator:
                 agenda_items = await self._process_agenda_items(
                     items_data, meeting_obj, stats,
                     prefer_native_ids=meeting_dict.get("authoritative_item_source") == "civicclerk_api",
+                    source_pages=source_pages,
                 )
 
                 # Dedupe items by matter_id early - before any DB operations that use item IDs
@@ -790,6 +983,7 @@ class MeetingSyncOrchestrator:
         stats: MeetingStoreStats,
         *,
         prefer_native_ids: bool = False,
+        source_pages: Optional[Mapping[str, tuple[bytes, str]]] = None,
     ) -> List[AgendaItem]:
         """Build AgendaItem list, preserving existing summaries."""
         existing_items = await self.db.items.get_agenda_items(stored_meeting.id)
@@ -873,6 +1067,17 @@ class MeetingSyncOrchestrator:
                 collision_items += 1
 
             item_attachments = deserialize_attachments(item_data.get("attachments"))
+            documents = (item_data.get("metadata") or {}).get("documents") or []
+            spans, all_spanned = _document_spans(documents)
+            body_text = item_data.get("body_text")
+            if spans:
+                item_attachments = item_attachments + spans
+                # The chunker's body_text is the agenda's words plus every
+                # document's pages. Once each document is a span the pages are
+                # read from the corpus (OCR-complete, receipted), so body_text
+                # keeps only the words no document holds.
+                if all_spanned and "agenda_text" in item_data["metadata"]:
+                    body_text = item_data["metadata"]["agenda_text"] or None
             # Identity contract: whoever supplied matter_file (vendor field,
             # adapter, or the text extractor below), it is validated here and
             # nowhere else, and only parsing.identifiers decides what a number
@@ -900,7 +1105,11 @@ class MeetingSyncOrchestrator:
             identity = (
                 Identifier(matter_file, matter_type)
                 if matter_file
-                else extract_identifier(item_data.get("title"), item_data.get("body_text"))
+                else extract_identifier(
+                    item_data.get("title"),
+                    item_data.get("body_text"),
+                    *(document.get("text") for document in documents),
+                )
             )
             matter_year = None
             if identity:
@@ -932,7 +1141,11 @@ class MeetingSyncOrchestrator:
                 matter_type=matter_type,
                 sponsors=item_data.get("sponsors", []),
                 attachments=item_attachments,
-                body_text=item_data.get("body_text"),
+                body_text=body_text,
+                body_source=await self._pinned_body_source(
+                    item_data, body_text, existing_items_map.get(item_id),
+                    source_pages, stored_meeting.banana,
+                ),
                 summary=None,
                 topics=None,
             )

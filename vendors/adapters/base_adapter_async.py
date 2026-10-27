@@ -121,6 +121,9 @@ class AsyncBaseAdapter:
         self._chunk_audits: Dict[str, List[Dict[str, Any]]] = {}
         # html parse audits (which dialect pattern matched), same lifecycle
         self._html_audits: Dict[str, Dict[str, Any]] = {}
+        # Raw bytes of pages items were scraped from, by final URL, for the
+        # sync funnel to archive (see _source_page); same per-fetch lifecycle.
+        self.source_pages: Dict[str, Tuple[bytes, str]] = {}
         self._minutes_discovery_only = False
 
         logger.info("initialized async adapter", vendor=vendor, city_slug=city_slug)
@@ -338,6 +341,28 @@ class AsyncBaseAdapter:
         timeout = aiohttp.ClientTimeout(
             total=None, sock_connect=config.VENDOR_HTTP_TIMEOUT, sock_read=120)
         return await self._get(url, _max_attempts=1, timeout=timeout)
+
+    async def _source_page(
+        self, response: aiohttp.ClientResponse, items: List[Dict[str, Any]]
+    ) -> None:
+        """Record that these items' body_text was parsed out of this response.
+
+        The bytes already in hand are kept for the sync funnel, which archives
+        them only when an item's text is new or changed: a page carrying
+        per-request tokens would otherwise mint a new corpus revision every
+        sync. Items get a URL-only body_source; the funnel pins the sha of the
+        bytes it archived. Costs no request (aiohttp caches the read body).
+        """
+        try:
+            data = await response.read()
+        except Exception as e:
+            logger.debug("source page bytes unavailable", vendor=self.vendor, slug=self.slug, error=str(e))
+            return
+        url = str(response.url)
+        self.source_pages[url] = (data, response.headers.get("Content-Type", ""))
+        for item in items:
+            if item.get("body_text"):
+                item["body_source"] = [{"url": url}]
 
     async def _get(self, url: str, **kwargs) -> aiohttp.ClientResponse:
         """GET request. Raises VendorHTTPError on failure."""
@@ -803,10 +828,12 @@ class AsyncBaseAdapter:
         pdf_bytes: bytes,
         vendor_id: Optional[str] = None,
         force_method: Optional[str] = None,
+        source_url: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Legacy shim: maps force_method to a ladder, returns bare items."""
         result = await self._chunk_pdf_bytes(
-            pdf_bytes, vendor_id, ladder_for_force_method(force_method)
+            pdf_bytes, vendor_id, ladder_for_force_method(force_method),
+            source_url=source_url,
         )
         return result.items
 
@@ -1132,6 +1159,7 @@ class AsyncBaseAdapter:
         try:
             self._chunk_audits = {}
             self._html_audits = {}
+            self.source_pages = {}
             meetings = await self._fetch_meetings_impl(days_back, days_forward)
             if self._originals_only:
                 for meeting in meetings:

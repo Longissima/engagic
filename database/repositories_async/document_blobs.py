@@ -10,12 +10,39 @@ concurrently must both succeed, converging on one row.
 """
 
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional, Set
 
 from database.repositories_async.base import BaseRepository
 from config import get_logger
 
 logger = get_logger(__name__).bind(component="document_blob_repository")
+
+# The bounded retry ledger every ingest path shares (sync archival, the corpus
+# window, minutes and publications ingestion). Keyed by extractor version so
+# an extractor upgrade reconsiders identities the old one could not handle.
+RECORD_FAILURE_SQL = """
+    INSERT INTO document_ingest_failure AS current_failure (
+        source_identity, extract_version, banana, failure_stage,
+        attempt_count, permanent, last_error, retry_after
+    )
+    VALUES (
+        $1, $2, $3, $4, 1, ($6::boolean OR 1 >= $7), $5,
+        CURRENT_TIMESTAMP + make_interval(days => $8)
+    )
+    ON CONFLICT (source_identity, extract_version) DO UPDATE SET
+        banana = COALESCE(current_failure.banana, EXCLUDED.banana),
+        failure_stage = EXCLUDED.failure_stage,
+        attempt_count = current_failure.attempt_count + 1,
+        permanent = (
+            current_failure.permanent
+            OR $6::boolean
+            OR current_failure.attempt_count + 1 >= $7
+        ),
+        last_error = EXCLUDED.last_error,
+        last_failed_at = CURRENT_TIMESTAMP,
+        retry_after = CURRENT_TIMESTAMP + make_interval(days => $8)
+    RETURNING attempt_count, permanent
+"""
 
 
 class DocumentBlobRepository(BaseRepository):
@@ -275,6 +302,69 @@ class DocumentBlobRepository(BaseRepository):
             LIMIT 1
             """,
             source_identity,
+        )
+        return dict(row) if row else None
+
+    async def archived_identities(self, identities: Iterable[str]) -> Set[str]:
+        """The subset of URL identities whose original bytes are in R2."""
+        wanted = sorted(set(identities))
+        if not wanted:
+            return set()
+        rows = await self._fetch(
+            """
+            SELECT DISTINCT s.source_identity
+            FROM document_source s
+            JOIN document_blob b USING (content_sha256)
+            WHERE s.source_identity = ANY($1::text[])
+              AND b.original_key IS NOT NULL
+              AND COALESCE(b.bytes, 0) > 0
+            """,
+            wanted,
+        )
+        return {row["source_identity"] for row in rows}
+
+    async def deferred_download_identities(
+        self, identities: Iterable[str], extract_version: str
+    ) -> Set[str]:
+        """Identities whose download failed and must not be retried yet."""
+        wanted = sorted(set(identities))
+        if not wanted:
+            return set()
+        rows = await self._fetch(
+            """
+            SELECT source_identity FROM document_ingest_failure
+            WHERE source_identity = ANY($1::text[])
+              AND extract_version = $2
+              AND failure_stage = 'download'
+              AND (permanent OR retry_after > CURRENT_TIMESTAMP)
+            """,
+            wanted,
+            extract_version,
+        )
+        return {row["source_identity"] for row in rows}
+
+    async def record_ingest_failure(
+        self,
+        *,
+        source_identity: str,
+        extract_version: str,
+        banana: Optional[str],
+        stage: str,
+        error_text: str,
+        permanent: bool,
+        max_failures: int,
+        retry_days: int,
+    ) -> Optional[Dict[str, Any]]:
+        row = await self._fetchrow(
+            RECORD_FAILURE_SQL,
+            source_identity,
+            extract_version,
+            banana,
+            stage,
+            error_text[:1000],
+            permanent,
+            max_failures,
+            retry_days,
         )
         return dict(row) if row else None
 

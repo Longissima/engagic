@@ -40,6 +40,19 @@ class AttachmentSchema(BaseModel):
     meta_id: Optional[str] = None  # Granicus-specific
     cc_agenda_id: Optional[int] = None  # CivicClerk: Meetings/{id} for URL refresh
     cc_attachment_id: Optional[int] = None  # CivicClerk: attachment id within agenda
+    # A span of a meeting document rather than a whole file: [first, last],
+    # 1-indexed inclusive. Chunked packets have no per-item file, so an item
+    # points at the pages of the packet its text came from.
+    pages: Optional[List[int]] = None
+
+    @field_validator("pages")
+    @classmethod
+    def validate_pages(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        if v is None:
+            return None
+        if len(v) != 2 or not 1 <= v[0] <= v[1]:
+            raise ValueError(f"pages must be [first, last] with 1 <= first <= last, got {v}")
+        return v
 
     @field_validator("url")
     @classmethod
@@ -74,6 +87,9 @@ class AgendaItemSchema(BaseModel):
     sponsors: Optional[List[str]] = None
     votes: Optional[List[Dict[str, Any]]] = None  # Vote records from adapter
     metadata: Optional[Dict[str, Any]] = None  # Vendor-specific metadata (action_name, section, etc.)
+    # body_text and body_source ([{url, pages?, content_sha256?}], where the
+    # text was cut from) ride as extras: the item funnel normalizes them, so
+    # a malformed pointer drops the pointer, never the meeting.
 
     @field_validator("vendor_item_id", "matter_id", "agenda_number", mode="before")
     @classmethod

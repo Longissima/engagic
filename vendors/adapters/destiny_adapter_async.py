@@ -499,6 +499,7 @@ class AsyncDestinyAdapter(AsyncBaseAdapter):
 
         if body_parts:
             item['body_text'] = '\n\n'.join(body_parts)[:8000]
+            await self._source_page(response, [item])
 
         # Extract attachments from popupAttachments() onclick handlers
         attachments = []

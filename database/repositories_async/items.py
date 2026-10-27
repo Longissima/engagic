@@ -168,6 +168,7 @@ class ItemRepository(BaseRepository):
                     _strip_null_bytes(item.summary),
                     item.topics,
                     _strip_null_bytes(item.filter_reason),
+                    item.body_source,
                 )
                 for item in items
             ]
@@ -187,9 +188,10 @@ class ItemRepository(BaseRepository):
                 INSERT INTO items (
                     id, meeting_id, title, sequence, attachments,
                     attachment_hash, body_text, matter_id, matter_file, matter_type,
-                    agenda_number, sponsors, summary, topics, filter_reason
+                    agenda_number, sponsors, summary, topics, filter_reason,
+                    body_source
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 ON CONFLICT (id) DO UPDATE SET
                     title = CASE WHEN items.summary IS NOT NULL
                         THEN items.title ELSE EXCLUDED.title END,
@@ -202,6 +204,12 @@ class ItemRepository(BaseRepository):
                     body_text = CASE WHEN items.summary IS NOT NULL
                         THEN items.body_text
                         ELSE COALESCE(EXCLUDED.body_text, items.body_text) END,
+                    -- The pointer travels with the text it locates: new text
+                    -- brings its own source (or none), kept text keeps its own.
+                    body_source = CASE
+                        WHEN items.summary IS NOT NULL THEN items.body_source
+                        WHEN EXCLUDED.body_text IS NOT NULL THEN EXCLUDED.body_source
+                        ELSE items.body_source END,
                     matter_id = COALESCE(EXCLUDED.matter_id, items.matter_id),
                     matter_file = COALESCE(EXCLUDED.matter_file, items.matter_file),
                     matter_type = COALESCE(EXCLUDED.matter_type, items.matter_type),
@@ -271,7 +279,7 @@ class ItemRepository(BaseRepository):
                 f"""
                 SELECT
                     id, meeting_id, title, sequence, attachments,
-                    attachment_hash, body_text, matter_id, matter_file, matter_type,
+                    attachment_hash, body_text, body_source, matter_id, matter_file, matter_type,
                     agenda_number, sponsors, summary, topics, quality_score, rating_count,
                     filter_reason
                 FROM items
@@ -308,7 +316,7 @@ class ItemRepository(BaseRepository):
                 """
                 SELECT
                     id, meeting_id, title, sequence, attachments,
-                    attachment_hash, body_text, matter_id, matter_file, matter_type,
+                    attachment_hash, body_text, body_source, matter_id, matter_file, matter_type,
                     agenda_number, sponsors, summary, topics, quality_score, rating_count,
                     filter_reason
                 FROM items
@@ -366,7 +374,7 @@ class ItemRepository(BaseRepository):
                 """
                 SELECT
                     id, meeting_id, title, sequence, attachments,
-                    attachment_hash, body_text, matter_id, matter_file, matter_type,
+                    attachment_hash, body_text, body_source, matter_id, matter_file, matter_type,
                     agenda_number, sponsors, summary, topics, quality_score, rating_count,
                     filter_reason
                 FROM items
@@ -531,7 +539,7 @@ class ItemRepository(BaseRepository):
                 f"""
                 SELECT
                     id, meeting_id, title, sequence, attachments,
-                    attachment_hash, body_text, matter_id, matter_file, matter_type,
+                    attachment_hash, body_text, body_source, matter_id, matter_file, matter_type,
                     agenda_number, sponsors, summary, topics, quality_score, rating_count,
                     filter_reason
                 FROM items

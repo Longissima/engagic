@@ -48,6 +48,15 @@ def deserialize_agenda_sources(data: Any) -> Optional[List[Dict[str, str]]]:
     return data
 
 
+def deserialize_body_source(data: Any) -> Optional[List[Dict[str, Any]]]:
+    """Deserialize items.body_source JSONB to [{url, pages?, content_sha256?}]."""
+    if not data:
+        return None
+    if isinstance(data, str):
+        return json.loads(data)
+    return data
+
+
 def deserialize_extra_vendors(data: Any) -> Optional[List[Dict[str, str]]]:
     """Deserialize jurisdictions.extra_vendors JSONB to [{vendor, slug}]."""
     if not data:
@@ -143,6 +152,7 @@ def build_agenda_item(row: Any, topics: Optional[List[str]] = None) -> AgendaIte
         attachments=attachments,
         attachment_hash=row["attachment_hash"],
         body_text=row.get("body_text"),
+        body_source=deserialize_body_source(row.get("body_source")),
         matter_id=row["matter_id"],
         matter_file=row["matter_file"],
         matter_type=row["matter_type"],

@@ -1614,6 +1614,26 @@ def _parse_agenda_internal(pdf_path: str, force_method: Optional[str] = None) ->
 # Public API - returns pipeline-compatible dicts
 # ---------------------------------------------------------------------------
 
+def _memo_documents(memos: List[_MemoContent], item_title: str) -> List[Dict[str, Any]]:
+    """The page-range documents whose text an item's body_text carries.
+
+    A packet has no per-item file, so these pages are the item's source
+    documents. The producer stamps the packet URL on them and the item
+    funnel turns each into a page-span attachment; "text" rides along only
+    for identity derivation there (item metadata is never persisted).
+    """
+    return [
+        {
+            "name": (memo.subject or item_title or "Agenda packet")[:200],
+            "page_start": memo.page_start,
+            "page_end": memo.page_end,
+            "text": memo.full_text,
+        }
+        for memo in memos
+        if memo.full_text and memo.page_start
+    ]
+
+
 def parse_agenda_pdf(pdf_path: str, force_method: Optional[str] = None) -> Dict[str, Any]:
     """
     Parse a municipal agenda PDF into pipeline-compatible item dicts.
@@ -1719,6 +1739,10 @@ def parse_agenda_pdf(pdf_path: str, force_method: Optional[str] = None) -> Dict[
             # evidence boundary as page metadata instead of emitting a broken
             # AttachmentSchema record.
             item_metadata["embedded_documents"] = embedded_documents
+        documents = _memo_documents(item.memos, item.title)
+        if documents:
+            item_metadata["documents"] = documents
+            item_metadata["agenda_text"] = item.body
         if item_metadata:
             pipeline_item["metadata"] = item_metadata
 
