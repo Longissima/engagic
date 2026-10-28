@@ -1,217 +1,32 @@
-# Custom City Adapters
+# Custom adapters
 
-## Overview
+These adapters cover bodies that are not on a supported platform. Before writing a class here, check whether the body fits one of the registry-driven adapters. A registry entry costs a JSON entry; a class costs maintenance forever.
 
-Custom adapters are 1:1 with specific high-value cities that don't use standard civic tech vendor platforms. Unlike vendor adapters (1:many), these require custom HTML parsing for each city.
+## Registry-driven (one class, many bodies)
 
-**Trade-off**: High maintenance cost per city, but captures high-value targets (Berkeley, Menlo Park, etc.) that wouldn't otherwise be accessible.
+| Adapter | Covers | Registry (in `data/`, git-ignored, lives on the VPS) | Writer |
+|---|---|---|---|
+| `selfhosted_adapter_async.py` (vendor `selfhosted`) | agencies, boards, regulators, utilities and transit authorities that post meetings on their own site | `selfhosted_sites.json` | the normal sync path |
+| `publications_adapter_async.py` | reports, regulations, orders and findings published with no meeting around them | `publication_sources.json` | `scripts/ingest_publications.py` |
+| `dockets_adapter_async.py` | state regulatory commissions' case systems: cases, filings, documents | `docket_systems.json` | `scripts/ingest_dockets.py` |
 
-## When to Create a Custom Adapter
+**Selfhosted** reduces every site to one model: a meeting is a dated group of document links. Nothing is located by a site-specific selector. A listing row is the smallest ancestor of a document link whose text holds exactly one date. Items on a detail page are keyed by the item number in the document's own label or URL. Agenda PDFs without item documents go through the ordinary chunker cascade. To add a body, add a registry entry, fetch it once to verify, then run `scripts/onboard_selfhosted.py --apply`. `scripts/archive_meetings.py --vendors selfhosted` backfills its history through the normal write path.
 
-✅ **Create custom adapter when:**
-- City has high value (large population, important decisions, user demand)
-- City has structured HTML that can be parsed reliably
-- Maintenance burden is justified by city importance
-- No vendor adapter available or planned
+**Publications** stores a date only when the listing states a day for that document: in the link text, the file name, or a row holding that document alone. A month, a term or a page-level "updated" stamp is not a publication date.
 
-❌ **Don't create custom adapter when:**
-- City has <50k population and low civic engagement
-- HTML structure is too fragile or JavaScript-rendered
-- City already uses a supported vendor platform
-- Better investment is supporting a new vendor (reaches multiple cities)
+**Dockets** walk a system's own case keys, the only enumeration those systems expose. A missing case counts as absence. Public comment letters and ZIPs are not collected.
 
-## Self-hosted bodies (registry, not classes)
+Government sites sit behind WAFs that challenge bursts. Selfhosted is paced per host at one slot every 4 seconds, index pages are cached per adapter instance, and a challenge page raises instead of parsing as "no meetings". Once a host challenges, stop rather than retry.
 
-State boards, regional regulators, grid operators, utilities and transit
-agencies that publish meetings on their own sites go through one adapter,
-`selfhosted_adapter_async.py` (vendor `selfhosted`). Each body is an entry in
-`data/selfhosted_sites.json`: index URL(s) (`{year}`/`{page}` templates allowed),
-an optional `meeting_href` regex for per-meeting pages, and a `jurisdiction`
-block. `uv run scripts/onboard_selfhosted.py --apply` creates missing
-jurisdictions from the registry. Verify a new entry by fetching it before
-onboarding; it supports `fetch_meetings(start=, end=, originals_only=True)`, so
-`scripts/archive_meetings.py --vendors selfhosted` backfills it.
+## One city each
 
-Government WAFs (Imperva on waterboards.ca.gov) challenge bursts: pacing is
-one slot per host at 4 s, index pages are cached per adapter, and a challenge
-shell raises instead of parsing as "no meetings".
+| Adapter | Source |
+|---|---|
+| `berkeley_adapter_async.py` | Drupal agenda table, HTML agendas with linked staff reports |
+| `chicago_adapter_async.py` | City Clerk eLMS REST API; record numbers from the agenda PDF when the API's agenda groups are empty |
+| `menlopark_adapter_async.py` | one page listing eight bodies; council agendas chunk by URL, commission packets by outline |
+| `ross_adapter_async.py` | Drupal FastTrack meeting tables; staff reports from detail pages |
 
-## Target Cities
+Write one of these only when a high-value body has no platform and no registry shape fits. Register it in `vendors/factory.py`, give it a pacing entry in `vendors/rate_limiter_async.py`, and keep its URL patterns and page structure in the module docstring, where the next reader will look.
 
-**Implemented:**
-- Berkeley, CA (118k population) - Drupal CMS, item-level extraction
-- Chicago, IL (2.7M population) - REST API, concurrent matter fetches
-- Menlo Park, CA (35k population) - Simple table, monolithic processing
-- Ross, CA (2.5k population) - AHA FastTrack/Drupal 7, structured staff report items from detail pages
-
-**Potential Future:**
-- Honolulu, HI (350k) - City Council meetings at https://hnldoc.ehawaii.gov/hnldoc/videos. Has agendas (`/hnldoc/agenda/`), YouTube video links, and minutes (`/hnldoc/document-download/`). No API/RSS — would need HTML scraping. Year filter covers 2019-2027. Committees: Budget, Zoning & Planning, Energy, Infrastructure, etc.
-- San Francisco, CA (815k) - High value if feasible
-- Oakland, CA (440k) - High value if feasible
-- Mountain View, CA (82k) - If table structure is similar to Menlo Park
-
-**Threshold**: Generally target cities >30k population or with exceptionally high civic engagement.
-
-## Implementation Pattern
-
-### 1. Create adapter file
-
-```python
-# vendors/adapters/custom/cityname_adapter_async.py
-
-from vendors.adapters.base_adapter_async import AsyncBaseAdapter, logger
-
-class AsyncCityNameAdapter(AsyncBaseAdapter):
-    """City Name - Custom [CMS type] adapter (async)
-
-    URL patterns:
-    - Meetings list: https://city.gov/meetings
-    - Detail page: https://city.gov/meeting/2025-11-10
-
-    HTML structure:
-    - [Document key selectors and patterns]
-
-    Confidence: X/10 - [Note concerns]
-    """
-
-    def __init__(self, city_slug: str):
-        super().__init__(city_slug, vendor="cityname")
-        self.base_url = "https://city.gov"
-
-    async def fetch_meetings(self, days_back: int = 28, days_forward: int = 28):
-        """Fetch and parse meetings (async)"""
-        response = await self._get(f"{self.base_url}/meetings")
-        html = await response.text()
-        # Parse with asyncio.to_thread for CPU-bound work
-        soup = await asyncio.to_thread(BeautifulSoup, html, 'html.parser')
-        # Extract meetings
-        pass
-```
-
-### 2. Update factory.py
-
-```python
-# Add import
-from vendors.adapters.custom.cityname_adapter_async import AsyncCityNameAdapter
-
-# Add to VENDOR_ADAPTERS dict
-VENDOR_ADAPTERS = {
-    ...
-    "cityname": AsyncCityNameAdapter,
-}
-```
-
-### 3. Update custom/__init__.py
-
-```python
-from vendors.adapters.custom.cityname_adapter_async import AsyncCityNameAdapter
-
-__all__ = [..., "AsyncCityNameAdapter"]
-```
-
-### 4. Add city to database
-
-```sql
-INSERT INTO cities (city_banana, name, state, vendor, city_slug, ...)
-VALUES ('citynameCA', 'City Name', 'CA', 'cityname', 'cityname', ...);
-```
-
-## Common Patterns
-
-### Date Parsing
-
-Use base adapter's utility or implement custom:
-
-```python
-def _parse_date(self, date_str: str) -> datetime:
-    """Parse city-specific date formats"""
-    for fmt in ["%b. %d, %Y", "%B %d, %Y", "%m/%d/%Y"]:
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    return None
-```
-
-### Item Extraction
-
-Look for numbered or lettered items:
-
-```python
-# Numbered: 1., 2., 3.
-item_match = re.match(r'^(\d+)\.$', text)
-
-# Lettered: A1., B2., C3.
-item_match = re.match(r'^([A-Z])(\d+)\.$', text)
-```
-
-### Participation Info
-
-Reuse parsing patterns from `html_agenda_parser.py`:
-
-```python
-# Email
-email_match = re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}', text)
-
-# Zoom
-zoom_match = re.search(r'https://[^/]*zoom[^/]*/j/(\d+)', text)
-
-# Phone
-phone_match = re.search(r'1-(\d{3})-(\d{3})-(\d{4})', text)
-```
-
-## Maintenance Considerations
-
-**Each custom adapter requires:**
-- Initial development: 4-6 hours
-- Testing and refinement: 2-4 hours
-- Ongoing maintenance: ~1 hour per quarter (handle HTML changes)
-- Monitoring: Check success rate monthly
-
-**When to deprecate:**
-- City adopts a supported vendor platform → migrate to vendor adapter
-- HTML structure becomes too fragile → mark as unsupported
-- City population/engagement drops → not worth maintenance burden
-
-**Documentation:**
-- Document HTML structure in adapter docstring
-- Note confidence level (1-10 scale)
-- Add TODO comments for uncertain patterns
-- Update this README when adding/removing adapters
-
-## Testing
-
-Before deploying custom adapter:
-
-1. **Fetch test**: Verify meetings list URL and parsing
-2. **Detail test**: Check item extraction and participation info
-3. **Date range test**: Ensure future and past meetings parse correctly
-4. **Edge cases**: Test special meetings, cancelled meetings, empty agendas
-
-```bash
-# Manual test in Python REPL
-from vendors.factory import get_async_adapter
-adapter = get_async_adapter("berkeley", "berkeley")
-
-# Run async fetch
-import asyncio
-meetings = asyncio.run(adapter.fetch_meetings(max_meetings=3))
-print(meetings)
-```
-
-## Success Metrics
-
-Track per adapter:
-- **Fetch success rate**: % of attempts that return meetings
-- **Item extraction rate**: % of meetings with items extracted
-- **Average items per meeting**: Quality check (expect 5-20 for most councils)
-- **Failure patterns**: Common HTML changes that break parsing
-
-Target: >90% success rate or deprecate adapter.
-
----
-
-**Last Updated**: 2026-03-25
-**Active Adapters**: 4 (Berkeley, Chicago, Menlo Park, Ross)
-**Total Cities Covered**: 4
-**Architecture**: All async (migration complete Nov 2025)
+New jurisdictions are created through `scripts/db_viewer.py` (the shared flow in `scripts/_jurisdiction_onboarding.py`): pick a kind from `jurisdiction_kinds`, and the banana comes from `scripts/_jurisdiction_naming.py`.

@@ -1,258 +1,107 @@
 # Engagic
 
-AI-powered civic engagement platform that discovers, processes, and summarizes local government meeting agendas from 500+ cities.
+Engagic collects what local governments publish (agendas, packets, minutes, votes, dockets, reports) from every jurisdiction it can reach, keeps the originals, and turns them into structured, summarized, searchable records. Live at **[engagic.org](https://engagic.org)**.
 
-Live at **[engagic.org](https://engagic.org)**
+It covers five classes of jurisdiction (city, county, school district, special district, state) through vendor adapters for the platforms governments publish on. Live coverage numbers come from the hourly `platform_metrics_snapshot`, not from this file.
 
----
+Engagic owns the corpus and ingestion layer of a larger system. Two sibling repos read its Postgres read-only and never write to it:
+- **motioncount** owns extraction and analysis (budgets, votes, contracts).
+- **spygov** owns presentation.
 
-## What It Does
-
-Engagic fetches meeting agendas from civic tech platforms (Legistar, PrimeGov, Granicus, CivicPlus, Municode, and 14 more) used by cities, counties, and other public jurisdictions, extracts structured data, and uses LLMs to generate summaries that civilians can understand.
-
-**Key capabilities:**
-- **Item-level processing:** 97% of cities get structured agenda items (not just PDF blobs)
-- **Matters-first architecture:** Legislative items tracked across meetings with deduplication
-- **Council member profiles:** Elected officials tracked with normalized names, sponsorship history
-- **Committee tracking:** Legislative bodies with rosters and member assignments
-- **Voting records:** Individual votes per member per matter, tallies, outcomes across meetings
-- **Topic extraction:** 16 canonical civic topics for filtering and alerts
-- **Participation info:** Email, phone, Zoom links for civic action
-- **Deliberation:** Opinion clustering for structured public input, trust-based moderation
-- **Civic alerts:** Weekly digests with keyword matching, magic link auth
-- **Happening this week:** AI-curated important upcoming items per city
-
----
-
-## Architecture
+## How data flows
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              PRESENTATION LAYER                             │
-│  ┌─────────────────────┐                    ┌────────────────────────────┐  │
-│  │  Frontend           │  HTTP/JSON         │  Server (FastAPI)          │  │
-│  │  (SvelteKit)        │ ◄───────────────── │  17 route modules          │  │
-│  │  Cloudflare Pages   │                    │  Tiered rate limiting      │  │
-│  └─────────────────────┘                    └─────────────┬──────────────┘  │
-└───────────────────────────────────────────────────────────┼─────────────────┘
-                                                            │ Cache-only reads
-┌───────────────────────────────────────────────────────────┼─────────────────┐
-│                              DATA LAYER                   ▼                 │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Database (PostgreSQL)                                                │  │
-│  │  ┌─────────────┬─────────────┬─────────────┬─────────────────────────┐│  │
-│  │  │ Core        │ Legislative │ Engagement  │ Userland                ││  │
-│  │  │-jurisdictions│ - matters │ - watches   │ - users                 ││  │
-│  │  │ - meetings  │ - votes     │ - activity  │ - alerts                ││  │
-│  │  │ - items     │ - members   │ - ratings   │ - alert_matches         ││  │
-│  │  │ - queue     │ - committees│ - issues    │ - magic_links           ││  │
-│  │  └─────────────┴─────────────┴─────────────┴─────────────────────────┘│  │
-│  │  14 async repositories, connection pooling (5-20 conns)               │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────▲─────────────────┘
-                                                            │ Writes
-┌───────────────────────────────────────────────────────────┼─────────────────┐
-│                           PROCESSING LAYER                │                 │
-│  ┌────────────────────────────────────────────────────────┴───────────────┐ │
-│  │  Pipeline (Conductor)                                                  │ │
-│  │  ┌─────────────────────────┐    ┌────────────────────────────────────┐ │ │
-│  │  │  Sync Loop (24h)        │    │  Processing Loop (continuous)      │ │ │
-│  │  │  ┌─────────────────┐    │    │  ┌──────────────────────────────┐  │ │ │
-│  │  │  │ Fetcher         │    │    │  │ Processor                    │  │ │ │
-│  │  │  │ - rate limiting │    │    │  │ - item-level path (97%)      │  │ │ │
-│  │  │  │ - vendor routing│    │    │  │ - monolithic fallback (3%)  │  │ │ │
-│  │  │  │ - matter track  │    │    │  │ - matters-first dedup        │  │ │ │
-│  │  │  └────────┬────────┘    │    │  └──────────────┬───────────────┘  │ │ │
-│  │  └───────────┼─────────────┘    └─────────────────┼──────────────────┘ │ │
-│  │              │                                    │                    │ │
-│  │              ▼                                    ▼                    │ │
-│  │  ┌───────────────────────┐          ┌─────────────────────────────┐   │ │
-│  │  │  Vendors (19)         │          │  Analysis (LLM)             │   │ │
-│  │  │  - Legistar (110)     │          │  - GLM-5.3-flash (Z.AI)     │   │ │
-│  │  │  - Granicus (467)     │          │  - Adaptive prompting (v3)  │   │ │
-│  │  │  - PrimeGov (64)      │          │  - 16 topic taxonomy        │   │ │
-│  │  │  - IQM2 (45)          │          │  - Batch processing (50%)   │   │ │
-│  │  │  - 15 more adapters   │          │  - Context caching          │   │ │
-│  │  └───────────┬───────────┘          └──────────────┬──────────────┘   │ │
-│  └──────────────┼──────────────────────────────────────┼─────────────────┘ │
-│                 │                                      │                   │
-│                 ▼                                      ▼                   │
-│  ┌────────────────────────┐            ┌────────────────────────────────┐  │
-│  │  External APIs         │            │  Parsing (PDF)                 │  │
-│  │  Civic tech platforms  │            │  - PyMuPDF extraction          │  │
-│  │  (rate limited)        │            │  - OCR fallback (Tesseract)    │  │
-│  └────────────────────────┘            │  - Participation info          │  │
-│                                        │  - Legislative formatting      │  │
-│                                        └────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+ pulse (change signals) ─┐
+ cron sweeps ────────────┼─> SYNC   Fetcher -> vendor adapter -> MeetingSyncOrchestrator
+ run.sh sync <target> ───┘            item funnel: junk filter, identifiers, matter ids,
+                                      page spans, body_source; one write path
+                                    archive_sources: every named original -> R2 (stage 1)
+                                             │
+                                             ▼
+                        Postgres: meetings, items, matters, votes, queue + outbox
+                                             │
+ run.sh process <target> ──> PROCESS  claim job -> manufacture items if none (chunker)
+                                      -> text from corpus (extract on miss) -> LLM summary
+                                      -> topics, participation, canonical matter summary
+                                             │
+                                             ▼
+                        API (FastAPI), MCP server, frontend (SvelteKit on Cloudflare),
+                        weekly digest, motioncount and spygov readers
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           USER ENGAGEMENT LAYER                             │
-│  ┌─────────────────────────────────┐    ┌─────────────────────────────────┐ │
-│  │  Userland (Civic Alerts)        │    │  Deliberation (Opinion)         │ │
-│  │  - Magic link auth              │    │  - PCA dimensionality reduction │ │
-│  │  - Weekly digest emails         │    │  - K-means clustering           │ │
-│  │  - Keyword matching             │    │  - Consensus detection          │ │
-│  │  - Matter-based alerts          │    │  - Group vote analysis          │ │
-│  │  - CAN-SPAM compliance          │    │  - Trust-based moderation       │ │
-│  └─────────────────────────────────┘    └─────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
+ minutes: sweep_minutes -> ingest_minutes (corpus) -> parse_minutes_votes -> votes (source=minutes)
+ corpus window timer: backfill_corpus_attachments archives and texts the near-term attachments
 ```
 
-**~41,000 lines Python backend** organized into 8 focused modules:
+Everything about R2 lives in two prefixes: `originals/<sha256>` and `text/<sha256>.txt`, indexed by `document_blob` and `document_source`. Storing to the corpus is a passenger: an R2 failure degrades to a warning and never fails a sync or a summary.
 
-| Module | Lines | Purpose |
-|--------|-------|---------|
-| [vendors/](vendors/README.md) | ~15,300 | 22 async adapters for Legistar, Granicus, PrimeGov, IQM2, NovusAgenda, CivicClerk, CivicPlus, CivicEngage, CivicWeb, eScribe, Municode, OnBase, ProudCity, Vision Internet, WP Events, AgendaOnline, BoardBook, Destiny, Berkeley, Chicago, Menlo Park, Ross. HTML parsers, PDF chunker (1749 lines), rate limiting, vendor-agnostic ID contract. |
-| [database/](database/README.md) | ~8,300 | PostgreSQL with 14 async repositories (jurisdictions, meetings, items, matters, queue, search, userland, council_members, committees, engagement, feedback, deliberation, happening, helpers). asyncpg connection pooling, UPSERT preservation, normalized topics. |
-| [pipeline/](pipeline/README.md) | ~3,900 | Conductor orchestration with dual loops: Fetcher (24h sync) and Processor (continuous queue). Orchestrators for business logic (MeetingSyncOrchestrator, EnqueueDecider, MatterFilter, VoteProcessor). |
-| [analysis/](analysis/README.md) | ~2,300 | Provider-neutral LLM backends (Z.AI GLM native, OpenRouter bench, Gemini rollback), unified adaptive prompting, 16-topic taxonomy. |
-| [server/](server/README.md) | ~8,100 | FastAPI with 17 route modules (search, meetings, topics, matters, votes, committees, auth, dashboard, engagement, feedback, deliberation, flyer, donate, admin, monitoring, events, happening). Tiered rate limiting, JWT sessions. |
-| [userland/](userland/README.md) | ~2,500 | Civic alerts: magic link auth, weekly digests (Sundays 9am), dual-track matching (keyword + matter-based), Mailgun delivery. |
-| [parsing/](parsing/README.md) | ~1,200 | PDF extraction: PyMuPDF primary, OCR fallback (Tesseract), legislative formatting detection ([DELETED]/[ADDED]), participation info parsing (emails, phones, Zoom links). |
-| [deliberation/](deliberation/README.md) | ~300 | Opinion clustering: PCA to 2D, dynamic K-means, Laplace-smoothed consensus detection, group vote tallies. |
+## Rules the code depends on
 
----
+- **One write path.** Meetings and items enter only through `MeetingSyncOrchestrator`:
+  - `sync_meeting` for meetings.
+  - `_process_agenda_items` for items, which `attach_items` also uses.
+  - Backfills, claim-time chunking and archive imports route through the same funnel.
+- **One place mints ids.** `database/id_generation.py`. Adapters return vendor ids; the banana (`paloaltoCA`) is the jurisdiction key and is frozen once assigned.
+- **Matter identity comes from the government's own text.** The order is `matter_file`, then a labeled identifier extracted from the text (`parsing/identifiers.py`), then the vendor id. Restarting numbering schemes get a period.
+- **Summaries are frozen per appearance.** Once `items.summary` is set, a re-sync keeps the item's title, attachments, body and sources. `city_matters.canonical_summary` holds the latest version. An unchanged reappearance reuses the summary with no LLM call.
+- **Items cite their sources.** Each source in `items.attachments` is either a whole document or a page span (`pages: [first, last]`) of a meeting PDF. `items.body_source` locates `body_text`.
+- **Uniform rules beat lists.** Behavior is derived from the data (printed evidence, document shape) rather than per-city or per-vendor config.
 
-## Key Patterns
+## Repository map
 
-**Matters-First:** Legislative items (bills, ordinances) tracked across meetings. Process once, reuse summary. Attachment hash detects changes.
+| Path | Owns |
+|---|---|
+| [vendors/](vendors/README.md) | Adapters per publishing platform, the PDF chunker cascade, HTTP sessions and pacing |
+| [pipeline/](pipeline/README.md) | Sync, pulse, the item funnel, the processing queue and its runtime |
+| [corpus/](corpus/README.md) | R2 originals and text, content-addressed |
+| [parsing/](parsing/README.md) | Document text extraction, OCR, identifiers, participation info, crash containment |
+| [analysis/](analysis/README.md) | LLM backends, prompts, summarization, topic taxonomy |
+| [database/](database/README.md) | Schema, migrations, async repositories, id generation |
+| [server/](server/README.md) | Public HTTP API |
+| [userland/](userland/README.md) | Accounts, magic links, weekly digests |
+| [deliberation/](deliberation/README.md) | Opinion clustering for structured public input |
+| [scripts/](scripts/README.md) | Ingestion jobs, backfills, audits, onboarding, the `run.sh` entry point |
+| `mcp_server.py` | MCP server exposing the data to Claude clients |
+| `frontend/` | SvelteKit site, deployed as a Cloudflare Worker |
+| `munis/` | Target lists for `run.sh` (some regenerated from the DB on every use) |
+| `tests/chunker/` | The one sanctioned test suite: real PDFs, golden snapshots |
 
-**Item-Level Processing:** HTML agendas parsed into structured items. Each item gets focused summary. Topics aggregated to meeting level.
+## Running it
 
-**Cache-First API:** Server never fetches live. Background daemon syncs cities every 24 hours, processes queue continuously.
+Production is one VPS; Postgres, R2 credentials, LLM keys and every service exist only there. Code is developed in a local checkout and deployed with `./run.sh deploy`.
 
-**Async PostgreSQL:** Connection pooling (asyncpg, 5-20 connections), `FOR UPDATE SKIP LOCKED` for queue processing, UPSERT for idempotent updates.
+| What | How |
+|---|---|
+| API, MCP, pulse | Long-running systemd services. They load code once, so restart after a deploy. |
+| Sync | Pulse syncs jurisdictions whose signal moved. Cron sweeps cover the rest: `run.sh sync unpulsed` daily and `run.sh sync knowns` weekly. Manual runs use `./run.sh sync <banana \| state \| @file \| knowns \| all \| schools>`. |
+| Process | `./run.sh process knowns` for the routine run; `process all` after onboarding so new jurisdictions earn a first summary. |
+| Minutes | Cron: sweep weekly, ingest and vote parsing daily. |
+| Migrations | `uv run python -m database.migrate`. A new migration blocks every new process until it is applied. |
 
-**Legislative Accountability:** Council members tracked across votes and sponsorships. Committees tracked with rosters. Vote outcomes computed per matter per meeting.
-
-**Repository Pattern:** 14 async repositories with shared connection pool. Each repository handles one domain (jurisdictions, meetings, items, matters, queue, search, userland, council_members, committees, engagement, feedback, deliberation, happening, helpers).
-
-**AsyncBaseAdapter:** All 22 vendor adapters implement unified interface. Async HTTP with retry, rate limiting, date parsing. Adapters return `vendor_id`, database generates canonical IDs.
-
-**Orchestrator Delegation:** Pipeline delegates business logic to orchestrators (MeetingSyncOrchestrator, EnqueueDecider, MatterFilter, VoteProcessor). Enables testing and separation of concerns.
-
----
-
-## Processing Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  SYNC LOOP (every 24h)                                                      │
-│                                                                             │
-│    Conductor ──► Fetcher ──► Vendors (22 adapters)                          │
-│                     │              │                                        │
-│                     │              ▼                                        │
-│                     │        External APIs (Legistar, Granicus, etc.)       │
-│                     │              │                                        │
-│                     │              ▼                                        │
-│                     └──────► Database                                       │
-│                              - Store meetings + items                       │
-│                              - Track matters (city_matters)                 │
-│                              - Extract votes + sponsors                     │
-│                              - Enqueue for processing                       │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼ Queue (priority-sorted, typed jobs)
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  PROCESSING LOOP (continuous)                                               │
-│                                                                             │
-│    Conductor ──► Processor ──► Dequeue job (FOR UPDATE SKIP LOCKED)         │
-│                                     │                                       │
-│           ┌─────────────────────────┴─────────────────────────┐             │
-│           ▼                                                   ▼             │
-│    ┌──────────────────────────┐               ┌──────────────────────────┐  │
-│    │  ITEM-LEVEL PATH (97%)   │               │  MONOLITHIC PATH (3%)   │  │
-│    │  Meeting has agenda_url  │               │  Meeting has packet_url  │  │
-│    └────────────┬─────────────┘               └────────────┬─────────────┘  │
-│                 │                                          │                │
-│                 ▼                                          ▼                │
-│    ┌──────────────────────────┐               ┌──────────────────────────┐  │
-│    │  For each agenda item:   │               │  Single PDF packet:      │  │
-│    │  - Filter procedural     │               │  - Extract via Parsing   │  │
-│    │  - Extract PDFs (Parsing)│               │  - LLM: comprehensive    │  │
-│    │  - Document cache (dedup)│               │    summary (5-10 sent)   │  │
-│    │  - LLM: per-item summary │               └────────────┬─────────────┘  │
-│    │    (1-5 sentences each)  │                            │                │
-│    │  - Topic normalization   │                            │                │
-│    │  - Aggregate to meeting  │                            │                │
-│    └────────────┬─────────────┘                            │                │
-│                 │                                          │                │
-│                 └──────────────────┬───────────────────────┘                │
-│                                    ▼                                        │
-│                              Database                                       │
-│                              - Update summaries                             │
-│                              - Store topics (normalized)                    │
-│                              - Mark job complete                            │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Two Processing Paths:**
-- **Item-level (97%):** HTML agendas parsed into structured items. Each item gets focused 1-5 sentence summary. Topics aggregated to meeting. Document cache prevents re-extracting shared PDFs.
-- **Monolithic (3%):** PDF-only meetings. Single comprehensive 5-10 sentence summary. Falls back when vendor doesn't expose structured agenda.
-
----
-
-## Quick Start
-
-### Prerequisites
-- Python 3.13+
-- PostgreSQL 14+
-- Node.js 18+
-- Z.AI API key (or OpenRouter / Gemini, see ENGAGIC_LLM_BACKEND)
-
-### Backend
+Local development is limited to code, lint and the chunker suite:
 
 ```bash
-# Install dependencies
 uv sync
-
-# Set environment variables
-export ZAI_API_KEY="your-key"  # or OPENROUTER_API_KEY / GEMINI_API_KEY with ENGAGIC_LLM_BACKEND
-export POSTGRES_HOST="localhost"
-export POSTGRES_DB="engagic"
-export POSTGRES_USER="engagic"
-export POSTGRES_PASSWORD="***"
-
-# Run API server
-uvicorn server.main:app --host 0.0.0.0 --port 8000
-
-# Run background daemon (separate terminal)
-python -m pipeline.conductor daemon
+uv run pytest tests/chunker
+cd frontend && npm install && npm run dev
 ```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev  # localhost:5173
-```
-
----
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [docs/VISION.md](docs/VISION.md) | Mission, roadmap, architectural philosophy |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Production deployment guide |
-| [docs/API.md](docs/API.md) | Complete API endpoint reference |
-| [docs/SCHEMA.md](docs/SCHEMA.md) | Database schema quick reference |
-| [docs/MATTERS_ARCHITECTURE.md](docs/MATTERS_ARCHITECTURE.md) | Legislative matter tracking design |
-| [docs/ARCHITECTURE_REVIEW.md](docs/ARCHITECTURE_REVIEW.md) | Code health audit with end-to-end flow tracing (Apr 2026) |
-| [docs/TERMS_OF_SERVICE.md](docs/TERMS_OF_SERVICE.md) | API rate tiers and usage policies |
-| [docs/DELIBERATION_LOCAL_FIRST.md](docs/DELIBERATION_LOCAL_FIRST.md) | PWA local-first deliberation plan |
-| [CHANGELOG.md](CHANGELOG.md) | Version history and recent changes |
-
----
+| Document | About |
+|---|---|
+| [docs/VISION.md](docs/VISION.md) | Mission and direction |
+| [docs/CORPUS_ARCHITECTURE.md](docs/CORPUS_ARCHITECTURE.md) | The corpus and the stage model it introduced |
+| [docs/MATTERS_ARCHITECTURE.md](docs/MATTERS_ARCHITECTURE.md) | Legislative matter tracking |
+| [docs/MOTION_DATA_CONTRACT.md](docs/MOTION_DATA_CONTRACT.md) | Votes and motions as published facts |
+| [docs/JURISDICTION_ONBOARDING.md](docs/JURISDICTION_ONBOARDING.md) | Adding jurisdictions |
+| [docs/API.md](docs/API.md) | HTTP endpoints |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Production setup |
+| [CHANGELOG.md](CHANGELOG.md) | What changed and why |
 
 ## Stack
 
-Python 3.13, FastAPI, PostgreSQL, asyncpg, BeautifulSoup, PyMuPDF, GLM-5.3-flash via Z.AI, SvelteKit, Cloudflare Pages
-
----
+Python 3.13 (uv), asyncpg on PostgreSQL 17 with PostGIS, FastAPI, aiohttp, PyMuPDF with Tesseract OCR, Cloudflare R2, GLM-5.3-flash on Z.AI behind a provider-neutral backend, SvelteKit on Cloudflare Workers.
 
 ## License
 
-Open source. See LICENSE file.
+AGPL-3.0. See [LICENSE](LICENSE).

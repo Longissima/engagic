@@ -10,7 +10,7 @@
 | Service | Purpose | Status |
 |---------|---------|--------|
 | `engagic-api.service` | Main API (includes auth) | `systemctl status engagic-api` |
-| `engagic-digest.timer` | Weekly digest (Sun 9am) | `systemctl status engagic-digest.timer` |
+| `engagic-digest.timer` | Weekly digest (Sun 14:00 UTC) | `systemctl status engagic-digest.timer` |
 
 ### Environment
 

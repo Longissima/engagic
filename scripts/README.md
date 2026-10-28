@@ -1,216 +1,50 @@
-# Scripts - Operational Tools & Data Management
+# scripts
 
-CLI tools for data ingestion, validation, migration, and operations. All scripts use async PostgreSQL via the shared `Database` class.
+Operational jobs, backfills, audits and onboarding tools. Each script's module docstring is its documentation (purpose, flags, examples). This file is the index. Scripts run on the VPS, where the database and credentials live: `uv run python scripts/<name>.py` or `uv run python -m scripts.<name>`.
 
-## Data Ingestion
+Rules for new scripts are in the cookbook skill: stream and resume, bounded fan-out, classified errors, one write path. Backfills route through `MeetingSyncOrchestrator` (`sync_meeting`, `attach_items`), never a staging table. History is never put on a timer; a backfill runs in reviewed batches.
 
-### `ingest_manual_pdfs.py`
-Ingest manually-provided PDFs for cities behind bot protection (Akamai, Cloudflare, etc.).
+## Entry point
 
-```bash
-uv run scripts/ingest_manual_pdfs.py portolavalleyCA
-uv run scripts/ingest_manual_pdfs.py portolavalleyCA --dir /path/to/pdfs
-```
+`deploy.sh` is `run.sh` at the repo root (a symlink; never `sed -i` it). It wraps sync, process, deploy, logs, services, moderation and map commands, and resolves the target names `knowns`, `all`, `unpulsed` and `schools` by regenerating lists in `munis/` from the database.
 
-- Reads PDFs from `data/manual_pdfs/{banana}/`
-- Filename format: `{MMDDYYYY}_{body}_{type}.pdf` (e.g., `03252026_Council_Agenda_Packet.pdf`)
-- Falls back to extracting date/title from PDF content
-- Three parsing strategies attempted in order: Item-TOC (Portola Valley style), standard `parse_agenda_pdf()`, direct text parse
-- Stores the meeting/items and a versioned queue outbox intent in one transaction
-  (priority 100). The script re-reads locked rows before hashing so publication
-  describes the authoritative snapshot actually retained by freeze-on-summary.
+## Index
 
-### `probe_vendors.py`
-Detect correct vendor and slug for unconfigured cities by probing vendor URL patterns.
+**Jurisdictions and onboarding**
+- `db_viewer.py`: interactive DB viewer; "Add jurisdiction" runs the shared flow in `_jurisdiction_onboarding.py` (kinds registry, `_jurisdiction_naming.py` bananas, `_jurisdiction_geography.py` enrichment)
+- `probe_vendors.py`, `discover_vendor_slugs.py`: find a city's vendor and slug (guesses are never registrations)
+- `onboard_selfhosted.py`, `boardbook_bulk_import.py`: create jurisdictions from the selfhosted registry or BoardBook
+- `repair_civicplus_domains.py`, `audit_jurisdiction_collisions.py`: fix moved CivicPlus domains; find jurisdictions scraping another government's agendas
+- `import_census_boundaries.py`, `import_zcta_boundaries.py`, `import_city_populations.py`, `generate_tiles.py`: geometry, ZIPs, population, map tiles (to R2 `engagic-tiles`)
 
-```bash
-uv run scripts/probe_vendors.py         # Default: top 20 by population
-uv run scripts/probe_vendors.py 50      # Probe top 50
-```
+**Corpus and documents**
+- `backfill_corpus_attachments.py`: archive and extract item attachments; its rolling form is the `engagic-corpus-window` timer
+- `extract_archived_text.py`, `ingest_corpus_attachment.py`: text for archived originals; one-off single attachment
+- `archive_meetings.py`, `backfill_meetings_from_manifests.py`: historical originals and meetings through the normal sync path
+- `ingest_publications.py`, `ingest_dockets.py`: non-meeting bodies' publications and commission dockets
+- `ingest_manual_pdfs.py`: PDFs supplied by hand for bot-walled cities
+- `backfill_civicclerk_portal_agendas.py`: re-acquire CivicClerk agendas archived as the portal shell
 
-- Generates plausible slug candidates per vendor (10 vendors supported)
-- Validates city identity in page content (handles same-name cities in different states)
-- Checks for recent meeting dates (freshness)
-- Outputs SQL UPDATE statements for confirmed hits
+**Minutes and votes**
+- `sweep_minutes.py` (weekly cron), `ingest_minutes.py` (daily), `parse_minutes_votes.py` (daily): minutes into the corpus, then published motions and votes
+- `audit_minutes_identity.py`, `audit_minutes_votes.py`, `eval_rollcall.py`, `replay_rollcall_ab.py`: read-only audits, scoring against API votes, A/B against a git ref
+- `backfill_vote_outcomes.py`, `sync_roster.py`, `normalize_roster.py`, `backfill_committees.py`: outcomes, Legistar rosters, person and body clustering, committees
 
-### `sync_roster.py`
-Sync committee roster data from Legistar API.
+**Matters and identity**
+- `rekey_matters.py` (weekly cron): re-key history onto the identity contract and refresh `numbering_runs`
+- `backfill_body_identifiers.py`, `backfill_matter_ids.py`, `backfill_matter_titles.py`, `relink_vendor_keyed_items.py`: fill or repair matter linkage on old items
+- `migrate_meeting_ids.py`, `migrate_matter_ids.py`: one-time id format migrations
+- `reconcile_matter_queue.py`: audit or repair historical matter queue descriptors
 
-```bash
-uv run scripts/sync_roster.py --city newyorkNY
-uv run scripts/sync_roster.py --all-legistar
-uv run scripts/sync_roster.py --dry-run
-```
+**Queue, summaries and quality**
+- `recompute_item_filters.py`: apply changed item filters and requeue newly eligible meetings
+- `resummarize_items.py`, `compare_llm_backends.py`, `estimate_tokens.py`: prompt-version refresh, model bake-offs, token estimates
+- `audit_chunker.py`, `summary_quality_checker.py`: spot checks on item and summary quality
+- `reset_queue.py`, `health_check.py`, `diagnostics.py`: queue reset, per-city health, orphan and integrity checks
+- `moderate.py`: deliberation moderation
 
-## Data Validation
+**Shell**
+- `run_happening.sh`: fills the deprecated `happening_items`
+- `setup_vps_deps.sh`, `tune_postgres.sh`: early box setup; the tuning targets a 2 GB box and predates the current one
 
-### `health_check.py`
-Quick health check of all cities with summary statistics and issue flagging.
-
-```bash
-uv run scripts/health_check.py
-```
-
-Reports: overall stats, vendor breakdown, AI processing completion rate, cities with no meetings, vendor URL mismatches, recent sync activity.
-
-### `diagnostics.py`
-Identify orphaned records and data integrity issues.
-
-```bash
-uv run scripts/diagnostics.py           # Run all checks
-uv run scripts/diagnostics.py --fix     # Run with optional cleanup
-```
-
-Checks: orphaned matters, orphaned happening_items, orphaned queue jobs, summary desync between items and matters.
-
-### `summary_quality_checker.py`
-Analyze and validate AI-generated meeting summaries.
-
-```bash
-uv run scripts/summary_quality_checker.py
-```
-
-Classifies summaries as GOOD, ERROR, TRUNCATED, TOO_SHORT, PROCESSING_FAILURE, EMPTY, or SUSPICIOUS.
-
-## Data Migration
-
-### `migrate_meeting_ids.py` / `migrate_matter_ids.py`
-Migrate IDs from vendor-specific formats to unified `{banana}_{hash}` format. Cascades FK changes to all referencing tables.
-
-```bash
-uv run scripts/migrate_meeting_ids.py --dry-run
-uv run scripts/migrate_meeting_ids.py
-```
-
-### `backfill_*.py`
-Backfill scripts for data completeness:
-- `backfill_body_identifiers.py` - Set matter_file from identifiers cited in item title/body (dry run by default). Sync derives these on every pass; this covers meetings aged out of the sync window. Run `backfill_matter_ids.py` afterwards
-- `backfill_matter_ids.py` - Create city_matters for orphan items with matter_file but no matter_id
-- `backfill_matter_titles.py` - Fill missing matter titles from items
-- `backfill_vote_outcomes.py` - Compute vote outcomes from vote records
-- `backfill_committees.py` - Populate committee data
-- `relink_vendor_keyed_items.py` - Move items with a vendor matter_id but no matter_file onto the identifier cited in their text (dry run by default); copies children, deletes emptied matters
-
-## Minutes Route (votes without an API)
-
-- `sweep_minutes.py` - Fill `meetings.minutes_url` for past meetings beyond the sync window (cron weekly)
-- `ingest_minutes.py` - Pull minutes bytes into the R2 corpus and link them in `minutes_documents` (cron daily)
-- `parse_minutes_votes.py` - Parse ingested minutes into `votes` (per-member where the document supports it) and `matter_appearances` outcomes; dry run by default
-- `eval_rollcall.py` - Score the parser against API votes where both exist; gate consistency and `--audit` sample elsewhere
-
-## Geographic & Demographic Data
-
-### `import_census_boundaries.py`
-Import Census TIGER/Line Place and cartographic county boundaries into
-`jurisdictions.geom`.
-
-```bash
-uv run scripts/import_census_boundaries.py --all       # Full pipeline
-uv run scripts/import_census_boundaries.py --download   # Download shapefiles
-uv run scripts/import_census_boundaries.py --import     # Import to staging
-uv run scripts/import_census_boundaries.py --match      # Match to jurisdictions
-uv run scripts/import_census_boundaries.py --counties   # Validated county refresh + match
-```
-
-Smart name matching: exact, hyphens, township suffixes, Saint/St variations, abbreviation expansion, fuzzy LIKE fallback.
-County refreshes validate the national row count, required fields, geometry,
-and SRID in a disposable table before atomically replacing the live staging
-table.
-
-### `import_city_populations.py`
-Import population data from `cities.json` into jurisdictions table.
-
-```bash
-uv run scripts/import_city_populations.py --import
-uv run scripts/import_city_populations.py --status
-```
-
-## Map Generation
-
-### `generate_tiles.py`
-Generate PMTiles from jurisdiction geometries for map visualization.
-
-```bash
-uv run scripts/generate_tiles.py --all      # Full pipeline
-uv run scripts/generate_tiles.py --export   # Export GeoJSON
-uv run scripts/generate_tiles.py --tiles    # Generate PMTiles (requires tippecanoe)
-uv run scripts/generate_tiles.py --upload   # Upload to Cloudflare R2
-```
-
-## Operational Tools
-
-### `ingest_corpus_attachment.py`
-
-Archive and extract one attachment without changing or rerunning its summary.
-
-```bash
-uv run python scripts/ingest_corpus_attachment.py URL --banana cityST
-```
-
-### `recompute_item_filters.py`
-
-Re-evaluate stored item filters against the current rules. Dry-run is the
-default; execution versions every changed decision and requeues meetings whose
-items become eligible.
-
-```bash
-uv run python scripts/recompute_item_filters.py
-uv run python scripts/recompute_item_filters.py --execute
-```
-
-### `reconcile_matter_queue.py`
-
-Audit historical matter projections, appearance snapshots, and queue descriptors.
-Dry-run is the default; execution is a separate reviewed operator decision.
-
-```bash
-uv run python scripts/reconcile_matter_queue.py --limit 1000
-uv run python scripts/reconcile_matter_queue.py
-uv run python scripts/reconcile_matter_queue.py --execute  # only after reviewing dry-run
-```
-
-Execution recomputes each plan under matter/item/queue locks and publishes the
-current identity-only matter descriptor. It does not delete data. Re-run the
-default dry-run after execution to record the remaining set.
-
-### `resummarize_items.py`
-
-Invalidate summaries produced before a prompt version and atomically reactivate
-their authoritative meeting version. Past meetings route to the Batch lane.
-
-```bash
-uv run python scripts/resummarize_items.py --below v3 --dry-run
-uv run python scripts/resummarize_items.py --below v3 --limit 200 --yes
-uv run python scripts/resummarize_items.py --below v3.2 --attachments-matching '<regex>' --yes
-```
-
-The apply path locks the meeting/items, clears only rows still below the requested
-version, computes the current `work_version`, and reactivates that exact queue
-version in the same transaction. It never relies on an unversioned best-effort
-enqueue.
-
-This is the single path for prompt-version backfills, including corpus-only
-reconstruction for items whose vendor URLs have expired: document acquisition is
-corpus-first with fail-open, and the queue path enforces the freeze/batch/matter
-invariants. `--attachments-matching <regex>` narrows targeting by attachments
-JSON (case-insensitive), reproducing the retired `backfill_v32_summaries.py`
-transactional-document selection (regex in the module docstring).
-
-### `db_viewer.py`
-Interactive database viewer and editor. Browse jurisdictions, meetings, items, queue; add/update jurisdictions with Census data lookup.
-
-```bash
-uv run scripts/db_viewer.py
-```
-
-### `reset_queue.py`
-Manage the processing queue.
-
-```bash
-uv run scripts/reset_queue.py --stats
-uv run scripts/reset_queue.py --reset all --yes
-uv run scripts/reset_queue.py --reset failed --yes
-```
-
-### `moderate.py`
-Content moderation for summaries and user-submitted content.
+`archive/` and `migrations/` hold retired tools (SQLite migration, a pre-runner SQL file); `spikes/` holds experiments.

@@ -1,60 +1,26 @@
-# City Lists
+# munis
 
-Status tracking and regional lists for city coverage.
+Target lists for `run.sh sync|process|sync-and-process`. A list has one banana per line; `#` starts a comment and blank lines are ignored.
 
-## Usage
-
-Process cities from a list file:
 ```bash
-./deploy.sh sync-cities @munis/bay-area.txt
-./deploy.sh process-cities @munis/synced.txt
-./deploy.sh sync-and-process-cities @munis/florida.txt
+./run.sh sync @munis/bay-area.txt
+./run.sh process knowns
+./run.sh sync 'paloaltoCA,oaklandCA'
 ```
 
-Or use comma-separated list directly:
-```bash
-./deploy.sh sync-cities 'paloaltoCA,oaklandCA,berkeleyCA'
-```
+`run.sh` resolves a bare name to `munis/<name>.txt`, so `./run.sh sync socal` works too.
 
-## File Format
+## Generated on every use
 
-- One city banana per line
-- Comments start with `#`
-- Blank lines are ignored
+`scripts/deploy.sh` (`resolve_targets`) rebuilds these from the database whenever its target name is used, so they never drift. The copy here is whatever the last run wrote.
 
-## Status Tracking Files
-
-| File | Count | Description |
+| Target | File | Contents |
 |---|---|---|
-| `processed.txt` | auto | `run.sh <cmd> knowns`: active non-school jurisdictions with any summary. Routine target. |
-| `all.txt` | auto | `run.sh <cmd> all`: every active jurisdiction with a meeting. Periodic onboarding pass. |
-| `meeting-level.txt` | 31 | Monolithic packet summaries only (their ceiling) |
-| `synced.txt` | 71 | Have meetings in DB, pending processing |
-| `never-synced.txt` | 302 | In DB but 0 meetings fetched from vendor |
+| `knowns` / `processed` | `processed.txt` | active non-school jurisdictions with at least one summary; the routine target |
+| `all` | `all.txt` | every active jurisdiction with a meeting; the onboarding pass that earns new ones a first summary |
+| `unpulsed` | `unpulsed.txt` | active jurisdictions that pulse is not watching or has not probed cleanly in a day, plus all of BoardBook; the daily sweep |
+| `schools` | `school-districts.txt` | active school districts |
 
-Last updated: 2026-03-28. Total jurisdictions: 959.
+## Hand-made
 
-## Regional Lists
-
-- `bay-area.txt` - SF Peninsula + East Bay core (45)
-- `bay-area-2.txt` - Bay Area smaller cities + counties (66)
-- `bay-area-all.txt` - Complete Bay Area coverage (109)
-- `socal.txt` - Southern California (70)
-- `ca-counties.txt` - California counties (22)
-- `florida.txt` - Florida cities (81)
-- `texas-triangle.txt` - Texas Triangle metro (82)
-- `east-coast.txt` - BosWash corridor (12)
-- `metro-areas.txt` - All working metro area cities (140)
-- `sbc.txt` - SBC office locations (18)
-- `notable-unprocessed.txt` - High-value cities to onboard (62)
-- `test-small.txt` - Quick validation set (2)
-
-## September 17 expansion
-
-`new-jurisdictions-2026-09-17.txt` is the consolidated list of all 148 jurisdictions
-from the regional expansion: 140 additions and 8 existing jurisdictions with
-source or extraction repairs. It includes agency batches 7, 8, and 9, plus Motioncount research batches 3–6.
-
-```bash
-./run.sh sync @munis/new-jurisdictions-2026-09-17.txt
-```
+Regional sets (`bay-area*.txt`, `socal.txt`, `ca-counties.txt`, `monterey-county.txt`, `florida.txt`, `texas-triangle.txt`, `texas-isds.txt`, `east-coast.txt`, `metro-areas.txt`, `sbc.txt`, `basket.txt`) and onboarding batches (`new-*.txt`, `top-50-pending-*.txt`). These are snapshots from when they were written. The older status lists (`synced.txt`, `never-synced.txt`, `meeting-level.txt`, `notable-unprocessed.txt`, `newly-synced.txt`, `queued-no-summaries.txt`) date from March 2026 and are no longer maintained. `discovery-seed-2026-09.csv` seeds `scripts/discover_vendor_slugs.py`.

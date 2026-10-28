@@ -1,91 +1,23 @@
-# Database Migrations
+# Migrations
 
-Simple versioned SQL migrations for PostgreSQL. No ORM dependencies.
-
-## Usage
+These numbered SQL files define the production schema. Each one documents its own intent in comments at the top, and `ls` is the list of migrations.
 
 ```bash
-# Apply all pending migrations
-python -m database.migrate
-
-# Check migration status
-python -m database.migrate --status
-
-# Rollback last migration (if .down.sql exists)
-python -m database.migrate --rollback 1
+uv run python -m database.migrate              # apply pending
+uv run python -m database.migrate --status     # applied vs pending
+uv run python -m database.migrate --rollback 1 # undo the last one, if it has a .down.sql
 ```
 
-## Creating Migrations
+- **Files**: `NNN_snake_name.sql` (three digits, next free number), plus an optional `NNN_snake_name.down.sql`. Write a down file only when rolling back loses nothing; a migration that drops data has none.
+- **Tracking**: each migration runs in one transaction and is recorded in `schema_migrations` (version, name, applied_at). A migration applied by hand needs its row inserted too.
+- **Idempotence**: use `IF NOT EXISTS` / `IF EXISTS` so a partial manual run can be finished by the runner.
 
-1. Create a numbered SQL file in this directory:
-   ```
-   002_feature_name.sql
-   ```
+## Deploying one
 
-2. Optionally create a rollback file:
-   ```
-   002_feature_name.down.sql
-   ```
+A new file here is a deploy. `Database.create()` calls `assert_schema_current`, which refuses to start any process while a migration is pending. Every service and cron job restarted after the code lands fails until `migrate` runs. Apply it in the same change that ships the file.
 
-## Naming Convention
+Order matters when code and schema change together:
+- **Adding a column that code selects**: migrate, then restart. Repository SELECTs name their columns, so they fail against the old schema.
+- **Replacing a constraint that running writers name** (for example in `ON CONFLICT`): ship the code, restart the writers, then drop the old constraint.
 
-```
-{version}_{name}.sql       # Up migration
-{version}_{name}.down.sql  # Down migration (optional)
-```
-
-- **version**: 3-digit zero-padded number (001, 002, 003)
-- **name**: snake_case description
-
-## Migration Tracking
-
-Applied migrations are tracked in the `schema_migrations` table:
-
-```sql
-CREATE TABLE schema_migrations (
-    version TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## Current Migrations
-
-| Version | Name | Description |
-|---------|------|-------------|
-| 001 | council_members | Council members + sponsorships tables |
-| 019 | jurisdictions | Rename `cities` -> `jurisdictions`, add `type` column (city/county/transit/utility/etc.), rename `county` -> `county_banana` with self-referencing FK for hierarchical jurisdiction relationships. Full rollback support. |
-| 029 | pipeline_lifecycle | Durable pipeline runs, job attempts, stage events, and transactional outbox. |
-| 030 | batch_lifecycle | Recoverable Batch provider intents, polling clocks, leases, and submission identities. |
-| 031 | jurisdiction_sync_lifecycle | Set-wise sync scheduling inputs and jurisdiction lifecycle state. |
-| 032 | outbox_delivery | FIFO outbox delivery with per-claim UUID fencing, leases, retries, dead letters, and the shared monotonic work-generation sequence. |
-| 033 | queue_claim_ownership | Per-claim queue ownership, stable claim/heartbeat clocks, separate ready-work time, and generation-fenced desired work. |
-| 034 | document_source_freshness | Separate cached observations from successful origin validation; persist HTTP validators and retry-attempt state for bounded conditional revalidation. |
-| 035 | batch_submission_clock | Record provider acceptance separately from durable pre-provider intent creation so provider wait is measured from the correct boundary. |
-| 036 | nullable_appearance_dates | Preserve authoritative appearances for undated meetings by allowing `matter_appearances.appeared_at` to remain NULL. |
-| 037 | items_summary_updated_cursor | Add the `(summary_updated_at, id)` item index used by Motioncount incremental summary discovery. |
-| 038 | processing_observability | Version filter decisions, retain append-only ingest-path audits, and record corpus extraction outcomes. |
-| 039 | chunk_audit_root_backfill | Promote winning-run quality, morphology, and profile to the queryable chunk root. |
-| 052 | minutes_preference | Shared minutes-first selection and statement triggers that maintain public vote counts across every writer. |
-| 053 | referrer_lineage | Source receipts and parse-run lineage for replaceable minutes referrers. |
-
-## Guidelines
-
-1. **Atomic**: Each migration runs in a single transaction
-2. **Idempotent**: Use `IF NOT EXISTS` / `IF EXISTS` where possible
-3. **Forward-only**: Prefer new columns over altering existing ones
-4. **Documented**: Include comments explaining design decisions
-5. **Tested**: Test on VPS before production deploy
-
-## Rollback Safety
-
-Not all migrations can be safely rolled back:
-- Adding columns: Safe to rollback (drop column)
-- Dropping columns: **Cannot rollback** (data lost)
-- Data migrations: Depend on implementation
-
-If a migration cannot be rolled back, don't create a `.down.sql` file.
-
-Migration 045 (`corpus_pending_pages`) adds the nullable one-based OCR-pending page
-list to `document_blob`. Existing rows remain unknown; no re-extraction or data
-backfill is required.
+Also update `../schema_postgres.sql` by hand so it stays a readable reference. It is not applied anywhere, and it already lags several migrations.

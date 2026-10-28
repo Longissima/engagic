@@ -21,6 +21,12 @@ to monolithic summaries ("fallback" — the chunker's hardest inputs).
 | `test_morphology.py` | Classifier rule table + corpus blast-radius pinning |
 | `test_quality.py` | Garbage-title lint, repair strategies, segmentation smell |
 | `test_ground_truth.py` | Extraction vs `truth/*.json` — recall/precision ratchets |
+| `test_router_unit.py` | Ladders, hints, audit summaries (no fixtures; always runs) |
+| `test_audit_plumbing.py` | Base adapter records cascade audits and sets sticky hints |
+| `test_text_pass.py` | The ground-truth text pass inside `chunk_pdf`: produced, gated, kept out of audits |
+| `test_embedded_representation.py` | Packet-local documents stay evidence without fake download URLs |
+| `test_bare_agenda.py` | Item bodies end where the next item starts; bare agendas keep their last item |
+| `corpus_lib.py` | Shared fixture loader; routes each fixture through the ladder prod would use |
 | `truth/` | Item lists read directly from the PDFs (committed; see `read_by`) |
 | `grow_truth.py` | Gemini reads fixtures lacking truth files → pinned truth JSON |
 
