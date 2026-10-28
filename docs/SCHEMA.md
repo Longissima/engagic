@@ -302,7 +302,6 @@ Core matters table - legislative items deduplicated across meetings.
 - `idx_city_matters_banana` on `banana`
 - `idx_city_matters_status` on `status`
 - `idx_city_matters_matter_file` on `matter_file`
-- `idx_city_matters_first_seen` on `first_seen`
 - `idx_city_matters_final_vote` on `final_vote_date`
 - `idx_city_matters_search_vector` GIN index on `search_vector`
 
@@ -1260,7 +1259,6 @@ CREATE INDEX idx_items_meeting_sequence ON items(meeting_id, sequence ASC);
 CREATE INDEX idx_city_matters_banana ON city_matters(banana);
 CREATE INDEX idx_city_matters_status ON city_matters(status);
 CREATE INDEX idx_city_matters_matter_file ON city_matters(matter_file);
-CREATE INDEX idx_city_matters_first_seen ON city_matters(first_seen);
 CREATE INDEX idx_city_matters_banana_last_seen ON city_matters(banana, last_seen DESC);
 
 -- Council Members

@@ -371,10 +371,6 @@ CREATE TABLE IF NOT EXISTS meeting_ingest_audits (
 );
 CREATE INDEX IF NOT EXISTS idx_meeting_ingest_audits_meeting
     ON meeting_ingest_audits (meeting_id, observed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_meeting_ingest_audits_path
-    ON meeting_ingest_audits (source_path, observed_at DESC);
-CREATE INDEX IF NOT EXISTS idx_meeting_ingest_audits_vendor
-    ON meeting_ingest_audits (vendor, observed_at DESC);
 
 CREATE TABLE IF NOT EXISTS pipeline_outbox (
     id BIGSERIAL PRIMARY KEY,
@@ -470,15 +466,9 @@ CREATE TABLE IF NOT EXISTS document_source (
     published_on DATE,  -- as the listing printed it; NULL when it names none
     PRIMARY KEY (content_sha256, source_identity)
 );
-CREATE INDEX IF NOT EXISTS idx_document_source_identity
-    ON document_source (
-        source_identity,
-        last_validated_at DESC NULLS LAST,
-        first_seen DESC
-    );
-CREATE INDEX IF NOT EXISTS idx_document_blob_untexted
-    ON document_blob (created_at)
-    WHERE text_key IS NULL;
+-- Lookups by identity are equality and an identity has about one row (067).
+CREATE INDEX IF NOT EXISTS idx_document_source_identity_hash
+    ON document_source USING hash (source_identity);
 
 -- Retry ledger for minutes/document ingestion. Scoped to extractor version so
 -- a future extractor upgrade reconsiders identities that the current version
@@ -857,7 +847,6 @@ CREATE INDEX IF NOT EXISTS idx_item_topics_item ON item_topics(item_id);
 -- City Matters
 CREATE INDEX IF NOT EXISTS idx_city_matters_banana ON city_matters(banana);
 CREATE INDEX IF NOT EXISTS idx_city_matters_matter_file ON city_matters(matter_file);
-CREATE INDEX IF NOT EXISTS idx_city_matters_first_seen ON city_matters(first_seen);
 CREATE INDEX IF NOT EXISTS idx_city_matters_status ON city_matters(status);
 CREATE INDEX IF NOT EXISTS idx_city_matters_banana_file ON city_matters(banana, matter_file) WHERE matter_file IS NOT NULL;  -- Composite for matter lookup
 CREATE INDEX IF NOT EXISTS idx_city_matters_final_vote ON city_matters(final_vote_date) WHERE final_vote_date IS NOT NULL;
