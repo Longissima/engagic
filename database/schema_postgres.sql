@@ -470,6 +470,21 @@ CREATE TABLE IF NOT EXISTS document_source (
 CREATE INDEX IF NOT EXISTS idx_document_source_identity_hash
     ON document_source USING hash (source_identity);
 
+-- Which archived documents each item lists (migration 068). Hashes are raw
+-- bytes; `pages` marks a page span of a packet. Maintained by
+-- document_blobs.refresh_item_documents.
+CREATE TABLE IF NOT EXISTS item_documents (
+    content_sha256 BYTEA NOT NULL,
+    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    ordinal SMALLINT NOT NULL,
+    page_first INTEGER,
+    page_last INTEGER,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (content_sha256, item_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_item_documents_item ON item_documents (item_id);
+CREATE INDEX IF NOT EXISTS idx_item_documents_recorded ON item_documents (recorded_at);
+
 -- Retry ledger for minutes/document ingestion. Scoped to extractor version so
 -- a future extractor upgrade reconsiders identities that the current version
 -- cannot handle.

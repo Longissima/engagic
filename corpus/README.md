@@ -12,6 +12,7 @@ The corpus keeps every public document engagic has seen. It holds the original b
 | `document_source` | where those bytes were seen: `source_identity` (the URL with only signed query parameters stripped, `pipeline.utils.attachment_identity`), banana, freshness and validation clocks, and the title and date a publications listing printed |
 | `document_ingest_failure` | the shared failure ledger keyed by identity and extract version: bounded retries, then permanent |
 | `corpus_extract_versions` | the published extract policy: which versions are readable and which is current |
+| `item_documents` | which archived documents each item lists: hash (raw bytes), item, attachment ordinal, page span, and when the appearance was first known (migration 068). Readers ask it both ways: an item's documents, and every item carrying one document |
 
 Writes are idempotent by construction: two workers storing the same bytes converge on one object and one row.
 
@@ -33,4 +34,11 @@ Writes are idempotent by construction: two workers storing the same bytes conver
 | `scripts/backfill_corpus_attachments.py` | Archives and extracts attachments the processor has not reached. The `engagic-corpus-window` timer runs it over a rolling window (two weeks back, about six weeks ahead), so readers who want documents rather than summaries never wait on the LLM queue. |
 | `scripts/ingest_minutes.py`, `ingest_publications.py`, `ingest_dockets.py`, `extract_archived_text.py`, `ingest_corpus_attachment.py` | The other ingestion routes. |
 
-Readers include the processor (corpus first, download on a miss), motioncount, and spygov through motioncount.
+`item_documents` is maintained by one resolver, `document_blobs.refresh_item_documents`. It reads the stored attachments, tries `pipeline.utils.attachment_source_identities` (signature-stripped URL, CivicClerk's permanent API URL, OnBase sibling endpoints) against `document_source`, and replaces the item's rows without disturbing unchanged ones. It runs:
+- at item store, in the same transaction;
+- after sync archival, for the meetings just synced;
+- after processor acquisition;
+- in the corpus window;
+- once over history, via `scripts/backfill_item_documents.py`, which dates rows by item creation so history is not news.
+
+Readers include the processor (corpus first, download on a miss), motioncount (feed recurrence reads `item_documents`; it keeps no copy), and spygov through motioncount.

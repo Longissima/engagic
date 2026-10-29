@@ -10,10 +10,13 @@ concurrently must both succeed, converging on one row.
 """
 
 from datetime import date
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
+
+from asyncpg import Connection
 
 from database.repositories_async.base import BaseRepository
 from config import get_logger
+from pipeline.utils import attachment_source_identities
 
 logger = get_logger(__name__).bind(component="document_blob_repository")
 
@@ -43,6 +46,80 @@ RECORD_FAILURE_SQL = """
         retry_after = CURRENT_TIMESTAMP + make_interval(days => $8)
     RETURNING attempt_count, permanent
 """
+
+
+# item_documents: each item's attachments joined to the corpus (migration 068).
+# An identity has about one document_source row; the newest validation wins
+# when a URL has served more than one version.
+_ITEM_ATTACHMENTS_SQL = "SELECT id, attachments FROM items WHERE id = ANY($1::text[])"
+_IDENTITY_SHAS_SQL = """
+    SELECT DISTINCT ON (source_identity) source_identity, content_sha256
+    FROM document_source WHERE source_identity = ANY($1::text[])
+    ORDER BY source_identity, last_validated_at DESC NULLS LAST, first_seen DESC, content_sha256
+"""
+# Replace without touching rows that did not change, so recorded_at stays the
+# moment an appearance was first known (readers page new appearances by it).
+_ITEM_DOCUMENTS_DELETE_SQL = """
+    DELETE FROM item_documents d
+    WHERE d.item_id = ANY($1::text[])
+      AND NOT EXISTS (
+          SELECT 1 FROM unnest($2::bytea[], $3::text[], $4::int2[], $5::int[], $6::int[])
+              AS n(sha, item_id, ordinal, page_first, page_last)
+          WHERE n.sha = d.content_sha256 AND n.item_id = d.item_id AND n.ordinal = d.ordinal
+            AND n.page_first IS NOT DISTINCT FROM d.page_first AND n.page_last IS NOT DISTINCT FROM d.page_last)
+"""
+# recorded_at is when an appearance became known: now for live writers, the
+# item's own creation for a backfill of history, so readers paging "new
+# appearances" see only news.
+_ITEM_DOCUMENTS_INSERT_SQL = """
+    INSERT INTO item_documents (content_sha256, item_id, ordinal, page_first, page_last, recorded_at)
+    SELECT n.sha, n.item_id, n.ordinal, n.page_first, n.page_last,
+           CASE WHEN $6::boolean THEN COALESCE(i.created_at, now()) ELSE now() END
+    FROM unnest($1::bytea[], $2::text[], $3::int2[], $4::int[], $5::int[])
+        AS n(sha, item_id, ordinal, page_first, page_last)
+    JOIN items i ON i.id = n.item_id
+    ON CONFLICT (content_sha256, item_id, ordinal) DO UPDATE
+        SET page_first = EXCLUDED.page_first, page_last = EXCLUDED.page_last
+        WHERE (item_documents.page_first, item_documents.page_last)
+              IS DISTINCT FROM (EXCLUDED.page_first, EXCLUDED.page_last)
+"""
+
+
+def _pages(attachment: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    pages = attachment.get("pages")
+    if isinstance(pages, list) and len(pages) == 2 and all(isinstance(p, int) for p in pages):
+        return pages[0], pages[1]
+    return None, None
+
+
+async def refresh_item_documents(conn: Connection, item_ids: List[str], *, backdate: bool = False) -> int:
+    """Rewrite these items' item_documents rows from their stored attachments.
+
+    Reads the stored rows, not the caller's objects, so a frozen (summarized)
+    item keeps the documents it was summarized from. `backdate` dates new rows
+    by their item's creation (history backfills). Returns the resolved count.
+    """
+    if not item_ids:
+        return 0
+    items = await conn.fetch(_ITEM_ATTACHMENTS_SQL, item_ids)
+    wanted: List[tuple[str, int, Dict[str, Any], List[str]]] = []
+    for row in items:
+        attachments = row["attachments"] if isinstance(row["attachments"], list) else []
+        for ordinal, attachment in enumerate(attachments):
+            if isinstance(attachment, dict):
+                wanted.append((row["id"], ordinal, attachment, attachment_source_identities(attachment)))
+    keys = sorted({k for *_, ids in wanted for k in ids})
+    sha = {r["source_identity"]: r["content_sha256"] for r in await conn.fetch(_IDENTITY_SHAS_SQL, keys)} if keys else {}
+    resolved = []
+    for item_id, ordinal, attachment, identities in wanted:
+        found = next((sha[k] for k in identities if k in sha), None)
+        if found:
+            resolved.append((bytes.fromhex(found), item_id, ordinal, *_pages(attachment)))
+    cols = [list(c) for c in zip(*resolved)] if resolved else [[], [], [], [], []]
+    await conn.execute(_ITEM_DOCUMENTS_DELETE_SQL, [r["id"] for r in items], *cols)
+    if resolved:
+        await conn.execute(_ITEM_DOCUMENTS_INSERT_SQL, *cols, backdate)
+    return len(resolved)
 
 
 class DocumentBlobRepository(BaseRepository):
@@ -304,6 +381,15 @@ class DocumentBlobRepository(BaseRepository):
             source_identity,
         )
         return dict(row) if row else None
+
+    async def refresh_meeting_documents(self, meeting_ids: List[str]) -> int:
+        """Re-resolve every item of these meetings, after their documents were archived."""
+        if not meeting_ids:
+            return 0
+        async with self._ensure_conn(None) as conn:
+            item_ids = [r["id"] for r in await conn.fetch(
+                "SELECT id FROM items WHERE meeting_id = ANY($1::text[])", meeting_ids)]
+            return await refresh_item_documents(conn, item_ids)
 
     async def archived_identities(self, identities: Iterable[str]) -> Set[str]:
         """The subset of URL identities whose original bytes are in R2."""

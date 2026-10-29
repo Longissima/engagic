@@ -16,7 +16,7 @@ This package holds the PostgreSQL 17 schema (with PostGIS), the migration runner
 | Matters | `city_matters` (`canonical_summary`), `matter_appearances`, `matter_topics`, `numbering_runs` |
 | People and bodies | `council_members`, `council_member_profiles`, `sponsorships`, `committees`, `committee_members`, `bodies`, `member_bodies` |
 | Votes and minutes | `votes` (grain `(item_id, motion_index)`, `source` api or minutes, with a receipt), `item_motions`, `motion_actors`, `matter_actors`; minutes runs in `minutes_documents`, `minutes_text_snapshots`, `minutes_parse_runs`, `minutes_observations`, `minutes_publications` |
-| Corpus | `document_blob`, `document_source`, `document_ingest_failure`, `corpus_extract_versions` (see [corpus/README.md](../corpus/README.md)) |
+| Corpus | `document_blob`, `document_source`, `document_ingest_failure`, `corpus_extract_versions`, `item_documents` (see [corpus/README.md](../corpus/README.md)) |
 | Non-meeting records | `dockets`, `docket_filings` |
 | Pipeline | `queue`, `pipeline_outbox`, `pipeline_runs`, `job_attempts`, `pipeline_stage_events`, `batch_jobs`, `item_filter_audits`, `meeting_ingest_audits`, `cache` |
 | Product | `userland.*` (users, alerts, magic links, watches, ratings), `deliberations` and their participants, comments, votes and results, `tenants`, `tracked_items`, `session_events`, `happening_items` (deprecated), `platform_metrics_snapshot` |

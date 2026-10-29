@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 from asyncpg import Connection
 
 from database.repositories_async.base import BaseRepository
+from database.repositories_async.document_blobs import refresh_item_documents
 from database.repositories_async.helpers import (
     build_agenda_item,
     fetch_topics_for_ids,
@@ -234,6 +235,9 @@ class ItemRepository(BaseRepository):
                 await replace_entity_topics_batch(
                     c, "item_topics", "item_id", items_with_topics
                 )
+            # The items' documents, resolved against what the corpus already
+            # holds; documents archived later join at the post-archival refresh.
+            await refresh_item_documents(c, [item.id for item in items])
 
         logger.debug("stored agenda items", count=len(items), meeting_id=meeting_id)
         return len(items)

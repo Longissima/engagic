@@ -45,6 +45,7 @@ from analysis.llm.input_budget import DOCUMENT_ATTACHMENT_TYPES
 from config import get_logger
 from corpus.store import COMPATIBLE_EXTRACT_VERSIONS as CORPUS_COMPATIBLE_VERSIONS, EXTRACT_VERSION, get_corpus
 from database.db_postgres import Database
+from database.repositories_async.document_blobs import refresh_item_documents
 from database.models import AttachmentInfo
 from exceptions import DocumentDownloadError, ExtractionError
 from parsing.memory_budget import MemoryAdmissionTimeout
@@ -303,6 +304,9 @@ async def ingest_one(db, analyzer: AsyncAnalyzer, candidate: Candidate, args, co
             )
             return DONE
         await record_ingest_result(db, result, identity, url, candidate.banana)
+        # Every item listing this attachment now resolves to its document.
+        async with db.pool.acquire() as conn:
+            await refresh_item_documents(conn, candidate.item_ids)
         counts["ingested"] += 1
         logger.info(
             "attachment ingested",

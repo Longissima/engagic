@@ -468,6 +468,7 @@ class Fetcher:
             matters_duplicate_count = 0
             skipped_meetings = 0
             interrupted = False
+            stored_meeting_ids: List[str] = []
 
             logger.info("storing meetings", city=city.banana, vendor=vendor, meeting_count=len(all_meetings))
             for i, meeting_dict in enumerate(all_meetings):
@@ -494,6 +495,7 @@ class Fetcher:
                     continue
 
                 processed_count += 1
+                stored_meeting_ids.append(stored_meeting.id)
                 items_stored_count += storage_stats.get('items_stored', 0)
                 matters_tracked_count += storage_stats.get('matters_tracked', 0)
                 matters_duplicate_count += storage_stats.get('matters_duplicate', 0)
@@ -504,6 +506,8 @@ class Fetcher:
                 # archival trouble never changes the sync's outcome.
                 try:
                     await self.meeting_sync.archive_sources(all_meetings, city, adapter)
+                    # What was just archived now resolves for these meetings' items.
+                    await self.db.document_blobs.refresh_meeting_documents(stored_meeting_ids)
                 except Exception as e:
                     logger.warning("sync archival failed", city=city.banana, vendor=vendor,
                                    error=str(e), error_type=type(e).__name__)

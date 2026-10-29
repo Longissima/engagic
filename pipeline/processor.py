@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 from database.db_postgres import Database
+from database.repositories_async.document_blobs import refresh_item_documents
 from database.models import Meeting, Matter, MatterMetadata, ParticipationInfo
 from database.id_generation import validate_matter_id, extract_banana_from_matter_id
 from pipeline.ground_truth import produce_ground_truth
@@ -3327,6 +3328,14 @@ class Processor:
 
         shared_urls = {key for key, items in key_to_items.items() if len(items) > 1 and key in document_cache}
         logger.info("cached documents", total_cached=len(document_cache), shared_count=len(shared_urls))
+
+        # Acquisition just archived these items' documents, so publish the join.
+        # A passenger, like every corpus write.
+        try:
+            async with self.db.pool.acquire() as conn:
+                await refresh_item_documents(conn, [item.id for item in need_processing])
+        except Exception as e:
+            logger.warning("item documents refresh failed", error=str(e), error_type=type(e).__name__)
 
         return document_cache, item_attachments, shared_urls
 

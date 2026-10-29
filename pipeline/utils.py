@@ -89,6 +89,51 @@ def canonical_fetch_url(url: str) -> str:
     return url
 
 
+# CivicClerk attachment portal pages name a permanent public download API.
+_CC_PORTAL_ATTACHMENT_RE = re.compile(
+    r"https://([a-z0-9_-]+)\.portal\.civicclerk\.com/event/\d+/files/attachment/(\d+)",
+    re.IGNORECASE,
+)
+# OnBase serves one document from sibling endpoints; acquisition falls back
+# from ViewDocument (an HTML shell on some deployments) to DownloadFileBytes.
+_ONBASE_SIBLINGS = (
+    ("/Documents/ViewDocument/", ("/Documents/DownloadFileBytes/",)),
+    ("/Documents/DownloadFileBytes/", ("/Documents/ViewDocument/",)),
+    ("/Documents/DownloadFile/", ("/Documents/ViewDocument/", "/Documents/DownloadFileBytes/")),
+)
+
+
+def attachment_source_identities(attachment: Dict[str, Any]) -> List[str]:
+    """Every corpus identity this attachment's bytes may be archived under.
+
+    The corpus keys bytes by the URL that yielded them, which is not always the
+    URL on the item: CivicClerk attachment URLs are expiring SAS links whose
+    portal page names a permanent API URL, and OnBase acquisition falls back to
+    a sibling endpoint. Readers that join an item to its blobs try these in
+    order; the first one the corpus holds wins.
+    """
+    raw = str(attachment.get("url") or "")
+    portal = str(attachment.get("portal_url") or "")
+    match = _CC_PORTAL_ATTACHMENT_RE.match(portal)
+    resolved = (f"https://{match.group(1)}.api.civicclerk.com/v1/Meetings/GetAttachmentFile(fileId={match.group(2)})"
+                if match else raw)
+    urls: List[str] = []
+    for url in (resolved, raw):
+        if url and url not in urls:
+            urls.append(url)
+    for url in (resolved, raw, portal):
+        for marker, siblings in _ONBASE_SIBLINGS:
+            if marker in url:
+                urls.extend(u for u in (url.replace(marker, s) for s in siblings) if u not in urls)
+                break
+    identities: List[str] = []
+    for url in urls:
+        identity = attachment_identity(url)
+        if identity not in identities:
+            identities.append(identity)
+    return identities
+
+
 def attachment_identity(url: str) -> str:
     """Stable identity for an attachment URL across re-scrapes.
 

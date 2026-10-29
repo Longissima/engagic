@@ -38,7 +38,7 @@ Fetcher._sync_city
 
 Item metadata from the chunker is never persisted, so anything the funnel does not carry over is lost.
 
-**Archival** (`archive_sources`) downloads every original a synced meeting names (agenda, packets, minutes, item attachments, agenda sources) into the corpus as bytes only. It is capped at `ENGAGIC_SYNC_ARCHIVE_BUDGET` new downloads per city per sync, newest meetings first. Downloads that failed recently are skipped using the shared `document_ingest_failure` ledger. Text extraction stays with the processor and the corpus-window timer.
+**Archival** (`archive_sources`) downloads every original a synced meeting names (agenda, packets, minutes, item attachments, agenda sources) into the corpus as bytes only. It is capped at `ENGAGIC_SYNC_ARCHIVE_BUDGET` new downloads per city per sync, newest meetings first. Downloads that failed recently are skipped using the shared `document_ingest_failure` ledger. Text extraction stays with the processor and the corpus-window timer. Afterwards the fetcher refreshes `item_documents` for the meetings it just stored, so what was archived resolves to its items.
 
 **Enqueue** (`orchestrators/enqueue_decider.py`): a meeting is queued unless every item already has a summary or a filter reason that still applies, or it already has a monolithic summary. A matter is queued when its attachments, work version or title changed since it was last processed, or when it still lacks a canonical summary and has no terminal disposition or exhausted attempts. Administrative matter types are skipped (`filters.should_skip_matter`). Work is written to `pipeline_outbox` in the same transaction as the data it describes, then dispatched to the queue, so a crash cannot leave stored data without its queued work.
 
